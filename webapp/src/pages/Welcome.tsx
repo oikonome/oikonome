@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type CSSProperties, type ReactNode, useEffect, useRef, useState }
   from "react";
 import { Link, useNavigate } from "react-router";
-import { api, errText, kindIs, money, type Onboarding, type SetupMode,
+import { api, errText, kindIs, money, toast, type Onboarding, type SetupMode,
          type Settings, type WizardStep } from "../api/client";
 import { saveSettings, SETTINGS_SAVES } from "../api/cache";
 import { browserPushBlocked, enableBrowserPush } from "../push";
@@ -11,7 +11,8 @@ import BudgetPlanner from "../components/BudgetPlanner";
 import ConnectHub, { FIRST_SYNC_RUNNING } from "../components/ConnectHub";
 import HistoryChoice, { historyLabel } from "../components/HistoryChoice";
 import PrimaryCheckingPick from "../components/PrimaryCheckingPick";
-import { billsContinue, checklistSummary, connectDoneHint } from "../checklist";
+import { billsContinue, budgetsStepKept, checklistSummary, connectDoneHint }
+  from "../checklist";
 import ManualBudgets from "../components/ManualBudgets";
 import { chooseTheme, type Theme } from "../components/themeChoice";
 import { VerifyEmailCard } from "../components/VerifyEmailCard";
@@ -20,8 +21,10 @@ import { AutoBillsPane, ManualBillsPane, SetupQuestion }
 import { isOwner, isViewer } from "../role";
 import { looksLikeMailbox, NEED_BASE_URL, recipientDuplicate }
   from "../recipients";
+import { failLine, saveWaits, UNKNOWN_FIGURE } from "../moneymath";
 import { readStore } from "../safestorage";
 import { sharedLock } from "../sharedlogin";
+import { reducedMotion } from "../motion";
 
 /** strict linear guided setup. One step at a time, one clear
  *  primary action per step; the dots are a passive progress indicator.
@@ -37,6 +40,9 @@ import { sharedLock } from "../sharedlogin";
 
 const STEP_KEYS: WizardStep[] =
   ["appearance", "connect", "bills", "budgets", "email", "finish"];
+
+// why Continue waits on the budgets step while the planner holds edits
+const BUDGET_UNSAVED = "save or discard the changes first";
 
 // prominent forward/primary button in the wizard footer
 const fwdBtn: CSSProperties = {
@@ -124,7 +130,8 @@ function BalanceNudge() {
         <div key={a.id} style={{ display: "flex", gap: ".5rem",
                                  alignItems: "center", marginTop: ".3rem" }}>
           <span style={{ flex: "0 1 14rem" }}>{a.name}</span>
-          $<input inputMode="decimal" style={{ width: "8rem" }}
+          $<input aria-label={`${a.name} balance today`}
+                  inputMode="decimal" style={{ width: "8rem" }}
                   value={vals[a.id] ?? ""} placeholder="0.00"
                   onChange={(e) =>
                     setVals({ ...vals, [a.id]: e.target.value })} />
@@ -142,11 +149,14 @@ function BalanceNudge() {
  *  still sending, so a fill that has not moved for a while still reads
  *  as working rather than hung. Full and still only when the bank says
  *  the window is complete. */
-function BackfillBar({ frac, live, tall, muted }: {
-  frac: number; live: boolean; tall?: boolean; muted?: boolean }) {
+function BackfillBar({ frac, live, tall, muted, label }: {
+  frac: number; live: boolean; tall?: boolean; muted?: boolean;
+  /** the bar's accessible name: what is being imported */
+  label: string }) {
   const pct = Math.round(Math.max(0, Math.min(1, frac)) * 100);
   return (
     <div className={"bf-bar" + (tall ? " tall" : "")} role="progressbar"
+         aria-label={label}
          aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}
          style={{ flexBasis: "100%" }}>
       <div className={"bf-fill" + (live ? " live" : "")
@@ -167,7 +177,8 @@ function LiveCount({ n }: { n: number }) {
   useEffect(() => {
     const from = prev.current;
     prev.current = n;
-    if (n <= from) { setShown(n); return; }
+    // a drop, or a person who asked for less motion: the new count at once
+    if (n <= from || reducedMotion()) { setShown(n); return; }
     setFlash(true);
     const t0 = performance.now(), dur = 1500;
     let raf = 0;
@@ -226,12 +237,13 @@ function BackfillGate({ children }: { children: ReactNode }) {
   // So it repeats every 30 s while the wait lasts; the server keeps its
   // guards (no pull in the last 45 s, no sync running, no first sync queued, at most one queued pull per bank a minute), so a
   // re-nudge costs nothing while history is flowing and rescues the quiet
-  // case.
+  // case. Only while history is still owed: a step opened on an import
+  // that is complete (a re-run, a resume) only reads, and sends nothing.
   // A viewer's 403 is expected and ignored.
   const waiting = !!q.data && !q.data.all_ready;
   useEffect(() => {
-    api.onboardingBackfillNudge().catch(() => {});
     if (!waiting) return;
+    api.onboardingBackfillNudge().catch(() => {});
     const t = setInterval(() => {
       api.onboardingBackfillNudge().catch(() => {});
     }, 30_000);
@@ -268,7 +280,7 @@ function BackfillGate({ children }: { children: ReactNode }) {
         <b>Importing your full transaction history — {done}/{items.length}{" "}
         {items.length === 1 ? "connection" : "connections"} complete.</b></p>
       <BackfillBar frac={overall} live={items.some((it) => !it.ready && !it.stalled)}
-                   tall />
+                   tall label="Transaction history imported" />
       <p className="mut">
         Your bank sends up to two years of transactions after it connects,
         and this step waits for all of it. That history is what everything
@@ -304,7 +316,8 @@ function BackfillGate({ children }: { children: ReactNode }) {
                   : "waiting for the bank to send more…"}</span>
             )}
             <BackfillBar frac={it.stalled ? 1 : it.progress}
-                         live={!it.ready && !it.stalled} muted={it.stalled} />
+                         live={!it.ready && !it.stalled} muted={it.stalled}
+                         label={`${it.institution || "bank"} history imported`} />
           </div>
         ))}
       </div>
@@ -327,6 +340,26 @@ export function flagsOf(d: Delivery): { on: boolean; push: boolean } {
 }
 const DELIVERY_WORDS: Record<Delivery, string> = {
   email: "Email", push: "Push", both: "Email and push", off: "Off" };
+
+/** Who the daily message reaches, as the server worked it out
+ *  (notify/reach.py — the senders' own rules: mutes, a mail relay, the
+ *  browsers and phones registered). */
+type DailyReach = NonNullable<Settings["email_reach"]>["daily"];
+
+/** What the first daily message is, or null when none will arrive: only
+ *  a channel the server counts as reaching someone is promised. */
+export function firstMessage(r: DailyReach | undefined):
+    "email" | "notification" | "text" | null {
+  if (!r || !r.on || !r.receiving) return null;
+  return r.email > 0 ? "email" : r.push > 0 ? "notification"
+    : r.sms ? "text" : null;
+}
+
+/** The Done step's and the Email & push step's line: the server's words,
+ *  marked when the schedule is on and nobody receives it. */
+export function reachLine(r: DailyReach | undefined): string | null {
+  return r ? (r.warn ? "⚠ " : "") + r.text : null;
+}
 
 /** Who the scheduled mail reaches: the owner first, then every other
  *  address on the settings view, each with its on/off. The owner can mute
@@ -474,11 +507,16 @@ function EmailPushStep() {
   type Daily = { on: boolean; push: boolean; hour: number; summary: boolean };
   const save = useMutation({
     mutationFn: async (patch: Partial<Daily>) => {
-      const live = (await api.settings()).email_schedule ?? {};
-      const was = (live as { daily?: Partial<Daily> }).daily ?? {};
+      const cur = await api.settings();
+      const live = cur.email_schedule ?? {};
+      // the stored daily entry with its unset fields filled in: the basis
+      // the save is checked against, so a filled-in default is not read
+      // as this tap's change
+      const was = { on: true, push: false, hour: 7, summary: false,
+                    ...((live as { daily?: Partial<Daily> }).daily ?? {}) };
       return saveSettings(qc, { email_schedule: {
-        ...live, daily: { on: true, push: false, hour: 7, summary: false,
-                          ...was, ...patch } } });
+        ...live, daily: { ...was, ...patch } } },
+        { ...cur, email_schedule: { ...live, daily: was } });
     },
     scope: SETTINGS_SAVES,
     onError: () => setDeliveryOv(null),     // failed write ≠ new truth
@@ -510,7 +548,11 @@ function EmailPushStep() {
       const r = await enableBrowserPush(notify.data.vapid_public_key);
       setPushNote(r.ok ? { text: "This browser will receive it." }
                        : { bad: true, text: r.reason });
-      if (r.ok) qc.invalidateQueries({ queryKey: ["notify"] });
+      if (r.ok) {
+        qc.invalidateQueries({ queryKey: ["notify"] });
+        // a new push target changes who the schedule reaches
+        qc.invalidateQueries({ queryKey: ["settings"] });
+      }
     } catch (e) { setPushNote({ bad: true, text: errText(e) }); }
   };
   const choose = async (next: Delivery) => {
@@ -524,6 +566,9 @@ function EmailPushStep() {
   };
   const hosted = !!me.data?.hosted;
   const smtpSet = !!(s.data?.smtp_host || s.data?.smtp_password_set);
+  // who the saved schedule reaches (the server's); a tap re-reads it with
+  // the save's returned view
+  const reach = s.data?.email_reach?.daily;
   return (
     <div>
       <div className="wiz-field">
@@ -586,12 +631,19 @@ function EmailPushStep() {
         <p className="mut" style={{ margin: "0 0 .5rem", fontSize: 13 }}>
           {pushNote ? <span className={pushNote.bad ? "neg" : ""}>{pushNote.text}</span>
             : pushHere ? "This browser will receive it."
+            : reach && reach.push === 0
+              ? "No browser or phone has push turned on yet — nothing "
+                + "arrives by push until one does."
             : webPush ? "Push goes to the browsers and phones you have enabled."
             : "Push goes to the phones you have enabled — this browser "
               + "cannot receive it on this instance."}
           {phones > 0 && ` ${phones} phone${phones === 1 ? "" : "s"} registered via the mobile app.`}
         </p>
       )}
+      {/* the schedule is on and nobody receives it: the server's reason */}
+      {reach?.warn && (
+        <p className="wiz-sub" style={{ fontSize: 14, color: "var(--amber)" }}>
+          {reachLine(reach)}</p>)}
       {save.isError && <p className="neg">{errText(save.error)}</p>}
       <RecipientsBlock />
       {/* a self-hosted instance sends through its own outbound account;
@@ -616,13 +668,6 @@ function DoneStep({ d }: { d: Onboarding | undefined }) {
   const tracked = (bills.data?.bills ?? []).filter((b) => !b.disabled);
   const nInc = tracked.filter((b) => b.income).length;
   const nBills = tracked.length - nInc;
-  const daily = s.data?.email_schedule?.daily;
-  const delivery = deliveryOf(daily?.on ?? true, !!daily?.push);
-  // no status list (an older server, or still loading) = the owner alone,
-  // as the Email & push step shows it; a list where every address is
-  // muted mails nobody, and the summary says so
-  const recips = recipientRows(s.data);
-  const nRecip = recips.length ? recips.filter((r) => !r.off).length : 1;
   const plural = (n: number, w: string) => `${n} ${w}${n === 1 ? "" : "s"}`;
   const conns = d?.connections ?? 0;
   const reach = d && d.history_months !== undefined ? d.history_months
@@ -630,25 +675,32 @@ function DoneStep({ d }: { d: Onboarding | undefined }) {
   const accounts = conns > 0 ? `${conns} connected`
     : (d?.accounts ?? 0) > 0 ? `${plural(d?.accounts ?? 0, "account")} from files`
     : "none yet";
-  // the figures only when the household set a budget (onboarding's
-  // budgets_set, the verdict's own gate): under a month of history the
-  // settings carry a provisional seed nobody chose, and the summary would
-  // otherwise call the app's guess the person's budget
-  const budgets = d?.budgets_set
-    ? `Food ${money(s.data?.food_monthly ?? 0)} · Everything else `
-      + money(s.data?.other_monthly ?? 0)
+  // the figures only when the household saved a budget of its own
+  // (budgetsStepKept): the settings can carry a first-run seed nobody
+  // chose — provisional, or stored once a month has closed — and the
+  // summary would otherwise call the app's guess the person's budget
+  const kept = !!d && budgetsStepKept(d);
+  const budgets = kept
+    // the month's total first: "Everything else" here would be the stored
+    // figure with every category carved out of it still inside, which is
+    // not the "Everything else" row the planner and Today show
+    ? money((s.data?.food_monthly ?? 0) + (s.data?.other_monthly ?? 0))
+      + ` a month · Food ${money(s.data?.food_monthly ?? 0)}`
     : "not set yet (Budget page any time)";
+  // a line whose read has not answered prints the unknown mark, never a
+  // count or a default ("0 bills", "at 7 AM · 1 recipient")
   const rows: [string, string][] = [
     ["Appearance", theme.charAt(0).toUpperCase() + theme.slice(1)],
-    ["Accounts", `${accounts} · ${historyLabel(reach)}`],
-    ["Bills & income",
-      `${plural(nBills, "bill")}, ${plural(nInc, "paycheck")} approved`],
-    ["Budgets", budgets],
-    ["Email & push", `${DELIVERY_WORDS[delivery]}`
-      + (delivery === "off" ? "" : ` at ${hourLabel(daily?.hour ?? 7)}`)
-      + ` · ${nRecip ? plural(nRecip, "recipient") : "nobody"}`],
+    ["Accounts", d ? `${accounts} · ${historyLabel(reach)}` : UNKNOWN_FIGURE],
+    ["Bills & income", bills.data
+      ? `${plural(nBills, "bill")}, ${plural(nInc, "paycheck")} approved`
+      : UNKNOWN_FIGURE],
+    ["Budgets", d && (!kept || s.data) ? budgets : UNKNOWN_FIGURE],
+    // who it reaches is the server's answer (email_reach): a schedule
+    // that is on says nothing about whether anyone gets it
+    ["Email & push", reachLine(s.data?.email_reach?.daily) ?? UNKNOWN_FIGURE],
     // what the Today page's checklist will say — the same list it reads
-    ["Today checklist", d ? checklistSummary(d) : "…"],
+    ["Today checklist", d ? checklistSummary(d) : UNKNOWN_FIGURE],
   ];
   return (
     <div>
@@ -690,9 +742,21 @@ export default function Welcome() {
   // the bills step opens on its question; Continue there shows the pane
   // the answer picked, inside the same step
   const [billsPane, setBillsPane] = useState<"ask" | "work">("ask");
+  // the planner holds typed figures it has not saved: Continue would keep
+  // the stored plan and Done would report a figure this step did not show
+  // last, so the step is left only once they are saved or discarded
+  const [budgetDirty, setBudgetDirty] = useState(false);
+  // a scan the person asked for: Continue on "find them for me" is that
+  // ask. Opening the pane again (Back, a resume) only shows the offers the
+  // last scan left — the nightly finder keeps them current
+  const [scanAsk, setScanAsk] = useState(0);
   const [modeOv, setModeOv] = useState<SetupMode | null>(null);
-  const mode: SetupMode = modeOv ?? st.data?.setup_mode ?? d?.setup_mode
-    ?? "auto";
+  // the stored answer, or null while neither read has answered: a guess
+  // here would be written by Continue — "auto" over a household's
+  // "manual" turns the nightly finder back on
+  const mode: SetupMode | null = modeOv ?? st.data?.setup_mode
+    ?? d?.setup_mode ?? null;
+  const modeWaits = saveWaits(mode !== null, st.isError && ob.isError);
   // resume at the first step with no done/skipped mark
   useEffect(() => {
     if (step === null && d && !me.isPending) {
@@ -724,6 +788,14 @@ export default function Welcome() {
       qc.invalidateQueries({ queryKey: ["onboarding"] });
       leftWizard(me.data?.tenant_id);
       nav("/");
+    },
+    // on the last step this is the only way out, so a save the server
+    // could not take still leaves the wizard (the device remembers it was
+    // left; the nav keeps the way back) and says the mark was not stored
+    onError: (e) => {
+      leftWizard(me.data?.tenant_id);
+      nav("/");
+      toast(`Setup wasn't marked finished: ${errText(e)}`);
     },
   });
   // The answer to the bills question is saved on the tap: manual also
@@ -800,6 +872,8 @@ export default function Welcome() {
     // walking forward into the bills step opens its question; Back from
     // budgets returns to the pane that was left
     if (keys[i] === "bills" && i > idx) setBillsPane("ask");
+    // a planner left by another door re-seeds from what is saved
+    setBudgetDirty(false);
     setStep(i);
   };
   const advance = (state: "done" | "skipped") => {
@@ -812,11 +886,12 @@ export default function Welcome() {
     qc.invalidateQueries({ queryKey: ["onboarding"] });
     qc.invalidateQueries({ queryKey: ["settings"] });
   };
+  // the first message is promised only when the server says it reaches
+  // someone (email_reach); a schedule nobody receives promises nothing
   const daily = st.data?.email_schedule?.daily;
-  const delivery = deliveryOf(daily?.on ?? true, !!daily?.push);
-  const firstSend = delivery === "off" ? ""
-    : `; the first ${delivery === "push" ? "notification" : "email"} `
-      + `arrives tomorrow at ${hourLabel(daily?.hour ?? 7)}`;
+  const first = firstMessage(st.data?.email_reach?.daily);
+  const firstSend = first === null ? ""
+    : `; the first ${first} arrives tomorrow at ${hourLabel(daily?.hour ?? 7)}`;
 
   const billsOut = billsContinue(d?.pending_proposals ?? 0);
   const billsPrimary = { label: billsOut.label, hint: billsOut.hint,
@@ -829,15 +904,25 @@ export default function Welcome() {
     blurb: "Your history is in. Oikonome can read it and propose your " +
            "recurring bills, paychecks and a starting budget — or you can " +
            "enter them yourself.",
-    primary: { label: "Continue →", disabled: pickMode.isPending,
+    primary: { label: "Continue →",
+               disabled: pickMode.isPending || mode === null,
+               hint: modeWaits ?? undefined,
                onClick: () => {
+                 if (mode === null) return;
+                 const open = () => {
+                   if (mode === "auto") setScanAsk((n) => n + 1);
+                   setBillsPane("work");
+                 };
                  // the pre-selected answer was never tapped: save it now,
                  // before the pane that depends on it opens
-                 if (st.data?.setup_mode === mode) { setBillsPane("work"); return; }
-                 chooseMode(mode, () => setBillsPane("work"));
+                 if (st.data?.setup_mode === mode) { open(); return; }
+                 chooseMode(mode, open);
                } },
     skippable: true,
-    body: <SetupQuestion mode={mode} onPick={(m) => chooseMode(m)} />,
+    body: <>
+      <SetupQuestion mode={mode} onPick={(m) => chooseMode(m)} />
+      {modeWaits && <p className="mut">{modeWaits}</p>}
+    </>,
   } : mode === "manual" ? {
     key: "bills", label: "Enter bills & income",
     blurb: "Add the bills and paychecks you know. Each one matches its " +
@@ -861,7 +946,7 @@ export default function Welcome() {
     primary: backfillReady ? { ...billsPrimary } : null,
     skippable: backfillReady,
     onBack: () => setBillsPane("ask"),
-    body: <BackfillGate><AutoBillsPane /></BackfillGate>,
+    body: <BackfillGate><AutoBillsPane scan={scanAsk} /></BackfillGate>,
   };
 
   const steps: StepView[] = [
@@ -872,23 +957,27 @@ export default function Welcome() {
       primary: { label: "Continue →" }, skippable: false,
       body: <AppearanceStep /> },
     { key: "connect", label: "Connect your accounts",
-      blurb: "Link every bank you use — the grid shows what's already " +
-             "connected. When you've added everything you plan to, say so " +
-             "below. (File imports alone work completely too.)",
+      blurb: "Link every bank you use. When you've added everything " +
+             "you plan to, say so below. (File imports alone work " +
+             "completely too.)",
       // files-only households have no connection but DO have transactions
       // after an inline import — that also counts as "connected enough"
+      // "connect at least one source" only from a setup state that
+      // answered: unread, nothing is known about what is connected
       primary: { label: "Done connecting →",
-                 disabled: ((d?.connections ?? 0) === 0
-                   && (d?.transactions ?? 0) === 0) || !!askChecking,
-                 hint: (d?.connections ?? 0) === 0
-                       && (d?.transactions ?? 0) === 0
+                 disabled: d === undefined || ((d.connections ?? 0) === 0
+                   && (d.transactions ?? 0) === 0) || !!askChecking,
+                 hint: d === undefined
+                   ? (ob.isError
+                      ? failLine(ob.error, "the setup progress", "web").text
+                      : "Loading…")
+                   : (d.connections ?? 0) === 0
+                       && (d.transactions ?? 0) === 0
                    ? "connect at least one source, or skip" : askChecking },
       skippable: true,
       body: (
         <>
-          <ConnectHub />
-          <p style={{ margin: ".6rem 0 0" }}>
-            <Link to="/import">Import a file instead</Link></p>
+          <ConnectHub inWizard />
           <div className="wiz-sub"><HistoryChoice /></div>
           {/* the forecast's anchor: one checking account is pinned on the
               way out; two or more are asked here, before the step is left */}
@@ -910,11 +999,15 @@ export default function Welcome() {
           "and bills from the last step, spending budgets from your " +
           "history, and what's left as savings. The daily verdict only " +
           "judges the variable spending.",
-      primary: { label: "Continue →", disabled: !d?.budgets_set,
-                 hint: d?.budgets_set ? undefined : "save budgets first" },
+      primary: { label: "Continue →",
+                 disabled: !d || !budgetsStepKept(d) || budgetDirty,
+                 hint: !d || !budgetsStepKept(d) ? "save budgets first"
+                   : budgetDirty ? BUDGET_UNSAVED : undefined },
       skippable: true,
-      body: mode === "manual" ? <ManualBudgets onSaved={refreshBadges} />
-        : <BudgetPlanner onSaved={refreshBadges} /> },
+      body: mode === null ? <p className="mut">{modeWaits}</p>
+        : mode === "manual" ? <ManualBudgets onSaved={refreshBadges} />
+        : <BudgetPlanner onSaved={refreshBadges}
+                         onDirtyChange={setBudgetDirty} /> },
     { key: "email", label: "Email & push",
       blurb: "One message a day with your verdict, and alerts when " +
              "something needs you. Choose how it reaches you, when, and who " +
@@ -932,6 +1025,9 @@ export default function Welcome() {
 
   return (
     <>
+      {/* the page's heading for a screen reader; each step's title is the
+          h2 under it, and the progress row already shows where you are */}
+      <h1 className="sr-only">Setup</h1>
       <div className="card wiz-card" style={{ marginBottom: "1rem" }}>
         {/* one progress row: dots · where you are · the way out. A
             full-width h1, an exit sentence dressed as a button and a
@@ -949,13 +1045,14 @@ export default function Welcome() {
           </span>
           <span className="wiz-where">
             Step {idx + 1} of {steps.length} · <b>{s.label}</b></span>
-          <button className="linklike mut wiz-later"
+          {/* nothing is left to finish later on the last step */}
+          {!last && <button className="linklike mut wiz-later"
             style={{ background: "none", border: "none",
                      cursor: "pointer", fontSize: 12 }}
             onClick={() => { leftWizard(me.data?.tenant_id); nav("/"); }}
             title="your answers so far are saved; the nav keeps a
                    “Finish setup” door">
-            save &amp; finish later</button>
+            save &amp; finish later</button>}
         </div>
         <h2 style={{ margin: ".1rem 0 .3rem", fontSize: "1.1rem" }}>
           {s.title ?? s.label}</h2>
@@ -990,13 +1087,14 @@ export default function Welcome() {
               Go to Today →</button>
           )}
         </div>
-        <div style={{ textAlign: "right", marginTop: ".5rem" }}>
+        {/* "Go to Today" already is this door on the last step */}
+        {!last && <div style={{ textAlign: "right", marginTop: ".5rem" }}>
           <button className="linklike mut" style={{ background: "none",
               border: "none", cursor: "pointer", fontSize: 12 }}
             disabled={finish.isPending}
             onClick={() => finish.mutate()}>
             don't show this again</button>
-        </div>
+        </div>}
       </div>
     </>
   );

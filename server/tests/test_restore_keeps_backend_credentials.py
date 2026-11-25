@@ -74,7 +74,9 @@ class RestoreKeepsBackendCredentialsTests(unittest.TestCase):
 
     def test_zip_may_still_rename_and_repoint_a_backend(self):
         """Carrying the destination's secret forward must not freeze the
-        rest of the entry — the ZIP's non-secret fields still win."""
+        rest of the entry — the ZIP's non-secret fields still win. A
+        repointed entry lands without the stored key: it was saved for the
+        old endpoint, and an edited archive must not hand it to another."""
         budget.save_config(self.conn, {
             "llm_backends": [
                 {"id": "fast", "name": "Old", "url": "https://old.dev/v1",
@@ -89,7 +91,7 @@ class RestoreKeepsBackendCredentialsTests(unittest.TestCase):
         b = self._backends()[0]
         self.assertEqual((b["name"], b["url"], b["model"]),
                          ("New", "https://new.dev/v1", "large"))
-        self.assertEqual(b["api_key"], "key-fast")
+        self.assertNotIn("api_key", b)
 
     def test_backend_the_destination_never_had_arrives_without_a_key(self):
         """A ZIP entry with no counterpart here has no credential to carry

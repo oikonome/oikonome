@@ -27,7 +27,7 @@ import re
 
 from ..engine.compat import as_date
 from . import flowmap, reimport
-from .base import (FileImportIds, Transaction, mask_long_digits,
+from .base import (FileRowCount, FileImportIds, Transaction, mask_long_digits,
                    drop_before_history, upsert_transactions)
 from .rowcap import capped
 from .dedup import WINDOW_DAYS as DEDUP_WINDOW_DAYS  # noqa: F401 (re-export)
@@ -557,7 +557,10 @@ def import_csv(conn, account_id: str, text: str, mapping: dict, *,
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
-    added = upsert_transactions(conn, txns)
-    return {"imported": added, "rows": len(txns),
+    count = FileRowCount(conn, txns)
+    upsert_transactions(conn, txns)
+    added, matched = count.after()
+    return {"imported": added, "matched": matched, "rows": len(txns),
             "skipped_duplicates": skipped_dupes, "corrected": corrected,
             "skipped_older": skipped_older}
+

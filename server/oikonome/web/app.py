@@ -13,6 +13,7 @@ are pooled (tenancy.py owns the pools and the connection budget).
 
 import contextlib
 import datetime as dt
+import time
 import html as _htmlmod
 import json
 import logging
@@ -21,6 +22,7 @@ import re
 import uuid
 
 from fastapi import Body, Depends, FastAPI, Form, HTTPException, Request, Response
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -42,6 +44,11 @@ from ..engine import budget
 from ..envnum import env_flag
 from .. import ext
 from ..jobs import unverified as _unverified
+from .schemas import Ok, documented
+from .schemas import auth as auth_shapes
+from .schemas import devices as device_shapes
+from .schemas import doctor as doctor_shapes
+from .schemas import household as household_shapes
 from . import demoguard
 from . import permissions
 from . import security
@@ -49,6 +56,9 @@ from . import turnstile
 # the widget's form field is hyphenated, so every handler that reads it needs
 # the name as a Form alias — evaluated at def time, hence a module import
 _TS_FIELD = turnstile.FIELD
+# the one signed-in-user dependency; the checks it runs are
+# _resolve_current_user below
+from .session_user import current_user  # noqa: F401
 from .security import AutoBanMiddleware, BodySizeLimitMiddleware, \
     OriginCheckMiddleware, forwarded_host, limit, request_scheme
 
@@ -111,6 +121,10 @@ def _csp() -> str:
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
+        # when the request ARRIVED: a door that reads a large body before
+        # its check (a whole-ledger restore) judges a time window as of
+        # this moment, so the upload's own length does not spend it
+        request.state.arrived_at = time.monotonic()
         resp = await call_next(request)
         h = resp.headers
         h.setdefault("X-Content-Type-Options", "nosniff")
@@ -380,9 +394,19 @@ def _reserve_login_guess(email: str):
     count — the caller does not also record the failure."""
     slot = security.reserve_login_guess(email)
     if slot is None:
-        raise HTTPException(429, "too many failed attempts on this account "
-                                 "— try again in a few minutes")
+        _raise_login_locked(email)
     return slot
+
+
+def _raise_login_locked(email: str):
+    """429 for a sign-in the account's second-factor lock refuses, saying
+    how long it really holds (the lock escalates to hours)."""
+    left = security.login_lock_remaining(email) or security._ACCT_FAIL_WINDOW
+    raise HTTPException(
+        429, "too many failed attempts on this account — try again in "
+             f"{security.wait_words(left)}, or reset your password from "
+             "the sign-in page",
+        headers={"Retry-After": str(int(left) + 1)})
 
 
 def _step_up_factor_miss(user_id, email: str, route: str,
@@ -406,11 +430,18 @@ def _refuse_if_step_up_locked(user_id) -> None:
     right one, or the lock would only slow a grind down. Another session of
     the same user, and the sign-in door, are unaffected."""
     if security.step_up_locked(user_id):
-        raise HTTPException(429, _STEP_UP_LOCKED_MSG)
+        _raise_step_up_locked(user_id)
 
 
-_STEP_UP_LOCKED_MSG = ("too many failed attempts from this session — try "
-                       "again in a few minutes")
+def _raise_step_up_locked(user_id):
+    """429 for a session whose step-up lock holds, saying how long (the
+    lock escalates to hours)."""
+    left = (security.step_up_lock_remaining(user_id)
+            or security._STEP_UP_FAIL_WINDOW)
+    raise HTTPException(
+        429, "too many failed attempts from this session — try again in "
+             f"{security.wait_words(left)}",
+        headers={"Retry-After": str(int(left) + 1)})
 
 
 def _reserve_step_up_guess(user_id):
@@ -423,7 +454,7 @@ def _reserve_step_up_guess(user_id):
     `_step_up_factor_miss` on a wrong one."""
     slot = security.reserve_step_up_guess(user_id)
     if slot is None:
-        raise HTTPException(429, _STEP_UP_LOCKED_MSG)
+        _raise_step_up_locked(user_id)
     return slot
 
 
@@ -480,6 +511,36 @@ def _unspend_unlock(email: str) -> None:
     except Exception:                    # noqa: BLE001 — best-effort
         log.warning("could not re-arm an emailed unlock after a busy "
                     "hasher", exc_info=True)
+
+
+_UNLOCK_COOKIE = "oikonome_unlock"
+_UNLOCK_PROOF_MAX = 128
+
+
+def _unlock_proof(request: Request, field: str = "") -> str:
+    """The emailed unlock's proof this sign-in carries: the sign-in code a
+    native app sends in the form, else the cookie /unlock/confirm set in
+    the confirming browser. Without one the unlock cannot be spent."""
+    # a door called as a plain function (not through the router) passes
+    # its Form() default object, which is no proof
+    if not isinstance(field, str):
+        field = ""
+    proof = (field or request.cookies.get(_UNLOCK_COOKIE, "") or "").strip()
+    return proof[:_UNLOCK_PROOF_MAX]
+
+
+def _set_unlock_cookie(resp, request: Request, proof: str,
+                       ttl: dt.timedelta) -> None:
+    # HttpOnly: page script never needs it, the sign-in posts carry it.
+    # SameSite=Strict: only this site's own forms and fetches send it.
+    # Secure on https only, by the session cookie's rule (a Secure cookie
+    # on a plain-http LAN install silently vanishes).
+    from . import security
+    resp.set_cookie(_UNLOCK_COOKIE, proof, httponly=True,
+                    secure=(security.request_scheme(request) == "https")
+                    and not DEV_MODE,
+                    samesite="strict", path="/",
+                    max_age=int(ttl.total_seconds()))
 
 
 def _in_session_password_ok(user_id, row, password: str, email: str,
@@ -738,7 +799,11 @@ SCRIPT_TOKEN_RATE = (60, 3600.0)     # (requests, window seconds)
 # boundary, plus the Prometheus text endpoint. GET only: a read token
 # that could POST anywhere would be a write credential by another name.
 READ_TOKEN_PREFIXES = ("/api/integrations",)
-READ_TOKEN_EXACT = frozenset({("GET", "/metrics")})
+# The one POST a read token may make: the MCP endpoint's JSON-RPC door,
+# which dispatches to read tools only (web/mcp.py) and answers 404 until
+# OIKONOME_MCP_ENABLED is set.
+READ_TOKEN_EXACT = frozenset({("GET", "/metrics"),
+                              ("POST", "/api/integrations/mcp")})
 # A scraper polls every 15-60 s and a sensor refreshes on its own clock,
 # so the read budget is ten times the push one — still a bound, so a
 # leaked read token cannot be used to hammer the summary computation.
@@ -772,7 +837,9 @@ def _script_token_ratelimit(request: Request, scope: str = "push") -> None:
         raise HTTPException(429, "too many requests — try again later")
 
 
-def current_user(request: Request) -> dict:
+def _resolve_current_user(request: Request) -> dict:
+    # What the `current_user` dependency (web/session_user.py) runs for
+    # every request.
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer " + api_tokens.PREFIX):
         # The door check needs the token's scope, and the scope is on the
@@ -829,7 +896,8 @@ def current_user(request: Request) -> dict:
         return {"user_id": row["created_by"], "tenant_id": row["tenant_id"],
                 "email": f"script:{row['name']}",
                 "role": "owner" if scope == "push" else "viewer",
-                "script_token": True, "token_scope": scope}
+                "script_token": True, "token_scope": scope,
+                "token_id": str(row["id"])}
     if auth.startswith("Bearer " + widget_tokens.PREFIX):
         # a home-screen widget token is a CHILD of a device token that
         # can reach one door — the glance payload — and nothing else. The
@@ -1096,7 +1164,8 @@ def login_page(request: Request):
 @app.post("/login", dependencies=[Depends(limit("login", *_LOGIN_PER_IP))])
 def login_form(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
                password: str = Form(...), totp_code: str = Form(""),
-               cf_token: str = Form("", alias=_TS_FIELD)):
+               cf_token: str = Form("", alias=_TS_FIELD),
+               unlock_proof: str = Form("")):
     from fastapi.responses import HTMLResponse
     from ..auth import totp as totp_mod
     from . import security, todayview
@@ -1104,7 +1173,8 @@ def login_form(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
     # with recent failures behind it (see turnstile.verify_login). No-JS
     # door: one submit, one token. A rejected token re-renders the form
     # rather than 4xx-ing, so the widget gets a fresh challenge.
-    if not turnstile.verify_login(cf_token, security.client_ip(request), email):
+    if not turnstile.verify_login(cf_token, security.client_ip(request), email,
+                                  _unlock_proof(request, unlock_proof)):
         # show_unlock is load-bearing HERE above all: this is the
         # response a user gets when they cannot complete the widget — script
         # blocked, JS off, corporate proxy — so omitting it leaves exactly
@@ -1120,6 +1190,8 @@ def login_form(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
     # account-scoped lockout: stops a distributed TOTP/password brute at
     # one account regardless of source IP
     def _locked_page():
+        left = (security.login_lock_remaining(email)
+                or security._ACCT_FAIL_WINDOW)
         return HTMLResponse(todayview._env.get_template("login.html").render(
             centered=True, title="Sign in", email=email,
             turnstile_key=turnstile.render_key(),
@@ -1128,7 +1200,9 @@ def login_form(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
             show_unlock=turnstile.enabled() and turnstile.required_for_login(
                 security.client_ip(request), email),
             error="Too many failed attempts on this account — try again "
-                  "in a few minutes."), status_code=429)
+                  f"in {security.wait_words(left)}, or reset your password "
+                  "with “Forgot password”."), status_code=429,
+            headers={"Retry-After": str(int(left) + 1)})
     if security.account_login_locked(email):
         return _locked_page()
     _slot = None
@@ -1491,7 +1565,8 @@ def _reset_send_allowed(conn, user_id) -> bool:
 @app.post("/forgot", dependencies=[Depends(limit("forgot", 5, 3600)),
                               Depends(_not_demo_instance)])
 def forgot_submit(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
-                  cf_token: str = Form("", alias=_TS_FIELD)):
+                  cf_token: str = Form("", alias=_TS_FIELD),
+                  unlock_proof: str = Form("")):
     from fastapi.responses import HTMLResponse
     from . import security, todayview
     # /forgot sits inside the human-check perimeter. Outside it, with only
@@ -1515,7 +1590,9 @@ def forgot_submit(request: Request, email: str = Form(..., max_length=EMAIL_MAX)
         # per-account RISK bucket deliberately stays out of this gate (see
         # the comment above), so nobody can arm a challenge against a
         # stranger by guessing at their login here.
-        if not turnstile.spend_unlock(email_in):
+        if not turnstile.spend_unlock(email_in,
+                                      _unlock_proof(request, unlock_proof),
+                                      ip):
             return HTMLResponse(
                 todayview._env.get_template("forgot.html").render(
                     centered=True, title="Reset password", sent=False,
@@ -1590,9 +1667,12 @@ def unlock_page(request: Request, token: str = ""):
 
 @app.post("/unlock/confirm", dependencies=[Depends(limit("unlock", 10, 3600)),
                                            Depends(_not_demo_instance)])
-def unlock_confirm(token: str = Form("")):
-    """The explicit human action that actually spends the link."""
-    from fastapi.responses import HTMLResponse, RedirectResponse
+def unlock_confirm(request: Request, token: str = Form("")):
+    """The explicit human action that actually spends the link — the only
+    place the unlock's proof is handed out, because it is the only step
+    that proves the mailbox. The confirming browser gets it as a cookie;
+    the page shows its short form, the sign-in code, for the app."""
+    from fastapi.responses import HTMLResponse
     from . import todayview
     with _control_conn() as conn:
         row = login_unlock.follow(conn, token)
@@ -1604,7 +1684,13 @@ def unlock_confirm(token: str = Form("")):
     # NOT a sign-in: no session is created here. The password (and any
     # second factor) is still required — that is the whole difference
     # between this and a magic link.
-    return RedirectResponse("/login?unlocked=1", status_code=303)
+    resp = HTMLResponse(todayview._env.get_template("unlock.html").render(
+        centered=True, title="Sign-in help", unlocked_code=row["code"],
+        email=row["email"]))
+    _set_unlock_cookie(resp, request, row["proof"], login_unlock.UNLOCK_TTL)
+    # a sign-in code on the page: nothing about it may be cached or kept
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.post("/unlock", dependencies=[Depends(limit("unlock", 5, 3600)),
@@ -1625,6 +1711,8 @@ def unlock_submit(request: Request, email: str = Form(..., max_length=EMAIL_MAX)
                          daemon=True).start()
     # identical response whether the account exists, or existed and was over
     # its hourly cap — neither the prober nor the mail-bomber learns anything
+    # Nothing usable goes back to the asker: anyone may ask for any
+    # address, so only the confirm step (the mailbox) hands out the proof.
     return HTMLResponse(todayview._env.get_template("unlock.html").render(
         centered=True, title="Sign-in help", sent=True, message=UNLOCK_MSG))
 
@@ -1722,9 +1810,22 @@ def reset_submit(token: str = Form(...), password: str = Form(...),
     from ..auth import recovery
     slot = None
     if needs and recovery_code:
-        # the code's slot in the account lock is taken before it is
-        # checked, as at sign-in
-        slot = _reserve_login_guess(row["email"])
+        # the code's slot is taken before it is checked, as at sign-in —
+        # from the reset link's own plain budget, not the escalating
+        # sign-in lock (see security.reserve_reset_guess): the mailbox must
+        # be able to reset while that lock holds
+        slot = security.reserve_reset_guess(row["email"])
+        if slot is None:
+            left = (security.reset_lock_remaining(row["email"])
+                    or security._RESET_FAIL_WINDOW)
+            return HTMLResponse(
+                todayview._env.get_template("reset.html").render(
+                    centered=True, title="Reset password", token=token,
+                    needs_recovery=True, support_email=support_email(),
+                    error="Too many recovery codes tried on this link — "
+                          f"try again in {security.wait_words(left)}."),
+                status_code=429,
+                headers={"Retry-After": str(int(left) + 1)})
     if needs:
         with _control_conn() as conn:
             redeemed = recovery.redeem(conn, row["user_id"],
@@ -1783,6 +1884,8 @@ def reset_submit(token: str = Form(...), password: str = Form(...),
         # the clock too — whoever holds a code does not need the door
         if needs:
             factor_reset.cancel_for_user(conn, row["user_id"], reason="reset")
+    # the password a second-factor lock was holding off no longer works
+    security.lift_login_lock(row["email"])
     return RedirectResponse("/login?reset=1", status_code=303)
 
 
@@ -1822,8 +1925,16 @@ def recover_request(request: Request, token: str = Form(...)):
             landed = factor_reset.matured(conn, row["user_id"]) is not None
             return _recover_page(state="landed" if landed else "not_needed",
                                  token=token)
-        req, cancel = factor_reset.request(conn, row["user_id"],
-                                           ip=client_ip(request))
+        try:
+            req, cancel = factor_reset.request(conn, row["user_id"],
+                                               ip=client_ip(request))
+        except HTTPException as e:
+            # an email change undone days ago holds this door shut: the
+            # person asked from a page, so the reason is shown on that page
+            if (isinstance(e.detail, dict)
+                    and e.detail.get("error") == "recently_reverted"):
+                return _recover_page(error=e.detail["message"], status=403)
+            raise
         u = conn.execute("SELECT tenant_id FROM users WHERE id=%s",
                          (row["user_id"],)).fetchone()
     import threading
@@ -1879,6 +1990,7 @@ def recover_cancel(token: str = Form("")):
 
 @app.post("/api/recovery/cancel-pending",
           dependencies=[Depends(limit("recover_cancel_pending", 30, 3600))])
+@documented(response=auth_shapes.RecoveryCancelled)
 def recover_cancel_pending(user: dict = Depends(current_user)):
     """Stop a factor-clearing recovery from inside the app.
 
@@ -1966,8 +2078,8 @@ def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
                               url=_SECURITY_SETTINGS_URL,
                               user_id=me["id"], connect=_control_conn)
         if own_native:
-            _native.send_tenant(None, tenant_id, "alert",
-                                user_id=me["id"], connect=_control_conn)
+            _native.send_security(None, tenant_id, user_id=me["id"],
+                                  connect=_control_conn)
         # A browser subscription on the account is not proof the
         # account's owner will see it: whoever held the session could
         # have added their own browser. So only the account's own
@@ -1977,6 +2089,10 @@ def _security_fan_out(email: str, tenant_id, title: str, short: str, *,
             _push.send_tenant(None, tenant_id, "Security notice", neutral,
                               url=_SECURITY_SETTINGS_URL,
                               connect=_control_conn)
+            # the rest of the household gets the plain alert, never the
+            # security event: the relay's line for that one speaks of "your
+            # account" and its tap opens the reader's own Security screen,
+            # where nothing of theirs is pending
             _native.send_tenant(None, tenant_id, "alert",
                                 connect=_control_conn)
             for uid in muted_ids:
@@ -2052,6 +2168,27 @@ _SECURITY_CHANGES = {
     "connections_imported": "A connections file was imported into your "
                             "Oikonome account; it can change where AI and "
                             "mail settings send data.",
+    "ai_route_changed": "The AI service your Oikonome household sends its "
+                        "transactions, receipts and questions to was "
+                        "changed in Settings.",
+    "ai_route_restored": "The AI service your Oikonome household sends its "
+                         "transactions, receipts and questions to was "
+                         "changed by restoring an exported archive.",
+    # not a change: the one sign that the password is known to someone
+    "second_factor_failed": "Someone signed in to your Oikonome account "
+                            "with its password and then failed the second "
+                            "step (the sign-in code) again and again, so "
+                            "signing in with the password is paused for a "
+                            "while. A password reset (“Forgot password” on "
+                            "the sign-in page) still works while it is "
+                            "paused, and lifts the pause.",
+    # the same sign from inside a signed-in session: someone holding it
+    # tried to confirm a sensitive change and kept failing
+    "step_up_failed": "Someone using a signed-in browser or device on your "
+                      "Oikonome account tried again and again to confirm "
+                      "it is you (the password, sign-in code or passkey "
+                      "asked before a sensitive change) and failed, so "
+                      "that browser or device cannot confirm for a while.",
 }
 
 # The changes whose door leaves the account's other sign-ins as they were
@@ -2060,7 +2197,11 @@ _SECURITY_CHANGES = {
 _KEEPS_OTHER_SIGN_INS = frozenset({"passkey_added", "passkey_removed",
                                    "api_token_created",
                                    "connections_exported",
-                                   "connections_imported"})
+                                   "connections_imported",
+                                   "ai_route_changed",
+                                   "ai_route_restored",
+                                   "second_factor_failed",
+                                   "step_up_failed"})
 
 
 def _deliver_security_notice(email: str, tenant_id, change: str) -> None:
@@ -2111,6 +2252,57 @@ def _notify_security_change(user: dict, change: str) -> None:
     threading.Thread(target=_deliver_security_notice,
                      args=(user.get("email") or "", user.get("tenant_id"),
                            change), daemon=True).start()
+
+
+def _notify_second_factor_lockout(email: str) -> None:
+    """security.reserve_login_guess calls this when the second-factor lock
+    trips after a verified password (at most once a day per account): the
+    owner hears that the password is known, on the security notice's
+    channels. Off the request, like every security notice. NEVER raises."""
+    import threading
+
+    def _run():
+        addr = (email or "").strip().lower()
+        try:
+            with _control_conn() as c:
+                row = c.execute("SELECT tenant_id FROM users WHERE email=%s",
+                                (addr,)).fetchone()
+        except Exception:                                # noqa: BLE001
+            log.exception("second-factor lockout notice: account lookup "
+                          "failed")
+            return
+        if row:
+            _deliver_security_notice(addr, row["tenant_id"],
+                                     "second_factor_failed")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+security.on_second_factor_lockout = _notify_second_factor_lockout
+
+
+def _notify_step_up_lockout(user_id: str) -> None:
+    """security calls this when a credential's step-up lock trips (at most
+    once a day per user): the account the confirmations were asked of gets
+    the failed sign-in's notice, on the same channels and under the same
+    rules (_deliver_security_notice). Off the request. NEVER raises."""
+    import threading
+
+    def _run():
+        try:
+            with _control_conn() as c:
+                row = c.execute(
+                    "SELECT email, tenant_id FROM users WHERE id::text = %s",
+                    (str(user_id or ""),)).fetchone()
+        except Exception:                                # noqa: BLE001
+            log.exception("step-up lockout notice: account lookup failed")
+            return
+        if row and row["email"]:
+            _deliver_security_notice(row["email"], row["tenant_id"],
+                                     "step_up_failed")
+    threading.Thread(target=_run, daemon=True).start()
+
+
+security.on_step_up_lockout = _notify_step_up_lockout
 
 
 def _deliver_email_change_notice(old_email: str, new_email: str, tenant_id,
@@ -2750,7 +2942,8 @@ async def unsubscribe_act(request: Request):
     if got is None:
         return _unsubscribe_page("unknown", status=400)
     tid, email = got
-    if not _unsub.apply(tid, email):
+    # the write runs off the event loop (a tenant checkout and an update)
+    if not await run_in_threadpool(_unsub.apply, tid, email):
         return _unsubscribe_page("failed", email=email, status=503)
     return _unsubscribe_page("done", email=email)
 
@@ -2815,7 +3008,8 @@ async def act_do(request: Request):
     tok, bad = _act_token(form_token or request.query_params.get("token", ""))
     if bad:
         return _act_page(bad, status=400)
-    got = mailact.apply(tok)
+    # approving a bill from mail opens a tenant connection: off the loop
+    got = await run_in_threadpool(mailact.apply, tok)
     st = got["state"]
     return _act_page(st, sentence=got.get("sentence", ""), email=tok["email"],
                      status=200 if st in ("done", "already") else
@@ -3020,6 +3214,7 @@ _RECLAIM_NOT_OCCUPANCY = frozenset({
     "job_runs", "job_progress", "sync_log", "script_heartbeats",
     "alerts_log", "tenant_keys",
     "budget_snapshots", "networth_snapshot", "categorizer_model",
+    "forecast_learned", "forecast_nights",
 }) | ext.gate.machinery_tables()
 
 # The settings keys provisioning itself writes. Anything else in the config
@@ -3676,6 +3871,7 @@ _VERIFY_RESEND_PER_ACCOUNT = (3, 3600)
 
 @app.post("/api/verify-email/resend",
           dependencies=[Depends(limit("verify_resend", 30, 3600))])
+@documented(response=auth_shapes.VerifyResent)
 def verify_email_resend(user: dict = Depends(current_user)):
     """Mail a fresh confirmation link.
 
@@ -3884,6 +4080,21 @@ async def _lock_busy(request: Request, exc: LockNotAvailable):
                        headers={"Retry-After": "2"})
 
 
+from ..engine.budget import ConfigTooLarge  # noqa: E402
+
+
+@app.exception_handler(ConfigTooLarge)
+async def _config_full(request: Request, exc: ConfigTooLarge):
+    """A settings write that would grow the household's settings document
+    past its bound is the caller's to fix (remove saved entries), not a
+    fault: nothing was written, and every door that writes the document
+    answers the same way without catching it itself."""
+    from fastapi.responses import JSONResponse
+    if _machine_path(request.url.path):
+        return JSONResponse({"detail": str(exc)}, status_code=413)
+    return _error_page(413, "Settings are full", str(exc))
+
+
 def _db_unreachable(exc: BaseException) -> bool:
     """An OperationalError that means "no connection to be had right now":
     the server out of slots (class 53, 53300 too_many_connections), the
@@ -4034,6 +4245,7 @@ def apple_app_site_association():
 
 
 @app.get("/api/access")
+@documented(response=auth_shapes.AccessInfo)
 def access_info():
     """How a person WITHOUT an account gets one on this instance — read by
     the native app's sign-in screen (and anyone) before any login, so it
@@ -4316,6 +4528,7 @@ _SIGNUP_REPEAT_WINDOW = dt.timedelta(minutes=15)
 
 @app.post("/api/signup", dependencies=[Depends(limit("signup", *_SIGNUP_PER_IP)),
                                   Depends(_not_demo_instance)])
+@documented(response=auth_shapes.SignedIn)
 def signup(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
            password: str = Form(...), invite: str = Form(""),
            ref: str = Form(""),
@@ -4554,9 +4767,11 @@ def signup(request: Request, email: str = Form(..., max_length=EMAIL_MAX),
 
 
 @app.post("/api/login", dependencies=[Depends(limit("login", *_LOGIN_PER_IP))])
+@documented(response=auth_shapes.SignedIn)
 def login(request: Request, email: str = Form(..., max_length=EMAIL_MAX), password: str = Form(...),
           totp_code: str = Form(""),
-          cf_token: str = Form("", alias=_TS_FIELD)):
+          cf_token: str = Form("", alias=_TS_FIELD),
+          unlock_proof: str = Form("")):
     from ..auth import totp as totp_mod
     from . import security
     # EVERY call is checked, not just the first step. Both steps carry the
@@ -4565,13 +4780,13 @@ def login(request: Request, email: str = Form(..., max_length=EMAIL_MAX), passwo
     # single-use, so pages.js resets the widget after each response.
     # Risk-gated: an IP and account with no recent failures are not asked for
     # a token at all (turnstile.verify_login).
-    if not turnstile.verify_login(cf_token, security.client_ip(request), email):
+    if not turnstile.verify_login(cf_token, security.client_ip(request), email,
+                                  _unlock_proof(request, unlock_proof)):
         raise HTTPException(403, "human_check_failed")
     # account-scoped lockout: source-IP-
     # independent brute defense — see security.account_login_locked
     if security.account_login_locked(email):
-        raise HTTPException(429, "too many failed attempts on this account "
-                                 "— try again in a few minutes")
+        _raise_login_locked(email)
     with _control_conn() as conn:
         u = conn.execute(
             "SELECT id, tenant_id, password_hash, totp_secret, "
@@ -4683,6 +4898,7 @@ def _demo_login_payload(nusers: int, cfg: dict | None) -> dict:
 
 @app.get("/api/demo-login",
          dependencies=[Depends(limit("demo_login", 30, 3600))])
+@documented(response=auth_shapes.DemoLogin)
 def demo_login():
     """Pre-auth: the demo instance's printed credentials, so the login
     page can pre-fill them."""
@@ -4835,6 +5051,7 @@ def _clear_session_cookie(resp: Response, request: Request) -> None:
 
 
 @app.post("/api/logout")
+@documented(response=Ok, body=auth_shapes.LogoutBody)
 def logout(request: Request, body: dict | None = Body(None)):
     token = request.cookies.get(sessions.COOKIE_NAME, "")
     # The browser names its own web-push endpoint when it has one. A push
@@ -5082,6 +5299,7 @@ def _still_signed_in_under_factor_lock(user):
 
 @app.post("/api/password/change",
           dependencies=[Depends(limit("password_change", 5, 3600))])
+@documented(response=auth_shapes.PasswordChanged, body=auth_shapes.PasswordChangeBody)
 def password_change(request: Request, user: dict = Depends(current_user),
                     body: dict = Body(...)):
     """Change the signed-in user's password. Re-verifies the current
@@ -5317,6 +5535,8 @@ def _require_live_totp(user_id: str, totp_code: str) -> None:
 # no password/passkey) still cannot elevate, and cannot borrow the owner's
 # other session's stamp because it lives on the row, not the user.
 ELEVATION_TTL = dt.timedelta(minutes=10)
+# the most of a request's own upload time the elevation check forgives
+ELEVATION_ARRIVAL_CREDIT_MAX = dt.timedelta(minutes=30)
 
 
 def _elevation_row(user: dict) -> dict | None:
@@ -5426,7 +5646,8 @@ def _stamp_elevation(user: dict, passkey_id: str | None = None) -> None:
 
 def _require_elevation(user: dict, *, fresh_seconds: int | None = None,
                        password: str = "", totp_code: str = "",
-                       recovery_code: str = "") -> None:
+                       recovery_code: str = "",
+                       as_of_arrival: "Request | None" = None) -> None:
     """The re-auth gate every account-security door now calls.
 
     LEGACY first: when the request carries a password (or a recovery
@@ -5450,6 +5671,17 @@ def _require_elevation(user: dict, *, fresh_seconds: int | None = None,
         _require_live_totp(user["user_id"], totp_code)
         return
     age = _elevation_age(user)
+    if age is not None and as_of_arrival is not None:
+        # judged as of the request's arrival: the body it carried (a
+        # 500 MB archive on a slow uplink) must not spend the window
+        arrived = getattr(as_of_arrival.state, "arrived_at", None)
+        if arrived is not None:
+            # capped: a body stretched on purpose must not hold a window
+            # open for hours; the cap is the longest a capped upload can
+            # legitimately take on a slow uplink
+            credit = min(max(0.0, time.monotonic() - arrived),
+                         ELEVATION_ARRIVAL_CREDIT_MAX.total_seconds())
+            age = max(dt.timedelta(0), age - dt.timedelta(seconds=credit))
     limit_ = ELEVATION_TTL
     if fresh_seconds is not None:
         limit_ = min(limit_, dt.timedelta(seconds=fresh_seconds))
@@ -5459,6 +5691,7 @@ def _require_elevation(user: dict, *, fresh_seconds: int | None = None,
 
 
 @app.get("/api/auth/elevation")
+@documented(response=auth_shapes.Elevation)
 def elevation_status(user: dict = Depends(current_user)):
     """Is this session inside its sudo window, and what proof opens it."""
     return _elevation_state(user)
@@ -5470,6 +5703,7 @@ def elevation_status(user: dict = Depends(current_user)):
 # the set, not login's 10 per 5 minutes.
 @app.post("/api/auth/elevate",
           dependencies=[Depends(limit("elevate", 10, 3600))])
+@documented(response=auth_shapes.Elevation, body=auth_shapes.ElevateBody)
 def elevate(user: dict = Depends(current_user), body: dict = Body(...)):
     """Open the window on this session. Returns the GET shape. Exactly the
     proofs the doors take per request:
@@ -5653,6 +5887,7 @@ def _drop_web_push(conn, user_id, keep_endpoint: str = "",
 
 @app.post("/api/totp/enroll",
           dependencies=[Depends(limit("totp_enroll", 10, 3600))])
+@documented(response=auth_shapes.TotpEnrollment)
 def totp_enroll(request: Request, user: dict = Depends(current_user),
                 current_code: str = Form(""), password: str = Form(""),
                 recovery_code: str = Form("")):
@@ -5698,6 +5933,7 @@ def totp_enroll(request: Request, user: dict = Depends(current_user),
 
 @app.post("/api/totp/confirm",
           dependencies=[Depends(limit("totp_enroll", 10, 3600))])
+@documented(response=auth_shapes.TotpConfirmed)
 def totp_confirm(request: Request, user: dict = Depends(current_user),
                  secret: str = Form(...), code: str = Form(...),
                  current_code: str = Form(""), password: str = Form(""),
@@ -5794,6 +6030,7 @@ def totp_confirm(request: Request, user: dict = Depends(current_user),
 
 @app.post("/api/totp/recovery-regenerate",
           dependencies=[Depends(limit("totp_enroll", 10, 3600))])
+@documented(response=auth_shapes.RecoveryRegenerated)
 def recovery_regenerate(user: dict = Depends(current_user),
                         password: str = Form(""), totp_code: str = Form(""),
                         recovery_code: str = Form("")):
@@ -5828,6 +6065,7 @@ def recovery_regenerate(user: dict = Depends(current_user),
 # session an offline-speed oracle against the password.
 @app.post("/api/totp/disable",
           dependencies=[Depends(limit("totp_disable", 5, 3600))])
+@documented(response=auth_shapes.TotpDisabled)
 def totp_disable(request: Request, user: dict = Depends(current_user),
                  code: str = Form(...), password: str = Form(""),
                  reissue_codes: str = Form("")):
@@ -5971,6 +6209,7 @@ def _delivery_state_for(email: str) -> dict | None:
 
 
 @app.get("/api/me")
+@documented(response=household_shapes.Me)
 def me(user: dict = Depends(current_user)):
     with _control_conn() as conn:
         pending_change = _pending_email_change(conn, user["user_id"])
@@ -6059,6 +6298,18 @@ def me(user: dict = Depends(current_user)):
             # and still connect, and an uncapped one always may.
             features["bank_awaits_confirm"] = (
                 _cap == 0 and bool(ext.gate.bank_awaits_confirm(tc)))
+            # the line under the add-a-bank buttons: how many more banks,
+            # and "several in one go" only when the next link would really
+            # ask Plaid for several (pages.link_offer, which the start obeys)
+            from .pages import link_offer as _link_offer
+            try:
+                _line = _link_offer(user, tc)["line"]
+            except Exception:                    # noqa: BLE001
+                # a failed offer costs the line, never the rest of the
+                # answer (the start door decides afresh either way)
+                _line = None
+            if _line:
+                features["bank_link_line"] = _line
             # an operator's opt-out of the per-request Plaid products turns
             # them off on every instance and plan, so their controls hide
             # (self-host included, where no plan gate answers)
@@ -6266,6 +6517,7 @@ def _owner_only(user: dict) -> None:
 
 @app.post("/api/invites",
           dependencies=[Depends(limit("invite_create", 10, 3600))])
+@documented(response=household_shapes.InviteCreated, body=household_shapes.InviteCreate)
 def invite_create(request: Request, user: dict = Depends(current_user),
                   body: dict = Body(...)):
     """Mint a one-time share-link. Also emails it when the label is an
@@ -6367,6 +6619,7 @@ def invite_create(request: Request, user: dict = Depends(current_user),
 
 
 @app.get("/api/invites")
+@documented(response=household_shapes.Invites)
 def invite_list(user: dict = Depends(current_user)):
     from ..auth import invites
     _owner_only(user)
@@ -6378,6 +6631,7 @@ def invite_list(user: dict = Depends(current_user)):
 
 
 @app.delete("/api/invites/{token_hash}")
+@documented(response=Ok)
 def invite_revoke(token_hash: str, user: dict = Depends(current_user)):
     demoguard.deny(user)
     from ..auth import invites
@@ -6390,6 +6644,7 @@ def invite_revoke(token_hash: str, user: dict = Depends(current_user)):
 
 
 @app.get("/api/users")
+@documented(response=household_shapes.HouseholdUsers)
 def users_list(user: dict = Depends(current_user)):
     """Household members — visible to everyone (shared truth), managed
     by the owner. The shared demonstration login sees only itself: every
@@ -6440,6 +6695,7 @@ def users_list(user: dict = Depends(current_user)):
 
 @app.post("/api/users/{user_id}/role",
           dependencies=[Depends(limit("user_role", 20, 3600))])
+@documented(response=household_shapes.UserRoleChanged, body=household_shapes.UserRoleSet)
 def user_set_role(user_id: str, user: dict = Depends(current_user),
                   body: dict = Body(...)):
     """Move a household member between 'member' (can edit) and 'viewer'.
@@ -6511,6 +6767,7 @@ def user_set_role(user_id: str, user: dict = Depends(current_user),
 
 @app.delete("/api/users/{user_id}",
             dependencies=[Depends(limit("user_remove", 10, 3600))])
+@documented(response=Ok, body=household_shapes.UserRemove)
 def user_remove(user_id: str, user: dict = Depends(current_user),
                 body: dict = Body(default=None)):
     """Remove a member (sessions cascade). Not yourself — an instance
@@ -6723,6 +6980,7 @@ def invite_landing(token: str):
 
 
 @app.get("/api/invite/peek")
+@documented(response=auth_shapes.InvitePeek)
 def invite_peek(token: str = ""):
     """Claim-page greeting: is this link still good, and for which role?"""
     from ..auth import invites
@@ -6758,6 +7016,7 @@ def _assert_tenant_accepts_members(conn, tenant_id) -> None:
 
 @app.post("/api/invite/claim",
           dependencies=[Depends(limit("invite_claim", 10, 3600))])
+@documented(response=auth_shapes.SignedIn, body=auth_shapes.InviteClaimBody)
 def invite_claim(request: Request, body: dict = Body(...)):
     from ..auth import invites
     with _control_conn() as conn:
@@ -6834,6 +7093,7 @@ def _rp(request: Request) -> tuple[str, str]:
 
 @app.post("/api/passkeys/options",
           dependencies=[Depends(limit("passkey_options", 30, 3600))])
+@documented(response=auth_shapes.PasskeyRegisterOptions, body=auth_shapes.PasskeyOptionsBody)
 def passkey_register_options(request: Request,
                              user: dict = Depends(current_user),
                              body: dict = Body(default={})):
@@ -6864,6 +7124,7 @@ def passkey_register_options(request: Request,
 
 @app.post("/api/passkeys",
           dependencies=[Depends(limit("passkey_manage", 10, 3600))])
+@documented(response=auth_shapes.PasskeyAdded, body=auth_shapes.PasskeyRegisterBody)
 def passkey_register(request: Request, user: dict = Depends(current_user),
                      body: dict = Body(...)):
     """Enrolling a passkey is a security-posture change — a stolen
@@ -6918,8 +7179,8 @@ def passkey_register(request: Request, user: dict = Depends(current_user),
     # ever showed.
     with recovery.issue_staged(tenancy.admin_connect, maybe_first) as batch:
       with _control_conn() as conn:
-        conn.execute("SELECT pg_advisory_lock(hashtext(%s))",
-                     ("oikonome:passkeys:" + str(user["user_id"]),))
+        tenancy.take_lock(conn, "SELECT pg_advisory_lock(hashtext(%s))",
+                          ("oikonome:passkeys:" + str(user["user_id"]),))
         try:
             # a reset that landed during the step-up has signed this
             # caller out; the key must not be stored after it
@@ -6997,6 +7258,7 @@ def passkey_register(request: Request, user: dict = Depends(current_user),
 
 
 @app.get("/api/passkeys")
+@documented(response=auth_shapes.Passkeys)
 def passkey_list(user: dict = Depends(current_user)):
     _require_hosted()
     with _control_conn() as conn:
@@ -7009,6 +7271,7 @@ def passkey_list(user: dict = Depends(current_user)):
 
 @app.delete("/api/passkeys/{pk_id}",
             dependencies=[Depends(limit("passkey_manage", 10, 3600))])
+@documented(response=auth_shapes.PasskeyRemoved, body=auth_shapes.PasskeyDeleteBody)
 def passkey_delete(pk_id: str, user: dict = Depends(current_user),
                    body: dict = Body(default=None)):
     """Removing a factor is a posture change too — a stolen session must
@@ -7144,6 +7407,7 @@ def passkey_delete(pk_id: str, user: dict = Depends(current_user),
 # physical authenticator (UV enforced on the signed response).
 @app.post("/api/stepup/passkey/options",
           dependencies=[Depends(limit("stepup_passkey", 20, 3600))])
+@documented(response=auth_shapes.PasskeyAssertOptions)
 def stepup_passkey_options(request: Request,
                            user: dict = Depends(current_user)):
     _require_hosted()
@@ -7158,6 +7422,7 @@ def stepup_passkey_options(request: Request,
 
 @app.post("/api/stepup/passkey",
           dependencies=[Depends(limit("stepup_passkey", 20, 3600))])
+@documented(response=auth_shapes.StepUpTicket, body=auth_shapes.WebAuthnAssertionBody)
 def stepup_passkey(request: Request, user: dict = Depends(current_user),
                    body: dict = Body(...)):
     _require_hosted()
@@ -7180,6 +7445,7 @@ def stepup_passkey(request: Request, user: dict = Depends(current_user),
 # address); the sign-in itself is counted per account in `passkey_login`.
 @app.post("/api/login/passkey/options",
           dependencies=[Depends(limit("passkey_login", 120, 3600))])
+@documented(response=auth_shapes.PasskeyAssertOptions, body=auth_shapes.PasskeyLoginOptionsBody)
 def passkey_login_options(request: Request, body: dict = Body(default=None)):
     """email is optional. Empty → discoverable (usernameless) passkey login;
     with email → allow-list that user's credentials (helps non-resident keys)."""
@@ -7193,6 +7459,7 @@ def passkey_login_options(request: Request, body: dict = Body(default=None)):
 
 @app.post("/api/login/passkey",
           dependencies=[Depends(limit("passkey_login", 120, 3600))])
+@documented(response=auth_shapes.SignedIn, body=auth_shapes.WebAuthnAssertionBody)
 def passkey_login(request: Request, body: dict = Body(...)):
     _require_hosted()
     from ..auth import passkeys
@@ -7227,6 +7494,7 @@ def passkey_login(request: Request, body: dict = Body(...)):
 # ---- session management ----------------------------------------------------
 
 @app.get("/api/sessions")
+@documented(response=auth_shapes.AuthSessions)
 def sessions_list(request: Request, user: dict = Depends(current_user)):
     """The user's live sessions. Exposes the surrogate UUID id only —
     token hashes never leave the server."""
@@ -7259,6 +7527,7 @@ def sessions_list(request: Request, user: dict = Depends(current_user)):
 # one more re-auth surface a session thief can grind.
 @app.post("/api/sessions/revoke",
           dependencies=[Depends(limit("sessions_revoke", 10, 3600))])
+@documented(response=auth_shapes.SessionsRevoked, body=auth_shapes.SessionRevokeBody)
 def sessions_revoke(request: Request, user: dict = Depends(current_user),
                     body: dict = Body(...)):
     """{"all_others": true} — sign out everywhere else;
@@ -7405,6 +7674,7 @@ _DEVICE_MINT_PER_ACCOUNT = (20, 3600)
 
 @app.post("/api/devices",
           dependencies=[Depends(limit("device_mint", 120, 3600))])
+@documented(response=device_shapes.DeviceMinted, body=device_shapes.DeviceMint)
 def device_mint_ticketed(request: Request, body: dict = Body(...)):
     """The cookie-free half of the mint, for native apps.
 
@@ -7483,6 +7753,7 @@ def device_mint_ticketed(request: Request, body: dict = Body(...)):
 
 @app.post("/api/devices/abandon",
           dependencies=[Depends(limit("device_mint_abandon", 20, 3600))])
+@documented(response=Ok, body=device_shapes.DeviceMintAbandon)
 def device_mint_abandon(body: dict = Body(...)):
     """Give up a sign-in the phone will not finish: spend its mint ticket
     without minting, which closes the session that login opened.
@@ -7706,6 +7977,7 @@ def _device_mint_session(request: Request, user: dict, body: dict):
 
 
 @app.get("/api/devices")
+@documented(response=device_shapes.MobileDevices)
 def devices_list(request: Request, user: dict = Depends(current_user)):
     """The user's live mobile devices — surrogate ids only, same contract
     as the sessions list (and the same demo-instance silence: the shared
@@ -7732,6 +8004,7 @@ def devices_list(request: Request, user: dict = Depends(current_user)):
 
 @app.post("/api/devices/widget",
           dependencies=[Depends(limit("device_widget", 30, 3600))])
+@documented(response=device_shapes.WidgetToken)
 def device_widget_mint(request: Request, user: dict = Depends(current_user)):
     """Mint this device's home-screen widget token — the lesser
     credential the widget polls the glance door with while the device
@@ -7754,6 +8027,7 @@ def device_widget_mint(request: Request, user: dict = Depends(current_user)):
 
 @app.post("/api/devices/push",
           dependencies=[Depends(limit("device_push", 30, 3600))])
+@documented(response=device_shapes.DevicePushSaved, body=device_shapes.DevicePushSet)
 def device_push_register(request: Request, user: dict = Depends(current_user),
                          body: dict = Body(...)):
     """{"token": "<platform push token>", "platform": "fcm"|"apns"} —
@@ -7803,6 +8077,7 @@ def device_push_register(request: Request, user: dict = Depends(current_user),
 
 @app.post("/api/devices/revoke",
           dependencies=[Depends(limit("devices_revoke", 10, 3600))])
+@documented(response=device_shapes.DeviceRevoked, body=device_shapes.DeviceRevoke)
 def devices_revoke(request: Request, user: dict = Depends(current_user),
                    body: dict = Body(...)):
     """{"id": "<uuid>"} — revoke one device (own devices only). The
@@ -7845,6 +8120,7 @@ _delete_tenant_rows = tenancy.delete_tenant_rows
 # the single most destructive endpoint (full tenant wipe).
 @app.post("/api/account/delete",
           dependencies=[Depends(limit("account_delete", 5, 3600))])
+@documented(response=Ok)
 def account_delete(request: Request, user: dict = Depends(current_user),
                    password: str = Form(""), totp_code: str = Form(""),
                    recovery_code: str = Form("")):
@@ -7940,6 +8216,7 @@ def account_delete(request: Request, user: dict = Depends(current_user),
 
 @app.post("/api/me/email",
           dependencies=[Depends(limit("me_email", 30, 3600))])
+@documented(response=household_shapes.MeEmailChanged, body=household_shapes.MeEmailSet)
 def me_email(user: dict = Depends(current_user), body: dict = Body(...)):
     """This login's own daily-email delivery: mute or unmute MY address in
     the household's `email_muted` list. Viewers may do this (it is in
@@ -7988,6 +8265,7 @@ def me_email(user: dict = Depends(current_user), body: dict = Body(...)):
 
 @app.post("/api/me/push",
           dependencies=[Depends(limit("me_push", 30, 3600))])
+@documented(response=household_shapes.MePushChanged, body=household_shapes.MePushSet)
 def me_push(user: dict = Depends(current_user), body: dict = Body(...)):
     """This login's own switch for the household's push notices — the
     daily verdict, alerts and reports stop reaching MY browsers and phones
@@ -8085,6 +8363,7 @@ def _member_notify(cc, cfg: dict, tenant_id, rows: list[dict],
 
 @app.post("/api/users/{user_id}/notify",
           dependencies=[Depends(limit("user_notify", 60, 3600))])
+@documented(response=household_shapes.UserNotifyChanged, body=household_shapes.UserNotifySet)
 def user_set_notify(user_id: str, user: dict = Depends(current_user),
                     body: dict = Body(...)):
     """The owner sets what one household member receives: their push
@@ -8167,6 +8446,7 @@ def user_set_notify(user_id: str, user: dict = Depends(current_user),
 
 @app.post("/api/account/leave",
           dependencies=[Depends(limit("account_leave", 5, 3600))])
+@documented(response=Ok)
 def account_leave(request: Request, user: dict = Depends(current_user),
                   password: str = Form(""), totp_code: str = Form(""),
                   recovery_code: str = Form("")):
@@ -8263,6 +8543,7 @@ _PENDING_VERIFY_SENT = False
 
 @app.post("/api/email/change",
           dependencies=[Depends(limit("email_change", 5, 3600))])
+@documented(response=household_shapes.EmailChanged)
 def email_change(request: Request, user: dict = Depends(current_user),
                  new_email: str = Form(..., max_length=EMAIL_MAX), password: str = Form(""),
                  totp_code: str = Form(""), recovery_code: str = Form(""),
@@ -8605,6 +8886,7 @@ def _pending_email_change(conn, user_id) -> dict | None:
 
 
 @app.post("/api/email/change/cancel")
+@documented(response=household_shapes.EmailChangeCancelled)
 def email_change_cancel(user: dict = Depends(current_user)):
     """Withdraw a pending login-email change. Only takes something away,
     so it asks for no step-up."""
@@ -8620,6 +8902,7 @@ def email_change_cancel(user: dict = Depends(current_user)):
 
 @app.post("/api/email/change/resend",
           dependencies=[Depends(limit("email_change_resend", 5, 3600))])
+@documented(response=household_shapes.EmailChanged)
 def email_change_resend(request: Request,
                         user: dict = Depends(current_user),
                         keep_push_endpoint: str = Form(""),
@@ -9162,21 +9445,26 @@ def doctor_page(user: dict = Depends(current_user)):
 
 
 @app.get("/api/doctor")
+@documented(response=doctor_shapes.DoctorReport)
 def doctor_api(user: dict = Depends(current_user)):
     """The same named checks the Jinja /doctor page renders, plus an
     overall verdict — the SPA Doctor page consumes this."""
     from . import doctor
-    checks = doctor.checks(str(user["tenant_id"]))
+    checks = doctor.checks(str(user["tenant_id"]),
+                           owner=user.get("role") == "owner")
     return {"ok": all(c["ok"] for c in checks), "checks": checks}
 
 
 @app.get("/api/doctor/bundle")
+@documented(response=doctor_shapes.DoctorBundle)
 def doctor_bundle(user: dict = Depends(current_user)):
     from . import doctor
-    return doctor.bundle(str(user["tenant_id"]))
+    return doctor.bundle(str(user["tenant_id"]),
+                         owner=user.get("role") == "owner")
 
 
 @app.get("/api/doctor/scripts")
+@documented(response=doctor_shapes.ScriptHeartbeats)
 def doctor_scripts(user: dict = Depends(current_user)):
     """Push-heartbeats for the Doctor page's Data-collectors panel: one
     row per script-fed source with a computed fresh/stale/off status."""
@@ -9189,6 +9477,7 @@ def doctor_scripts(user: dict = Depends(current_user)):
 
 
 @app.post("/api/doctor/scripts/{source}")
+@documented(response=Ok, body=doctor_shapes.ScriptWatchSet)
 def doctor_scripts_update(source: str, user: dict = Depends(current_user),
                           body: dict = Body(...)):
     """Watch settings for one source: expected_hours (0 = never warn)
@@ -9223,6 +9512,7 @@ def doctor_scripts_update(source: str, user: dict = Depends(current_user),
 
 
 @app.get("/api/today")
+@documented(response=household_shapes.MonthVerdict)
 def today(user: dict = Depends(current_user)):
     """The verdict — the product's core loop, straight from the engine."""
     conn = tenancy.tenant_connect(user["tenant_id"])
@@ -9247,8 +9537,8 @@ def today(user: dict = Depends(current_user)):
     }
 
 
-# management API (JSON, SPA-facing) — imported last: api resolves
-# current_user lazily, so this is cycle-safe
+# management API (JSON, SPA-facing) — imported last; its modules take
+# current_user from web/session_user.py, never from here
 from . import api as _api  # noqa: E402
 from . import pages as _pages  # noqa: E402
 from . import testing as _testing  # noqa: E402
@@ -9260,6 +9550,9 @@ app.include_router(_rapi.router)
 # owner's webhook management
 from . import integrations as _integrations  # noqa: E402
 app.include_router(_integrations.router)
+# the MCP endpoint over HTTP; 404 on every method until OIKONOME_MCP_ENABLED
+from . import mcp as _mcp  # noqa: E402
+app.include_router(_mcp.router)
 from . import help as _help  # noqa: E402
 app.include_router(_help.router)
 from . import logos as _logos  # noqa: E402

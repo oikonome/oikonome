@@ -1,12 +1,20 @@
 # Troubleshooting
 
-**Start at /doctor.** Every check below matches a row on that page.
+**Start at /doctor** (System health). Every check below matches a row on
+that page. The household's setup on it — the mail relay's and AI
+endpoint's addresses, model names, a last run's error words, who the
+daily email reaches — is shown to the owner only; a member or viewer
+reads that the relay and endpoint are configured and whether they
+answer.
 
 ### database
 Container can't reach Postgres: check that the `postgres` service is
 healthy (`docker compose ps`). `OIKONOME_DSN` is **not** yours to set in
 `.env` — `compose.yaml` builds it from `OIKONOME_APP_PASSWORD` and
-overrides whatever `.env` says, so that is the variable to check.
+overrides whatever `.env` says, so that is the variable to check. A
+password typed by hand must keep to letters, digits and `- _ . ~`: it is
+pasted into the connection URL as typed, and a `/`, `@`, `%`, `#`, `?` or
+space there reads as part of the address (the installer generates hex).
 
 **Postgres major upgrade.** When a release moves the bundled Postgres to a
 new major version (16 → 18, say), `./oikonome.sh upgrade` migrates
@@ -84,6 +92,20 @@ email now** (in the Daily email card under Settings → Email & Push) still send
 on demand if you want to see the message. Doctor's daily email row says
 *not sent: no budget is set yet* when this is the cause.
 
+### the schedule says "nobody receiving it"
+The Settings list and the cadence editor show each email's schedule with
+who it actually reaches. **daily 9am · nobody receiving it** means it is
+switched on but nothing would arrive anywhere: every address is muted,
+unconfirmed or has turned it off, no browser or phone takes its push, and
+no verified number takes a text. **(no mail relay)** means no mail relay
+is set up, so no address receives mail at all (Settings → Email, or the
+instance's `OIKONOME_SMTP_*`); *mail relay held until you confirm it*
+means a relay saved in Settings is paused after a credential change until
+the owner presses the banner's resume, and *refused by the address
+policy* that the instance will not send through it. System health's daily
+email row says the same thing in the same words. The setup wizard's last
+step promises a first email only when someone would receive it.
+
 ### someone you added isn't receiving it
 Adding an address invites it; it does not enrol it. The person is emailed
 once and starts receiving the daily summary only after they accept — until
@@ -159,7 +181,10 @@ receipt again on its own for 7 days after it was uploaded, so there is
 no need to re-parse it by hand; only one still failed after that week
 needs a manual re-parse; an extra
 Assistant question is refused outright — waiting in line would hold the
-very thread the limit exists to spare. Wait a moment and retry. On a big machine, raise
+very thread the limit exists to spare. Wait a moment and retry. When several
+households are reading receipts at once, a free read slot goes to the
+household using the fewest, so one household's big batch cannot hold every
+slot while another waits; a household on its own can use them all. On a big machine, raise
 `OIKONOME_RECEIPT_PARSE_CONCURRENCY`, `OIKONOME_RECEIPT_PARSE_WAIT_S`,
 `OIKONOME_RECEIPT_READ_SLOTS`, `OIKONOME_RECEIPT_READ_WAIT_S`
 and `OIKONOME_ASSISTANT_CONCURRENCY` in `docker/.env`; the defaults suit
@@ -291,6 +316,11 @@ and Settings says so. Fix the receiver, press **Send a test**, then tick
 the webhook back on. A LAN address is fine on a self-hosted instance; the
 cloud metadata address never is.
 
+"too many webhook changes — try again later" means the account pointed
+webhooks somewhere new (a new webhook, a new URL, or one switched back
+on) 20 times within the hour. Only changes that got past the password
+confirm count; one refused at the confirm does not.
+
 ### the home-screen widget is grey or says "Sign in"
 Grey with a time means the phone has not refreshed it for over an hour,
 or not since the day turned —
@@ -419,7 +449,9 @@ still sign in, the last key may go.
 Open a GitHub issue with the **diagnostic bundle** from /doctor attached
 (it contains check results and versions — never tokens or transactions,
 and no hostnames, bank names or collector labels, so it is safe to attach to
-a public issue; the signed-in /doctor page still shows them). It names no
+a public issue; the signed-in /doctor page still shows them to the owner,
+while a member or viewer reads the mail relay and the AI endpoint only as
+configured). It names no
 time zone and gives ages in whole days only — a scheduled job reads as on
 schedule or overdue — so it does not give away where the instance runs.
 Issues without the bundle get auto-asked for it.

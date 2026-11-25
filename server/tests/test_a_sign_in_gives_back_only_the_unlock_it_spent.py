@@ -51,7 +51,8 @@ class UnlockGiveBackTests(unittest.TestCase):
         turnstile.forget_spent_unlocks()
         self.uid, self.email = self._user()
         with self._control() as conn:
-            login_unlock.follow(conn, login_unlock.create(conn, self.uid))
+            self.proof = login_unlock.follow(
+                conn, login_unlock.create(conn, self.uid))["proof"]
 
     def _user(self):
         from oikonome.db import tenancy
@@ -79,7 +80,8 @@ class UnlockGiveBackTests(unittest.TestCase):
     def _concurrent_spend(self):
         """Another attempt, mid-request, spends the unlock."""
         with self._control() as conn:
-            self.assertTrue(login_unlock.consume(conn, self.email))
+            self.assertTrue(login_unlock.consume(conn, self.email,
+                                                 self.proof))
 
     def test_a_busy_sign_in_by_token_leaves_a_concurrent_spend_spent(self):
         from oikonome.web import turnstile
@@ -103,14 +105,15 @@ class UnlockGiveBackTests(unittest.TestCase):
         with mock.patch.object(passwords, "_gated",
                                side_effect=passwords.HasherBusy("full")):
             r = c.post("/api/login", data={"email": self.email,
-                                           "password": PW})
+                                           "password": PW,
+                                           "unlock_proof": self.proof})
         self.assertEqual(r.status_code, 503, r.text)
         self.assertTrue(self._unlocked())
 
     def test_the_spend_is_recorded_by_id_and_re_armed_by_id(self):
         from oikonome.web import turnstile
         self.assertTrue(turnstile.verify_login("", "198.51.100.7",
-                                               self.email))
+                                               self.email, self.proof))
         ids = turnstile.spent_unlocks()
         self.assertEqual(len(ids), 1)
         self.assertFalse(self._unlocked())
@@ -122,7 +125,7 @@ class UnlockGiveBackTests(unittest.TestCase):
     def test_a_new_check_starts_the_record_afresh(self):
         from oikonome.web import turnstile
         self.assertTrue(turnstile.verify_login("", "198.51.100.7",
-                                               self.email))
+                                               self.email, self.proof))
         with mock.patch.object(turnstile, "verify", return_value=True):
             self.assertTrue(turnstile.verify_login("tok", "198.51.100.7",
                                                    self.email))
@@ -142,7 +145,7 @@ class UnlockGiveBackTests(unittest.TestCase):
     def test_a_two_step_refund_gives_back_the_unlock_it_spent(self):
         from oikonome.web import turnstile
         self.assertTrue(turnstile.verify_login("", "198.51.100.7",
-                                               self.email))
+                                               self.email, self.proof))
         self.assertFalse(self._unlocked())
         turnstile.refund_unlock(self.email)
         self.assertTrue(self._unlocked())

@@ -254,3 +254,22 @@ export function receiptDateBounds(createdAt: string): { min: string;
   const iso = (n: number) => new Date(n * 86_400_000).toISOString().slice(0, 10);
   return { min: iso(snapped - 366), max: iso(snapped + 1) };
 }
+
+/** A person's answer about two receipts read alike (specs/receipts.md, "A
+ *  receipt is one slip"). Which copy counts moves on the panel, the
+ *  waiting list and the Receipts page, so all three refetch; nothing is
+ *  patched first, because the server alone decides which copy counts. */
+export function useSlipAnswer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, other, same }: { id: string; other: string;
+                                         same: boolean }) =>
+      same ? api.receiptSameSlip(id, other)
+           : api.receiptTwoPurchases(id, other),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["receipts"] });
+      qc.invalidateQueries({ queryKey: WAITING_KEY });
+      qc.invalidateQueries({ queryKey: ["receipt-items"] });
+      qc.invalidateQueries({ queryKey: ["receipt-report"] });
+    } });
+}

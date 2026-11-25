@@ -233,7 +233,7 @@ class LinkPrefetchTests(unittest.TestCase):
         # the human's explicit action is what spends it
         r = client.post("/unlock/confirm", data={"token": token},
                         follow_redirects=False)
-        self.assertEqual(r.status_code, 303)
+        self.assertEqual(r.status_code, 200)
         with self.appmod._control_conn() as conn:
             self.assertIsNone(login_unlock.peek(conn, token))
 

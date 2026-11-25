@@ -55,7 +55,7 @@ class BusinessDoorsUseHouseholdDay(unittest.TestCase):
         cls.year = dt.date.today().year - 2
 
     def _on(self, day):
-        return mock.patch("oikonome.web.api._today", return_value=day)
+        return mock.patch("oikonome.web.api_business._today", return_value=day)
 
     def test_a_deadline_due_today_is_still_listed(self):
         due = dt.date(self.year, 4, 15)

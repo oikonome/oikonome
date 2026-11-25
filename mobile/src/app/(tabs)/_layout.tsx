@@ -2,17 +2,18 @@ import { Ionicons } from "@expo/vector-icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Tabs, useRouter } from "expo-router";
 import { useEffect, useRef, useState } from "react";
-import { Alert, ColorValue, Image, Pressable, Text,
+import { Alert, ColorValue, Image, Pressable, ScrollView, Text,
          View } from "react-native";
 
+import { AccountExit } from "../../components/account-exits";
 import LensSwitch from "../../components/lens-switch";
 import { Lockout } from "../../components/lockout";
 import { ext } from "../../ext";
 import { seedSettings } from "../../lib/cache";
 import { useSession } from "../../lib/session";
 import { deviceZone } from "../../lib/zone";
-import { accountTheme, retriesZoneAdopt, SIGN_IN_AGAIN, twoFactorRecheck,
-         zoneToAdopt } from "../../lib/pure";
+import { accountTheme, retriesZoneAdopt, themeFollowsHousehold, SIGN_IN_AGAIN, twoFactorRecheck,
+         failLine, verifyNagDue, zoneToAdopt } from "../../lib/pure";
 import { C, getThemeMode, mmddyy, setThemeMode } from "../../lib/theme";
 import { ApiError, errText, type Me } from "../../lib/api";
 
@@ -36,20 +37,23 @@ function Brand() {
 function AlertsBell({ count, tone }: { count: number; tone: string }) {
   const router = useRouter();
   return (
-    <Pressable onPress={() => router.push("/alerts" as never)}
-               hitSlop={8}
+    <Pressable accessibilityRole="button" onPress={() => router.push("/alerts" as never)}
+               hitSlop={10}
                accessibilityLabel={count > 0
                  ? `Alerts, ${count} active` : "Alerts"}
                style={{ marginRight: 14, padding: 2 }}>
       <Ionicons name="notifications-outline" size={22} color={C.text} />
       {count > 0 && (
         <View style={{ position: "absolute", top: -3, right: -6,
-                       minWidth: 16, height: 16, borderRadius: 8,
+                       minWidth: 16, minHeight: 16, borderRadius: 8,
                        paddingHorizontal: 3, alignItems: "center",
                        justifyContent: "center",
                        backgroundColor: tone === "bad" ? C.bad
                          : tone === "warn" ? C.warn : C.accent }}>
-          <Text style={{ color: C.bg, fontSize: 10, fontWeight: "700" }}>
+          {/* the badge rides the icon's corner and cannot move out of
+              the way, so its count grows only so far */}
+          <Text style={{ color: C.bg, fontSize: 10, fontWeight: "700" }}
+                maxFontSizeMultiplier={1.6}>
             {count > 99 ? "99+" : count}
           </Text>
         </View>
@@ -229,7 +233,8 @@ export default function TabsLayout() {
     const id = setInterval(tick, 1000);
     return () => clearInterval(id);
   }, [isDemo]);
-  // theme follows the ACCOUNT for owners (the web's reconcile): the
+  // theme follows the HOUSEHOLD for owners and members (the web's
+  // reconcile; themeFollowsHousehold): the
   // server-stored preference wins over this device's cache; with no
   // pin the default is dark, and only an explicit "auto" follows the
   // OS. Palette resolves at bundle load, so an adopted change applies
@@ -239,7 +244,7 @@ export default function TabsLayout() {
     select: (v) => ({ theme: v.theme as string | undefined }),
     enabled: !!client, staleTime: 5 * 60_000 });
   useEffect(() => {
-    if (me.data?.role !== "owner" || me.data.demo || !themePeek.data)
+    if (!themeFollowsHousehold(me.data) || !themePeek.data)
       return;
     const server = accountTheme(themePeek.data.theme);
     if (server && server !== getThemeMode())
@@ -262,7 +267,14 @@ export default function TabsLayout() {
   // that case is said in words rather than a silent drop to the login
   // screen (the api layer has already cleared the dead token by then).
   if (me.data?.needs_2fa) {
+    // Nor is the gate a toll: the server lets a factorless session erase
+    // the household (owner) or leave it (anyone else), so the way out is
+    // offered beside it, keyed on the role /api/me already answered (web:
+    // TwoFactorGate). No export from here — that door wants the factor.
     return (
+      <ScrollView style={{ flex: 1, backgroundColor: C.bg }}
+                  contentContainerStyle={{ flexGrow: 1 }}
+                  keyboardShouldPersistTaps="handled">
       <Lockout title="Secure your account"
         body={"Oikonome protects your financial data — before you "
               + "continue, add a second factor so a stolen password alone "
@@ -286,11 +298,19 @@ export default function TabsLayout() {
             else if (next === "set-up-here")
               router.push("/security" as never);
             else if (next === "unreachable")
-              Alert.alert("Couldn't reach the server",
-                          r.error ? errText(r.error) : "Try again.");
+              Alert.alert("Couldn't check your account",
+                          r.error ? failLine(r.error, "your account", "phone").text
+                                  : "Try again.");
           });
         } }}
         onOut={signOut} />
+      <View style={{ paddingHorizontal: 24, paddingBottom: 24 }}>
+        <AccountExit role={me.data?.role}
+          exportHint={"Want a copy first? Secure the account, then export "
+                      + "it under Settings → Your data."}
+          onDone={signOut} />
+      </View>
+      </ScrollView>
     );
   }
   // an installed add-on's own frozen states — each brings the screen that
@@ -355,12 +375,9 @@ export default function TabsLayout() {
       : a.severity === "warn" ? "warn" : w), "info" as string);
   // the verify nudge waits 3 days and yields to the bounce banner —
   // two banners about the same address contradict each other
-  const created = me.data?.created_at
-    ? Date.parse(String(me.data.created_at)) : NaN;
   const verifyDue = me.data?.hosted && me.data.verified === false
     && !bounce
-    && (!Number.isFinite(created)
-        || Date.now() - created >= 3 * 86_400_000);
+    && verifyNagDue(me.data.created_at, me.data.verify_deadline);
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
       {/* a deadline broadcast is a RESTART: the web counts down, then

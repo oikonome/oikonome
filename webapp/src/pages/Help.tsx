@@ -8,12 +8,19 @@ import { useState, type ReactNode } from "react";
 import { useSearchParams } from "react-router";
 import { api } from "../api/client";
 import { useNarrow } from "../narrow";
+import PageSkeleton from "../components/PageSkeleton";
+import { FailedLine } from "../components/Loaded";
 
-// the sidebar groups the topic catalog — feature guides first,
-// then the setup/data docs, then reference. The server stamps each topic
-// with its group; anything unstamped (older payload) reads as reference.
+// the sidebar groups the topic catalog — feature guides first, then
+// bringing your history in, then reference, and last the docs for running
+// and extending an instance, folded away: a household reading its guides
+// does not need the operator's manual in the same column. The server
+// stamps each topic with its group; anything unstamped (older payload)
+// reads as reference.
 const GROUPS: [string, string][] = [
-  ["guides", "Guides"], ["setup", "Setup & data"], ["reference", "Reference"]];
+  ["guides", "Guides"], ["setup", "Your data"], ["reference", "Reference"],
+  ["selfhost", "Self-hosting & developers"]];
+const FOLDED = new Set(["selfhost"]);
 const groupOf = (t: object) => (t as { group?: string }).group ?? "reference";
 
 export default function Help() {
@@ -25,16 +32,20 @@ export default function Help() {
   // article is on screen first rather than below a column of links.
   const narrow = useNarrow();
   const [pickerOpen, setPickerOpen] = useState(false);
-  if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
-  if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
+  if (q.isPending) return <PageSkeleton />;
+  // the page keeps its title when its read fails, as every page does
+  if (q.isLoadingError)
+    return <><h1>Help</h1><FailedLine q={q} what="help" /></>;
   const topics = q.data.topics;
   const needle = filter.trim().toLowerCase();
   const hits = needle
     ? topics.filter((t) => t.title.toLowerCase().includes(needle)
                         || t.body.toLowerCase().includes(needle))
     : topics;
-  const current = topics.find((t) => t.id === (sp.get("topic") || "faq"))
-    ?? topics[0];
+  // a bare /help opens the everyday guide, not the reference material
+  // somebody running their own server reads
+  const current = topics.find((t) => t.id === (sp.get("topic") || "today"))
+    ?? topics.find((t) => t.id === "faq") ?? topics[0];
 
   const pick = (id: string) => {
     setSp({ topic: id });
@@ -43,26 +54,39 @@ export default function Help() {
   };
   const index = (
     <>
-      <input type="search" placeholder="Search help…" value={filter}
+      <input aria-label="Search help" type="search" placeholder="Search help…" value={filter}
              style={{ width: "100%", marginBottom: ".6rem" }}
              onChange={(e) => setFilter(e.target.value)} />
-      {hits.length === 0 && <p className="sub">Nothing matches.</p>}
+      {hits.length === 0 && <p className="sub">No topics match “{filter.trim()}”.</p>}
       {GROUPS.map(([g, label]) => {
         const inGroup = hits.filter((t) => groupOf(t) === g);
         if (inGroup.length === 0) return null;
+        const heading = { margin: ".6rem 0 .1rem", textTransform: "uppercase",
+                          letterSpacing: ".05em" } as const;
+        const links = inGroup.map((t) => (
+          <a key={t.id} href={`#${t.id}`}
+             onClick={(e) => { e.preventDefault(); pick(t.id); }}
+             style={{ display: "block", padding: ".25rem 0",
+                      fontWeight: t.id === current?.id ? 700 : 400 }}>
+            {t.title}</a>
+        ));
+        // a folded group opens by itself while a search is running or when
+        // the topic on screen is one of its own
+        if (FOLDED.has(g)) {
+          const forced = !!needle || inGroup.some((t) => t.id === current?.id);
+          return (
+            <details key={g + (forced ? "-open" : "")} open={forced}>
+              <summary className="sub" style={{ ...heading,
+                                                cursor: "pointer" }}>
+                {label}</summary>
+              {links}
+            </details>
+          );
+        }
         return (
           <div key={g}>
-            <p className="sub" style={{ margin: ".6rem 0 .1rem",
-                                        textTransform: "uppercase",
-                                        letterSpacing: ".05em" }}>
-              {label}</p>
-            {inGroup.map((t) => (
-              <a key={t.id} href={`#${t.id}`}
-                 onClick={(e) => { e.preventDefault(); pick(t.id); }}
-                 style={{ display: "block", padding: ".25rem 0",
-                          fontWeight: t.id === current?.id ? 700 : 400 }}>
-                {t.title}</a>
-            ))}
+            <p className="sub" style={heading}>{label}</p>
+            {links}
           </div>
         );
       })}
@@ -141,10 +165,11 @@ const docTopic = (href: string): string | null => {
 type TopicNav = (id: string) => void;
 
 function inline(text: string, key = 0, onTopic?: TopicNav): ReactNode[] {
-  // links → bold → inline code, left to right
+  // links → bold → inline code → emphasis, left to right. Emphasis is one
+  // asterisk hugging a word on each side, so "2 * 3" stays arithmetic.
   const out: ReactNode[] = [];
   let rest = text, k = key;
-  const rx = /\[([^\]]+)\]\(([^)\s]+)\)|\*\*([^*]+)\*\*|`([^`]+)`/;
+  const rx = /\[([^\]]+)\]\(([^)\s]+)\)|\*\*([^*]+)\*\*|`([^`]+)`|\*([^*\s](?:[^*]*[^*\s])?)\*/;
   while (rest) {
     const m = rx.exec(rest);
     if (!m) { out.push(rest); break; }
@@ -163,8 +188,10 @@ function inline(text: string, key = 0, onTopic?: TopicNav): ReactNode[] {
         : <span key={k++}>{m[1]}</span>);
     } else if (m[3] !== undefined) {
       out.push(<b key={k++}>{inline(m[3], k * 100, onTopic)}</b>);
-    } else {
+    } else if (m[4] !== undefined) {
       out.push(<code key={k++}>{m[4]}</code>);
+    } else {
+      out.push(<i key={k++}>{inline(m[5], k * 100, onTopic)}</i>);
     }
     rest = rest.slice(m.index + m[0].length);
   }

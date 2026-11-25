@@ -36,7 +36,16 @@ class ShadowAccountDoubleCountTests(unittest.TestCase):
         self.assertIn("reporting._NOT_SHADOW", _src("engine/books.py"))
         self.assertIn("reporting._NOT_SHADOW", _src("engine/selfemploy.py"))
 
-    def test_the_spa_fallback_excludes_shadows_too(self):
+    def test_the_cash_figures_exclude_shadows_too(self):
+        """The cash in the business and the tax set-aside's held figure are
+        the server's (books.entity_cash, selfemploy.tax_set_aside), under
+        the same shadow and hidden rule; the page sums no balance."""
+        import inspect
+
+        from oikonome.engine import selfemploy
+        self.assertIn("links.shadow_ids", inspect.getsource(books.entity_cash))
+        self.assertIn("links.shadow_ids",
+                      inspect.getsource(selfemploy.tax_set_aside))
         spa = (pathlib.Path(oikonome.__file__).parent.parent.parent
                / "webapp" / "src" / "pages" / "Business.tsx")
         if not spa.exists():
@@ -44,6 +53,5 @@ class ShadowAccountDoubleCountTests(unittest.TestCase):
         s = spa.read_text()
         i = s.index("function TaxSetAside")
         j = s.index("function ", i + 1)
-        self.assertIn(".filter(countsInTotals)", s[i:j])
-        rule = (spa.parent.parent / "bizmath.ts").read_text()
-        self.assertIn("!a.link || a.link.primary", rule)
+        self.assertIn("set_aside", s[i:j])
+        self.assertNotIn("balance_current", s[i:j])

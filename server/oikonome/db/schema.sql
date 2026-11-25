@@ -498,6 +498,14 @@ CREATE TABLE IF NOT EXISTS receipts (
     match_method      TEXT CONSTRAINT receipts_match_method_known
         CHECK (match_method IS NULL OR match_method IN ('auto', 'manual')),
     unmatched_txn_ids TEXT[] NOT NULL DEFAULT '{}',
+    -- migration 232: which slip it is (specs/receipts.md, "A receipt is
+    -- one slip"); its indexes are in that file
+    image_sha256      BYTEA GENERATED ALWAYS AS (sha256(image)) STORED,
+    slip_id           UUID,
+    slip_source       TEXT CONSTRAINT receipts_slip_source_known
+        CHECK (slip_source IS NULL OR slip_source IN ('image', 'person')),
+    slip_decided_at   TIMESTAMPTZ,
+    not_same_slip     UUID[] NOT NULL DEFAULT '{}',
     PRIMARY KEY (tenant_id, id),
     -- migration 071: the FK migration 067 gave every other transaction-child
     -- table. Without it a purge/resync (collector ids are content hashes, so
@@ -609,6 +617,12 @@ CREATE TABLE IF NOT EXISTS transaction_splits (
 CREATE TABLE IF NOT EXISTS bills (
     tenant_id      UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
     id             TEXT NOT NULL,                -- rec:<slug>
+    -- the bill's identity, kept through a rename (the id is not); its
+    -- index is migration 234's
+    uid            UUID NOT NULL DEFAULT gen_random_uuid(),
+    -- the day the bill was set up (NULL: set up before it was kept);
+    -- migration 235
+    created_on     DATE DEFAULT CURRENT_DATE,
     type           TEXT,                         -- BILL | INCOME
     payee          TEXT,
     amount         DOUBLE PRECISION,             -- per occurrence; negative = money out
@@ -651,6 +665,44 @@ CREATE TABLE IF NOT EXISTS bill_proposals (
 -- a pending charge a person retired by hand: removed=1 like any soft
 -- retirement, but stamped so the next sync's upsert leaves it retired
 ALTER TABLE transactions ADD COLUMN IF NOT EXISTS retired_at TIMESTAMPTZ;
+
+-- WHEN a row last went from live to retired, by any path; NULL while it is
+-- live (migration 230, specs/receipts.md "When a row left the ledger").
+-- It says when only: why stays with raw.feed_removed_at (the bank took it
+-- back) and retired_at (someone decided). Written by the trigger below,
+-- never by a caller: every door retires a row with an UPDATE of
+-- `removed`, and a row that arrives already retired (a restore, a
+-- whole-row copy, an older build's insert) is stamped as it lands, so one trigger
+-- covers them all; an explicit value is kept. No index: readers reach
+-- retired rows through receipts or an id list.
+ALTER TABLE transactions ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ;
+COMMENT ON COLUMN transactions.removed_at IS
+    'when the row last left the ledger (removed went from 0 to non-zero, '
+    'or it was inserted retired); NULL while live. Set by the trigger '
+    'transactions_stamp_removed, specs/receipts.md';
+
+CREATE OR REPLACE FUNCTION transactions_stamp_removed() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.removed = 0 THEN
+        NEW.removed_at := NULL;
+    ELSIF TG_OP = 'INSERT' THEN
+        -- a row that arrives retired left the ledger now, unless the
+        -- writer says when (an archive, a whole-row copy)
+        NEW.removed_at := COALESCE(NEW.removed_at, now());
+    ELSIF OLD.removed = 0
+          AND NEW.removed_at IS NOT DISTINCT FROM OLD.removed_at THEN
+        -- an explicit value (a whole-row copy, a restore) is kept
+        NEW.removed_at := now();
+    END IF;
+    RETURN NEW;
+END $$;
+
+-- an INSERT fires it on every row; an UPDATE only when it names
+-- `removed` or `removed_at`
+CREATE OR REPLACE TRIGGER transactions_stamp_removed
+    BEFORE INSERT OR UPDATE OF removed, removed_at ON transactions
+    FOR EACH ROW EXECUTE FUNCTION transactions_stamp_removed();
 
 CREATE TABLE IF NOT EXISTS merchant_merge_proposals (
     tenant_id        UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
@@ -729,6 +781,11 @@ CREATE TABLE IF NOT EXISTS business_entity (
     -- entity's tax settings with it.
     tax_reserve_account_id TEXT,
     archived_at         TIMESTAMPTZ,             -- when the business was closed (status='archived')
+    -- (migration 239) whose business it is: whose W-2 Social Security
+    -- wages close its self-employment wage base; 'unknown' nets none
+    owner               TEXT NOT NULL DEFAULT 'unknown'
+        CONSTRAINT business_entity_owner_is_known
+            CHECK (owner IN ('primary', 'spouse', 'unknown')),
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (tenant_id, id)
@@ -974,6 +1031,14 @@ CREATE TABLE IF NOT EXISTS income_annual (
     tax_paid          DOUBLE PRECISION,
     wages             DOUBLE PRECISION,    -- 1040 wages line (joint if MFJ)
     primary_wages     DOUBLE PRECISION,    -- primary's own W-2 wages
+    -- (migration 221) not read: superseded by the *_w2 values below
+    primary_wages_from_w2 BOOLEAN NOT NULL DEFAULT false,
+    spouse_wages_from_w2  BOOLEAN NOT NULL DEFAULT false,
+    -- (migration 226) the value the W-2s last wrote into primary_wages /
+    -- spouse_wages; the figure is the W-2s' to set while it is empty or
+    -- still equals this (specs/w2-wages.md)
+    primary_wages_w2  DOUBLE PRECISION,
+    spouse_wages_w2   DOUBLE PRECISION,
     investment_income DOUBLE PRECISION,    -- taxable interest + ordinary dividends
     capital_gain      DOUBLE PRECISION,    -- may be negative
     spouse_wages      DOUBLE PRECISION,
@@ -993,8 +1058,13 @@ CREATE TABLE IF NOT EXISTS income_documents (
     id             BIGINT NOT NULL,
     year           INTEGER NOT NULL,
     form           TEXT NOT NULL,          -- W-2, 1099-INT, 1099-DIV, ...
-    owner          TEXT DEFAULT 'primary',
+    -- whose the document is: 'primary', 'spouse' or 'unassigned'
+    -- (migration 221); an unassigned W-2 counts toward nobody's wages
+    owner          TEXT NOT NULL DEFAULT 'primary',
     payer          TEXT,
+    -- (migration 233) a name a person typed: shown exactly as typed,
+    -- never read as an IRS name control (taxdocs.payer_shown)
+    payer_named_by_person BOOLEAN NOT NULL DEFAULT false,
     -- Always NULL (migration 077): the full EIN is never stored in this
     -- exported table; business_entity keeps that identifier encrypted and
     -- export-excluded. The column stays so restoring an older export still
@@ -1004,10 +1074,78 @@ CREATE TABLE IF NOT EXISTS income_documents (
     primary_amount DOUBLE PRECISION,       -- most-representative figure for the doc
     amounts        JSONB,                  -- all boxes/fields
     notes          TEXT,
+    -- (migration 231) the stored upload this form came in
+    upload_id      BIGINT,
     PRIMARY KEY (tenant_id, id)
 );
 CREATE INDEX IF NOT EXISTS idx_income_docs_tenant_year
     ON income_documents(tenant_id, year);
+
+-- (migration 231) One stored tax or income document and the figures it
+-- wrote (specs/tax-documents.md, "Stored documents"): each income_annual
+-- column is the value of the newest live upload that wrote it
+-- (taxdocs.resolve_year). removed_at marks one taken back; a removed W-2
+-- upload holds its forms in held_documents until it is put back or purged.
+-- Original integer ids travel in restores, so no identity.
+CREATE TABLE IF NOT EXISTS income_uploads (
+    tenant_id      UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    id             BIGINT NOT NULL,
+    -- the upload's identity across an export and a restore
+    uid            UUID NOT NULL DEFAULT gen_random_uuid(),
+    kind           TEXT NOT NULL CHECK (kind IN ('ssa', 'transcript', '1040',
+                       'w2', 'document', 'legacy_ssa', 'legacy_return')),
+    filename       TEXT,
+    stored_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    stored_by      UUID,
+    removed_at     TIMESTAMPTZ,
+    removed_by     UUID,
+    held_documents JSONB,
+    PRIMARY KEY (tenant_id, id)
+);
+-- a database that holds the table from before its identity converges:
+-- every row is given one (the unique index is migration 231's)
+ALTER TABLE income_uploads
+    ADD COLUMN IF NOT EXISTS uid UUID NOT NULL DEFAULT gen_random_uuid();
+CREATE TABLE IF NOT EXISTS income_upload_values (
+    tenant_id UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    upload_id BIGINT NOT NULL,
+    year      INTEGER NOT NULL,
+    fields    JSONB NOT NULL,
+    PRIMARY KEY (tenant_id, upload_id, year)
+);
+CREATE INDEX IF NOT EXISTS income_upload_values_by_year
+    ON income_upload_values (tenant_id, year);
+GRANT SELECT, INSERT, UPDATE, DELETE ON income_uploads, income_upload_values
+    TO oikonome_app, oikonome_admin;
+
+-- One Plaid user per (household, client_id) — what lets a person connect
+-- several banks in one Link session (migration 236). Not exported, not
+-- restored; erased with the household.
+CREATE TABLE IF NOT EXISTS plaid_users (
+    tenant_id  UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    client_id  TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- the client_user_id the user was made for: the household id, or it
+    -- with a short suffix when Plaid refused the plain one (NULL = plain)
+    client_user_id TEXT,
+    -- link tokens Plaid refused with this user in a row; dropped at 2
+    refusals   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (tenant_id, client_id)
+);
+ALTER TABLE plaid_users ADD COLUMN IF NOT EXISTS client_user_id TEXT;
+ALTER TABLE plaid_users
+    ADD COLUMN IF NOT EXISTS refusals INTEGER NOT NULL DEFAULT 0;
+-- several banks per sign-in switched off for this household and keys
+-- until then (Plaid refusing the flag, or a session that went far past
+-- the cap), why, and how many such pauses in a row (each doubles)
+ALTER TABLE plaid_users
+    ADD COLUMN IF NOT EXISTS multi_item_off_until TIMESTAMPTZ;
+ALTER TABLE plaid_users ADD COLUMN IF NOT EXISTS off_reason TEXT;
+ALTER TABLE plaid_users
+    ADD COLUMN IF NOT EXISTS cooldowns INTEGER NOT NULL DEFAULT 0;
+GRANT SELECT, INSERT, UPDATE, DELETE ON plaid_users
+    TO oikonome_app, oikonome_admin;
 
 -- Canonical merchant map for DISPLAY/grouping only. Keyed by the raw
 -- descriptor COALESCE(merchant_name, name); display surfaces read
@@ -1311,6 +1449,45 @@ CREATE TABLE IF NOT EXISTS category_undo (
     PRIMARY KEY (tenant_id, id)
 );
 
+-- what the cash forecast learned from history, one row per household per
+-- day (migration 237): derived, never exported or restored, gone with
+-- the household; the forecast's nightly step and the first build of a
+-- day write it, every build reads it (engine/forecast.learned)
+CREATE TABLE IF NOT EXISTS forecast_learned (
+    tenant_id    UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    as_of        DATE NOT NULL,
+    rule_version INTEGER NOT NULL,
+    stamp        TEXT NOT NULL,
+    written_by   TEXT NOT NULL DEFAULT '',
+    facts        JSON NOT NULL
+        CONSTRAINT forecast_learned_facts_is_an_object
+            CHECK (json_typeof(facts) = 'object'),
+    computed_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, as_of)
+);
+
+-- what the cash forecast said each night (migration 238): one row per
+-- household per local day, written once by the nightly forecast step;
+-- exported and restored (restored rows are graded only against each
+-- other), gone with the household (specs/forecast-grading.md)
+CREATE TABLE IF NOT EXISTS forecast_nights (
+    tenant_id      UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    as_of          DATE NOT NULL,
+    recorded_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    model          TEXT NOT NULL,
+    checking_id    TEXT NOT NULL,
+    start_checking DOUBLE PRECISION NOT NULL,
+    fresh          BOOLEAN NOT NULL,
+    restored       BOOLEAN NOT NULL DEFAULT false,
+    walks          JSONB NOT NULL
+        CONSTRAINT forecast_nights_walks_is_an_object
+            CHECK (jsonb_typeof(walks) = 'object'),
+    pace           JSONB NOT NULL,
+    inputs         JSONB,
+    score          JSONB,
+    PRIMARY KEY (tenant_id, as_of)
+);
+
 -- the household's secret that file-row ids hashed over a full account
 -- number are keyed with (migration 202): never exported, gone with the
 -- household
@@ -1338,6 +1515,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS account_sources_one_account_per_source
 CREATE INDEX IF NOT EXISTS account_sources_by_account
     ON account_sources (tenant_id, account_id);
 
+-- the transactions that last wrote a household's dated ledger rows
+-- (migration 218): the Cash Flow month stamps are served again while this
+-- set is unchanged (engine/reporting._fixed_month_probe). Kept by the
+-- triggers below the row-security block.
+CREATE TABLE IF NOT EXISTS ledger_writes (
+    tenant_id UUID NOT NULL DEFAULT NULLIF(current_setting('app.tenant_id', true), '')::uuid,
+    xact      XID8 NOT NULL,
+    PRIMARY KEY (tenant_id, xact)
+);
+-- granted here, not only by migrate's blanket grant: that runs after every
+-- migration, and an older database gets the triggers above from this file
+-- first, while the running app keeps writing the tables they fire on
+GRANT SELECT, INSERT, UPDATE, DELETE ON ledger_writes
+    TO oikonome_app, oikonome_admin;
+
 DO $$
 DECLARE t TEXT;
 BEGIN
@@ -1346,14 +1538,16 @@ BEGIN
         'sync_log','script_heartbeats','feedback_reports','account_links','receipts','receipt_items','bills','bill_proposals','reimbursements',
         'reimburse_flags','business_flags','transaction_notes','manual_categories','alerts_log','job_runs','job_progress',
         'holdings','crypto_holdings','networth_recorded','networth_snapshot',
-        'income_annual','income_documents','merchant_canonical','merchant_renames','merchants',
+        'income_annual','income_documents','income_uploads','income_upload_values',
+        'merchant_canonical','merchant_renames','merchants',
         'merchant_categories','merchant_merge_proposals','amazon_orders','amazon_matches','amazon_summaries',
         'costco_receipts','costco_matches',
         'transaction_splits','activity_log','webhooks','webhook_deliveries',
         'import_staging','business_entity','entity_membership','equity_movement',
         'business_txn_class','compliance_obligation','mileage_log','vendor_1099',
         'bulk_import_jobs','bulk_import_files','assistant_turns',
-        'category_undo','txn_id_keys','account_sources']
+        'category_undo','txn_id_keys','account_sources','ledger_writes',
+        'plaid_users','forecast_learned','forecast_nights']
     LOOP
         EXECUTE format('ALTER TABLE %I ENABLE ROW LEVEL SECURITY', t);
         EXECUTE format('DROP POLICY IF EXISTS tenant_isolation ON %I', t);
@@ -1363,6 +1557,101 @@ BEGIN
             'WITH CHECK (tenant_id = (SELECT NULLIF(current_setting(''app.tenant_id'', true), '''')::uuid))', t);
     END LOOP;
 END $$;
+
+-- every write to a dated ledger table records its transaction in
+-- ledger_writes (migration 218 says why; mirrored from it)
+CREATE OR REPLACE FUNCTION ledger_writes_mark() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    me     xid8 := pg_current_xact_id();
+    tids   uuid[];
+    marked integer;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        tids := ARRAY(SELECT DISTINCT tenant_id FROM ledger_new);
+    ELSIF TG_OP = 'DELETE' THEN
+        tids := ARRAY(SELECT DISTINCT tenant_id FROM ledger_old);
+    ELSE
+        -- an update can move a row to another household only on the
+        -- admin connection; both are marked
+        tids := ARRAY(SELECT tenant_id FROM ledger_new
+                      UNION SELECT tenant_id FROM ledger_old);
+    END IF;
+    IF cardinality(tids) = 0 THEN
+        RETURN NULL;
+    END IF;
+    -- a restore lands its rows one statement each: once this transaction
+    -- has marked these households, the rest of its statements stop here
+    IF cardinality(tids) = 1 AND current_setting('oikonome.ledger_marked',
+            true) = me::text || ':' || tids[1]::text THEN
+        RETURN NULL;
+    END IF;
+    INSERT INTO ledger_writes (tenant_id, xact)
+    SELECT t, me FROM unnest(tids) AS t
+    ON CONFLICT DO NOTHING;
+    GET DIAGNOSTICS marked = ROW_COUNT;
+    IF cardinality(tids) = 1 THEN
+        PERFORM set_config('oikonome.ledger_marked',
+                           me::text || ':' || tids[1]::text, true);
+    END IF;
+    IF marked > 0
+       AND current_setting('transaction_isolation') = 'read committed' THEN
+        DELETE FROM ledger_writes w
+         USING (SELECT p.tenant_id, p.xact FROM ledger_writes p
+                 WHERE p.tenant_id = ANY (tids) AND p.xact < me
+                 FOR UPDATE SKIP LOCKED) prior
+         WHERE w.tenant_id = prior.tenant_id AND w.xact = prior.xact;
+    END IF;
+    RETURN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION ledger_writes_mark_all() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO ledger_writes (tenant_id, xact)
+    SELECT id, pg_current_xact_id() FROM tenants
+    ON CONFLICT DO NOTHING;
+    RETURN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION ledger_writes_forget() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM ledger_writes WHERE tenant_id IN (SELECT id FROM gone);
+    RETURN NULL;
+END $$;
+
+DO $$
+DECLARE t TEXT;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['transactions', 'transaction_splits',
+                             'manual_categories', 'reimbursements']
+    LOOP
+        -- one trigger per event: a trigger with transition tables may
+        -- fire on one event only
+        EXECUTE format(
+            'CREATE OR REPLACE TRIGGER ledger_writes_mark_insert '
+            'AFTER INSERT ON %I REFERENCING NEW TABLE AS ledger_new '
+            'FOR EACH STATEMENT EXECUTE FUNCTION ledger_writes_mark()', t);
+        EXECUTE format(
+            'CREATE OR REPLACE TRIGGER ledger_writes_mark_update '
+            'AFTER UPDATE ON %I '
+            'REFERENCING NEW TABLE AS ledger_new OLD TABLE AS ledger_old '
+            'FOR EACH STATEMENT EXECUTE FUNCTION ledger_writes_mark()', t);
+        EXECUTE format(
+            'CREATE OR REPLACE TRIGGER ledger_writes_mark_delete '
+            'AFTER DELETE ON %I REFERENCING OLD TABLE AS ledger_old '
+            'FOR EACH STATEMENT EXECUTE FUNCTION ledger_writes_mark()', t);
+        EXECUTE format(
+            'CREATE OR REPLACE TRIGGER ledger_writes_mark_all '
+            'AFTER TRUNCATE ON %I '
+            'FOR EACH STATEMENT EXECUTE FUNCTION ledger_writes_mark_all()', t);
+    END LOOP;
+END $$;
+
+CREATE OR REPLACE TRIGGER ledger_writes_forget AFTER DELETE ON tenants
+    REFERENCING OLD TABLE AS gone
+    FOR EACH STATEMENT EXECUTE FUNCTION ledger_writes_forget();
 
 -- merchant logos cached instance-wide (migration 099): Plaid's public
 -- assets served from /api/logo so clients never fetch plaid.com themselves
@@ -1395,8 +1684,26 @@ CREATE TABLE IF NOT EXISTS plaid_link_sessions (
     exchanged       JSONB NOT NULL DEFAULT '{}'::jsonb,
     done_at         TIMESTAMPTZ,
     reply           JSONB,
-    days_requested  INTEGER                -- the window its link token asked for (migration 213)
+    days_requested  INTEGER,               -- the window its link token asked for (migration 213)
+    multi_item      BOOLEAN NOT NULL DEFAULT false, -- several banks in one session (migration 236)
+    results_until   TIMESTAMPTZ,           -- until when Plaid can still report a bank (236)
+    last_result_at  TIMESTAMPTZ,           -- when it last brought a new bank (236)
+    looked_at       TIMESTAMPTZ            -- last look at Plaid once finished (236)
 );
+ALTER TABLE plaid_link_sessions
+    ADD COLUMN IF NOT EXISTS multi_item BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE plaid_link_sessions
+    ADD COLUMN IF NOT EXISTS results_until TIMESTAMPTZ;
+ALTER TABLE plaid_link_sessions
+    ADD COLUMN IF NOT EXISTS last_result_at TIMESTAMPTZ;
+ALTER TABLE plaid_link_sessions
+    ADD COLUMN IF NOT EXISTS looked_at TIMESTAMPTZ;
+-- the client_id whose keys made the session's link token: every exchange
+-- and removal of the session uses those keys (236)
+ALTER TABLE plaid_link_sessions ADD COLUMN IF NOT EXISTS client_id TEXT;
+-- the newest client poll's protocol (2 = keeps its window open on a
+-- quiet answer); NULL = only older clients have looked (236)
+ALTER TABLE plaid_link_sessions ADD COLUMN IF NOT EXISTS client_v SMALLINT;
 CREATE INDEX IF NOT EXISTS plaid_link_sessions_open
     ON plaid_link_sessions (tenant, created_at) WHERE done_at IS NULL;
 

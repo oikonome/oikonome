@@ -18,6 +18,7 @@ import { KINDS, RemoveAccountPanel, type DoneFn,
          type Moved } from "./RemoveAccountPanel";
 import { isOwner } from "../role";
 import { sharedLock } from "../sharedlogin";
+import Note from "./Note";
 
 interface Grp {
   itemId: string;
@@ -41,6 +42,8 @@ export default function ManageAccounts() {
   const [notice, setNotice] = useState<string | null>(null);
   const [openId, setOpenId] = useState<string | null>(null);
   const [syncing, setSyncing] = useState<string | null>(null);
+  // the manual and imported groups, folded until asked for
+  const [showOffline, setShowOffline] = useState(false);
 
   // Callers say what their write moved; the editors below patch the cached
   // rows first, so the refetch confirms rather than reveals. No list means
@@ -96,17 +99,26 @@ export default function ManageAccounts() {
   const ordered = [...groups.values()].sort((x, y) =>
     Number(y.conn !== null) - Number(x.conn !== null)
     || x.institution.localeCompare(y.institution));
+  // The live bank links are what this list is for; the manual and imported
+  // groups (old statements, closed accounts, a past app's history) can
+  // run to dozens of rows, so they wait behind one button — unless there
+  // is nothing linked, when they are the whole list.
+  const linked = ordered.filter((g) => g.conn !== null);
+  const offlineCount = ordered.filter((g) => g.conn === null)
+    .reduce((n, g) => n + g.accounts.length, 0);
 
   return (
     <div>
       {notice && (
-        <p className="note" role="status" onClick={() => setNotice(null)}>
-          {notice}</p>
+        <Note as="p" onDismiss={() => setNotice(null)}>
+          {notice}</Note>
       )}
+      <ReplacedConnections conns={conns.data.connections} lock={credLock}
+                           onDone={done} />
       {credLock && ordered.some((g) => g.conn !== null) && (
         <p className="sub" style={{ color: "var(--amber)" }}>{credLock}</p>
       )}
-      {ordered.map((g) => (
+      {(showOffline || !linked.length ? ordered : linked).map((g) => (
         <GroupPanel key={g.itemId || g.institution} g={g} primary={primary}
                     anchor={anchor} pinUnused={pinUnused}
                     credLock={credLock}
@@ -114,6 +126,13 @@ export default function ManageAccounts() {
                     syncing={syncing === g.itemId}
                     onSync={() => sync.mutate(g.itemId)} onDone={done} />
       ))}
+      {linked.length > 0 && offlineCount > 0 && (
+        <button type="button" className="show-more"
+                aria-expanded={showOffline}
+                onClick={() => setShowOffline(!showOffline)}>
+          {showOffline ? "Hide manual and imported accounts"
+            : `Show ${offlineCount} manual or imported account${
+                offlineCount === 1 ? "" : "s"}`}</button>)}
       <p className="sub" style={{ marginTop: ".8rem" }}>
         Balances, holdings and history live on{" "}
         <Link to="/accounts">Accounts</Link> · add a bank or import files
@@ -189,7 +208,8 @@ function GroupPanel({ g, primary, anchor, pinUnused, credLock, excluded,
           )}
           {live && (plaid || c !== null) && (
             <details className="usermenu macct-menu">
-              <summary title="more connection actions">⋯</summary>
+              <summary title="more connection actions"
+                       aria-label="More connection actions">⋯</summary>
               <div className="usermenu-panel">
                 {plaid && (
                   <button type="button" disabled={linking || !!credLock}
@@ -420,22 +440,22 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
       <form className="macct-fields"
             onSubmit={(e) => { e.preventDefault(); save.mutate(); }}>
         {field("Name",
-          <input type="text" value={name} style={{ width: "12rem" }}
+          <input aria-label="Name" type="text" value={name} style={{ width: "12rem" }}
                  title="display name — sync never overwrites it"
                  onChange={(e) => setName(e.target.value)} />)}
         {field("Type",
-          <select value={kind} onChange={(e) => setKind(e.target.value)}>
+          <select aria-label="Type" value={kind} onChange={(e) => setKind(e.target.value)}>
             {KINDS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
             {!KINDS.some(([v]) => v === a.kind) &&
               <option value={a.kind}>{a.kind}</option>}
           </select>)}
         {field("Owner",
-          <input type="text" value={ownerLbl} placeholder="ours"
+          <input aria-label="Owner" type="text" value={ownerLbl} placeholder="ours"
                  style={{ width: "6rem" }}
                  title="whose money — a reporting filter, never the budget"
                  onChange={(e) => setOwnerLbl(e.target.value)} />)}
         {manual && field("Balance",
-          <input value={bal} size={8} placeholder="0.00"
+          <input aria-label="Balance" value={bal} size={8} placeholder="0.00"
                  style={{ textAlign: "right" }}
                  onChange={(e) => setBal(e.target.value)} />)}
         <label className="mut macct-chk"
@@ -476,6 +496,42 @@ function Editor({ a, isPrimary, isExcluded, live, hidden, onDone }: {
         <RemoveAccountPanel a={a} liveConn={live}
           onDone={onDone} onCancel={() => setRemoving(false)} />
       )}
+    </div>
+  );
+}
+
+
+/** Links the bank feed removed that the household has since linked again
+ *  (the server's `replaced`): history, not work, so they no longer raise
+ *  "needs attention". Each is said once, with the server's words, beside a
+ *  forget button — the disconnect door, which on a removed link only stops
+ *  listing it; its history stays. */
+export function ReplacedConnections({ conns, lock, onDone }: {
+  conns: Connection[]; lock: string | null; onDone: DoneFn;
+}) {
+  const qc = useQueryClient();
+  const forget = useMutation({
+    mutationFn: (id: string) => api.connectionDisconnect(id),
+    onSuccess: (_r, id) => {
+      removeFromList<{ connections: Connection[] }, Connection>(
+        qc, ["connections"], "connections", (c) => c.id === id);
+      onDone("Forgotten — its history stays.", ["connections"]);
+    },
+    onError: (e) => onDone(errText(e), []),
+  });
+  const gone = conns.filter((c) => c.replaced);
+  if (!gone.length) return null;
+  return (
+    <div className="card" style={{ marginTop: 0 }}>
+      {gone.map((c) => (
+        <div key={c.id} style={{ display: "flex", gap: ".6rem",
+                                 alignItems: "baseline", flexWrap: "wrap" }}>
+          <b>{c.institution_name || c.id}</b>
+          <span className="sub" style={{ flex: 1 }}>{c.removed_text}</span>
+          <button disabled={forget.isPending || !!lock} title={lock ?? undefined}
+                  onClick={() => forget.mutate(c.id)}>forget</button>
+        </div>
+      ))}
     </div>
   );
 }

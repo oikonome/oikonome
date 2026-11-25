@@ -1,5 +1,9 @@
 """An account is findable by either of its names, and a rename is undoable.
 
+A term some row's own text matches lists those rows only, with the
+matching account offered as its own link; a term only an account's name
+matches lists that account's rows.
+
 The ledger's generated search_text column cannot reference the accounts
 table, so account-name matching is resolved once on the accounts table and
 joined in by id — which is also what makes it exist at all: without it,
@@ -85,13 +89,22 @@ class AccountNameSearch(unittest.TestCase):
         self.assertEqual(total, 2)
         self.assertEqual(hits, [])
 
-    def test_the_name_clause_widens_never_replaces_the_text_match(self):
-        # a term matching BOTH a merchant and an account must return the
-        # union: the checking row by its text, the card rows by the name
+    def test_a_term_rows_match_by_text_lists_those_rows_only(self):
+        # a term matching BOTH a merchant and an account's name is about
+        # the merchant: its rows by their own text, and the account
+        # offered as a link of its own (rows_listed false) — the card's
+        # hardware store row is not a coffee
         data.set_account_display_name(self.conn, "card", "Coffee Fund")
         rows, total, hits = self._search("coffee")
-        self.assertEqual(total, 3)
+        self.assertEqual(total, 2)
+        self.assertEqual({r["payee"] for r in rows}, {"Coffee Shop"})
         self.assertEqual(len(hits), 1)
+        self.assertFalse(hits[0]["rows_listed"])
+
+    def test_a_term_only_an_account_matches_lists_its_rows(self):
+        rows, total, hits = self._search("test card")
+        self.assertEqual(total, 2)
+        self.assertTrue(hits[0]["rows_listed"])
 
 
 if __name__ == "__main__":

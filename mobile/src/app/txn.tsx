@@ -9,19 +9,23 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useEffect, useMemo, useState } from "react";
-import { Alert, Modal, Pressable, ScrollView, StyleSheet, Text, TextInput,
-         View } from "react-native";
+import { Alert, Modal, Platform, Pressable, ScrollView, StyleSheet, Text,
+         TextInput, View } from "react-native";
 
 import * as DocumentPicker from "expo-document-picker";
 import * as ImagePicker from "expo-image-picker";
 
-import { Card, H, KV } from "../components/ui";
-import { discardPicked, errText, getHandedOffTxn, Receipt, SplitPart, TodayFull, Txn,
+import { Card, H, KV, Note } from "../components/ui";
+import { EmptyState, FailedLine, StaleLine } from "../components/loaded";
+import SlipNote from "../components/slip-note";
+import { OfflineNote, offlineGrey, useOffline } from "../components/offline";
+import { ApiError, discardPicked, errText, getHandedOffTxn, Receipt, SplitPart, TodayFull, Txn,
          TxnPage } from "../lib/api";
 import { patchQueries, removeFromList } from "../lib/cache";
-import { categoryForServer, CLEAR_CATEGORY, catLabel, filterCategories,
+import { catKey, categoryForServer, CLEAR_CATEGORY, catLabel, filterCategories,
+         isMovedMoney, rowCategoryLabel,
          isCategoryReset, spendPickerGroups, CATEGORY_MAX, goneTxnIds,
-         splitDraftCheck } from "../lib/pure";
+         pickedImagePart, splitDraftCheck } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { forgetParseStart, parseStalled, rankWaiting, useMatchReceipt,
@@ -29,6 +33,8 @@ import { forgetParseStart, parseStalled, rankWaiting, useMatchReceipt,
   from "../lib/waiting";
 import { C, mmddyy, money } from "../lib/theme";
 import MerchantAvatar from "../components/merchant-avatar";
+import { fieldA11y } from "../components/field";
+import { useSheetAnimation } from "../lib/a11y";
 
 // A pending authorization the bank never posted and never released. Card
 // holds clear within days, so a row still pending after two weeks is
@@ -49,16 +55,36 @@ const stuckPending = (t: Txn) => {
 const OFFER_HEAD = 3;
 
 export default function TxnDetail() {
+  const sheetAnim = useSheetAnimation();
   const { id } = useLocalSearchParams<{ id?: string }>();
   const { client } = useSession();
   const router = useRouter();
   const qc = useQueryClient();
+  // offline, every write here is greyed with "You're offline." beside it
+  const offline = useOffline();
+  // hosted has no System health screen, so the parsing hint names it only
+  // on a self-hosted instance
+  const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
+                        enabled: !!client });
   // The hand-off is one slot that the next row tap overwrites, so it is
   // read once, when this screen mounts: coming back to it from a later
   // transaction must still find its own receipts and history.
   const [initial] = useState(() =>
     getHandedOffTxn(id ? String(id) : undefined));
   const [txn, setTxn] = useState<Txn | null>(initial);
+  // With no hand-off (an app restart, a link) the screen reads its own row
+  // from the server; once it answers, the screen holds it like a hand-off.
+  const one = useQuery({
+    queryKey: ["txn", id],
+    queryFn: () => client!.txn(String(id)),
+    enabled: !!client && !!id && !initial,
+    // a 404 is an answer (no such row here), never worth asking again
+    retry: false,
+  });
+  useEffect(() => {
+    if (one.data && !txn) setTxn(one.data);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [one.data]);
   const [picking, setPicking] = useState(false);
   const [filter, setFilter] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -93,6 +119,22 @@ export default function TxnDetail() {
       setNoteDraft(null);
       // a note moves no money: the row is patched, nothing is refetched
       patchRow({ note: n || null });
+    },
+    onError: (e) => setErr(errText(e)),
+  });
+  // a check counted under Checks asks once whom it paid; the answer is
+  // its note, and may file it under the payee's category (web: the row's
+  // "who was this to?")
+  const [payeeDraft, setPayeeDraft] = useState("");
+  const payee = useMutation({
+    mutationFn: (p: string) => client!.checkPayee(txn!.id, p),
+    onSuccess: (r) => {
+      setTxn((x) => (x ? { ...x, note: r.note, needs_payee: false } : x));
+      patchRow({ note: r.note, needs_payee: false });
+      setPayeeDraft("");
+      // a category may have moved, and with it the figures
+      qc.invalidateQueries({ queryKey: ["txns"] });
+      qc.invalidateQueries({ queryKey: ["today"] });
     },
     onError: (e) => setErr(errText(e)),
   });
@@ -183,9 +225,14 @@ export default function TxnDetail() {
       const perm = await ImagePicker.requestCameraPermissionsAsync();
       if (!perm.granted) return;
     }
-    const res = await fn({ mediaTypes: ["images"], quality: 0.8 });
+    // Compatible: iOS hands a library HEIC over as a JPEG, a type the
+    // server takes; the photo's own type is sent with it either way
+    const res = await fn({ mediaTypes: ["images"], quality: 0.8,
+      preferredAssetRepresentationMode:
+        ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible });
     if (!res.canceled && res.assets[0])
-      upload.mutate({ uri: res.assets[0].uri, kind });
+      upload.mutate({ ...pickedImagePart(res.assets[0], Platform.OS, kind),
+                      kind });
   };
   // emailed receipts are PDFs — the server and the web client take them
   // (they rasterize for parsing), so the phone needs a door for one too:
@@ -291,9 +338,17 @@ export default function TxnDetail() {
   // the category, the provenance line under it, and the override flag the
   // "Use automatic" button is gated on.
   const adoptServerRow = async () => {
-    const fresh = await client!.txnById(txn!.id, txn!.date);
-    // not in its own day's listing: leave what is on screen rather than
-    // replace it with a guess — the write itself landed either way
+    // the one-row door, as the web reads it: it finds a removed or backup
+    // account's row and answers a settled hold with its posted row. A 404
+    // (no such row, or a server older than the door) falls back to the
+    // row's own day listing
+    const fresh = await client!.txn(txn!.id).catch((e) => {
+      if (e instanceof ApiError && e.status === 404)
+        return client!.txnById(txn!.id, txn!.date);
+      throw e;
+    });
+    // found nowhere: leave what is on screen rather than replace it with
+    // a guess — the write itself landed either way
     if (!fresh) return;
     setTxn(fresh);
     patchRow(fresh);
@@ -439,8 +494,19 @@ export default function TxnDetail() {
   const flowNames = useMemo(() => new Set(
     (cats.data?.plaid_flow ?? []).map((c) => c.toUpperCase())), [cats.data]);
 
+  // The row arrives by the hand-off from the list that was tapped, or is
+  // read by its id. A 404 (no such row in this household, or a server
+  // older than the one-row door) leaves the way back to Transactions; any
+  // other failure is the failed line.
   if (!txn) {
-    return <Text style={[s.big, { padding: 20 }]}>Transaction not found.</Text>;
+    if (id && one.isPending && one.fetchStatus !== "idle")
+      return <Text style={{ color: C.mut, textAlign: "center",
+                            padding: 20 }}>Loading…</Text>;
+    if (one.isError && !(one.error instanceof ApiError
+                         && one.error.status === 404))
+      return <FailedLine q={one} what="this transaction" />;
+    return <EmptyState title="This transaction is no longer open here."
+                       to="/transactions" action="Find it on Transactions" />;
   }
   const inflow = txn.amount < 0;
   const flagged = !!(txn.reimb || txn.reimb_flag);
@@ -528,8 +594,12 @@ export default function TxnDetail() {
           <MerchantAvatar name={txn.payee} logo={txn.merchant_logo} size={40} />
           <Text style={[s.payee, { flex: 1 }]}>{txn.payee}</Text>
         </View>
-        <Text style={[s.big, inflow && { color: C.good }]}>
-          {inflow ? `+${money(-txn.amount)}` : money(txn.amount)}
+        {/* the web's sign: money out reads negative, money in plain and
+            green, money moved muted */}
+        <Text style={[s.big, isMovedMoney(txn.category, txn.amount,
+                                          txn.category_detailed)
+                               ? { color: C.mut } : inflow && { color: C.good }]}>
+          {money(-txn.amount)}
         </Text>
         <KV k="Date" v={mmddyy(txn.date)} />
         <KV k="Account" v={txn.account || "—"} />
@@ -546,6 +616,28 @@ export default function TxnDetail() {
             .filter(Boolean).join(" · ")} />
         ) : null}
         {txn.check_number ? <KV k="Check" v={`#${txn.check_number}`} /> : null}
+        {txn.needs_payee && !viewer && !demo ? (
+          <View style={{ gap: 4, marginTop: 4 }}>
+            <Text style={{ color: C.warn, fontSize: 13 }}>
+              Who was check{txn.check_number ? ` #${txn.check_number}` : ""} to?
+            </Text>
+            <View style={s.actRow}>
+              <TextInput {...fieldA11y("Check payee")}
+                style={[s.noteInput, { minHeight: 36 }]}
+                placeholder="payee" placeholderTextColor={C.mut}
+                maxLength={120 /* the server's cap on a payee */}
+                value={payeeDraft} onChangeText={setPayeeDraft} />
+              {payeeDraft.trim() ? (
+                <Pressable accessibilityRole="button"
+                           style={[s.btn, offlineGrey(offline)]}
+                           disabled={payee.isPending || offline}
+                           onPress={() => payee.mutate(payeeDraft.trim())}>
+                  <Text style={s.btnText}>Save</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          </View>
+        ) : null}
         {txn.authorized_date && txn.authorized_date !== txn.date ? (
           <KV k="Authorized" v={mmddyy(txn.authorized_date)} />
         ) : null}
@@ -589,7 +681,7 @@ export default function TxnDetail() {
         <View style={s.actRow}>
           <View style={{ flex: 1 }}>
             <Text style={s.mut}>Category</Text>
-            <Text style={s.actVal}>{catLabel(txn.category) || "—"}</Text>
+            <Text style={s.actVal}>{rowCategoryLabel(txn)}</Text>
             {txn.category_why ? (
               <Text style={{ color: C.mut, fontSize: 12, marginTop: 2 }}>
                 {txn.category_why}
@@ -598,20 +690,23 @@ export default function TxnDetail() {
           </View>
           {!viewer && (
             <View style={{ gap: 6, alignItems: "flex-end" }}>
-              <Pressable style={s.btn} onPress={() => setPicking(true)}>
+              <Pressable accessibilityRole="button"
+                         disabled={offline} style={[s.btn, offlineGrey(offline)]} onPress={() => setPicking(true)}>
                 <Text style={s.btnText}>Change</Text>
               </Pressable>
               {/* a category you set yourself goes back to the automatic
                   layer in one tap, without opening the picker for its
                   reset entry (web: the ↺ beside the category) */}
               {txn.override_manual ? (
-                <Pressable style={s.btn}
+                <Pressable accessibilityRole="button"
+                           disabled={offline} style={[s.btn, offlineGrey(offline)]}
                            onPress={() => setCat.mutate({
                              category: CLEAR_CATEGORY, scope: "one" })}
                            accessibilityLabel="use the automatic category">
                   <Text style={s.btnText}>Use automatic</Text>
                 </Pressable>
               ) : null}
+              <OfflineNote />
             </View>
           )}
         </View>
@@ -630,8 +725,9 @@ export default function TxnDetail() {
             )}
           </View>
           {!txn.reimb && !viewer && (
-            <Pressable style={[s.btn, flagged && s.btnQuiet]}
-                       disabled={reimb.isPending}
+            <Pressable accessibilityRole="button"
+                       style={[s.btn, flagged && s.btnQuiet, offlineGrey(offline)]}
+                       disabled={reimb.isPending || offline}
                        onPress={() => (flagged
                          ? reimb.mutate({ flag: false }) : askFlag())}>
               <Text style={[s.btnText, flagged && { color: C.mut }]}>
@@ -640,8 +736,8 @@ export default function TxnDetail() {
             </Pressable>
           )}
         </View>
-        {err ? <Text style={{ color: C.bad, fontSize: 12, marginTop: 8 }}
-                     onPress={() => setErr(null)}>{err}</Text> : null}
+        {err ? <Note bad style={{ color: C.bad, fontSize: 12, marginTop: 8 }}
+                     onPress={() => setErr(null)}>{err}</Note> : null}
       </Card>
 
       {/* one charge, several categories — the parts count where the
@@ -671,7 +767,7 @@ export default function TxnDetail() {
           {!viewer && splitDraft === null && (
             <View style={{ gap: 6, alignItems: "flex-end" }}>
               {canSplit && (
-              <Pressable style={s.btn} onPress={() => setSplitDraft(
+              <Pressable accessibilityRole="button" style={s.btn} onPress={() => setSplitDraft(
                 txn.split?.length
                   ? txn.split.map((p) => ({ category: p.category,
                                             amount: Math.abs(p.amount).toFixed(2) }))
@@ -683,7 +779,8 @@ export default function TxnDetail() {
               </Pressable>
               )}
               {txn.split?.length ? (
-                <Pressable style={[s.btn, s.btnQuiet]} disabled={splitClear.isPending}
+                <Pressable accessibilityRole="button"
+                           style={[s.btn, s.btnQuiet, offlineGrey(offline)]} disabled={splitClear.isPending || offline}
                            onPress={() => splitClear.mutate()}>
                   <Text style={[s.btnText, { color: C.mut }]}>Remove</Text>
                 </Pressable>
@@ -703,7 +800,7 @@ export default function TxnDetail() {
               </Text>
               {splitDraft.map((p, i) => (
                 <View key={i} style={s.actRow}>
-                  <Pressable style={[s.entChip, { flex: 1 }]}
+                  <Pressable accessibilityRole="button" style={[s.entChip, { flex: 1 }]}
                              onPress={() => { setFilter(""); setPickFor(i); }}
                              accessibilityLabel={`category of part ${i + 1}`}>
                     <Text style={{ color: p.category ? C.text : C.mut, fontSize: 14 }}
@@ -743,12 +840,13 @@ export default function TxnDetail() {
                     ? `${(left / 100).toFixed(2)} left to place`
                     : `${(-left / 100).toFixed(2)} over the charge`}
                 </Text>
-                <Pressable style={[s.btn, s.btnQuiet]}
+                <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                            onPress={() => setSplitDraft(null)}>
                   <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
                 </Pressable>
-                <Pressable style={[s.btn, !ready && { opacity: 0.4 }]}
-                           disabled={!ready || splitSave.isPending}
+                <Pressable accessibilityRole="button"
+                           style={[s.btn, !ready && { opacity: 0.4 }, offlineGrey(offline)]}
+                           disabled={!ready || splitSave.isPending || offline}
                            onPress={() => splitSave.mutate(splitDraft.map((p, i) => ({
                              category: p.category,
                              amount: sign * (cents[i] ?? 0) / 100 })))}>
@@ -772,8 +870,9 @@ export default function TxnDetail() {
             </Text>
           </View>
           {!viewer && (
-          <Pressable style={[s.btn, txn.biz_flag && s.btnQuiet]}
-                     disabled={biz.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, txn.biz_flag && s.btnQuiet, offlineGrey(offline)]}
+                     disabled={biz.isPending || offline}
                      onPress={() => biz.mutate(!txn.biz_flag)}>
             <Text style={[s.btnText, txn.biz_flag && { color: C.mut }]}>
               {txn.biz_flag ? "Unflag" : "Flag"}
@@ -795,10 +894,10 @@ export default function TxnDetail() {
               {[{ id: null as string | null, name: "Personal" },
                 ...entities.data!.entities
                   .filter((e) => e.status === "active")].map((e) => (
-                <Pressable key={e.id ?? "personal"}
+                <Pressable accessibilityRole="button" key={e.id ?? "personal"}
                            style={[s.entChip,
-                             assigned === e.id && s.entChipOn]}
-                           disabled={assign.isPending}
+                             assigned === e.id && s.entChipOn, offlineGrey(offline)]}
+                           disabled={assign.isPending || offline}
                            onPress={() => assign.mutate(e.id)}>
                   <Text style={{ color: assigned === e.id
                                    ? C.text : C.mut, fontSize: 12 }}>
@@ -833,19 +932,21 @@ export default function TxnDetail() {
           </Text>
         )}
         <View style={s.actRow}>
-          <TextInput
+          <TextInput {...fieldA11y("Note")}
             style={[s.noteInput, demo && { opacity: 0.5 }]}
             placeholder="add a note…" placeholderTextColor={C.mut}
             value={noteDraft ?? txn.note ?? ""}
             editable={!demo}
             onChangeText={setNoteDraft} multiline />
           {!demo && noteDraft !== null && noteDraft !== (txn.note ?? "") && (
-            <Pressable style={s.btn} disabled={note.isPending}
+            <Pressable accessibilityRole="button"
+                       style={[s.btn, offlineGrey(offline)]} disabled={note.isPending || offline}
                        onPress={() => note.mutate(noteDraft.trim())}>
               <Text style={s.btnText}>Save</Text>
             </Pressable>
           )}
         </View>
+        {noteDraft !== null && <OfflineNote />}
         {/* offered only where the row is old enough to be stuck — a hold
             from yesterday is still in flight and dropping it would
             delete a charge that is about to post. Not on the demo: one
@@ -860,7 +961,8 @@ export default function TxnDetail() {
                 weeks
               </Text>
             </View>
-            <Pressable style={[s.btn, s.btnQuiet]} disabled={retire.isPending}
+            <Pressable accessibilityRole="button"
+                       style={[s.btn, s.btnQuiet, offlineGrey(offline)]} disabled={retire.isPending || offline}
                        onPress={() => retire.mutate()}>
               <Text style={[s.btnText, { color: C.mut }]}>
                 Remove stuck pending
@@ -872,6 +974,10 @@ export default function TxnDetail() {
 
       <Card>
         <H>Receipts</H>
+        <StaleLine query={receipts} />
+        {receipts.data === undefined && receipts.isError && (
+          <FailedLine q={receipts} what="receipts" />
+        )}
         {(receipts.data?.receipts ?? []).map((r) => (
           <View key={r.id} style={{ marginTop: 6 }}>
             <View style={s.actRow}>
@@ -904,6 +1010,7 @@ export default function TxnDetail() {
                 <Text style={[{ color: C.mut, fontSize: 16, padding: 4 },
                       delReceipt.isPending && delReceipt.variables === r.id
                         && { opacity: 0.4 }]}
+                      accessibilityRole="button" accessibilityLabel="Remove this receipt"
                       onPress={() => !delReceipt.isPending
                         && delReceipt.mutate(r.id)}>✕</Text>
               )}
@@ -914,8 +1021,9 @@ export default function TxnDetail() {
             )}
             {r.status === "parsing" && !stalled(r) && (
               <Text style={s.mut}>
-                Parsing… safe to navigate away — queued work shows under
-                Settings → System health.
+                Parsing… safe to navigate away
+                {me.data?.hosted ? "." : " — queued work shows under "
+                  + "Settings → System health."}
               </Text>
             )}
             {r.status === "failed" && r.error ? (
@@ -936,12 +1044,33 @@ export default function TxnDetail() {
                   : ""}
               </Text>
             )}
+            {/* what the server counted (web: ReceiptPanel.tsx): a copy of
+                a slip counted on another receipt lists its lines greyed,
+                and a look-alike asks the person once */}
+            <SlipNote id={r.id} counts={r.counts ?? true}
+              twins={r.slip_twins ?? []}
+              suspected={r.suspected ?? []} mayAnswer={!viewer} />
+            {r.lines_gap != null ? (
+              <Text style={s.mut}>
+                the lines come to {money(Math.abs(r.lines_gap))}{" "}
+                {r.lines_gap > 0 ? "less" : "more"} than the charge — a
+                discount, fee or line the reading missed
+              </Text>
+            ) : null}
             {(r.items ?? []).map((it) => (
               <Text key={it.line} style={s.mut}>
                 {money(it.amount)}
                 {it.qty != null && it.qty !== 1 ? ` · ×${it.qty}` : ""}
                 {" · "}{it.description}
                 {it.tag ? `  [${it.tag}]` : ""}
+              </Text>
+            ))}
+            {(r.listed_items ?? []).map((it) => (
+              <Text key={`listed-${it.line}`}
+                    style={[s.mut, { opacity: 0.6 }]}>
+                {money(it.amount)}
+                {it.qty != null && it.qty !== 1 ? ` · ×${it.qty}` : ""}
+                {" · "}{it.description}
               </Text>
             ))}
             <View style={{ flexDirection: "row", gap: 14 }}>
@@ -990,9 +1119,9 @@ export default function TxnDetail() {
             <Text style={s.mut}>Snapped earlier and still waiting:</Text>
             <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
               {offered.map((w) => (
-                <Pressable key={w.id} style={[s.btn, s.btnQuiet,
-                             matchWaiting.isPending && { opacity: 0.5 }]}
-                           disabled={matchWaiting.isPending}
+                <Pressable accessibilityRole="button" key={w.id} style={[s.btn, s.btnQuiet,
+                             matchWaiting.isPending && { opacity: 0.5 }, offlineGrey(offline)]}
+                           disabled={matchWaiting.isPending || offline}
                            onPress={() => matchWaiting.mutate(
                              { id: w.id, txnId: txn.id },
                              { onSuccess: () => receipts.refetch(),
@@ -1007,7 +1136,7 @@ export default function TxnDetail() {
               {moreWaiting && offered.length === 0 && (
                 <Text style={s.mut}>No waiting receipt matches</Text>)}
               {!moreWaiting && ranked.length > OFFER_HEAD && (
-                <Pressable style={[s.btn, s.btnQuiet]}
+                <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                            onPress={() => setMoreWaiting(true)}>
                   <Text style={[s.btnText, { color: C.mut, fontSize: 13 }]}>
                     More… ({ranked.length - OFFER_HEAD})</Text>
@@ -1030,17 +1159,20 @@ export default function TxnDetail() {
         {mayWriteReceipts && (
         <View style={{ flexDirection: "row", gap: 8, marginTop: 8,
                        flexWrap: "wrap" }}>
-          <Pressable style={s.btn} disabled={upload.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, offlineGrey(offline)]} disabled={upload.isPending || offline}
                      onPress={() => snap(true)}>
             <Text style={s.btnText}>
               {upload.isPending ? "Uploading…" : "📷 Capture"}
             </Text>
           </Pressable>
-          <Pressable style={[s.btn, s.btnQuiet]} disabled={upload.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet, offlineGrey(offline)]} disabled={upload.isPending || offline}
                      onPress={() => snap(false)}>
             <Text style={[s.btnText, { color: C.mut }]}>Choose photo</Text>
           </Pressable>
-          <Pressable style={[s.btn, s.btnQuiet]} disabled={upload.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet, offlineGrey(offline)]} disabled={upload.isPending || offline}
                      onPress={() => snap(true, "check")}>
             <Text style={[s.btnText, { color: C.mut }]}>
               Capture check
@@ -1050,17 +1182,20 @@ export default function TxnDetail() {
               downloads the front, or a scanner makes a PDF. These two
               bring either in without photographing a screen, which
               parses badly. */}
-          <Pressable style={[s.btn, s.btnQuiet]} disabled={upload.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet, offlineGrey(offline)]} disabled={upload.isPending || offline}
                      onPress={() => snap(false, "check")}>
             <Text style={[s.btnText, { color: C.mut }]}>
               Choose check photo
             </Text>
           </Pressable>
-          <Pressable style={[s.btn, s.btnQuiet]} disabled={upload.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet, offlineGrey(offline)]} disabled={upload.isPending || offline}
                      onPress={() => pickPdf()}>
             <Text style={[s.btnText, { color: C.mut }]}>Attach PDF</Text>
           </Pressable>
-          <Pressable style={[s.btn, s.btnQuiet]} disabled={upload.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet, offlineGrey(offline)]} disabled={upload.isPending || offline}
                      onPress={() => pickPdf("check")}>
             <Text style={[s.btnText, { color: C.mut }]}>
               Attach check PDF
@@ -1109,12 +1244,12 @@ export default function TxnDetail() {
             // the web's gate: only a non-transfer EXPENSE can become a
             // bill — an inflow or a transfer is never offered one
             || txn.amount <= 0
-            || catLabel(txn.category || "").includes("TRANSFER")
+            || catKey(txn.category).includes("TRANSFER")
             ? null : (
             // the history screen's add form: amount/cadence/date all
             // choosable, prefilled from the ledger fit — never a silent
             // hardcoded monthly
-            <Pressable style={[s.btn, { alignSelf: "flex-start",
+            <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start",
                                         marginTop: 8 }]}
                        onPress={() => router.push({
                          pathname: "/bill-history",
@@ -1125,28 +1260,24 @@ export default function TxnDetail() {
         </Card>
       )}
 
-      <Modal visible={picking || pickFor !== null} animationType="slide" transparent
+      <Modal visible={picking || pickFor !== null} animationType={sheetAnim} transparent
              onRequestClose={() => { setPicking(false); setPickFor(null); }}>
         <View style={s.sheetWrap}>
           <View style={s.sheet}>
             <Text style={s.sheetTitle}>Category</Text>
             {/* the filter doubles as a new custom name ("✎ Create …") */}
-            <TextInput style={s.search} placeholder="filter…"
+            <TextInput {...fieldA11y("Filter categories, or type a new one")}
+                       style={s.search} placeholder="filter…"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        maxLength={CATEGORY_MAX}
                        value={filter} onChangeText={setFilter} />
             <ScrollView style={{ maxHeight: 420 }}>
               {cats.isPending && <Text style={s.mut}>Loading…</Text>}
-              {cats.isError && (
-                <Text style={{ color: C.bad, fontSize: 14, paddingVertical: 8 }}
-                      onPress={() => cats.refetch()}>
-                  Couldn't load categories — tap to retry.
-                </Text>
-              )}
+              {cats.isError && <FailedLine q={cats} what="the categories" />}
               {/* clearing an override is inherently this-row-only; a
                   split's part has nothing to reset to */}
               {pickFor === null && (
-              <Pressable style={s.catRow}
+              <Pressable accessibilityRole="button" style={s.catRow}
                          onPress={() => setCat.mutate({
                            category: CLEAR_CATEGORY, scope: "one" })}>
                 <Text style={{ color: C.mut, fontSize: 15 }}>
@@ -1159,7 +1290,7 @@ export default function TxnDetail() {
                   filter.trim().replace(/\s+/g, "_").toUpperCase()))
                 && !catList.some((c) =>
                      c.toLowerCase() === filter.trim().toLowerCase()) && (
-                <Pressable style={s.catRow}
+                <Pressable accessibilityRole="button" style={s.catRow}
                            onPress={() => chooseCategory(filter.trim())}>
                   <Text style={{ color: C.accent, fontSize: 15 }}>
                     ✎ Create “{filter.trim()}”
@@ -1167,7 +1298,7 @@ export default function TxnDetail() {
                 </Pressable>
               )}
               {catList.map((c) => (
-                <Pressable key={c} style={s.catRow}
+                <Pressable accessibilityRole="button" key={c} style={s.catRow}
                            onPress={() => chooseCategory(c)}>
                   {/* the row's category arrives in DISPLAY form (spaces),
                       the list holds raw keys — compare as labels */}
@@ -1181,7 +1312,8 @@ export default function TxnDetail() {
                 </Pressable>
               ))}
             </ScrollView>
-            <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "center" }]}
+            <Pressable accessibilityRole="button"
+                       style={[s.btn, s.btnQuiet, { alignSelf: "center" }]}
                        onPress={() => { setPicking(false); setPickFor(null); }}>
               <Text style={[s.btnText, { color: C.mut }]}>Close</Text>
             </Pressable>
@@ -1200,14 +1332,14 @@ const s = StyleSheet.create({
   mut: { color: C.mut, fontSize: 12 },
   actRow: { flexDirection: "row", alignItems: "center", gap: 10 },
   actVal: { color: C.text, fontSize: 15, fontWeight: "600" },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 16, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   entChip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
              borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
   entChipOn: { borderColor: C.accent, backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 14, fontWeight: "600" },
-  noteInput: { flex: 1, backgroundColor: C.bg, borderColor: C.border,
+  noteInput: { flex: 1, backgroundColor: C.bg, borderColor: C.field,
                borderWidth: 1, borderRadius: 8, color: C.text,
                fontSize: 14, paddingHorizontal: 10, paddingVertical: 8,
                minHeight: 40 },
@@ -1216,7 +1348,7 @@ const s = StyleSheet.create({
   sheet: { backgroundColor: C.card, borderTopLeftRadius: 16,
            borderTopRightRadius: 16, padding: 16, gap: 10 },
   sheetTitle: { color: C.text, fontSize: 16, fontWeight: "700" },
-  search: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  search: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
             borderRadius: 8, color: C.text, fontSize: 14,
             paddingHorizontal: 10, paddingVertical: 7 },
   catRow: { paddingVertical: 9, borderTopColor: C.border,

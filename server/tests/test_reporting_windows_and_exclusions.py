@@ -10,7 +10,7 @@ for the same range."""
 import datetime as dt
 import unittest
 
-from oikonome.engine import reporting
+from oikonome.engine import bills, reporting
 
 from .util import add_bill, make_db, seed_accounts, write_config
 
@@ -39,10 +39,13 @@ class FlowBreakdownExcludedAccountsTests(unittest.TestCase):
         invisible to the flow picture's spend total too, or it lands in
         'variable' on a page that promises to agree with the Budget page."""
         write_config(self.conn, excluded_accounts=["card"])
+        # both detected from their August payments (last_seen): the rent's
+        # was on the card, which the budget does not see, so the ledger
+        # gives it no start and it counts as scheduled all along
         add_bill(self.conn, "RENT", 1500.0, frequency="MONTHLY",
-                 next_due=dt.date(2026, 9, 10))
+                 next_due=dt.date(2026, 9, 10), last_seen=dt.date(2026, 8, 10))
         add_bill(self.conn, "INTERNET", 80.0, frequency="MONTHLY",
-                 next_due=dt.date(2026, 9, 3))
+                 next_due=dt.date(2026, 9, 3), last_seen=dt.date(2026, 8, 3))
         # the rent lands on the EXCLUDED card; internet on the counted bank
         _txn(self.conn, "card", dt.date(2026, 8, 10), 1500.0, "RENT",
              category_primary="RENT_AND_UTILITIES")
@@ -52,6 +55,9 @@ class FlowBreakdownExcludedAccountsTests(unittest.TestCase):
              category_primary="FOOD_AND_DRINK")
         _txn(self.conn, "card", dt.date(2026, 8, 14), 55.0, "CINEMA",
              category_primary="ENTERTAINMENT")
+        # the bills were entered before their payments arrived: the
+        # nightly has since read where each one's payments start
+        bills.fill_scheduled_since(self.conn, today=self.today)
         m = reporting.flow_breakdown(self.conn, self.today, "3m")
         self.assertEqual(m["out"]["fixed"], 80.0)
         self.assertEqual(m["out"]["variable"], 240.0)
@@ -65,6 +71,7 @@ class FlowBreakdownExcludedAccountsTests(unittest.TestCase):
              category_primary="RENT_AND_UTILITIES")
         _txn(self.conn, "chk", dt.date(2026, 8, 12), 240.0, "GROCER",
              category_primary="FOOD_AND_DRINK")
+        bills.fill_scheduled_since(self.conn, today=self.today)
         m = reporting.flow_breakdown(self.conn, self.today, "3m")
         self.assertEqual(m["out"]["fixed"], 1500.0)
         self.assertEqual(m["out"]["variable"], 240.0)
@@ -114,7 +121,7 @@ class EveryReportSharesTheExclusionTests(unittest.TestCase):
         self.assertEqual(spend["total"], 240.0)
         self.assertEqual(spend["total"], flow["out"]["total"])
         self.assertEqual([c[0] for c in spend["categories"]],
-                         ["FOOD AND DRINK"])
+                         ["FOOD_AND_DRINK"])
         self.assertNotIn("BOATYARD", [m[0] for m in spend["merchants"]])
 
     def test_income_window_agrees_with_flow_breakdown_on_the_same_window(self):
@@ -133,9 +140,11 @@ class EveryReportSharesTheExclusionTests(unittest.TestCase):
 
     def test_compute_cashflow_omits_the_excluded_accounts_rows(self):
         # the counted checking feed covers all of 2026, so the year's income
-        # is known (a transfer opens it: neither spend nor income)
-        _txn(self.conn, "chk", dt.date(2026, 1, 2), 25.0, "FEED OPENED",
-             category_primary="TRANSFER_OUT")
+        # is known: every month before August carries a transfer, neither
+        # spend nor income (a month with no checking row is a feed hole)
+        for m in range(1, 8):
+            _txn(self.conn, "chk", dt.date(2026, m, 2), 25.0,
+                 f"TO SAVINGS {m}", category_primary="TRANSFER_OUT")
         cf = reporting.compute_cashflow(self.conn, today=self.today)
         year = {r[0]: r for r in cf["savings_by_year"]}["2026"]
         self.assertEqual(year[1], 3000.0)          # income

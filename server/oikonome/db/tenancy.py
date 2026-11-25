@@ -129,7 +129,8 @@ def admin_connect(dsn: str | None = None) -> psycopg.Connection:
     kw = {}
     if "connect_timeout" not in dsn:
         kw["connect_timeout"] = ADMIN_CONNECT_TIMEOUT_S
-    return psycopg.connect(dsn, row_factory=dict_row, autocommit=True, **kw)
+    return psycopg.connect(dsn, row_factory=dict_row, autocommit=True,
+                           options=_SESSION_OPTIONS, **kw)
 
 
 # ---- app-role connection pool ----------------------------------------------
@@ -169,6 +170,17 @@ import atexit  # noqa: E402
 atexit.register(_close_pools)
 
 
+# The report aggregates carry correlated reimbursement subplans that the
+# planner prices far above jit_above_cost, so PostgreSQL's JIT compiles a
+# hundred-odd functions to run a query that reads a few thousand rows: on a
+# real ledger the compile was ~45 ms of a ~50 ms income query, every time a
+# request landed on a fresh connection. No query here is long enough to
+# repay a compile. Set at connect (as the control pool's limits are), so a
+# RESET on return to the pool cannot drop it and no database-level ALTER is
+# needed on a managed server.
+_SESSION_OPTIONS = "-c jit=off"
+
+
 def _pool(dsn: str) -> ConnectionPool:
     with _pools_lock:
         p = _pools.get(dsn)
@@ -181,7 +193,8 @@ def _pool(dsn: str) -> ConnectionPool:
                 # pool's default ten) gives slots back soon after a burst;
                 # reconnecting on the next burst is cheap.
                 max_idle=POOL_MAX_IDLE_S,
-                kwargs={"row_factory": dict_row, "autocommit": True},
+                kwargs={"row_factory": dict_row, "autocommit": True,
+                        "options": _SESSION_OPTIONS},
                 # A managed provider may restart the server under the app (weekly
                 # maintenance, major upgrades, failover). Without a check,
                 # every idle connection the pool kept across the restart is
@@ -255,6 +268,7 @@ def _control_options() -> str:
     for setting, env, default in _CONTROL_LIMITS_MS:
         raw = (os.environ.get(env) or "").strip()
         out.append(f"-c {setting}={int(raw) if raw.isdigit() else default}")
+    out.append(_SESSION_OPTIONS)
     return " ".join(out)
 
 
@@ -538,6 +552,35 @@ def release_lock(conn, key: str) -> bool:
         return True
 
 
+def take_lock(conn, sql: str, params=None):
+    """Run the advisory-lock TAKE `sql` on `conn` and return its row; if the
+    statement raises, DROP the connection before re-raising.
+
+    The mirror of :func:`release_lock` on the way in. A take that raises
+    leaves the session's lock state unknown: a statement timeout or a
+    cancel can land after the server granted the lock, and a connection
+    inside an aborted transaction refuses the statement outright. The
+    doors take the lock outside the try whose finally releases it, so
+    after a raised take nothing unlocks — and an ordinary close() would
+    hand a possibly-locked session to the next borrower, who then finds
+    the household "already running" until the backend dies.
+
+    Session-level locks only matter here; a transaction-level lock dies
+    with the transaction a failed take aborts. The returned row is the
+    caller's to read (`["ok"]` for a try-lock)."""
+    try:
+        return conn.execute(sql, params).fetchone()
+    except BaseException:
+        log.exception("advisory lock take failed — dropping the connection "
+                      "rather than pooling a session whose lock state is "
+                      "unknown")
+        try:
+            (conn.discard if hasattr(conn, "discard") else conn.close)()
+        except Exception:                                # noqa: BLE001
+            pass
+        raise
+
+
 def tenant_connect(tenant_id: str | uuid.UUID,
                    dsn: str | None = None):
     """A connection scoped to one tenant. RLS makes cross-tenant reads
@@ -753,6 +796,26 @@ def delete_tenant_rows(admin: psycopg.Connection, tenant_id) -> None:
         # release (erasure.release_external) first. plaid_release_queue
         # is keyed the same way and deliberately stays: it is what removes
         # the household's Items at Plaid after the rows are gone.
-        admin.execute("DELETE FROM plaid_link_sessions WHERE tenant = %s",
+        # …except a several-bank session that can still bring a bank: the
+        # person may still be in Plaid's window, and a bank they add there
+        # after the erasure would bill with nothing here to remove it. Its
+        # row stays as a tombstone for its window, marked so that every
+        # bank it brings is exchanged and handed straight back.
+        from ..jobs import plaid_links as _pl
+        # Stripped to what the hand-back needs — the link token, the keys
+        # it was made under, the hashes of the tokens already settled —
+        # with no bank names, Item ids or answers left; it goes when its
+        # window closes (plaid_links.sweep).
+        admin.execute(
+            "UPDATE plaid_link_sessions SET "
+            "reply = jsonb_build_object('refuse', %s::text), "
+            "institution = NULL, item_id = NULL, manage_accounts = false, "
+            "days_requested = NULL, exchanged = COALESCE((SELECT "
+            "jsonb_object_agg(k, '{\"erased\": true}'::jsonb) FROM "
+            "jsonb_object_keys(exchanged) k), '{}'::jsonb) "
+            f"WHERE tenant = %s AND kind = 'add' AND {_pl.ACCEPTING_SQL}",
+            (_pl.ERASED, str(tenant_id)))
+        admin.execute("DELETE FROM plaid_link_sessions WHERE tenant = %s "
+                      f"AND NOT (kind = 'add' AND {_pl.ACCEPTING_SQL})",
                       (str(tenant_id),))
         admin.execute("DELETE FROM tenants WHERE id = %s", (tenant_id,))

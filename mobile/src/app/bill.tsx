@@ -7,7 +7,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text,
          TextInput, View } from "react-native";
 
-import { Card, H } from "../components/ui";
+import { EmptyState, FailedLine } from "../components/loaded";
+import { OfflineNote, useOffline } from "../components/offline";
+import { Card, H, Skeleton, Note } from "../components/ui";
 import type { Bill, BillDetail, BillsData, BillsHistoryData } from "../lib/api";
 import { patchList, patchQuery } from "../lib/cache";
 import { TWICE_A_MONTH, cadenceFields, cadencePick, withSeveralDays } from "../lib/monthdays";
@@ -17,6 +19,10 @@ import { C } from "../lib/theme";
 import { billToggleNote, cadenceChoices, catLabel, missedBillPill, parseMoneyDraft }
   from "../lib/pure";
 import { errText, takeBillPrefill } from "../lib/api";
+import { fieldA11y } from "../components/field";
+
+// the server refuses a fee's words past this length (POST /api/bills/save)
+const FEE_WORDS_MAX = 80;
 
 export default function BillEdit() {
   // only the payee comes from the route: a ledger fit ("edit with these
@@ -232,32 +238,35 @@ export default function BillEdit() {
   // one destructive write at a time — a slow request invites a second
   // click (double purge; double toggle silently nets to no change), and a
   // save racing an archive could bring the bill straight back
-  const busy = save.isPending || toggle.isPending || del.isPending;
+  // offline, every write here is greyed with "You're offline." beside it
+  const offline = useOffline();
+  const busy = save.isPending || toggle.isPending || del.isPending || offline;
 
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}>
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      {/* reached with no bill named: nothing to load, so no spinner */}
+      {!payee && <EmptyState title="Pick a bill on Bills & Income."
+                             to="/bills" action="Bills & Income" />}
+      {!!payee && query.isPending && <Skeleton />}
       {query.isError && !d && (
-        <Text style={[s.center, { color: C.bad }]}
-              onPress={() => query.refetch()}>
-          Couldn't load this bill — tap to retry.
-        </Text>
-      )}
+        <FailedLine q={query} what="this bill" />)}
       {d && (
         <>
           <Card>
             <H>{d.payee}</H>
             {withdrawnNote ? (
-              <Text style={{ color: C.warn, fontSize: 12, marginBottom: 6 }}>
+              <Note style={{ color: C.warn, fontSize: 12, marginBottom: 6 }}>
                 {withdrawnNote}
-              </Text>
+              </Note>
             ) : null}
             <Text style={s.lbl}>
               Payee (renaming changes ledger matching)
             </Text>
-            <TextInput style={s.input} value={name} onChangeText={setName} />
+            <TextInput {...fieldA11y("Payee (renaming changes ledger matching)")}
+                       style={s.input} value={name} onChangeText={setName} />
             <Text style={s.lbl}>Amount</Text>
-            <TextInput style={s.input} value={amount} onChangeText={setAmount}
+            <TextInput {...fieldA11y("Amount")}
+                       style={s.input} value={amount} onChangeText={setAmount}
                        keyboardType="decimal-pad" />
             <Text style={s.lbl}>Cadence</Text>
             <View style={s.cadRow}>
@@ -268,7 +277,7 @@ export default function BillEdit() {
                  cadence === TWICE_A_MONTH ? null : cadence]),
                  days ?? d.by_month_day)
                 .map(([key, label]) => (
-                <Pressable key={key}
+                <Pressable accessibilityRole="button" key={key}
                            style={[s.cad, cadence === key && s.cadOn]}
                            onPress={() => setCadence(key)}>
                   <Text style={{ color: cadence === key ? C.text : C.mut,
@@ -277,7 +286,7 @@ export default function BillEdit() {
               ))}
             </View>
             <Text style={s.lbl}>Next due (YYYY-MM-DD)</Text>
-            <TextInput style={s.input} value={nextDue}
+            <TextInput {...fieldA11y("Next due (YYYY-MM-DD)")} style={s.input} value={nextDue}
                        onChangeText={setNextDue} autoCapitalize="none" />
             {/* an occurrence count, not a dollar pool — envelopes have
                 no occurrence cap (the amount IS their pool) */}
@@ -285,21 +294,30 @@ export default function BillEdit() {
               <Text style={s.lbl}>
                 Occurrence cap (max per month, blank = none)
               </Text>
-              <TextInput style={s.input} value={cap} onChangeText={setCap}
+              <TextInput {...fieldA11y("Occurrence cap (max per month, blank = none)")}
+                         style={s.input} value={cap} onChangeText={setCap}
                          keyboardType="number-pad" />
             </>)}
             {isEnv && (<>
               <Text style={s.lbl}>Envelope category (blank = none)</Text>
-              <TextInput style={s.input} value={category}
+              <TextInput {...fieldA11y("Envelope category (blank = none)")}
+                         style={s.input} value={category}
                          onChangeText={setCategory} autoCapitalize="none" />
               <View style={s.switchRow}>
                 <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
-                  Count all {category.trim() || "category"} spending
+                  Count all {category.trim() ? catLabel(category.trim()) : "category"} spending
                   toward the pool, even when the merchant doesn&apos;t
                   match
+                  {/* the envelope's own charges carry another category
+                      (the list row's charges_category, as on the web) */}
+                  {listRow?.charges_category && category.trim()
+                    && catLabel(listRow.charges_category) !== catLabel(category.trim())
+                    ? ` — its charges this month are ${catLabel(listRow.charges_category)}`
+                    : ""}
                 </Text>
                 <Switch value={matchCat && !!category.trim()}
                         disabled={!category.trim()}
+                        accessibilityLabel={`Count all ${category.trim() ? catLabel(category.trim()) : "category"} spending toward the pool`}
                         onValueChange={setMatchCat}
                         trackColor={{ true: C.accent, false: C.hover }}
                         thumbColor={C.text} />
@@ -313,13 +331,14 @@ export default function BillEdit() {
                 always wins.
               </Text>
               <View style={s.cadRow}>
-                <Pressable style={[s.cad, !txnCat && s.cadOn]}
+                <Pressable accessibilityRole="button" style={[s.cad, !txnCat && s.cadOn]}
                            onPress={() => setTxnCat("")}>
                   <Text style={{ color: C.text, fontSize: 13 }}>
                     merchant&apos;s category</Text>
                 </Pressable>
                 {txnCatOptions.map((c) => (
-                  <Pressable key={c} style={[s.cad, txnCat === c && s.cadOn]}
+                  <Pressable accessibilityRole="button"
+                             key={c} style={[s.cad, txnCat === c && s.cadOn]}
                              onPress={() => setTxnCat(c)}>
                     <Text style={{ color: C.text, fontSize: 13 }}>
                       {catLabel(c)}</Text>
@@ -332,7 +351,9 @@ export default function BillEdit() {
               <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
                 Pin to Today (its own card + daily email)
               </Text>
-              <Switch value={showToday} onValueChange={setShowToday}
+              <Switch value={showToday}
+                      accessibilityLabel="Pin to Today"
+                      onValueChange={setShowToday}
                       trackColor={{ true: C.accent, false: C.hover }}
                       thumbColor={C.text} />
             </View>
@@ -346,7 +367,7 @@ export default function BillEdit() {
               </Text>
               <View style={[s.cadRow, { marginTop: 6 }]}>
                 {merchants.map((m) => (
-                  <Pressable key={m} style={[s.cad, s.cadOn]}
+                  <Pressable accessibilityRole="button" key={m} style={[s.cad, s.cadOn]}
                              onPress={() => { setMerchantsDirty(true);
                                setMerchants(merchants.filter((x) => x !== m)); }}>
                     <Text style={{ color: C.text, fontSize: 13 }}>{m}  ×</Text>
@@ -356,12 +377,13 @@ export default function BillEdit() {
               {merchants.length < 20 && (
                 <View style={{ flexDirection: "row", gap: 6,
                                alignItems: "center", marginTop: 6 }}>
-                  <TextInput style={[s.input, { flex: 1 }]} value={newMerchant}
+                  <TextInput {...fieldA11y("Add a merchant")}
+                             style={[s.input, { flex: 1 }]} value={newMerchant}
                              placeholder="add a merchant"
                              placeholderTextColor={C.mut}
                              onChangeText={setNewMerchant}
                              onSubmitEditing={() => addMerchant(newMerchant)} />
-                  <Pressable onPress={() => addMerchant(newMerchant)}>
+                  <Pressable accessibilityRole="button" onPress={() => addMerchant(newMerchant)}>
                     <Text style={{ color: C.accent, fontSize: 13 }}>add</Text>
                   </Pressable>
                 </View>
@@ -369,7 +391,8 @@ export default function BillEdit() {
               {suggestions.length > 0 && (
                 <View style={s.cadRow}>
                   {suggestions.map((m) => (
-                    <Pressable key={m} style={s.cad} onPress={() => addMerchant(m)}>
+                    <Pressable accessibilityRole="button"
+                               key={m} style={s.cad} onPress={() => addMerchant(m)}>
                       <Text style={{ color: C.text, fontSize: 13 }}>{m}</Text>
                     </Pressable>
                   ))}
@@ -386,33 +409,37 @@ export default function BillEdit() {
               {fees.map((f, i) => (
                 <View key={i} style={{ flexDirection: "row", gap: 6,
                                        alignItems: "center", marginTop: 6 }}>
-                  <TextInput style={[s.input, { flex: 2 }]} value={f.tokens}
+                  <TextInput {...fieldA11y(`Fee ${i + 1}, words on the charge`)}
+                             style={[s.input, { flex: 2 }]} value={f.tokens}
                              placeholder="words on the charge"
+                             maxLength={FEE_WORDS_MAX}
                              placeholderTextColor={C.mut}
                              onChangeText={(v) => { setFeesDirty(true);
                                setFees(fees.map((x, j) =>
                                  j === i ? { ...x, tokens: v } : x)); }} />
-                  <TextInput style={[s.input, { width: 64 }]} value={f.amount}
+                  <TextInput {...fieldA11y(`Fee ${i + 1}, amount`)}
+                             style={[s.input, { width: 64 }]} value={f.amount}
                              placeholder="$" keyboardType="decimal-pad"
                              placeholderTextColor={C.mut}
                              onChangeText={(v) => { setFeesDirty(true);
                                setFees(fees.map((x, j) =>
                                  j === i ? { ...x, amount: v } : x)); }} />
-                  <TextInput style={[s.input, { width: 44 }]}
+                  <TextInput {...fieldA11y(`Fee ${i + 1}, window in days`)}
+                             style={[s.input, { width: 44 }]}
                              value={f.window_days} keyboardType="number-pad"
                              placeholderTextColor={C.mut}
                              onChangeText={(v) => { setFeesDirty(true);
                                setFees(fees.map((x, j) =>
                                  j === i ? { ...x, window_days: v } : x)); }} />
                   <Text style={{ color: C.mut, fontSize: 12 }}>d</Text>
-                  <Pressable onPress={() => { setFeesDirty(true);
+                  <Pressable accessibilityRole="button" onPress={() => { setFeesDirty(true);
                                setFees(fees.filter((_, j) => j !== i)); }}>
                     <Text style={{ color: C.bad, fontSize: 12 }}>remove</Text>
                   </Pressable>
                 </View>
               ))}
               {fees.length < 8 && (
-                <Pressable onPress={() => { setFeesDirty(true);
+                <Pressable accessibilityRole="button" onPress={() => { setFeesDirty(true);
                              setFees([...fees, { tokens: "", amount: "",
                                                  window_days: "3" }]); }}
                            style={{ marginTop: 6 }}>
@@ -423,22 +450,22 @@ export default function BillEdit() {
             </View>
             )}
             {err ? (
-              <Text style={{ color: C.bad, fontSize: 12 }}
-                    onPress={() => setErr(null)}>{err}</Text>
+              <Note bad style={{ color: C.bad, fontSize: 12 }}
+                    onPress={() => setErr(null)}>{err}</Note>
             ) : null}
             {note ? (
-              <Text style={{ color: C.mut, fontSize: 12 }}
-                    onPress={() => setNote(null)}>{note}</Text>
+              <Note style={{ color: C.mut, fontSize: 12 }}
+                    onPress={() => setNote(null)}>{note}</Note>
             ) : null}
             {!viewer && (<>
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8,
                            marginTop: 12 }}>
-              <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
+              <Pressable accessibilityRole="button" style={[s.btn, busy && { opacity: 0.5 }]}
                          disabled={busy}
                          onPress={() => save.mutate()}>
                 <Text style={s.btnText}>Save</Text>
               </Pressable>
-              <Pressable style={[s.btn, s.btnQuiet,
+              <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                            busy && { opacity: 0.5 }]}
                          disabled={busy}
                          onPress={() => toggle.mutate(!d.disabled)}>
@@ -447,13 +474,13 @@ export default function BillEdit() {
                   {d.disabled ? "Enable" : "Disable"}
                 </Text>
               </Pressable>
-              <Pressable style={[s.btn, s.btnQuiet,
+              <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                            busy && { opacity: 0.5 }]}
                          disabled={busy}
                          onPress={() => del.mutate("archive")}>
                 <Text style={[s.btnText, { color: C.warn }]}>Archive</Text>
               </Pressable>
-              <Pressable style={[s.btn, s.btnQuiet,
+              <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                            busy && { opacity: 0.5 }]}
                          disabled={busy}
                          onPress={askPurge}>
@@ -462,6 +489,7 @@ export default function BillEdit() {
                 </Text>
               </Pressable>
             </View>
+            <OfflineNote />
             <Text style={[s.footer, { textAlign: "left", marginTop: 8 }]}>
               Disable excludes the bill from the budget while keeping it
               here. Archive keeps a restorable copy under Bills.
@@ -478,7 +506,7 @@ const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   center: { color: C.mut, textAlign: "center", padding: 20 },
   lbl: { color: C.mut, fontSize: 12, marginTop: 10, marginBottom: 4 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 15,
            paddingHorizontal: 10, paddingVertical: 8 },
   cadRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
@@ -487,7 +515,7 @@ const s = StyleSheet.create({
   cadOn: { borderColor: C.accent, backgroundColor: C.hover },
   switchRow: { flexDirection: "row", alignItems: "center", gap: 8,
                marginTop: 12 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 18, paddingVertical: 9 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 14, fontWeight: "600" },

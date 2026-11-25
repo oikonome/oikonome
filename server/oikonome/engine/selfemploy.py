@@ -8,6 +8,7 @@ one: Oikonome categorizes and estimates; the CPA files. Not tax advice.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 from decimal import Decimal
 
@@ -68,10 +69,10 @@ def reportable_1099_threshold(year: int) -> float:
 
 # ---- mileage ---------------------------------------------------------------
 
-def add_trip(conn, entity_id: str, *, date, miles, purpose=None,
-             note=None) -> dict:
-    from .compat import req_date
-    date = req_date(date)
+def check_trip(miles) -> float:
+    """A trip's miles as the table takes them, or ValueError: the one
+    judgement both doors that write a trip apply, the Business page's and
+    a restore's archived row."""
     try:
         m = round(float(miles), 1)
     except (TypeError, ValueError, OverflowError):
@@ -86,6 +87,14 @@ def add_trip(conn, entity_id: str, *, date, miles, purpose=None,
     # the "must be positive" check gives.
     if m > 999_999_999.9:
         raise ValueError("miles is too large")
+    return m
+
+
+def add_trip(conn, entity_id: str, *, date, miles, purpose=None,
+             note=None) -> dict:
+    from .compat import req_date
+    date = req_date(date)
+    m = check_trip(miles)
     r = conn.execute(
         """INSERT INTO mileage_log (entity_id, date, miles, purpose, note)
            VALUES (%s,%s,%s,%s,%s) RETURNING id""",
@@ -174,36 +183,302 @@ def balance_sheet(conn, entity_id: str) -> dict:
         else:
             assets.append({"name": r["name"], "amount": round(bal, 2)})
             ta += bal
-    cap = equity.capital_summary(conn, entity_id)
+    from . import books
+    lifetime = books.entity_transactions(conn, entity_id, None)
+    cap = equity.capital_summary(conn, entity_id, lifetime=lifetime)
+    net = round(ta - tl, 2)
+    gap = round(net - cap["capital_balance"], 2)
     return {"assets": assets, "liabilities": liabilities,
             "total_assets": round(ta, 2), "total_liabilities": round(tl, 2),
-            "net": round(ta - tl, 2),
+            "net": net,
             "capital_account": cap["capital_balance"],
+            "capital_gap": gap,
+            "reconcile": reconcile_lines(
+                gap, cap.get("paid_personally") or 0.0,
+                books.unrecorded_owner_money(lifetime),
+                has_accounts=bool(rows)),
             # the household member's share of it, when one is marked and
             # carries an ownership percentage
             "household_share_pct": cap.get("household_share_pct"),
             "household_capital": cap.get("household_capital")}
 
 
+def _cents(v: float) -> str:
+    return ("-$" if v < 0 else "$") + f"{abs(v):,.2f}"
+
+
+def reconcile_lines(gap: float, paid_personally: float, unrecorded: float,
+                    *, has_accounts: bool = True) -> list[str]:
+    """Why the capital account and the business's net assets differ, in
+    the sentences the page, the phone and balance-sheet.csv print
+    (specs/business-books.md → Why capital and cash differ). `gap` is net
+    less capital, `unrecorded` the owner transfers with no contribution or
+    draw recorded (money in less money out)."""
+    out = []
+    if paid_personally >= 0.005:
+        out.append(f"Capital includes {_cents(paid_personally)} of business "
+                   "costs paid personally, counted as money you put in.")
+    if not has_accounts or abs(gap) < 0.005:
+        return out
+    out.append(f"Net assets and capital differ by {_cents(abs(gap))}.")
+    rest = gap
+    if abs(unrecorded) >= 0.005:
+        rest = round(gap - unrecorded, 2)
+        out.append(
+            f"{_cents(abs(unrecorded))} is owner money moved "
+            + ("in, not yet recorded as a contribution"
+               if unrecorded > 0 else "out, not yet recorded as a draw")
+            + " — record it under Owner equity.")
+    if abs(rest) >= 0.005:
+        out.append(f"{_cents(abs(rest))} the books cannot see: balances from "
+                   "before the ledger begins, or money moved outside the "
+                   "linked accounts.")
+    return out
+
+
 # ---- quarterly estimated taxes ---------------------------------------------
 
 def quarterly_deadlines(tax_year: int) -> list[dt.date]:
-    """Federal 1040-ES due dates for a tax year (Q4 falls in January next year).
-    Weekend/holiday shifts are ignored — an estimate."""
-    return [dt.date(tax_year, 4, 15), dt.date(tax_year, 6, 15),
-            dt.date(tax_year, 9, 15), dt.date(tax_year + 1, 1, 15)]
+    """Federal 1040-ES due dates for a tax year (Q4 falls in January next
+    year), each moved past a weekend or a federal holiday the way the
+    compliance calendar moves it (compliance.business_day), so the estimate
+    and the calendar name the same day."""
+    from .compliance import business_day
+    return [business_day(d) for d in (
+        dt.date(tax_year, 4, 15), dt.date(tax_year, 6, 15),
+        dt.date(tax_year, 9, 15), dt.date(tax_year + 1, 1, 15))]
 
 
-def _se_tax(se_base: float, year: int) -> float:
+def _se_tax(se_base: float, year: int, w2_ss_wages: float = 0.0) -> float:
     """One person's self-employment tax on their net SE earnings.
-    Social Security (12.4%) applies only up to the year's wage base and
-    Medicare (2.9%) has no cap, so a flat 15.3% overstates it for higher
-    earners. IRC §1402(b)(2): none at all under $400, or a first-year or
-    hobby-scale entity is told to send quarterly payments it does not owe."""
+    Social Security (12.4%) applies only to what the person's own W-2
+    Social Security wages left open of the year's wage base (Schedule SE;
+    `owner_w2_wages`), and Medicare (2.9%) has no cap, so a flat 15.3%
+    overstates it for higher earners. IRC §1402(b)(2): none at all under
+    $400, or a first-year or hobby-scale entity is told to send quarterly
+    payments it does not owe."""
     if se_base < 400:
         return 0.0
-    ss = min(se_base, ss_wage_base(year)) * SS_RATE
+    room = max(0.0, ss_wage_base(year) - max(0.0, w2_ss_wages or 0.0))
+    ss = min(se_base, room) * SS_RATE
     return round(ss + se_base * MEDICARE_RATE, 2)
+
+
+# the structures with one owner, whose W-2 wages close their wage base
+_ONE_OWNER = ("sole_prop", "single_member_llc")
+# who each owner setting is, in the note's words
+_PERSON = {"primary": "the primary earner", "spouse": "the spouse"}
+
+
+def _amount(v) -> float | None:
+    """A box as read: a finite number at or above 0 (0 is a real 0), else
+    None (not read)."""
+    if isinstance(v, bool):
+        return None
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    from .taxdocs import _money
+    # beyond what the tax-document doors accept (a restored 9e14, say) is
+    # no box that was read
+    return v if math.isfinite(v) and v >= 0 and _money(v) else None
+
+
+def owner_w2_wages(conn, entity_id: str, year: int) -> dict:
+    """THE rule for the W-2 wages a business owner's self-employment
+    Social Security starts after (specs/business-books.md, "Social
+    Security after the owner's W-2 wages"). The business says whose it is
+    (`business_entity.owner`; 'unknown' nets nothing). Its person's W-2s
+    count, box 3 only: a box 3 of 0 is a real 0, a W-2 whose box 3 was not
+    read counts as none (`unread`), box 1 never stands in, and neither
+    does a return's wage figure. Only tax year `year`'s own W-2s count: a
+    year with none of that person's yet (a year's W-2 arrives the next
+    January, so the year in progress never has one) nets NOTHING — an
+    earlier year's wages are a guess that reads the estimate low when the
+    job ended or the wage base moved.
+
+    Only a W-2 a PERSON said is theirs counts. 'spouse' is only ever a
+    person's answer (the upload's whose-is-it question, the stored list's
+    owner change, an archive of either). 'primary' is not: an app older
+    than the question, and a restore of an older archive, file a W-2
+    under the primary earner when the year has none yet
+    (`taxdocs.unsaid_owner`), a spouse's included, and the stored row does
+    not record which happened. So a primary earner's W-2 is never netted
+    (`unproven` counts them); netting one could read the estimate low. It
+    needs a stored mark that the owner was chosen.
+
+    One W-2 stored twice counts once (`folded`), by the tax documents' own
+    "looks like the same W-2" (`taxdocs.w2_matches`: the same read box 1,
+    no EIN last four telling them apart); a group counts its smallest box
+    3, since counting a form twice would read the estimate low. A W-2 not
+    yet marked whose counts for nobody.
+
+    Returns {owner, ss_wages, from_year (`year` when its W-2s were netted,
+    else None), unproven, unread, folded, unassigned (the year's W-2s marked for
+    nobody), on_file (the household holds W-2 wages of any year), others
+    (the owner's other active businesses that owe SE tax)}."""
+    row = conn.execute("SELECT owner FROM business_entity WHERE id = %s",
+                       (entity_id,)).fetchone()
+    owner = (row["owner"] if row and row.get("owner") in _PERSON
+             else "unknown")
+    unassigned = conn.execute(
+        "SELECT COUNT(*) AS n FROM income_documents WHERE year = %s "
+        "AND form = 'W-2' AND owner = 'unassigned'", (year,)).fetchone()["n"]
+    on_file = bool(conn.execute(
+        "SELECT 1 FROM income_documents WHERE form = 'W-2' LIMIT 1"
+    ).fetchone() or conn.execute(
+        "SELECT 1 FROM income_annual WHERE COALESCE(primary_wages, 0) > 0 "
+        "OR COALESCE(spouse_wages, 0) > 0 LIMIT 1").fetchone())
+    out = {"owner": owner, "ss_wages": 0.0, "from_year": None,
+           "unproven": 0, "unread": 0,
+           "folded": 0, "unassigned": int(unassigned), "on_file": on_file,
+           "others": 0}
+    if owner == "unknown":
+        return out
+    out["others"] = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM business_entity WHERE owner = %s "
+        "AND id <> %s AND status = 'active' AND structure <> 's_corp'",
+        (owner, entity_id)).fetchone()["n"])
+    docs = conn.execute(
+        "SELECT id, ein_last4, primary_amount, amounts "
+        "FROM income_documents WHERE form = 'W-2' AND owner = %s "
+        "AND year = %s ORDER BY id", (owner, year)).fetchall()
+    if not docs:
+        return out
+    if owner != "spouse":
+        out["unproven"] = len(docs)
+        return out
+    from .taxdocs import w2_matches
+    ids = {d["id"] for d in docs}
+    group: dict = {}                     # id -> its group's first id
+    for d in docs:
+        if d["id"] in group:
+            continue
+        group[d["id"]] = d["id"]
+        for m in w2_matches(conn, year, None, d["ein_last4"],
+                            d["primary_amount"]):
+            if m["id"] in ids and m["id"] not in group:
+                group[m["id"]] = d["id"]
+    box3: dict = {}
+    for d in docs:
+        amounts = d["amounts"]
+        if isinstance(amounts, str):
+            try:
+                amounts = json.loads(amounts)
+            except ValueError:
+                amounts = None
+        box3[d["id"]] = (_amount(amounts.get("3"))
+                         if isinstance(amounts, dict) else None)
+    ss = 0.0
+    for first in sorted(set(group.values())):
+        members = [i for i, g in group.items() if g == first]
+        out["folded"] += len(members) - 1
+        read = [box3[i] for i in members if box3[i] is not None]
+        if len(read) < len(members):
+            out["unread"] += 1
+        # unread counts as none, so the group's smallest is what counts
+        ss += 0.0 if len(read) < len(members) else min(read)
+    out["ss_wages"] = round(ss, 2)
+    out["from_year"] = int(year)
+    return out
+
+
+def _ss_wages_note(wages: dict, year: int, structure: str | None,
+                   nets: bool, unavailable: str | None) -> str | None:
+    """The sentence the clients print under the SE tax line, exactly as
+    sent (`owner_w2_wages`; specs/business-books.md): whose W-2 wages were
+    counted, named from the business's own setting, and how much of the
+    tax year's wage base they left; or why no W-2 wages are
+    counted, and that the estimate may be high. None when the business is
+    not set and the household has no W-2 wages on file."""
+    parts = []
+    owner, base = wages["owner"], ss_wage_base(year)
+    person = _PERSON.get(owner)
+    if owner == "unknown":
+        if wages["on_file"]:
+            parts.append(
+                "W-2 wages are not counted: this business does not say "
+                "whose it is, so the estimate may be high. Set whose "
+                "business it is in the business's details.")
+        return " ".join(parts) or None
+    src = wages["from_year"]
+    if not nets:
+        cap = person[:1].upper() + person[1:]
+        if unavailable == "shares_incomplete":
+            parts.append(
+                f"{cap}'s {year} W-2 wages are not counted until every "
+                "member has an ownership share and together they make "
+                "100%. The estimate may be high.")
+        else:
+            parts.append(
+                f"{cap}'s {year} W-2 wages are not counted: no member of "
+                "this business is marked as this household. The estimate "
+                "may be high.")
+    elif src is None and wages["unproven"]:
+        set_as = (f"This business is set as {person}'s"
+                  if structure in _ONE_OWNER else
+                  f"The member marked as this household is set as {person}")
+        parts.append(
+            f"{set_as}, but their {year} W-2 wages are not counted: a W-2 "
+            f"filed under {person} cannot yet be told apart from one an "
+            "older app filed there without asking whose it was. The "
+            "estimate may be high.")
+    elif src is None:
+        set_as = (f"This business is set as {person}'s"
+                  if structure in _ONE_OWNER else
+                  f"The member marked as this household is set as {person}")
+        parts.append(
+            f"{set_as}, but no {year} W-2 of theirs is on file yet, so no "
+            "W-2 wages are counted and the estimate may be high. Wages "
+            "count once the year's W-2 is added.")
+    else:
+        who = (f"This business is set as {person}'s"
+               if structure in _ONE_OWNER else
+               "The member marked as this household is set as "
+               f"{person}")
+        ss = wages["ss_wages"]
+        whose = f"their {year} W-2 Social Security wages of ${ss:,.0f}"
+        room = max(0.0, base - ss)
+        if room > 0:
+            parts.append(
+                f"{who}: {whose} leave ${room:,.0f} of the ${base:,.0f} "
+                "Social Security wage base, and only that much of the "
+                "profit is charged Social Security.")
+        else:
+            parts.append(
+                f"{who}: {whose} already reach the ${base:,.0f} Social "
+                "Security wage base, so the profit is charged Medicare "
+                "only.")
+    if src is not None and nets and wages["folded"]:
+        n = wages["folded"] + 1
+        parts.append(f"{n} W-2s with the same box 1 and no EIN telling "
+                     "them apart are counted once: the same form stored "
+                     "twice must not count twice.")
+    if src is not None and nets and wages["unread"]:
+        n = wages["unread"]
+        many = n > 1
+        parts.append(
+            f"{n} of {person}'s {src} W-2s {'have' if many else 'has'} no "
+            "Social Security wages (box 3) read, so "
+            f"{'they count' if many else 'it counts'} as none. The estimate "
+            "may be high.")
+    if wages["unassigned"]:
+        n = wages["unassigned"]
+        many = n > 1
+        parts.append(
+            f"{n} W-2{'s' if many else ''} for {year} {'are' if many else 'is'}"
+            f" not marked whose, so {'they are' if many else 'it is'} not "
+            "counted. The estimate may be high.")
+    if wages["others"]:
+        n = wages["others"]
+        many = n > 1
+        parts.append(
+            f"{n} other business{'es' if many else ''} set as {person}'s "
+            f"{'are' if many else 'is'} figured separately, so together "
+            "they may be charged Social Security past the wage base: the "
+            "estimate may be high.")
+    return " ".join(parts) or None
 
 
 def _member_shares(conn, entity_id: str) -> list[dict]:
@@ -253,7 +528,8 @@ def _household_unavailable(conn, entity_id: str, structure: str | None,
 
 
 def _tax_on(taxable: float, year: int, rate: float | None,
-            structure: str | None, members: list[dict]) -> dict:
+            structure: str | None, members: list[dict],
+            w2_ss_wages: float = 0.0) -> dict:
     """SE + income tax on one year's taxable business profit.
 
     What is modelled, by structure:
@@ -267,7 +543,10 @@ def _tax_on(taxable: float, year: int, rate: float | None,
         expense. Payroll tax itself and reasonable-compensation rules are
         not modelled.
     Income tax is the entity's assumed effective rate on the profit less
-    the deductible half of the SE tax.
+    the deductible half of the SE tax. `w2_ss_wages` are the owner's W-2
+    Social Security wages (`owner_w2_wages`): they close the wage base of
+    the sole owner, or of the member marked as the household, and of no
+    other member.
 
     When one member is marked as the HOUSEHOLD (is_household), the
     headline figures — se_tax, income_tax, total — are that member's
@@ -283,12 +562,14 @@ def _tax_on(taxable: float, year: int, rate: float | None,
         se_tax = 0.0
         for m in members:
             share = round(taxable * m["ownership_pct"] / 100.0, 2)
-            t = _se_tax(round(share * SE_BASE_FACTOR, 2), year)
+            t = _se_tax(round(share * SE_BASE_FACTOR, 2), year,
+                        w2_ss_wages if m.get("is_household") else 0.0)
             shares.append({**m, "share_of_profit": share, "se_tax": t})
             se_tax += t
         se_tax = round(se_tax, 2)
     else:
-        se_tax = _se_tax(round(taxable * SE_BASE_FACTOR, 2), year)
+        se_tax = _se_tax(round(taxable * SE_BASE_FACTOR, 2), year,
+                         w2_ss_wages if structure in _ONE_OWNER else 0.0)
     income_tax = None
     if rate is not None:
         income_base = max(0.0, taxable - se_tax / 2)
@@ -389,7 +670,11 @@ def estimated_tax(conn, entity_id: str, year: int | None = None, *,
         is not None else None
     members = (_member_shares(conn, entity_id)
                if structure == "multi_member_llc" else [])
-    so_far = _tax_on(taxable, year, rate, structure, members)
+    wages = owner_w2_wages(conn, entity_id, year)
+    w2 = wages["ss_wages"]
+    so_far = _tax_on(taxable, year, rate, structure, members, w2)
+    nets = (structure in _ONE_OWNER
+            or any(m.get("is_household") for m in so_far["members"]))
 
     # Projection for the year in progress. Profit that accrues through the
     # year (net of the vehicle deduction) scales with the year's elapsed share; the home
@@ -413,7 +698,8 @@ def estimated_tax(conn, entity_id: str, year: int | None = None, *,
             a_taxable = max(0.0, round(
                 (p["net_operating"] - vehicle_adj) * factor - home
                 - startup, 2))
-            projected = _tax_on(a_taxable, year, rate, structure, members)
+            projected = _tax_on(a_taxable, year, rate, structure, members,
+                                w2)
     else:
         a_taxable, projected = taxable, so_far
     quarterly = round(projected["total"] / 4, 2)
@@ -470,8 +756,21 @@ def estimated_tax(conn, entity_id: str, year: int | None = None, *,
             "vehicle_expenses_added_back": added_back,
             "home_office_deduction": home,
             "startup_deduction": startup,
+            # what `startup_deduction` is made of, in the words the Tax
+            # line prints: the §248 organizational costs and/or the §195
+            # start-up costs
+            "startup_label": _startup_label(p),
+            # a loss is not "$0 taxable" with nothing said: whose return
+            # it lands on
+            "loss_note": _loss_note(structure, p["net_operating"] - startup
+                                    - mileage - home + added_back),
             "taxable_profit": taxable, "se_tax": so_far["se_tax"],
             "se_tax_applies": so_far["se_tax_applies"],
+            # which W-2 wages the Social Security part starts after, in
+            # the server's words (owner_w2_wages)
+            "ss_wages_note": (_ss_wages_note(wages, year, structure, nets,
+                                             unavailable)
+                              if so_far["se_tax_applies"] else None),
             "structure": structure,
             # whose tax the figure is: the owner's; the household member's
             # share, when one member is marked as the household; or every
@@ -498,6 +797,82 @@ def estimated_tax(conn, entity_id: str, year: int | None = None, *,
             "next_deadline": next_deadline,
             "next_payment": next_payment,
             "deadlines": [d.isoformat() for d in quarterly_deadlines(year)]}
+
+
+def _startup_label(p: dict) -> str:
+    org = p["organizational_deduction"].get("deductible_this_year", 0.0)
+    su = p["startup_deduction"].get("deductible_this_year", 0.0)
+    if org > 0 and su > 0:
+        return "organizational and start-up costs"
+    return "organizational costs" if org > 0 else "start-up costs"
+
+
+def _loss_note(structure: str | None, profit: float) -> str | None:
+    """The sentence under a year that ends in a loss: a pass-through's loss
+    is the owners', on their own returns."""
+    if profit >= -0.005:
+        return None
+    if structure in ("sole_prop", "single_member_llc"):
+        return ("A loss owes no tax here: it goes on Schedule C of your own "
+                "return, where it can lower the tax on your other income.")
+    return ("A loss owes no tax here: each owner's share goes on their own "
+            "return through their Schedule K-1.")
+
+
+def tax_set_aside(conn, entity_id: str, est: dict) -> dict:
+    """The "Set aside for tax" card's figures for the estimate `est`
+    (estimated_tax), on the estimate's own footing: when it is the
+    household member's share, so are the profit it is a rate of, the
+    payments already made toward it and the cash held for it.
+
+    - `still_due`: the estimate less what was paid toward it, never below
+      zero — a reserve that paid this year's earlier estimates is not
+      short by them.
+    - `rate_of_profit`: the estimate as a whole percent of that profit
+      (null without a profit).
+    - `held`: the nominated tax-reserve account's balance when it is still
+      one of the business's counted bank accounts, else all business cash
+      (books.entity_cash), times the household's share when the estimate
+      is the household's; `account` names the reserve, `stale` says a
+      nomination no longer points at one.
+    - `covered`: the printed held less the printed still to pay, in whole
+      dollars, so the card adds up as shown; negative is a shortfall."""
+    from . import books, links
+    from .reporting import whole_dollars
+    share = (est["household"]["ownership_pct"]
+             if est.get("covers") == "household" and est.get("household")
+             else None)
+    owed = float(est["total_estimated"] or 0)
+    paid = float(est.get("covered_tax_paid") or 0)
+    profit = float(est.get("covered_profit") or 0)
+    still_due = round(max(0.0, owed - paid), 2)
+    # whole percent, halves up, as the card has always printed it
+    rate = (int(math.floor(owed / profit * 100 + 0.5)) if profit > 0
+            else None)
+    ent = conn.execute(
+        "SELECT tax_reserve_account_id FROM business_entity WHERE id = %s",
+        (entity_id,)).fetchone()
+    nominated = ent["tax_reserve_account_id"] if ent else None
+    reserve = None
+    if nominated:
+        reserve = conn.execute(
+            """SELECT a.id, COALESCE(a.display_name, a.name) AS name, a.mask,
+                      a.balance_current AS bal
+                 FROM accounts a
+                WHERE a.id = %s AND a.entity_id = %s
+                  AND a.type = 'depository' AND NOT (a.id = ANY(%s))""",
+            (nominated, entity_id, links.shadow_ids(conn))).fetchone()
+    held = (float(reserve["bal"] or 0) if reserve
+            else books.entity_cash(conn, entity_id)["total"])
+    if share is not None:
+        held = held * share / 100
+    held = round(held, 2)
+    return {"still_due": still_due, "paid": paid, "rate_of_profit": rate,
+            "held": held,
+            "account": ({"id": reserve["id"], "name": reserve["name"],
+                         "mask": reserve["mask"]} if reserve else None),
+            "stale": bool(nominated) and reserve is None,
+            "covered": whole_dollars(held) - whole_dollars(still_due)}
 
 
 # ---- 1099-NEC vendor tracking ----------------------------------------------

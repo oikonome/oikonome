@@ -14,6 +14,7 @@ export const k$ = (v: number, money: (n: number, cents?: boolean) => string): st
 export const FLOW_COLORS = {
   paychecks: "#4f9bd6", interest: "#7fb8e6", other: "#3d7fb0",
   overspent: "#e0695d", fixed: "#e0695d", variable: "#f0b429", saved: "#5cb56b",
+  unsplit: "#9aa3ad",
 };
 
 export interface FlowNode { key: string; label: string; value: number; color: string }
@@ -30,10 +31,17 @@ export function flowLayout(f: FlowPeriod) {
   if (saved < 0) sources.push({ key: "overspent", label: "Overspent by",
                                 value: -saved, color: FLOW_COLORS.overspent });
   const sinks: FlowNode[] = [
-    { key: "fixed", label: "Fixed bills", value: f.out.fixed, color: FLOW_COLORS.fixed },
-    { key: "variable", label: "Variable spend", value: f.out.variable, color: FLOW_COLORS.variable },
+    { key: "fixed", label: "Bills & envelopes", value: f.out.fixed, color: FLOW_COLORS.fixed },
+    // the server's split: variable over the months a bill schedule
+    // reached, and the months none did apart (an older server sends no
+    // split, and its variable is the same figure)
+    // older-server path: stands in for `out.variable_scheduled`
+    { key: "variable", label: "Variable spend",
+      value: f.out.variable_scheduled ?? f.out.variable, color: FLOW_COLORS.variable },
+    { key: "unsplit", label: "Before any bill", value: f.out.unsplit ?? 0,
+      color: FLOW_COLORS.unsplit },
   ];
-  if (saved > 0) sinks.push({ key: "saved", label: "Invested & saved",
+  if (saved > 0) sinks.push({ key: "saved", label: "Left over",
                               value: saved, color: FLOW_COLORS.saved });
   const L = Math.max(f.in.total ?? 0, f.out.total, 0);
   return { sources: sources.filter((n) => n.value > 0),
@@ -74,4 +82,18 @@ export function flowGeometry(f: FlowPeriod, width: number, height: number) {
     }
   }
   return { S, K, bands, nodeW, x1, L };
+}
+
+/** A node's figure as the picture prints it: the server's whole dollars
+ *  and share (flow_breakdown → in.shown / out.shown, each side adding up
+ *  to its total and to 100). An older server sends no `shown`: the node
+ *  then prints its own value and no share, never one worked out here. */
+export function flowNodeFigure(f: FlowPeriod, n: FlowNode):
+    { dollars: number; share: number | null } {
+  // older-server path: stands in for `out.split_shown` / `shown`
+  const row = [...(f.in.shown ?? []),
+               ...(f.out.split_shown ?? f.out.shown ?? [])]
+    .find((x) => x.key === n.key);
+  return row ? { dollars: row.dollars, share: row.share }
+             : { dollars: n.value, share: null };
 }

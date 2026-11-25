@@ -8,44 +8,22 @@
 import { useRouter } from "expo-router";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
+import type { PlanTotal, RowStatus, ServerPlanRow } from "../lib/api";
+import { BillsAddsUp } from "./bills-table";
+import { ledgerParams, terseCaption } from "../lib/pure";
 import { C, money as money$ } from "../lib/theme";
 
 // the web map prints whole dollars (its money() default) — cents live on
 // transaction/recurring surfaces only
 const money = (v: number) => money$(v, false);
 
-export interface PlanBucket {
-  actual: number; expected: number; month_budget: number;
-  // paced_*: the share of the budget the month may spend (the whole of it
-  // unless the ledger began inside the month) — what Today's rows measure
-  // against, so they agree with the hero and the email. The Budget, Month
-  // and Year maps send none and fall back to the whole month.
-  paced_budget?: number;
-  children?: { name: string; actual: number; expected: number;
-               month_budget: number; paced_budget?: number }[];
-  display_actual?: number; display_expected?: number;
-  remaining_budget?: number; paced_remaining_budget?: number;
-}
 // the web's PlanRow.to: where the row's transactions are
-/** The transactions screen with the filters a row's `to` names
- *  ("bucket=…&y=…&m=…"). Mobile copies the web's deep link, as params. */
+/** The transactions screen with the filters a row's `to` names — the
+ *  server's path ("/transactions?bucket=…&y=…&m=…") or a bare query
+ *  ("bucket=…&y=…", the tiles' links). Mobile copies the web's deep
+ *  link, as params (ledgerParams). */
 export function ledgerRoute(to: string) {
-  const params: Record<string, string> = {};
-  for (const kv of to.split("&")) {
-    if (!kv) continue;
-    // a bucket is named by the household, so its name can contain "=" —
-    // split on the FIRST one only, or "Rent = home" loses its tail
-    const eq = kv.indexOf("=");
-    const k = eq < 0 ? kv : kv.slice(0, eq);
-    const raw = eq < 0 ? "" : kv.slice(eq + 1);
-    let v = raw;
-    // a bare "%" in a bucket name makes decodeURIComponent throw, and a
-    // thrown link is a screen that never opens; the raw text is then the
-    // best answer available
-    try { v = decodeURIComponent(raw); } catch { v = raw; }
-    params[k] = v;
-  }
-  return { pathname: "/(tabs)/transactions", params };
+  return { pathname: "/(tabs)/transactions", params: ledgerParams(to) };
 }
 
 export interface PlanRow {
@@ -54,140 +32,63 @@ export interface PlanRow {
   pending?: number; caption?: string; judged: boolean;
   // header override for the actual side — "—" when nothing is measurable
   actualLabel?: string;
+  // what the row says beside its figures (todayview.row_status); null or
+  // absent (an older server) says nothing
+  status?: RowStatus | null;
+  // the Bills row's parts and the table they open (bills_breakdown);
+  // absent from an older server, which sends no table to open
+  breakdown?: ServerPlanRow["breakdown"];
 }
 
-/** Plan rows in the wizard's order: categories (Food first, then the
- *  carve-outs), Unallocated, Bills, Savings — webapp planRows(), same
- *  wire semantics. */
-export function planRows(
-  buckets: Record<string, PlanBucket>,
-  opts: { fixedActual?: number; fixedBudget?: number;
-          fixedPending?: number;
-          savings?: { plan: number; saved: number | null } | null;
-          excess?: number | null;
-          // the period the rows cover; the ledger link opens that month —
-          // or, with no month, that YEAR's bucket (the year lens's map)
-          // (asOf: the day the figures were read on, when not today)
-          period?: { y: number; m?: number; asOf?: string } | null } = {},
-): PlanRow[] {
-  const rows: PlanRow[] = [];
-  // A plan row's rows are the rows the MONTH VERDICT counts in that
-  // bucket, which no category filter can express: the Food number also
-  // counts store rows overridden to food, a carve-out is a plan label
-  // rather than a stored category, and "Everything else" is everything
-  // the other rows did not claim. So the link names the bucket and the
-  // server answers with exactly the rows behind the number. A bucket is
-  // a month's, or — a year with no month — the union over the budgeted
-  // months the yearly map summed; a map with no period at all (the budget
-  // screen's plan) has no link rather than a link to the wrong set.
-  const ledger = (bucket: string) =>
-    opts.period
-      ? `bucket=${encodeURIComponent(bucket)}&y=${opts.period.y}${
-          opts.period.m ? `&m=${opts.period.m}` : ""}${
-          opts.period.asOf ? `&as_of=${opts.period.asOf}` : ""}`
-      : undefined;
-  const food = buckets.food;
-  const other = buckets.other;
-  if (food) {
-    const kids = food.children ?? [];
-    rows.push({
-      label: "Food", judged: true, to: ledger("food"),
-      actual: kids.length ? (food.display_actual ?? food.actual) : food.actual,
-      expected: kids.length ? (food.display_expected ?? food.expected)
-                            : food.expected,
-      budget: kids.length ? (food.paced_remaining_budget
-                             ?? food.remaining_budget ?? food.month_budget)
-                          : (food.paced_budget ?? food.month_budget),
-    });
-    for (const c of kids)
-      rows.push({ label: c.name, actual: c.actual, expected: c.expected,
-                  budget: c.paced_budget ?? c.month_budget, judged: true, to: ledger(c.name) });
-  }
-  if (other) {
-    for (const c of other.children ?? [])
-      rows.push({ label: c.name, actual: c.actual, expected: c.expected,
-                  budget: c.paced_budget ?? c.month_budget, judged: true, to: ledger(c.name) });
-    const kids = other.children ?? [];
-    rows.push({
-      label: "Everything else", judged: true, to: ledger("other"),
-      caption: kids.length ? "unallocated — spending outside the categories"
-                           : undefined,
-      actual: kids.length ? (other.display_actual ?? other.actual)
-                          : other.actual,
-      expected: kids.length ? (other.display_expected ?? other.expected)
-                            : other.expected,
-      budget: kids.length ? (other.paced_remaining_budget
-                             ?? other.remaining_budget ?? other.month_budget)
-                          : (other.paced_budget ?? other.month_budget),
-    });
-  }
-  // bills + savings are IN the plan but never in the verdict
-  if (opts.fixedBudget !== undefined || opts.fixedActual !== undefined) {
-    const posted = opts.fixedActual ?? 0;
-    rows.push({
-      // the row opens the period's bill payments and envelope swipes —
-      // the rows the fixed bucket owns — like the variable rows do
-      label: "Bills", judged: false, actual: posted, to: ledger("fixed"),
-      expected: buckets.fixed?.expected ?? 0,
-      budget: opts.fixedBudget ?? buckets.fixed?.month_budget ?? 0,
-      pending: opts.fixedPending,
-    });
-  }
-  if (opts.savings
-      && (opts.savings.plan > 0 || (opts.savings.saved ?? 0) > 0)) {
-    // plan-only goal (no destination account) — no transfers to measure,
-    // so the bar carries the plan alone
-    const planOnly = opts.savings.saved === null;
-    rows.push({
-      label: "Savings / Investment", judged: false,
-      actual: opts.savings.saved ?? 0, expected: opts.savings.plan,
-      budget: opts.savings.plan,
-      actualLabel: planOnly ? "—" : undefined,
-      caption: planOnly ? undefined : "transferred vs plan",
-    });
-  }
-  // the plan's residual — income the plan deliberately leaves unassigned
-  if (opts.excess != null && opts.excess > 0.005) {
-    rows.push({
-      label: "Excess cash", judged: false,
-      actual: 0, actualLabel: "—",
-      expected: opts.excess, budget: opts.excess,
-    });
-  }
-  return rows;
+/** The plan rows the server built (Today's payload and the Month and Year
+ *  lens replies, `plan_rows`), in the shape the map draws — nothing is
+ *  computed here. */
+export function sentPlanRows(rows: readonly ServerPlanRow[]): PlanRow[] {
+  return rows.map((r) => ({
+    label: r.label, judged: r.judged, actual: r.actual,
+    expected: r.expected, budget: r.budget,
+    pending: r.pending || undefined, to: r.to ?? undefined,
+    actualLabel: r.actual_label ?? undefined,
+    caption: r.caption ?? undefined,
+    status: r.status,
+    breakdown: r.breakdown,
+  }));
 }
 
-/** Right-side status text so over/under is never color-alone. */
+/** The "Variable spending" row the server sums over the judged rows
+ *  (todayview.plan_total), with its status — the web's sentPlanTotal. */
+export function sentPlanTotal(t: PlanTotal | null | undefined)
+  : PlanRow | null {
+  return t ? { label: t.label, judged: true, actual: t.actual,
+               expected: t.expected, budget: t.budget, status: t.status }
+           : null;
+}
+
+/** Right-side status text so over/under is never color-alone: the row's
+ *  status (todayview.row_status) in the words and tone the server wrote,
+ *  as on the web. A server from before the words were sent says nothing
+ *  here rather than this screen composing them. */
+const TONE_COLOR = { neg: C.bad, pos: C.good, mut: C.mut } as const;
 function rowDelta(row: PlanRow): { text: string; color: string } | null {
-  if (row.budget <= 0.005 || row.actualLabel === "—") return null;
-  const pend = row.pending ?? 0;
-  const left = row.budget - row.actual - pend;
-  if (row.actual > row.budget + 0.5)
-    return { text: `over by ${money(row.actual - row.budget)}`,
-             color: C.bad };
-  if (row.judged && row.actual > row.expected + 0.5)
-    return { text: `${money(row.actual - row.expected)} ahead of pace`,
-             color: C.bad };
-  if (row.judged)
-    return { text: `${money(left)} left`, color: C.good };
-  if (row.label === "Bills" && (left > 0.5 || pend > 0.5))
-    return { text: (pend > 0.5 ? `${money(pend)} awaiting · ` : "")
-               + `${money(Math.max(left, 0))} still due`,
-             color: C.mut };
-  return null;
+  const st = row.status;
+  if (!st || !st.text) return null;
+  return { text: st.text, color: TONE_COLOR[st.tone] ?? C.mut };
 }
 
 /** The bar: segments are % of the row's own budget (or of the actual when
  *  over). Overspend sits PAST a 2px budget divider; the post tick marks
  *  today's pace on judged rows. */
-export function Track({ row, paceLabel = false }:
-    { row: PlanRow; paceLabel?: boolean }) {
+export function Track({ row, paceLabel = null }:
+    // the tick's label as the server words it (null: none)
+    { row: PlanRow; paceLabel?: string | null }) {
   const unbudgeted = row.budget <= 0.005 && row.actual > 0.005;
   const extent = Math.max(row.budget, row.actual + (row.pending ?? 0), 1);
   const w = (v: number) => `${(100 * v) / extent}%` as const;
   const isover = row.judged ? row.actual > row.expected + 0.5
                             : row.actual > row.budget + 0.5;
-  const spent = Math.min(row.actual, row.budget);
+  // a month that took money back out of savings reads a negative actual:
+  // nothing is filled, and the rest of the bar is still only the budget
+  const spent = Math.max(0, Math.min(row.actual, row.budget));
   const pend = Math.min(row.pending ?? 0, Math.max(row.budget - spent, 0));
   const over = Math.max(row.actual - row.budget, 0);
   const remaining = Math.max(row.budget - spent - pend, 0);
@@ -236,7 +137,7 @@ export function Track({ row, paceLabel = false }:
           <Text style={{ position: "absolute",
                          left: `${Math.min(85, pace)}%`,
                          color: C.mut, fontSize: 10 }}>
-            today&apos;s pace
+            {paceLabel}
           </Text>
         </View>
       )}
@@ -249,12 +150,14 @@ function MapBar({ row, indent = false, onBudget }:
   const router = useRouter();
   const unbudgeted = row.budget <= 0.005 && row.actual > 0.005;
   const delta = rowDelta(row);
+  const caption = terseCaption(row.label, row.caption, row.breakdown);
   return (
     <View style={{ marginVertical: 5,
                    marginLeft: indent ? 18 : 0 }}>
       <View style={s.head}>
         {row.to !== undefined
-          ? <Pressable onPress={() => router.push(ledgerRoute(row.to!) as never)}
+          ? <Pressable accessibilityRole="button"
+                       onPress={() => router.push(ledgerRoute(row.to!) as never)}
                        style={({ pressed }) => [s.labelPress, pressed && s.labelPressed]}>
               {({ pressed }) => (
                 <Text style={[s.label, pressed && { color: C.accent }]}
@@ -279,9 +182,12 @@ function MapBar({ row, indent = false, onBudget }:
           <Text style={{ color: C.accent }}>set one</Text> so this
           counts toward the verdict
         </Text>
-      ) : row.caption ? (
-        <Text style={s.caption}>{row.caption}</Text>
+      ) : caption ? (
+        <Text style={s.caption}>{caption}</Text>
       ) : null}
+      {/* the Bills row opens how its figures add up, as on the web, only
+          when the server sends the table */}
+      <BillsAddsUp breakdown={row.breakdown} />
     </View>
   );
 }
@@ -290,12 +196,13 @@ function MapBar({ row, indent = false, onBudget }:
  *  rows sum into a "Variable spending" header and sit indented under it;
  *  Bills / Savings stay flat. Plan-only rows fold into one muted footer
  *  sentence instead of empty bars. */
-export default function MoneyMap({ rows, footnote, total: totalProp }: {
+export default function MoneyMap({ rows, footnote, total: totalRow }: {
   rows: PlanRow[];
   footnote?: React.ReactNode;
-  /** server-computed header row (the Budget page passes the real
-   *  variable budget/actual instead of a row-sum) */
-  total?: PlanRow | null;
+  /** the "Variable spending" row over the judged rows — the server's
+   *  (todayview.plan_total) on Today, Budget and both lenses; null (an
+   *  older server) draws none */
+  total: PlanRow | null;
 }) {
   const router = useRouter();
   const onBudget = () => router.push("/budget" as never);
@@ -303,19 +210,19 @@ export default function MoneyMap({ rows, footnote, total: totalProp }: {
   const folded = rows.filter((r) => r.actualLabel === "—");
   const judged = measurable.filter((r) => r.judged);
   const unjudged = measurable.filter((r) => !r.judged);
-  const total: PlanRow | null = totalProp !== undefined ? totalProp
-    : judged.length > 1 ? {
-        label: "Variable spending", judged: true,
-        actual: judged.reduce((s0, r) => s0 + r.actual, 0),
-        expected: judged.reduce((s0, r) => s0 + r.expected, 0),
-        budget: judged.reduce((s0, r) => s0 + r.budget, 0),
-      } : null;
+  // the header row stands over the judged rows only when there are two or
+  // more of them to stand over (as on the web)
+  const total = judged.length > 1 ? totalRow : null;
   const shown = [...(total ? [total] : []), ...judged, ...unjudged];
   const hasOverflow = shown.some((r) => r.actual > r.budget + 0.5);
   const hasPending = shown.some((r) => (r.pending ?? 0) > 0.5);
+  // the excess row's words are the server's (todayview.map_rows)
   const foldedBits = folded.map((r) =>
     r.label === "Excess cash"
-      ? `${money(r.budget)} excess stays in checking`
+      ? (r.caption !== undefined
+          ? r.caption
+          // older-server path: stands in for `caption`
+          : `${money(r.budget)} excess stays in checking`)
       : `${r.label.toLowerCase()} plan ${money(r.budget)}/mo (plan only)`);
   return (
     <View>

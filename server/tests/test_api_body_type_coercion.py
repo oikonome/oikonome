@@ -54,21 +54,27 @@ class BodyIdTypeCoercionTests(unittest.TestCase):
             r = self.client.post("/api/reimburse/unlink",
                                  json={"expense_id": bad, "reimburse_id": "x"})
             self.assertNotEqual(r.status_code, 500, r.text)
-            self.assertEqual(r.status_code, 200, r.text)
+            # a container is not an id: refused, naming the field
+            self.assertEqual(r.status_code, 400, r.text)
+            self.assertIn("expense_id", r.json()["detail"])
 
     def test_accounts_exclude_non_string_id_is_not_found_not_500(self):
         for bad in BAD_IDS:
             r = self.client.post("/api/accounts/exclude",
                                  json={"account_id": bad})
             self.assertNotEqual(r.status_code, 500, r.text)
-            self.assertEqual(r.status_code, 404, r.text)
+            # a container is not an id: refused, naming the field
+            self.assertEqual(r.status_code, 400, r.text)
+            self.assertIn("account_id", r.text)
 
     def test_accounts_balance_non_string_id_is_not_found_not_500(self):
         for bad in BAD_IDS:
             r = self.client.post("/api/accounts/balance",
                                  json={"account_id": bad, "balance": "10"})
             self.assertNotEqual(r.status_code, 500, r.text)
-            self.assertEqual(r.status_code, 404, r.text)
+            # a container is not an id: refused, naming the field
+            self.assertEqual(r.status_code, 400, r.text)
+            self.assertIn("account_id", r.text)
 
     def test_import_rollback_non_string_batch_id_does_not_500(self):
         for bad in BAD_IDS:

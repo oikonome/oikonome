@@ -52,8 +52,12 @@ def _money(v: float) -> str:
     return ("-$" if n < 0 else "$") + f"{abs(n):,}"
 
 
-def donut(segments: list[tuple[str, float]], size: int = 180) -> str:
-    """segments: [(label, value)] — negatives dropped. Returns SVG + legend HTML."""
+def donut(segments: list[tuple[str, float]], shown: dict,
+          size: int = 180) -> str:
+    """segments: [(label, value)] — the ring's geometry, negatives dropped;
+    `shown`: what it prints, {total, rows: [{label, dollars, share}]} for
+    the drawn parts in order (assistant_blocks.ring_figures). Returns SVG
+    + legend HTML."""
     segs = [(l, v) for l, v in segments if v and v > 0]
     total = sum(v for _, v in segs) or 1
     r, cx, cy, sw = size / 2 - 14, size / 2, size / 2, 26
@@ -62,7 +66,7 @@ def donut(segments: list[tuple[str, float]], size: int = 180) -> str:
     off = 0.0
     parts = []
     legend = []
-    for i, (label, val) in enumerate(segs):
+    for i, (_label, val) in enumerate(segs):
         frac = val / total
         color = PALETTE[i % len(PALETTE)]
         dash = frac * circ
@@ -71,13 +75,16 @@ def donut(segments: list[tuple[str, float]], size: int = 180) -> str:
             f'stroke-width="{sw}" stroke-dasharray="{dash:.2f} {circ - dash:.2f}" '
             f'stroke-dashoffset="{-off:.2f}" transform="rotate(-90 {cx} {cy})"/>')
         off += dash
+    for i, row in enumerate(shown["rows"]):
+        color = PALETTE[i % len(PALETTE)]
+        share = "" if row["share"] is None else f'{row["share"]}%'
         legend.append(
             f'<div class="lg"><span class="sw" style="background:{color}"></span>'
-            f'{html.escape(label)} <b>{_money(val)}</b> '
-            f'<span class="mut">{frac*100:.0f}%</span></div>')
+            f'{html.escape(row["label"])} <b>{_money(row["dollars"])}</b> '
+            f'<span class="mut">{share}</span></div>')
     svg = (f'<svg viewBox="0 0 {size} {size}" width="{size}" height="{size}">'
            + "".join(parts) +
-           f'<text x="{cx}" y="{cy-2}" text-anchor="middle" class="dc-t">{_money(total)}</text>'
+           f'<text x="{cx}" y="{cy-2}" text-anchor="middle" class="dc-t">{_money(shown["total"])}</text>'
            f'<text x="{cx}" y="{cy+16}" text-anchor="middle" class="dc-s">total</text></svg>')
     return f'<div class="donut">{svg}<div class="legend">{"".join(legend)}</div></div>'
 

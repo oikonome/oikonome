@@ -545,5 +545,28 @@ class BackendRoutingApi(unittest.TestCase):
         self._save({"llm_backends": [], "llm_roles": {}})
 
 
+
+class AStoredVisionModelOnHosted(unittest.TestCase):
+    def test_a_stored_vision_model_never_overrides_a_hosted_operators(self):
+        """On hosted the operator's endpoint answers with the operator's
+        model: a household's stored vision model (one an archive from a
+        self-hosted install carried in) is not sent to it. On a self-hosted
+        install the same key still pairs a vision model with the bundled
+        endpoint."""
+        from .util import make_db, write_config
+        conn = make_db()
+        self.addCleanup(conn.close)
+        write_config(conn, llm_vision_model="invented-vision:7b")
+        env = {"OIKONOME_LLM_URL": "http://ollama:11434",
+               "OIKONOME_LLM_MODEL": "operator-model"}
+        with patch.dict(os.environ, {**env, "OIKONOME_HOSTED": "1"}):
+            be = llm_categorize._backend(conn, role="vision")
+        self.assertEqual((be["source"], be["model"], be["vision_model"]),
+                         ("env", "operator-model", ""))
+        with patch.dict(os.environ, {**env, "OIKONOME_HOSTED": ""}):
+            be = llm_categorize._backend(conn, role="vision")
+        self.assertEqual(be["vision_model"], "invented-vision:7b")
+
+
 if __name__ == "__main__":
     unittest.main()

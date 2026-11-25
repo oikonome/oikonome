@@ -6,16 +6,26 @@
 // what-ifs, the retirement page's pattern.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
-import { interestSaved, parseMoneyDraft, rebaseFields, rebaseKeyed }
+import { Link } from "react-router";
+import { failLine, failureStatus, parseMoneyDraft, rebaseFields, rebaseKeyed }
   from "../moneymath";
+import { FailedLine, NoAccountsLine, useNoAccounts } from "../components/Loaded";
 import { isViewer } from "../role";
 import { api, errText, money, type DebtMethod, type DebtPlan, type DebtPlanSave,
-         type DebtRow, type DebtSchedule } from "../api/client";
+         type DebtRow } from "../api/client";
 import AreaChart from "../components/AreaChart";
+import PageSkeleton from "../components/PageSkeleton";
+import SegmentedControl from "../components/SegmentedControl";
+import Note from "../components/Note";
 
 const NAMES: Record<DebtMethod, string> = { avalanche: "Avalanche", snowball: "Snowball" };
 const OTHER: Record<DebtMethod, DebtMethod> = { avalanche: "snowball", snowball: "avalanche" };
 const KIND: Record<DebtRow["kind"], string> = { card: "card", mortgage: "mortgage", loan: "loan" };
+// where the walked minimum came from, as the row's caption says it
+const MIN_FROM: Record<DebtRow["min_basis"], string> = {
+  you: "yours", issuer: "issuer", estimate: "estimate",
+  ledger: "from your payments",
+};
 
 // '2029-03-01' → 'Mar 2029': the schedule walks month firsts, and the
 // day would read as a fact the walk never claimed
@@ -94,6 +104,7 @@ export default function Debt() {
   const [draft, setDraft] = useState<Draft | null>(null);
   // the overrides as they were when the first box was edited
   const [opened, setOpened] = useState<Draft | null>(null);
+  const noAccounts = useNoAccounts();
   const [err, setErr] = useState<string | null>(null);
   const save = useMutation({
     // The server replaces the whole plan, and the draft is a copy from
@@ -127,13 +138,33 @@ export default function Debt() {
     onError: (e) => setErr(errText(e)),
   });
 
-  if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
-  if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
-  const r: DebtPlan = q.data;
+  // A failed what-if leaves q.data empty (placeholderData only covers the
+  // pending fetch), and every control lives under `r`. Keep the last plan
+  // the server did send, so a refused amount is corrected in place, beside
+  // the fields, instead of taking the whole page with it (the phone's rule).
+  const [lastGood, setLastGood] = useState<DebtPlan | undefined>();
+  if (q.data && q.data !== lastGood) setLastGood(q.data);
+
+  if (q.isPending) return <PageSkeleton />;
+  const kept = q.data ?? lastGood;
+  if (kept === undefined) return <FailedLine q={q} what="the debt plan" />;
+  const r: DebtPlan = kept;
+  // a refusal (a 4xx about what was sent) is the server's own sentence, as
+  // on the phone; anything else is the failed line's words
+  const whatIfStatus = failureStatus(q.error);
+  const whatIfErr = q.isError && !q.data
+    ? (whatIfStatus !== null && whatIfStatus >= 400 && whatIfStatus < 500
+       && whatIfStatus !== 401
+       ? errText(q.error)
+       : failLine(q.error, "the debt plan", "web").text)
+    : null;
   const method = r.method;
   const plan = r.plan, alt = r.alt, base = r.minimums;
   const live = r.debts.filter((d) => !d.skip);
-  const owed = live.reduce((s, d) => s + d.balance, 0);
+  // the server's figures: what the plan starts from, and which debts it
+  // walks at a typical rate or an estimated minimum
+  const owed = plan.starting;
+  const guessed = live.filter((d) => d.estimated).length;
   const extraStr = extra ?? String(r.extra_monthly);
   const d = draft ?? draftOf(r.debts);
   const unsaved = method !== r.saved.method || r.extra_monthly !== r.saved.extra_monthly
@@ -162,18 +193,30 @@ export default function Debt() {
     planBase: { method: r.saved.method, extra_monthly: r.saved.extra_monthly },
     mine: d, base: opened ?? d,
   });
-  const saved = (s: DebtSchedule) => interestSaved(base, s);
 
+  // with nothing linked "Nothing owed" reads as a true zero: say what is
+  // missing instead
+  if (r.debts.length === 0 && noAccounts) {
+    return (
+      <>
+        <h1>Debt</h1>
+        <div className="card" style={{ marginTop: 0 }}><NoAccountsLine /></div>
+      </>
+    );
+  }
   if (r.debts.length === 0) {
     return (
       <>
         <h1>Debt</h1>
         <div className="card" style={{ marginTop: 0 }}>
-          <div className="kpi sm pos">Nothing owed</div>
-          <div className="sub">No card or loan carries a balance. A debt
-            on an account the Accounts page excludes stays out of the plan
-            too.</div>
+          <div className="kpi sm pos">{r.paid_in_full.length
+            ? "Nothing to pay off" : "Nothing owed"}</div>
+          <div className="sub">{r.paid_in_full.length
+            ? "Every card is paid in full each month, so none of it costs interest."
+            : "No card or loan carries a balance."} A debt on an account the
+            Accounts page excludes stays out of the plan too.</div>
         </div>
+        <PaidInFull rows={r.paid_in_full} />
       </>
     );
   }
@@ -184,7 +227,8 @@ export default function Debt() {
       {/* HERO: the date the page exists to produce */}
       <div className="card" style={{ marginTop: 0 }}>
         <div className="sub">Debt-free — {NAMES[method].toLowerCase()}
-          {r.extra_monthly > 0 ? `, ${money(r.extra_monthly)}/mo extra` : ", minimums only rolled"}
+          {r.extra_monthly > 0 ? `, ${money(r.extra_monthly)}/mo extra`
+            : ", no extra — each paid-off debt's minimum moves to the next"}
           {unsaved && <span className="pill a" style={{ marginLeft: ".5rem" }}>unsaved what-if</span>}
         </div>
         {plan.debt_free ? (
@@ -203,6 +247,14 @@ export default function Debt() {
               : "at these payments"}</span>
           </div>
         )}
+        {guessed > 0 ? (
+          <div className="sub" style={{ marginTop: ".3rem" }}>
+            <span className="pill a">estimated</span>{" "}
+            {guessed === 1 ? "1 debt is" : `${guessed} debts are`} walked at a
+            typical rate or an estimated minimum
+            {viewer ? "." : " — add the APR and minimum below for an exact date."}
+          </div>
+        ) : null}
         <div className="grid cols3" style={{ gap: ".6rem", marginTop: ".8rem" }}>
           <div className="tile">
             <div className="sub">Paying monthly</div>
@@ -210,12 +262,14 @@ export default function Debt() {
             <div className="sub">every minimum + {money(plan.extra)} extra</div>
           </div>
           <div className="tile">
-            <div className="sub">Interest to pay</div>
+            <div className="sub">Interest to pay{r.estimated ? " (estimated)" : ""}</div>
             {finishes(plan) ? (<>
             <div className="kpi sm">{money(plan.total_interest)}</div>
-            <div className={`sub ${saved(plan) > 0 ? "pos" : ""}`}>
-              {saved(plan) > 0
-                ? `saves ${money(saved(plan))} vs minimums only`
+            <div className={`sub ${(r.saves_vs_minimums ?? 0) > 0 ? "pos" : ""}`}>
+              {r.saves_vs_minimums !== null && r.saves_vs_minimums > 0
+                ? (r.extra_monthly > 0
+                  ? `saves ${money(r.saves_vs_minimums)} vs minimums only`
+                  : `saves ${money(r.saves_vs_minimums)} by moving each paid-off minimum on`)
                 : base.debt_free
                   ? `minimums only: ${money(base.total_interest)}`
                   : "minimums only never finish"}
@@ -233,12 +287,12 @@ export default function Debt() {
             ) : !finishes(plan) ? (
               <div className="sub pos">{money(alt.total_interest)} interest</div>
             ) : (
-            <div className={`sub ${alt.total_interest > plan.total_interest ? "" : "pos"}`}>
+            <div className={`sub ${(r.alt_extra_interest ?? 0) > 0 ? "" : "pos"}`}>
               {money(alt.total_interest)} interest
-              {alt.total_interest !== plan.total_interest && (
-                alt.total_interest > plan.total_interest
-                  ? ` — ${money(alt.total_interest - plan.total_interest)} more`
-                  : ` — ${money(plan.total_interest - alt.total_interest)} less`)}
+              {r.alt_extra_interest !== null && r.alt_extra_interest !== 0 && (
+                r.alt_extra_interest > 0
+                  ? ` — ${money(r.alt_extra_interest)} more`
+                  : ` — ${money(-r.alt_extra_interest)} less`)}
             </div>)}
           </div>
         </div>
@@ -247,14 +301,9 @@ export default function Debt() {
             convenience and must not block a cent-precise what-if. */}
         <form onSubmit={recalc} className="assume" noValidate
               style={{ display: "flex", gap: ".7rem", flexWrap: "wrap", alignItems: "flex-end" }}>
-          <div className="seg" role="radiogroup" aria-label="Payoff method"
-               style={{ display: "inline-flex", gap: ".3rem" }}>
-            {(["avalanche", "snowball"] as DebtMethod[]).map((m) => (
-              <button key={m} type="button" role="radio" aria-checked={method === m}
-                      className={method === m ? "pri" : undefined}
-                      onClick={() => pick(m)}>{NAMES[m]}</button>
-            ))}
-          </div>
+          <SegmentedControl label="Payoff method" value={method} onChange={pick}
+            options={(["avalanche", "snowball"] as DebtMethod[]).map((m) => (
+              { value: m, label: NAMES[m] }))} />
           <Fld label="extra $/mo" value={extraStr} step="25" w="6rem"
                onChange={setExtra} />
           <button className="pri" type="submit">Recalculate</button>
@@ -270,19 +319,28 @@ export default function Debt() {
             debt's minimum, roll onto the next target.
           </span>
         </form>
-        {err && <div className="note bad" style={{ marginTop: ".5rem" }}>{err}</div>}
+        {whatIfErr && <Note tone="bad" style={{ marginTop: ".5rem" }}>
+          {whatIfErr}</Note>}
+        {err && <Note tone="bad" style={{ marginTop: ".5rem" }}>{err}</Note>}
       </div>
 
       <div className="card">
         <h2>Balance owed <span className="sub" style={{ fontWeight: 400 }}>
-          — {NAMES[method].toLowerCase()} vs {NAMES[OTHER[method]].toLowerCase()}, same money</span></h2>
-        <AreaChart points={plan.series} second={alt.series}
+          — {r.alt_same_path
+            ? `${NAMES[method].toLowerCase()} and ${NAMES[OTHER[method]].toLowerCase()} pay these debts down the same way`
+            : `${NAMES[method].toLowerCase()} vs ${NAMES[OTHER[method]].toLowerCase()}, same money`}</span></h2>
+        <AreaChart points={plan.series}
+                   second={r.alt_same_path ? undefined : alt.series}
+                   subject={`Balance owed, ${NAMES[method].toLowerCase()}`}
                    labels={[NAMES[method], NAMES[OTHER[method]]]} xticks="years" />
       </div>
 
-      <div className="card">
+      <div className="card stickyhead">
         <h2>In payoff order</h2>
-        <table>
+        {/* .debt-table + c-*: at phone width each debt restacks into a
+            small grid (index.css) — eight columns with two inputs used to
+            scroll the APR box half out of the card */}
+        <table className="debt-table">
           <thead><tr>
             <th>#</th><th>Debt</th><th className="num">Balance</th>
             <th className="num">APR %</th><th className="num">Min $/mo</th>
@@ -294,38 +352,46 @@ export default function Debt() {
               const row = d[x.id];
               return (
                 <tr key={x.id} style={x.skip ? { opacity: .5 } : undefined}>
-                  <td className="mut">{p ? p.order : "—"}</td>
-                  <td>{x.name}{x.mask ? <span className="mut"> ···{x.mask}</span> : null}
-                    <div className="sub">{x.institution ? `${x.institution} · ` : ""}{KIND[x.kind]}</div></td>
-                  <td className="num">{money(x.balance)}</td>
-                  <td className="num">
+                  <td className="mut c-ord">{p ? p.order : "—"}</td>
+                  {/* the table scrolls sideways at a phone width; the name
+                      keeps a readable column instead of one word a line */}
+                  <td className="c-name" style={{ minWidth: "10rem" }}>{x.name}{x.mask ? <span className="mut"> ···{x.mask}</span> : null}
+                    <div className="sub">{x.institution ? `${x.institution} · ` : ""}{KIND[x.kind]}
+                      {x.origin === "hand_entered" ? " · entered on Net Worth" : ""}</div></td>
+                  <td className="num c-bal">{money(x.balance)}</td>
+                  <td className="num c-apr">
                     {viewer ? x.apr.toFixed(2) : (
                       <input type="number" step="0.01" min="0" max="100" value={row.apr}
-                             placeholder={x.apr_issuer != null ? x.apr_issuer.toFixed(2) : "0"}
+                             placeholder={x.apr_default.toFixed(2)}
+                             aria-label={`APR for ${x.name}`}
                              style={{ width: "5rem" }}
                              onChange={(e) => setRow(x.id, { apr: e.target.value })} />)}
                     <div className="sub">{x.apr_source === "you" ? "yours"
-                      : x.apr_source === "issuer" ? "issuer" : "unknown — 0%"}</div>
+                      : x.apr_source === "issuer" ? "issuer"
+                      : x.rate_needed ? (viewer ? "rate not given yet"
+                                         : "rate needed — type it once")
+                      : viewer ? "est. — typical rate" : "est. — add yours"}</div>
                   </td>
-                  <td className="num">
+                  <td className="num c-min">
                     {viewer ? money(x.min_payment) : (
                       <input type="number" step="1" min="0" value={row.min_payment}
-                             placeholder={String(Math.round(x.min_issuer ?? x.min_payment))}
+                             placeholder={x.min_default.toFixed(2)}
+                             aria-label={`Minimum payment for ${x.name}`}
                              style={{ width: "5.5rem" }}
                              onChange={(e) => setRow(x.id, { min_payment: e.target.value })} />)}
-                    <div className="sub">{x.min_source === "you" ? "yours"
-                      : x.min_source === "issuer" ? "issuer" : "estimate"}</div>
+                    <div className="sub">{MIN_FROM[x.min_basis]}</div>
                     {x.kind === "mortgage" && x.payment_reported != null
                       ? <div className="sub">Reported payment incl. escrow {money(x.payment_reported)}</div>
                       : null}
                   </td>
-                  <td>{x.skip ? <span className="pill m">left out</span>
+                  <td className="c-off">{x.skip ? <span className="pill m">left out</span>
                     : p?.paid_off ? <span className="pill g">{monthYear(p.paid_off)}</span>
                     : <span className="pill r">never</span>}</td>
                   {/* a debt the walk never clears has no interest total */}
-                  <td className="num">{p?.paid_off ? money(p.interest) : "·"}</td>
-                  <td>{viewer ? (x.skip ? "yes" : "") : (
+                  <td className="num c-int">{p?.paid_off ? money(p.interest) : "·"}</td>
+                  <td className="c-skip">{viewer ? (x.skip ? "yes" : "") : (
                     <input type="checkbox" checked={row.skip}
+                           aria-label={`Leave ${x.name} out of the plan`}
                            onChange={(e) => setRow(x.id, { skip: e.target.checked })} />)}</td>
                 </tr>
               );
@@ -333,14 +399,36 @@ export default function Debt() {
           </tbody>
         </table>
         <p className="sub">
-          Rates and minimums come from the bank where it reports them, else
-          from what you type here; an <b>estimate</b> is a month's
-          interest plus 1% of a card's balance, at least 2% and $25, a five-year payment for a loan, thirty
-          years for a mortgage — correct it and save. Minimums are held
-          flat for the whole walk, and interest accrues monthly at APR ÷ 12.
-          {!viewer && draft !== null && " Changes here apply when you save the plan."}
+          Rates and minimums are the bank's where it reports them, yours
+          where you type them, otherwise an estimate.{" "}
+          <Link to="/help?topic=debt">How this works</Link>
+          {!viewer && draft !== null && " · Changes apply when you save the plan."}
         </p>
       </div>
+      <PaidInFull rows={r.paid_in_full} />
     </>
+  );
+}
+
+// cards cleared every statement: the server leaves them out of the plan
+// (specs/debt-plan.md) and says on what evidence
+function PaidInFull({ rows }: { rows: DebtPlan["paid_in_full"] }) {
+  if (!rows.length) return null;
+  return (
+    <div className="card">
+      <h2>Paid in full monthly <span className="sub" style={{ fontWeight: 400 }}>
+        — no interest, so not in the plan</span></h2>
+      <table><tbody>
+        {rows.map((c) => (
+          <tr key={c.id}>
+            <td>{c.name}{c.mask ? <span className="mut"> ···{c.mask}</span> : null}
+              <div className="sub">{c.basis === "issuer" && c.statement_balance !== null
+                ? `last statement ${money(c.statement_balance)} paid in full`
+                : "your payments clear it each month"}</div></td>
+            <td className="num">{money(c.balance)}</td>
+          </tr>
+        ))}
+      </tbody></table>
+    </div>
   );
 }

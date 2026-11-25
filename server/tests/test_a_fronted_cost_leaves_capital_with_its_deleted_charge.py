@@ -56,7 +56,10 @@ class FrontedCostLeavesWithItsChargeTests(unittest.TestCase):
             " WHERE entity_id = %s", (self.ent,)).fetchall()
 
     def _contributions(self):
-        return equity.capital_summary(self.conn, self.ent)["contributions"]
+        """The contributions recorded as movements: a cost paid personally
+        with no movement of its own counts too, as `paid_personally`."""
+        cap = equity.capital_summary(self.conn, self.ent)
+        return round(cap["contributions"] - cap["paid_personally"], 2)
 
     def _account(self, item, aid):
         self.conn.execute(

@@ -11,6 +11,9 @@ never a value that breaks the app afterwards.
   one transaction, which an install from before that rule can hold, restore
   as the earliest one, whether or not this install has the index that
   enforces the rule, and the restore says it left the other out.
+* A business whose type is not one the Business page offers (an older
+  spelling, a blank cell) lands as a sole proprietorship, the restore
+  names the business and says so, and the Business page can save it.
 """
 import json
 import unittest
@@ -18,7 +21,7 @@ import uuid
 from pathlib import Path
 
 from oikonome.db import tenancy
-from oikonome.engine import budget
+from oikonome.engine import budget, entities
 from oikonome.sync import restore
 
 from .test_restore_guards import _zip
@@ -138,8 +141,11 @@ class FrontedMovementsTests(unittest.TestCase):
     def test_the_earliest_is_kept_and_the_other_reported(self):
         counts = restore.restore_zip(self.conn, self._archive())
         self.assertEqual(self._kept(), [self.first])
-        self.assertTrue(any("business movement" in n
-                            for n in counts["_notes"]))
+        self.assertIn(
+            "1 business movement left out: each was a second contribution "
+            "or reimbursement for a transaction that already has one (the "
+            "one for the business the charge is booked to is kept, else the "
+            "earliest)", counts["_notes"])
 
     def test_the_same_without_the_index(self):
         """An upgraded install may not have the index yet; the restore's
@@ -149,8 +155,10 @@ class FrontedMovementsTests(unittest.TestCase):
         admin.execute("DROP INDEX IF EXISTS "
                       "equity_movement_one_fronted_per_txn")
         self.addCleanup(admin.execute, MIGRATION.read_text())
-        restore.restore_zip(self.conn, self._archive())
+        counts = restore.restore_zip(self.conn, self._archive())
         self.assertEqual(self._kept(), [self.first])
+        self.assertTrue(any(n.startswith("1 business movement left out")
+                            for n in counts["_notes"]), counts["_notes"])
 
     def test_the_booked_business_keeps_its_movement(self):
         """Where the charge is booked to the business of the LATER
@@ -176,6 +184,56 @@ class FrontedMovementsTests(unittest.TestCase):
             "SELECT created_at::date::text AS d FROM equity_movement"
             " WHERE id=%s", (self.second,)).fetchone()["d"]
         self.assertEqual(at, "2026-07-02")
+
+
+class UnknownBusinessTypeTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = make_db()
+        self.addCleanup(self.conn.close)
+
+    def test_an_unknown_or_blank_type_lands_as_sole_proprietor(self):
+        odd, blank, known = (str(uuid.uuid4()) for _ in range(3))
+        counts = restore.restore_zip(self.conn, _zip({
+            "business_entity.csv": (
+                "id,name,structure\n"
+                f"{odd},Example Works,llc\n"
+                f"{blank},Sample Studio,\"   \"\n"
+                f"{known},Placeholder Co,s_corp\n")}))
+        got = {r["id"]: r["structure"] for r in self.conn.execute(
+            "SELECT id::text AS id, structure FROM business_entity")}
+        self.assertEqual(got, {odd: "sole_prop", blank: "sole_prop",
+                               known: "s_corp"})
+        for name in ("Example Works", "Sample Studio"):
+            self.assertIn(
+                f"{name}: its type was not recognised and was set to Sole "
+                f"proprietor — check it on the Business page",
+                counts["_notes"])
+        self.assertFalse(any("Placeholder Co" in n
+                             for n in counts["_notes"]), counts["_notes"])
+
+    def test_the_business_page_saves_a_restored_business(self):
+        """The edit form sends the business back as it read it; a type the
+        page refuses would make every save on that business fail."""
+        ent = str(uuid.uuid4())
+        restore.restore_zip(self.conn, _zip({
+            "business_entity.csv": ("id,name,structure,state\n"
+                                    f"{ent},Example Works,llc,ID\n")}))
+        row = entities.get_entity(self.conn, ent)
+        saved = entities.update_entity(
+            self.conn, ent, name=row["name"], structure=row["structure"],
+            state="WA")
+        self.assertEqual((saved["structure"], saved["state"]),
+                         ("sole_prop", "WA"))
+
+    def test_a_business_already_here_is_not_said_to_be_retyped(self):
+        ent = str(uuid.uuid4())
+        z = {"business_entity.csv": ("id,name,structure\n"
+                                     f"{ent},Example Works,llc\n")}
+        restore.restore_zip(self.conn, _zip(z))
+        counts = restore.restore_zip(self.conn, _zip(z))
+        self.assertFalse(any("Example Works" in n
+                             for n in counts.get("_notes", [])),
+                         counts.get("_notes"))
 
 
 class MarksAndJournalColumnsTests(unittest.TestCase):

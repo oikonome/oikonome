@@ -30,22 +30,23 @@ class AlertsPageShapeTests(unittest.TestCase):
             self.skipTest("webapp/ not present")
 
     def test_every_alert_offers_a_way_to_fix_it(self):
-        # the verb varies — a queue gets "review", breakage gets "fix this" —
-        # but every row still renders a link with one of them
-        self.assertIn('KIND_CTA[a.kind] || "fix this"', self.src)
-        self.assertIn("KIND_ROUTE[a.kind]", self.src)
+        # the verb varies — a queue gets "Review", breakage gets "Fix" —
+        # but every row still renders a link with one of them, from the
+        # one helper every surface shares, so the verbs cannot diverge
+        # between surfaces
+        self.assertIn("alertAction(a.kind)", self.src)
+        self.assertIn("a.link && (", self.src)
 
-    def test_history_rows_route_client_side(self):
-        """/alerts/history stores identity columns only — no link — so a
-        dismissed alert cannot be resurrected by retargeting it. The map is
-        the fallback for those rows."""
-        self.assertIn("const KIND_ROUTE", self.src)
-        for kind in ("stale-pull", "connection-removed", "reimb", "proposals",
-                     "merges"):
-            self.assertIn(kind, self.src)
+    def test_history_lines_carry_their_destination_from_the_server(self):
+        """The history row's link, name and chip are the server's
+        (alerts.history_lines) — a client map of kinds is a second copy
+        that falls out of step when a new kind is added on the server."""
+        self.assertNotIn("const KIND_ROUTE", self.src)
+        self.assertNotIn("FILTER_KINDS", self.src)
+        self.assertIn("r.group === filter", self.src)
 
     def test_the_three_date_columns_became_one_span(self):
-        self.assertIn("{mmdd(r.first_seen)}", self.src)
+        self.assertIn("{mmdd(r.first_seen)} → ", self.src)
         self.assertNotIn("<th>last seen</th>", self.src)
 
 
@@ -66,9 +67,14 @@ class AlertLinkTests(unittest.TestCase):
 
     def test_history_does_not_persist_the_link(self):
         """A stored link would be a second place to keep this map correct,
-        and rows already in the table would keep the stale one forever."""
+        and rows already in the table would keep the stale one forever: the
+        log stores kind + message, and the link is read from the map at
+        read time (history_lines)."""
         src = pathlib.Path(alerts.__file__).read_text()
-        self.assertNotIn("link", src.split("def history(")[1])
+        self.assertNotIn("link", src.split("def history(")[1]
+                         .split("\ndef ")[0])
+        insert = src.split("INSERT INTO alerts_log")[1].split(")")[0]
+        self.assertNotIn("link", insert)
 
 
 class AssistantShapeTests(unittest.TestCase):
@@ -115,4 +121,4 @@ class AssistantShapeTests(unittest.TestCase):
         """Hosted instances have no LLM, and the old copy told those users to
         'run the bundled model' — which is not a thing they can do."""
         self.assertNotIn("or run the bundled model", self.src)
-        self.assertIn("/settings/categorize", self.src)
+        self.assertIn('to="/settings/ai"', self.src)

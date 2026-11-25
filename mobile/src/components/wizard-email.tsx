@@ -8,8 +8,8 @@ import { useRouter } from "expo-router";
 import { useState } from "react";
 import { Pressable, Switch, Text, TextInput, View } from "react-native";
 
-import { errText } from "../lib/api";
-import { SETTINGS_SAVES, seedSettings } from "../lib/cache";
+import { errText, type EmailSchedule } from "../lib/api";
+import { SETTINGS_SAVES, saveSettings, seedSettings } from "../lib/cache";
 import { type Delivery, deliveryOf, flagsOf, looksLikeMailbox,
          NEED_BASE_URL, recipientDuplicate, recipientEditBody,
          SHARED_GRANT_NOTE } from "../lib/pure";
@@ -19,8 +19,11 @@ import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
 import { useSharedLock } from "../lib/viewer";
 import { VerifyEmailCard } from "./verify-email-card";
-import { clockHour, recipientRole } from "./wizard-logic";
+import { clockHour, type DailyReach, reachLine, recipientRole }
+  from "./wizard-logic";
 import { PillRow, TAP, ws } from "./wizard-ui";
+import { Note } from "./ui";
+import { fieldA11y } from "./field";
 
 export type RecipRow = { email: string; owner: boolean; muted?: boolean;
                          via?: string; invite?: string | null };
@@ -85,10 +88,13 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
   // before it; the reply seeds ["settings"].
   const save = useMutation({
     mutationFn: async (v: { base: DailyFlags; patch: Partial<DailyFlags> }) => {
-      const live = (await client!.settingsSchedule()) ?? {};
+      // the full view, not the schedule alone: its list_versions are what
+      // the save is checked against (saveSettings)
+      const cur = await client!.settingsFull();
+      const live = (cur.email_schedule as EmailSchedule | null) ?? {};
       const sent = rebaseSched({ daily: { ...v.base, ...v.patch } },
                                { daily: v.base }, live, "daily");
-      const r = await client!.settingsSaveSchedule(sent);
+      const r = await saveSettings(qc, client!, { email_schedule: sent }, cur);
       seedSettings(qc, { ...r, email_schedule: storedSched(r, sent) });
       return r;
     },
@@ -118,7 +124,11 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
         : r === "unsupported" ? { bad: true, text: "This build cannot "
             + "receive push; the installed app can." }
         : { bad: true, text: "Could not register this phone for push." });
-      if (r === "ok") qc.invalidateQueries({ queryKey: ["notify"] });
+      if (r === "ok") {
+        qc.invalidateQueries({ queryKey: ["notify"] });
+        // a new push target changes who the schedule reaches
+        qc.invalidateQueries({ queryKey: ["settings"] });
+      }
     } finally { setPushBusy(false); }
   };
   const choose = (next: Delivery) => {
@@ -158,6 +168,9 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
     recip.mutate(recipientEditBody({ kind: "add", email: v, recipients }));
   };
   const smtpSet = !!(sv?.smtp_host || sv?.smtp_password_set);
+  // who the saved schedule reaches (the server's, the web's line)
+  const reach = (sv?.email_reach as { daily?: DailyReach } | null
+                 | undefined)?.daily;
 
   return (
     <View style={ws.body}>
@@ -176,7 +189,8 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
         <View style={[ws.row, { justifyContent: "space-between" }]}>
           <Text style={{ color: C.text, fontSize: 14 }}>Send at</Text>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
-            <Pressable disabled={notLoaded} accessibilityLabel="An hour earlier"
+            <Pressable accessibilityRole="button"
+                       disabled={notLoaded} accessibilityLabel="An hour earlier"
                        style={{ minWidth: TAP, minHeight: TAP,
                                 alignItems: "center", justifyContent: "center" }}
                        onPress={() => { const h = (hourVal + 23) % 24;
@@ -185,7 +199,8 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
             </Pressable>
             <Text style={{ color: C.text, fontSize: 14, minWidth: 70,
                            textAlign: "center" }}>{clockHour(hourVal)}</Text>
-            <Pressable disabled={notLoaded} accessibilityLabel="An hour later"
+            <Pressable accessibilityRole="button"
+                       disabled={notLoaded} accessibilityLabel="An hour later"
                        style={{ minWidth: TAP, minHeight: TAP,
                                 alignItems: "center", justifyContent: "center" }}
                        onPress={() => { const h = (hourVal + 1) % 24;
@@ -201,6 +216,7 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
           <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
             Short summary instead of the full report</Text>
           <Switch value={summaryVal} disabled={notLoaded}
+                  accessibilityLabel="Short summary instead of the full report"
                   onValueChange={(v) => { setSummary(v);
                                           commit({ summary: v }); }}
                   trackColor={{ true: C.accent, false: C.border }} />
@@ -209,15 +225,23 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
       <View style={[ws.row, { justifyContent: "space-between" }]}>
         <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
           Push to this phone</Text>
-        <Pressable style={[ws.btn, ws.quiet,
+        <Pressable accessibilityRole="button" style={[ws.btn, ws.quiet,
                            (!pushReady || pushBusy) && { opacity: 0.5 }]}
                    disabled={!pushReady || pushBusy} onPress={turnOnPush}>
           <Text style={ws.btnText}>{pushBusy ? "Asking…" : "Turn on"}</Text>
         </Pressable>
       </View>
       {pushNote && (
-        <Text style={[ws.mut, pushNote.bad && { color: C.warn }]}>
-          {pushNote.text}</Text>
+        <Note bad={!!pushNote.bad} style={[ws.mut, pushNote.bad && { color: C.warn }]}>
+          {pushNote.text}</Note>
+      )}
+      {push && !pushNote && reach && reach.push === 0 && (
+        <Text style={ws.mut}>No browser or phone has push turned on yet —
+          nothing arrives by push until one does.</Text>
+      )}
+      {/* the schedule is on and nobody receives it: the server's reason */}
+      {reach?.warn && (
+        <Text style={[ws.mut, { color: C.warn }]}>{reachLine(reach)}</Text>
       )}
       {save.isError && <Text style={[ws.mut, { color: C.warn }]}>
         {errText(save.error)}</Text>}
@@ -261,12 +285,13 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
           <Text style={ws.mut}>{lockAdd}</Text>
         ) : (
           <View style={{ flexDirection: "row", gap: 8 }}>
-            <TextInput style={[ws.input, { flex: 1, minWidth: 0 }]}
+            <TextInput {...fieldA11y("Add another address")}
+                       style={[ws.input, { flex: 1, minWidth: 0 }]}
                        placeholder="Add another address"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        keyboardType="email-address" value={draft}
                        onChangeText={setDraft} onSubmitEditing={add} />
-            <Pressable style={[ws.btn, ws.quiet,
+            <Pressable accessibilityRole="button" style={[ws.btn, ws.quiet,
                                (!draft.trim() || recip.isPending)
                                  && { opacity: 0.5 }]}
                        disabled={!draft.trim() || recip.isPending}
@@ -275,8 +300,8 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
             </Pressable>
           </View>
         )}
-        {recipErr ? <Text style={[ws.mut, { color: C.bad }]}
-                          onPress={() => setRecipErr(null)}>{recipErr}</Text>
+        {recipErr ? <Note bad style={[ws.mut, { color: C.bad }]}
+                          onPress={() => setRecipErr(null)}>{recipErr}</Note>
                   : null}
         <Text style={ws.mut}>
           A new address gets one confirmation email first and can
@@ -286,7 +311,7 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
       </View>
 
       {!hosted && (
-        <Pressable onPress={() => router.push("/notifications" as never)}
+        <Pressable accessibilityRole="button" onPress={() => router.push("/notifications" as never)}
                    style={{ minHeight: TAP, justifyContent: "center" }}>
           <Text style={ws.mut}>
             Outbound mail account — {smtpSet ? "set up" : "not set up yet"}
@@ -297,14 +322,4 @@ export function EmailPane({ hosted }: { hosted: boolean }) {
       )}
     </View>
   );
-}
-
-/** The recipients the Done step counts: every row not turned off. */
-export function recipientCount(sv: Record<string, unknown> | undefined,
-                               ownerEmail: string | undefined): number {
-  const muted = ((sv?.email_muted as string[] | null) ?? [])
-    .map((x) => x.toLowerCase());
-  // the owner counts only when not self-muted, as on the web
-  return recipientRows(sv, ownerEmail).filter((r) =>
-    !(r.muted ?? muted.includes(r.email.toLowerCase()))).length;
 }

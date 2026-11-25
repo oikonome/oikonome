@@ -676,8 +676,8 @@ class FrontedChargeTests(_Biz):
         stamp = (dt.datetime.now(dt.timezone.utc)
                  - dt.timedelta(days=10)).isoformat()
         self.conn.execute(
-            "UPDATE transactions SET removed = 1, raw = %s WHERE id = 'p1'",
-            (jsonb({"feed_removed_at": stamp}),))
+            "UPDATE transactions SET removed = 1, raw = %s, removed_at = %s"
+            " WHERE id = 'p1'", (jsonb({"feed_removed_at": stamp}), stamp))
         self.assertEqual(equity.capital_summary(
             self.conn, self.eid)["contributions"], 0.0)
         # still inside the twin wait: kept, in case it is carried
@@ -699,8 +699,8 @@ class FrontedChargeTests(_Biz):
         stamp = (dt.datetime.now(dt.timezone.utc)
                  - dt.timedelta(days=10)).isoformat()
         self.conn.execute(
-            "UPDATE transactions SET removed = 1, raw = %s WHERE id = 'p1'",
-            (jsonb({"feed_removed_at": stamp}),))
+            "UPDATE transactions SET removed = 1, raw = %s, removed_at = %s"
+            " WHERE id = 'p1'", (jsonb({"feed_removed_at": stamp}), stamp))
         self.conn.execute("UPDATE business_entity SET status = 'archived'"
                           " WHERE id = %s", (self.eid,))
         self.assertEqual(equity.release_withdrawn_fronted(

@@ -977,12 +977,21 @@ restore_failed() {
   die "restore failed — the database is EMPTY (no rollback snapshot could be taken); fix the dump and restore again"
 }
 
+dump_statements() {
+  # The dump's statements, as a server of ours can load them. A managed
+  # Postgres service may stamp a column option of its own on the tables it
+  # hosts (`ALTER TABLE … ALTER COLUMN … SET (pg_attver=…);`); the stock
+  # server refuses the option and the load would stop on its first line.
+  # The option carries no data, so those lines are left out.
+  gunzip -c "$1" | grep -v -E '^ALTER TABLE (ONLY )?[^ ]+ ALTER COLUMN [^ ]+ SET \(pg_attver=[0-9]+\);$'
+}
+
 restore_rollback() {
   # Reload the pre-restore snapshot ($1) after a failed drop/recreate or
   # dump load. Returns 0 when the database is back exactly as it was.
   say "Rolling back to the snapshot taken a moment ago…"
   drop_recreate_db >/dev/null 2>&1 || true
-  if gunzip -c "$1" | pg_app_sql -q -v ON_ERROR_STOP=1 >/dev/null 2>&1; then
+  if dump_statements "$1" | pg_app_sql -q -v ON_ERROR_STOP=1 >/dev/null 2>&1; then
     $COMPOSE up -d >/dev/null 2>&1 || true
     ok "Database rolled back — everything is as it was before this restore."
     return 0
@@ -1124,7 +1133,7 @@ cmd_restore() {
   fi
 
   say "Loading dump (this can take a minute)…"
-  if ! gunzip -c "$file" | pg_app_sql -q -v ON_ERROR_STOP=1 >/dev/null; then
+  if ! dump_statements "$file" | pg_app_sql -q -v ON_ERROR_STOP=1 >/dev/null; then
     restore_failed "Dump load FAILED — the file may be truncated or not an Oikonome backup."
   fi
 

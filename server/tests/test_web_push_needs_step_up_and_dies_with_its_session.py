@@ -19,6 +19,7 @@ from fastapi.testclient import TestClient
 
 from oikonome.db import tenancy
 
+from .push_keys import browser_keys
 from .util import _ensure_db
 
 PW = "correct-horse-battery"
@@ -66,7 +67,7 @@ class _Base(unittest.TestCase):
     def _sub(self):
         return {"endpoint":
                 f"https://fcm.googleapis.com/fcm/send/{uuid.uuid4().hex}",
-                "keys": {"p256dh": uuid.uuid4().hex, "auth": "a1"}}
+                "keys": browser_keys()}
 
     def _rows(self):
         admin = tenancy.admin_connect()
@@ -109,7 +110,7 @@ class StepUpTests(_Base):
         # …but new keys on the endpoint are a new destination
         r = later.post("/api/notify/push/subscribe", json={
             "endpoint": sub["endpoint"],
-            "keys": {"p256dh": "other", "auth": "other"}})
+            "keys": browser_keys()})
         self.assertEqual(r.status_code, 403, r.text)
 
     def test_a_device_token_cannot_make_a_browser_subscription(self):

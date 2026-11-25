@@ -74,7 +74,8 @@ The installer generates the database passwords and the encryption master key
 the daily email is not asked for here — Settings → Email & Push or
 `docker/.env` takes it later). Re-running it is always safe —
 it keeps your `.env` and data. Prefer doing it by hand? Copy
-`docker/.env.example` to `docker/.env`, fill every value (the master key is
+`docker/.env.example` to `docker/.env`, fill every value (passwords keep to
+letters, digits and `- _ . ~`, as the note there says; the master key is
 32 random bytes, **urlsafe** base64: `openssl rand -base64 32 | tr '+/' '-_'`),
 then `docker compose up -d` from `docker/`.
 
@@ -119,7 +120,8 @@ the token is the key). Then, in order:
    forecast anchors on: with one checking account it is pinned for you
    (when the first bank or file brings it in, or as you leave the step);
    with two or more the step asks you to pick before **Done connecting**
-   (changeable later on Accounts).
+   (changeable later on Accounts). When at least two of them have had a
+   transaction in the last 90 days, only those are offered.
    Click **Done connecting** when you've
    added everything. When the instance enforces an institution limit, the
    card also says how many of the allowed institutions are connected, and
@@ -149,8 +151,12 @@ the token is the key). Then, in order:
    approved bills and income above and savings as what's left. On the
    finder path the figures are pre-filled from your history; on the
    enter-them-myself path they start blank, with a suggestion from your
-   history beside each one to tap if you want it. That's all the daily
-   verdict needs.
+   history beside each one to tap if you want it. Only a category spent
+   in at least half the finished months is suggested as a budget of its
+   own, so a one-off purchase stays in Everything else. Run the wizard
+   again later (Settings → Wizards) and this step opens on the plan you
+   saved, with history's figures beside each row as hints. That's all
+   the daily verdict needs.
 5. **Email & push** — the same on every instance. **Daily verdict**:
    **Email**, **Push**, **Both** or **Off**, and the hour it sends. For
    email, **Short summary instead of the full report** sends just the
@@ -167,11 +173,15 @@ the token is the key). Then, in order:
    history window, bills and paychecks approved, budgets, delivery and
    recipients), what the Today page's setup checklist will say (**Today
    checklist 4/5 done — still open: …**), and when the first email or
-   notification arrives. Then
+   notification arrives — the first email is promised only when someone
+   would actually receive it (step 5 says so when nobody would). Then
    **Go to Today**. Every step but the Appearance choice and the history
    wait is skippable, and the green **Finish setup** pill in the nav
    resumes at the first unfinished step — so does **Finish setup** under
-   Settings → Wizards, in the browser and the phone app.
+   Settings → Wizards, in the browser and the phone app — until
+   everything setup creates exists. Opening a step writes nothing: the
+   bill search runs only on **Continue** or **Scan again**, and its offers
+   read as they do on the Bills page.
 
 Signing in before setup is finished takes you straight back into the
 wizard, so you never land on an empty dashboard wondering where to start.
@@ -184,7 +194,7 @@ A self-hosted instance is claimed once, through the setup link the
 installer prints, and stays a single household from then on: `/signup`
 sends visitors to the sign-in page rather than letting anyone reachable
 on the network create a second account on your box. To give a partner
-their own login, invite them under **Settings → Users** (the same card
+their own login, invite them under **Settings → Household** (the same card
 is **Security & household** in the mobile app) — that shares *this*
 household, with its accounts and history, which is almost always what
 "add my partner" means. (Someone who really wants a separate household
@@ -221,7 +231,7 @@ so are password/2FA/passkey changes, since the printed credentials are
 the login. **Settings are read-only** for the same reason: the login is
 shared, so one visitor rewriting the budget or the notification schedule
 would rewrite it for everyone after them. Page preferences that only
-affect what you see — the Today page's summary/detail face, light/dark —
+affect what you see — the Today page's Summary/Detail view, light/dark —
 still work; each browser and phone remembers its own rather than the
 account remembering for everyone. Install normally when you're ready for real data. Discard the
 demo with its own `./oikonome.sh uninstall` — or sweep every demo
@@ -503,6 +513,10 @@ in `.env`. See [integrations.md](integrations.md).
 rebuilds — safe to re-run anytime. `./oikonome.sh upgrade` is the same
 command, and so is **Upgrade to the latest release** in the admin console.)
 Migrations run automatically at start (advisory-locked; multi-node safe).
+The image applies Debian's pending security updates when its package
+layer is built — a fresh install, or an upgrade that pulls a newer base
+image — so it carries OS fixes published after the Python base image it
+starts from.
 
 Before it changes anything, an upgrade that brings in new code saves a
 snapshot of the running database into `./backups` as
@@ -563,8 +577,10 @@ or transaction to its last four digits, as new rows already are —
 including any run of eight or more digits in a file-imported row's memo,
 payee, description or other free-text cell, or in cells past its header
 row. A card number printed in groups (four groups of four, or 4-6-5,
-separated by spaces, dashes, dots or slashes, singly, doubled or mixed)
-in a file-imported row's name, merchant or cells is cut the same way, and
+separated by spaces, dashes, dots or slashes, singly, doubled or mixed,
+or by a tab, a line break or a no-break space as spreadsheets and
+statements write them) in a file-imported row's name, merchant or cells
+is cut the same way, and
 so is one the app had carried into a merchant name it derived; a merchant
 name you typed yourself is kept. The same cut reaches what was named
 from those rows before it: detected bills (a bill whose name spelled a
@@ -610,6 +626,116 @@ finding it; accounts a multi-account export created, such as an OFX or QIF
 file, keep finding their sources by their ids instead. Nothing about the
 account itself changes, and existing ids stay as they are.
 
+A bill whose stored due date or schedule date does not read as a date
+has that date dropped (its due date is refilled from the bill's own due
+day), so it shows and schedules normally. OFX/QFX rows already imported
+are marked with how they were dated, so importing the same file again
+later lands on them instead of adding a second copy. None of these steps
+needs anything from you: every migration, the data-tidying ones
+included, runs by itself when the instance starts.
+
+A deposit a file import filed
+under its bank's own spelling of the label *Income* (`income`, `INCOME`
+in another case) is filed under INCOME, so it counts as pay rather than
+as negative spending; a category you set by hand is kept. A mail relay
+login saved in Settings is encrypted when the instance next starts, like
+its password, and dropped from the budget snapshots of closed months. The
+emailed sign-in link now works only in the browser that opened it, or
+through the sign-in code that page shows: a phone app too old to have a
+code field cannot use it, so its people update the app or sign in on the
+web (see the in-app Security guide).
+
+Two more tidy what is already stored. Each property, vehicle or other
+asset you entered by hand on Net Worth now keeps the day it was acquired
+(**Owned since**) apart from the day its value was last stated: the
+upgrade rewrites that list in the household's settings, giving every
+item saved before the field existed its last-stated date as its *Owned
+since*, so the trend counts it from that month. A value edit no longer
+moves it; if a house or car was owned earlier, set **Owned since** on
+Net Worth and the earlier months fill in. An item that already has the
+date, or whose stated date is not a date, is left as it is. And every
+Coinbase row is rewritten to carry the ledger's sign — Coinbase's own
+was the other way round, so a withdrawal read as money arriving and a
+deposit as money leaving. Its amount is taken again from the record
+Coinbase sent, negated, and a transfer-in/transfer-out label follows the
+new sign; a category you set by hand is kept. Both steps run once and
+change nothing on a second run, and restoring an older backup applies
+the same rules to it.
+
+Three more come with the stored-documents list and receipt slips. A
+transaction the bank or you retired now remembers when it left the
+ledger; rows already retired are stamped with the feed's withdrawal time,
+else the time it was retired, else the upgrade's own moment, so a receipt
+or a reimbursement pairing left on such a row waits one fresh reconcile
+window before it is let go, never less. Every tax and income document
+you stored becomes an entry of its own in **Stored tax & income
+documents** on the Import page: figures saved before the list existed
+are listed as *Stored earlier, date not kept* (a tax return's as one row
+per year), and no figure changes. And each receipt gains a record of
+which slip it is, including a fingerprint of its image. **Adding that
+fingerprint rewrites the whole receipts table, images included**: while
+it runs nothing can read or write a receipt, it takes roughly 0.6 s per
+100 MB of stored receipts, and it needs free disk of about the table's
+size again until it finishes (`pg_total_relation_size('receipts')` in
+psql gives the size). It waits for any read of receipts already running
+(an export, say) to finish first, and receipts requests wait behind it
+meanwhile, so on a large table start the upgrade when nobody is
+downloading an export. Existing
+receipts are sorted into slips, oldest first, when the worker first
+starts on the new code; until it has, a photo you attached twice can
+briefly count twice.
+
+One more gives every bill an identity that a rename keeps. Each stored
+bill draws its own, once: the bills table's rows are rewritten once,
+briefly (the table is small), and a bill saved while that runs waits
+for it and then lands. A closed month frozen before the upgrade
+names its bills by the names they had then, and is matched to them by
+those names and due dates as before; every month frozen after it
+follows a bill through a rename. In such an older month a bill created
+later with the same name and due date can be read on the Year as the
+one that month planned: the Year's total still equals its plan, but its
+Not paid and Under plan rows can be wrong until that month ages out of
+the Year. Restoring an older backup gives
+each of its bills a new identity the same way.
+
+Another records the day each bill is set up from now on, so a yearly
+envelope set up during the year counts that year's spending at its
+merchant from the month it was set up. The column is added without
+rewriting the bills table; the bills you already have read as having
+no such day and count from January 1, as before. Restoring an older
+backup leaves its bills without a day the same way. A bill saved by an
+install older than this upgrade, while it still runs against the
+upgraded database, is dated with the database's own day, which is UTC:
+saved late in the evening west of UTC it is dated tomorrow, and the
+pool is then left out of the plan for the rest of your day. Only a pool
+set up after the upgrade reads differently: spending at its merchant
+before the month it was set up no longer counts against it, and on a
+day before it was set up it is not in the plan yet — the cash
+timeline's look back at your spending reads those earlier days without
+it too; every pool you had before the upgrade reads as it did. On Today, Budget
+and the Month and Year views, envelopes then show as their own row
+under Bills, and the Bills row counts the bills that have a due date;
+the plan, the verdict and the excess read as before.
+
+One more lets a Plaid sign-in connect several banks in one go. It adds a
+small table for the household's Plaid user (made the first time you link
+a bank after the upgrade, under whichever Plaid keys the household uses)
+and a few columns on the link sessions, rewriting nothing. A sign-in still
+open across the upgrade finishes at its first bank, as before. The Plaid
+user is not part of an export and is not restored: a household restored
+on another instance gets a new one when it next links a bank. To keep
+one bank per sign-in, set `OIKONOME_PLAID_MULTI_ITEM=0`.
+
+The image installs only the committed, hash-checked resolution of the
+server's dependencies (`server/requirements.txt`) and then the product
+itself without resolving anything, so an upgrade moves a dependency only
+when a release moves that file. An operator's add-on in `extras/` is
+installed under the same pins: ship it with its own hash-checked
+`extras/requirements.txt`, or its dependencies resolve against the
+product's versions, and a build whose add-on needs a different version of
+a pinned package stops. A source checkout outside the containers updates
+with `make sync` after a pull (see DEVELOPMENT.md).
+
 The weekly report email no longer exists: a household that had it
 switched on simply stops receiving it, and the daily, monthly and yearly
 emails carry on as set. A hosted instance (`OIKONOME_HOSTED=1`) with no
@@ -630,6 +756,16 @@ a message naming the version it found. `OIKONOME_DB_NAME` may use letters,
 digits, `_` and `-` (at most 63 characters), and the name is used exactly
 as written, upper case included — `restore` and `reset` drop and recreate
 that database by that exact name and refuse any other spelling.
+`POSTGRES_PASSWORD` is the provider admin password exactly as issued —
+characters such as `/`, `@`, `%`, `#` or `:` need no URL-encoding, because
+it reaches the database clients as `PGPASSWORD`, never inside a connection
+URL. If you percent-encoded it to get it through the connection URL an
+earlier release built, write it back exactly as issued before you upgrade:
+the encoded text would now be sent as the password itself, and the
+migrate step, backups and restores would fail to sign in. Wrap the value
+in single quotes in `docker/.env` (`POSTGRES_PASSWORD='as issued'`):
+compose reads a `$` in an unquoted or double-quoted value as the start of
+a variable, and only a single-quoted value is taken literally.
 
 ## Backups
 
@@ -653,7 +789,10 @@ instead of leaving you empty; if that snapshot can't be taken and the
 database has data, the restore refuses to proceed), swaps the database in
 place, and then checks the restored database really has your tables and
 accounts rather than trusting that nothing errored. If the app then does
-not come back up on it, the restore loads its snapshot back.
+not come back up on it, the restore loads its snapshot back. A dump
+taken from a managed Postgres service restores too: the column options
+such a service stamps on its own tables, which a stock Postgres refuses,
+are left out of the load and nothing else is.
 
 Backups live **inside the install folder** by default — the whole install
 stays one self-contained directory. Because of that, `./oikonome.sh

@@ -139,10 +139,102 @@ def _sweep_only_brokerage_cash(conn):
 
 
 def _feed_that_stopped(conn):
-    # checking stops after June 2025; the card carries on. The rest of 2025
-    # still has bank rows that year, and 2026 has none: unknown
+    # checking stops after June 2025; the card carries on into 2026, so
+    # the rest of the ledger has long moved past the feed: every month
+    # after June is a hole, and 2025 and 2026 both have unknown income
     _monthly(conn, dt.date(2025, 1, 2), dt.date(2025, 6, 2), _pay, day=2)
     _monthly(conn, dt.date(2025, 1, 9), dt.date(2026, 3, 9), _spend)
+
+
+def _checking_with_a_hole_inside_the_year(conn):
+    # checking posts Jan-Mar and again from July; nothing in Apr-Jun while
+    # the card keeps spending: those three months are a missing feed, not
+    # three months of $0 pay
+    _monthly(conn, dt.date(2024, 1, 2), dt.date(2024, 3, 2), _pay, day=2)
+    _monthly(conn, dt.date(2024, 7, 3), dt.date(2024, 11, 3), _pay, day=3)
+    _monthly(conn, dt.date(2024, 1, 9), dt.date(2024, 12, 9), _spend)
+
+
+def _checking_with_a_hole_across_new_year(conn):
+    _monthly(conn, dt.date(2024, 1, 2), dt.date(2024, 10, 2), _pay, day=2)
+    _monthly(conn, dt.date(2025, 3, 3), dt.date(2025, 6, 3), _pay, day=3)
+    _monthly(conn, dt.date(2024, 1, 9), dt.date(2025, 6, 9), _spend)
+
+
+def _second_bank_account_posts_through_the_hole(conn):
+    # the paycheck account misses Mar-Apr; a second checking account the
+    # household also uses posts every month, so its rows were on file
+    conn.execute(
+        "INSERT INTO accounts (id, item_id, name, type, subtype) VALUES "
+        "('chk2', 'it1', 'Second Checking', 'depository', 'checking')")
+    for m in (1, 2, 5, 6):
+        _pay(conn, dt.date(2025, m, 2))
+    _monthly(conn, dt.date(2025, 1, 6), dt.date(2025, 6, 6),
+             lambda c, d: add_txn(c, d, 40.0, "LAKESIDE WATER WORKS",
+                                  primary="RENT_AND_UTILITIES",
+                                  account="chk2"))
+    _monthly(conn, dt.date(2025, 1, 9), dt.date(2025, 6, 9), _spend)
+
+
+def _dormant_savings_beside_continuous_checking(conn):
+    # a savings account with one row years back, then nothing: its quiet
+    # months say nothing about whether checking was on file
+    conn.execute(
+        "INSERT INTO accounts (id, item_id, name, type, subtype) VALUES "
+        "('sav', 'it1', 'Spare Savings', 'depository', 'savings')")
+    add_txn(conn, dt.date(2024, 2, 5), -1.0, "INTEREST CREDIT",
+            primary="INCOME", detailed="INCOME_INTEREST_EARNED",
+            account="sav")
+    _monthly(conn, dt.date(2024, 2, 2), dt.date(2025, 5, 2), _pay, day=2)
+    _monthly(conn, dt.date(2024, 2, 9), dt.date(2025, 5, 9), _spend)
+
+
+def _a_quiet_month_with_one_row(conn):
+    _pay(conn, dt.date(2025, 1, 2))
+    # February's only checking row is a small charge: the feed was on file
+    add_txn(conn, dt.date(2025, 2, 20), 7.0, "PAPER STATEMENT CHARGE",
+            primary="BANK_FEES", account="chk")
+    _pay(conn, dt.date(2025, 3, 2))
+    _monthly(conn, dt.date(2025, 1, 9), dt.date(2025, 3, 9), _spend)
+
+
+def _one_stray_old_row_on_a_savings_account(conn):
+    # a savings statement once imported a single row from 2019; checking
+    # is on file from 2025. The years between have no bank row at all, so
+    # they are holes, not years of $0 pay
+    conn.execute(
+        "INSERT INTO accounts (id, item_id, name, type, subtype) VALUES "
+        "('sav', 'it1', 'Spare Savings', 'depository', 'savings')")
+    add_txn(conn, dt.date(2019, 6, 3), -1.0, "INTEREST CREDIT",
+            primary="INCOME", detailed="INCOME_INTEREST_EARNED",
+            account="sav")
+    _monthly(conn, dt.date(2025, 1, 2), dt.date(2025, 5, 2), _pay, day=2)
+    _monthly(conn, dt.date(2024, 6, 9), dt.date(2025, 5, 9), _spend)
+
+
+def _checking_link_broke_last_month(conn):
+    # the checking link breaks after a Sep 24 row; the card keeps posting
+    # through Nov 9. On Nov 10 October is over with no checking row at all
+    # while the card posted: the feed is not catching up, it has stopped
+    _monthly(conn, dt.date(2026, 6, 2), dt.date(2026, 9, 2), _pay, day=2)
+    add_txn(conn, dt.date(2026, 9, 24), 40.0, "CARD AUTOPAY",
+            primary="TRANSFER_OUT", account="chk")
+    _monthly(conn, dt.date(2026, 6, 9), dt.date(2026, 11, 9), _spend)
+
+
+def _paycheck_not_yet_posted_on_the_last_day(conn):
+    _monthly(conn, dt.date(2025, 1, 2), dt.date(2025, 5, 2), _pay, day=2)
+    _monthly(conn, dt.date(2025, 1, 9), dt.date(2025, 6, 9), _spend)
+
+
+def _last_months_rows_not_landed_on_the_first(conn):
+    _monthly(conn, dt.date(2025, 1, 2), dt.date(2025, 4, 2), _pay, day=2)
+    _monthly(conn, dt.date(2025, 1, 9), dt.date(2025, 5, 9), _spend)
+
+
+def _new_year_before_anything_posts(conn):
+    _monthly(conn, dt.date(2025, 1, 2), dt.date(2025, 12, 2), _pay, day=2)
+    _monthly(conn, dt.date(2025, 1, 9), dt.date(2025, 12, 9), _spend)
 
 
 def _managed_account_funded_before_its_buys(conn):
@@ -243,11 +335,95 @@ SHAPES = [
          flow_all=("2025-04-01", False)),
     dict(name="a bank feed that stopped",
          seed=_feed_that_stopped, today=dt.date(2026, 4, 10),
-         income=({"2025"}, "2025-01"), known=["2025-01", "2025-09"],
-         unknown=["2026-01", "2026-03"], known_years=["2025"],
-         unknown_years=["2026"],
+         income=({"2025"}, "2025-01"),
+         known=["2025-01", "2025-06"],
+         unknown=["2025-07", "2025-08", "2025-09", "2026-01", "2026-03"],
+         unknown_years=["2025", "2026"],
          prev_range="1m", prev={"spend": True, "income": True},
          flow_all=("2025-01-01", False)),
+    dict(name="one stray old savings row years before the checking feed",
+         seed=_one_stray_old_row_on_a_savings_account,
+         today=dt.date(2025, 5, 20),
+         income=({"2019", "2025"}, "2019-06"),
+         known=["2019-06", "2025-01", "2025-05"],
+         unknown=["2019-09", "2022-03", "2024-08", "2024-12"],
+         unknown_years=["2019", "2022", "2024"], known_years=["2025"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         # 'All' opens with the card in Jun 2024; its months before the
+         # checking feed are left out of the picture on both sides
+         flow_all=("2024-06-01", False),
+         flow_gaps=["2024-06", "2024-07", "2024-08", "2024-09", "2024-10",
+                    "2024-11", "2024-12"]),
+    dict(name="a checking link that broke the month before last",
+         seed=_checking_link_broke_last_month, today=dt.date(2026, 11, 10),
+         income=({"2026"}, "2026-06"), known=["2026-06", "2026-09"],
+         unknown=["2026-10", "2026-11"], unknown_years=["2026"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2026-06-01", False), flow_gaps=["2026-10"]),
+    dict(name="the last day of a month whose checking has not posted yet",
+         seed=_paycheck_not_yet_posted_on_the_last_day,
+         today=dt.date(2025, 6, 30),
+         income=({"2025"}, "2025-01"), known=["2025-05", "2025-06"],
+         unknown=[], known_years=["2025"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2025-01-01", False), flow_gaps=[]),
+    dict(name="the 1st, with last month's checking rows not landed yet",
+         seed=_last_months_rows_not_landed_on_the_first,
+         today=dt.date(2025, 6, 1),
+         income=({"2025"}, "2025-01"),
+         known=["2025-04", "2025-05", "2025-06"], unknown=[],
+         known_years=["2025"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2025-01-01", False), flow_gaps=[]),
+    dict(name="New Year's Day before anything has posted",
+         seed=_new_year_before_anything_posts, today=dt.date(2026, 1, 1),
+         income=({"2025"}, "2025-01"), known=["2025-12", "2026-01"],
+         unknown=[], known_years=["2025", "2026"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2025-01-01", False), flow_gaps=[]),
+    dict(name="checking with a three-month hole inside the year",
+         seed=_checking_with_a_hole_inside_the_year,
+         today=dt.date(2024, 12, 20),
+         income=({"2024"}, "2024-01"),
+         known=["2024-01", "2024-03", "2024-07", "2024-11", "2024-12"],
+         unknown=["2024-04", "2024-05", "2024-06"],
+         unknown_years=["2024"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2024-01-01", False), flow_gaps=["2024-04", "2024-05",
+                                                    "2024-06"]),
+    dict(name="checking with a hole across the new year",
+         seed=_checking_with_a_hole_across_new_year,
+         today=dt.date(2025, 7, 10),
+         income=({"2024", "2025"}, "2024-01"),
+         known=["2024-10", "2025-03", "2025-06"],
+         unknown=["2024-11", "2024-12", "2025-01", "2025-02"],
+         unknown_years=["2024", "2025"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2024-01-01", False),
+         flow_gaps=["2024-11", "2024-12", "2025-01", "2025-02"]),
+    dict(name="a second checking account posts through the paycheck hole",
+         seed=_second_bank_account_posts_through_the_hole,
+         today=dt.date(2025, 7, 10),
+         income=({"2025"}, "2025-01"),
+         known=["2025-01", "2025-03", "2025-04", "2025-06"], unknown=[],
+         known_years=["2025"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2025-01-01", False), flow_gaps=[]),
+    dict(name="a dormant savings account beside continuous checking",
+         seed=_dormant_savings_beside_continuous_checking,
+         today=dt.date(2025, 5, 20),
+         income=({"2024", "2025"}, "2024-02"),
+         known=["2024-02", "2024-08", "2025-01", "2025-05"],
+         unknown=["2024-01"], known_years=["2025"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2024-02-01", False), flow_gaps=[]),
+    dict(name="a quiet month whose only checking row is a fee",
+         seed=_a_quiet_month_with_one_row, today=dt.date(2025, 3, 20),
+         income=({"2025"}, "2025-01"),
+         known=["2025-01", "2025-02", "2025-03"], unknown=[],
+         known_years=["2025"],
+         prev_range="1m", prev={"spend": True, "income": True},
+         flow_all=("2025-01-01", False), flow_gaps=[]),
     dict(name="managed account funded Jun 1, first buy Jun 5",
          seed=_managed_account_funded_before_its_buys,
          today=dt.date(2025, 12, 31),
@@ -308,20 +484,67 @@ class MeasuredWindowFeedShapes(unittest.TestCase):
         line = reporting._cumulative_savings(conn)
         for y, want in ([(k, True) for k in shape.get("known_years", [])]
                         + [(k, False) for k in shape.get("unknown_years", [])]):
-            self.assertEqual(cov.year_known(int(y)), want, f"lens year {y}")
+            # a year the shape calls known is measured in every month so
+            # far; one it calls unknown has a month that is not
+            upto = min(f"{y}-12", today.strftime("%Y-%m"))
+            every = all(cov.month_known(f"{y}-{mo:02d}")
+                        for mo in range(1, 13) if f"{y}-{mo:02d}" <= upto)
+            self.assertEqual(every, want, f"lens year {y}")
             if y in saved:
-                self.assertEqual(saved[y][1] is not None, want,
+                # Cash Flow judges by the month: a year has a saved figure
+                # exactly when one of its months is measured, and a note
+                # exactly when one is not
+                known_n, total_n = cf["savings_by_year_months"][y]
+                self.assertEqual(saved[y][3] is not None, known_n > 0,
                                  f"Cash Flow year {y}")
+                self.assertEqual(y in cf["savings_by_year_notes"],
+                                 known_n < total_n, f"Cash Flow note {y}")
+                if want:
+                    # a year the lens calls known is measured in every
+                    # month, so Cash Flow saves over all of them
+                    self.assertEqual(known_n, total_n,
+                                     f"Cash Flow year {y} months")
             i = next((n for n, (yy, _v) in enumerate(line) if yy == y), None)
-            if i is not None and not want:
+            # the cumulative line holds flat through a year with no
+            # measured month; a partly measured one adds those months
+            if (i is not None and y in saved
+                    and cf["savings_by_year_months"][y][0] == 0):
                 before = line[i - 1][1] if i else 0.0
                 self.assertEqual(line[i][1], before,
                                  f"cumulative savings flat through {y}")
-        # the flow picture's "All" starts at the first measured month
-        frm, unknown = shape["flow_all"]
+        # every Cash Flow tab reads ONE window: "All" opens at the same
+        # month on the Overview and Income, and inside it each unknown
+        # month is counted and marked incomplete, each known one is not.
+        # Spending's "All" opens where its /mo divides from: the shared
+        # start, or its first counted charge's month when that is later
+        _frm, unknown = shape["flow_all"]
         fb = reporting.flow_breakdown(conn, today, "all")
-        self.assertEqual(fb["from"], frm, "flow picture start")
+        sw = reporting.spending_window(conn, today, "all")
+        iw = reporting.income_window(conn, today, "all")
+        self.assertEqual(
+            sw["from"],
+            coverage.window(conn).pace_start(
+                dt.date.fromisoformat(fb["from"]),
+                coverage.SPEND).isoformat(), "flow vs spending start")
+        self.assertEqual(fb["from"], iw["from"], "flow vs income start")
+        self.assertEqual(fb["incomplete_months"], iw["incomplete_months"],
+                         "flow vs income incomplete months")
         self.assertEqual(fb["income_unknown"], unknown, "flow picture income")
+        marked = set(fb["incomplete_months"])
+        for k in shape["known"]:
+            self.assertNotIn(k, marked, f"known month {k} marked")
+        for k in shape["unknown"]:
+            if fb["from"][:7] <= k <= fb["to"][:7]:
+                self.assertIn(k, marked, f"unknown month {k} not marked")
+        if "flow_gaps" in shape:
+            frm = shape["flow_all"][0]
+            # through the last whole month, so the open one never counts
+            first = dt.date.fromisoformat(frm)
+            last = today.replace(day=1) - dt.timedelta(days=1)
+            cut = coverage.window(conn).clip(first, last,
+                                             last + dt.timedelta(days=1))
+            self.assertEqual(list(cut.gap_months), shape["flow_gaps"],
+                             "clip gap months")
         # the previous window, on both tabs
         rk = shape["prev_range"]
         sp = reporting.spending_window(conn, today, rk)
@@ -349,6 +572,30 @@ class MeasuredWindowFeedShapes(unittest.TestCase):
             y, want = shape["fee"]
             est = reporting._managed_fee_by_year(conn, ["rba"], 0.0025, today)
             self.assertAlmostEqual(est[y], want, delta=0.01)
+
+
+class AStrayFutureRowIsNotTimeThatPassed(unittest.TestCase):
+    """The ledger's latest month is bounded by the present: one row dated
+    a year ahead (a typo in an import) must not make the month in
+    progress, whose checking rows have not posted yet, a feed hole."""
+
+    def test_the_month_in_progress_stays_measured(self):
+        conn = make_db()
+        self.addCleanup(conn.close)
+        write_config(conn)
+        cur = dt.date.today().replace(day=1)
+        prev = (cur - dt.timedelta(days=1)).replace(day=1)
+        start = (prev - dt.timedelta(days=150)).replace(day=1)
+        _monthly(conn, start, prev, _pay, day=2)
+        _monthly(conn, start, prev, _spend, day=9)
+        _spend(conn, cur)
+        _spend(conn, cur + dt.timedelta(days=400))
+        conn.commit()
+        conn._memo = None
+        w = coverage.window(conn)
+        self.assertTrue(w.month_known(prev.strftime("%Y-%m")))
+        self.assertTrue(w.month_known(cur.strftime("%Y-%m")),
+                        "the month in progress before its checking posts")
 
 
 class PostingAllowance(unittest.TestCase):

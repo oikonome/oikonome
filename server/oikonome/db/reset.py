@@ -180,7 +180,8 @@ def reset_tenant_data(tenant_id) -> ResetResult:
             plaid_links.refuse_open_adds(admin, tenant_id, RESET_REFUSAL)
             admin.execute(
                 "DELETE FROM plaid_link_sessions WHERE tenant=%s "
-                "AND NOT (kind='add' AND done_at IS NULL)",
+                "AND NOT (kind='add' AND (done_at IS NULL "
+                f"OR ({plaid_links.ACCEPTING_SQL})))",
                 (str(tenant_id),))
         finally:
             # session-level, so it must not be left to the connection's close

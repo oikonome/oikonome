@@ -120,7 +120,7 @@ class YearMailContextTests(unittest.TestCase):
         self.assertEqual((rows["Dog walker"]["actual_text"],
                           rows["Dog walker"]["plan_text"]),
                          ("$14,400", "$18,000"))
-        self.assertIn("$3,600 of the cap left", rows["Dog walker"]["note"])
+        self.assertIn("monthly pool · $3,600 left", rows["Dog walker"]["note"])
 
     def test_the_pie_is_the_years_everyday_spend_with_the_bills_by_kind(self):
         # no bill categories in the fixture: the bills stay one slice,

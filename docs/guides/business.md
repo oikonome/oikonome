@@ -88,7 +88,21 @@ a member marked **this is us**, the page also shows that member's own
 capital account: the contributions, draws and distributions recorded
 against them, plus their ownership share of the retained earnings.
 Movements that name no member are split by ownership, so a sole owner's
-account is the whole capital account. A
+account is the whole capital account. A business cost paid on a personal
+card or account counts as money you put in: unless a contribution or a
+reimbursement is already recorded for it, it joins the contributions by
+itself, and the page says how much of them is costs paid personally.
+Nothing is written for it — delete the charge, move it back to the
+household or record a reimbursement, and it drops out again.
+
+Money you move between your own accounts and the business's — a transfer
+into the business checking, or out of it to you — is not business income
+or expense. The Books list leaves it out; Owner equity lists it under
+**Money you moved in or out**, each row with a one-tap **Record as a
+contribution** or **Record as a draw** at the row's own amount and date
+(or *recorded as a …* once it is). A transfer between two of the
+business's own accounts, and paying the business card, are neither
+income nor expense either. A
 business cost you paid personally can be **capitalized** (recorded as a
 contribution) or **reimbursed** (the business owes you back) — both keep
 the books straight. Do it right from the **Transactions page**: open any
@@ -130,20 +144,32 @@ Each business transaction sorts into one of three buckets:
 The **Review** tab is the **Schedule C review** queue: every business
 transaction without a line yet, with a suggested bucket and line you
 accept or override one row at a time; it says "Nothing to review" when
-the books are caught up. An operating expense's line can also be picked
+the books are caught up. A suggested line comes from your own earlier
+line for the same merchant in this business (marked **learned**) or,
+failing that, from the kind of business the merchant is — its card-network
+merchant code when the bank sends one, else words in its name or website —
+with the kind named on the badge ("software and hosting"). The bank's own
+category never suggests a line; with neither source, there is no
+suggestion. An operating expense's line can also be picked
 on its row in the Books list, and a row that already has a line keeps
 the picker there: choose another line to change it, or **clear line**
 to take it off (an operating row returns to the review queue).
 
 The **P&L** shows revenue versus categorized expenses, the equity
-summary, and a CSV export your CPA can consume. A refund from a vendor
+summary, and a CSV export your CPA can consume. Its operating lines are
+Schedule C lines only: an operating cost with no line yet is summed under
+**Uncategorized — needs a line**, never under a bank category. In the
+ledger CSV every row's Schedule C column says what the row is — its line,
+*Organizational cost (§248)* or *Start-up cost (§195)* for a capitalized
+cost (never its line as well, so it cannot be deducted twice), or words
+such as *Owner contribution* or *Transfer between business accounts*. A refund from a vendor
 reduces that vendor's expense rather than counting as revenue, and the
 CSVs carry the net amounts. A charge a client or the household paid back
 through a reimbursement link counts only for what was not repaid.
 Income and self-employment tax paid out of a business account (and a
 refund of it) is the **owner's**, not a business expense, so it stays
-off the P&L and out of the 1099 list; the P&L reports it separately as
-**estimated tax paid** toward the year (a January payment counts toward
+off the P&L and out of the 1099 list; it counts instead as estimates
+**paid** on the Tax tab's Set aside card (a January payment counts toward
 the year before, since the fourth estimate falls due then). Give such a
 payment a Schedule C line yourself if it really is a business tax. These figures are
 informational — Oikonome categorizes and exports; your CPA decides the
@@ -158,13 +184,30 @@ For freelancers and single-member LLCs, the pieces QuickBooks Self-Employed
 is known for — kept lean:
 
 - **Estimated taxes** — from your net profit the app estimates self-employment
-  tax (Social Security capped at the wage base; nothing at all when net
+  tax (Social Security capped at the wage base, less the W-2 Social
+  Security wages — box 3 — of the person the business belongs to (only
+  a spouse's W-2 is counted: a W-2 under the primary earner may have
+  been filed there by an older app without asking, so it is not counted
+  and the line says so). Set
+  **Whose business** (Primary earner, Spouse or Not set) in the business's
+  **Edit details**; for a partnership it is the person who is the member
+  marked **this is us**. Only the year's own W-2 counts: it arrives the
+  next January, so during the year no W-2 wages are counted and the line
+  under the SE tax says the estimate may be high until that W-2 is added
+  (an earlier year's W-2 is never used — a job may have ended). Until the
+  setting is made, no W-2 wages are counted either, and the line says
+  so. The line also says when the same W-2 was stored
+  twice (W-2s with the same box 1 and no EIN telling them apart count
+  once), a W-2's box 3 was not read, a W-2 is not marked
+  whose, a partnership's shares are incomplete or no member is marked, or
+  another business is set as the same person (they are not combined);
+  nothing at all when net
   self-employment earnings are under $400) and, if you set an assumed
   income-tax rate, income tax; in the year the business began, the
   start-up and organizational deduction comes off net profit first, and
-  the equation shows it; gives you a **quarterly set-aside** number;
-  and — only once that rate is set — adds the next 1040-ES deadline to
-  your compliance calendar (and its `.ics`).
+  the equation names it (organizational costs, start-up costs, or both);
+  a year that ends in a loss says whose return the loss goes on; and it
+  gives you a **quarterly set-aside** number.
 - **Set aside for tax** — the card at the top of the **Tax** tab puts the
   year's estimate beside the cash that covers it and says **Covered by**
   or **Short by**. An account hidden on the Accounts page, or the second
@@ -179,17 +222,24 @@ is known for — kept lean:
   to pay. A prior-year balance paid in April can't be told apart from
   that day's first estimate, so it counts as paid here.
 - **Year-end package** — pick the tax year beside the heading, then one
-  **Download package** button on the Tax tab zips the P&L, the ledger with Schedule C lines, the balance sheet, the
+  **Download 2025 package** button (it names the year you picked) on the Tax tab zips the P&L, the ledger with Schedule C lines, the balance sheet, the
   1099 vendor totals and the mileage log for your accountant. From
   January through April the year picker opens on last year, the return
-  being filed; the 1099 list below follows the same year.
+  being filed; the 1099 list below follows the same year. A package is
+  always one tax year's, every file in it: fetched with no year named,
+  it is the current year's.
 - **Mileage** — log trips; the IRS standard rate in force on each trip's
   date turns them into a Schedule C car-expense deduction (2026 has two
   rates, 72.5¢ through June 30 and 76¢ from July 1, so a year's summary
   lists each rate with its miles).
 - **Home office** — the simplified method ($5/sq ft, up to 300).
 - **Balance sheet** — a plain snapshot of business assets minus liabilities
-  next to your capital account (not double-entry books).
+  next to your capital account (not double-entry books). Under it, a few
+  sentences say why the two differ: the part of capital that is costs
+  paid personally, owner money moved in or out not yet recorded as a
+  contribution or draw, and what the books cannot see (balances from
+  before the ledger begins, money moved outside the linked accounts).
+  `balance-sheet.csv` carries the same sentences.
 - **1099 contractors** — mark who's a contractor; anyone you paid at least
   that year's IRS reporting threshold gets flagged as needing a 1099-NEC —
   $600 for payments made through 2025, $2,000 from 2026 (the panel states
@@ -214,5 +264,13 @@ Upcoming filing deadlines with reminders and an **.ics** download for
 your calendar. For the three states in the built-in table the LLC
 annual-report deadline is derived from the entity's state and formation
 date — the last day of the anniversary
-month; add another state's deadline, or any other obligation (a franchise
-tax, a federal filing), by hand.
+month. Beside it the calendar lists the federal dates for the entity's
+structure: the next quarterly estimated-tax payment (1040-ES), the
+1099-NEC filing on January 31 when the business paid any vendor at least
+the 1099-NEC amount the year before, and the annual return — Schedule C
+with the owner's 1040 (April 15) for a sole proprietor or single-member
+LLC, Form 1065 (March 15) for a multi-member LLC, Form
+1120-S (March 15) for an S corporation. A federal date on a weekend or a
+federal holiday moves to the next business day. Add another state's
+deadline, or any other obligation (a franchise tax), by hand. An archived
+business owes no future derived dates; the ones you added stay listed.

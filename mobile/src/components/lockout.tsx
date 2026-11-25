@@ -22,15 +22,15 @@ export function Lockout({ title, body, action, onOut }: {
         {body}
       </Text>
       {action && (
-        <Pressable onPress={action.onPress}
-                   style={{ backgroundColor: C.accent, borderRadius: 8,
+        <Pressable accessibilityRole="button" onPress={action.onPress}
+                   style={{ backgroundColor: C.btn, borderRadius: 8,
                             paddingVertical: 11, alignItems: "center" }}>
-          <Text style={{ color: "#04121d", fontWeight: "700" }}>
+          <Text style={{ color: C.text, fontWeight: "700" }}>
             {action.label}
           </Text>
         </Pressable>
       )}
-      <Pressable onPress={onOut}
+      <Pressable accessibilityRole="button" onPress={onOut}
                  style={{ backgroundColor: C.hover, borderRadius: 8,
                           paddingVertical: 10, alignItems: "center" }}>
         <Text style={{ color: C.mut, fontWeight: "600" }}>Sign out</Text>

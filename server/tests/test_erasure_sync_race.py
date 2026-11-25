@@ -305,7 +305,8 @@ class LockKeyContractTests(unittest.TestCase):
                           f"{name} does not wait for the tenant's writers")
         self.assertEqual(erasure.writer_lock_keys("T"),
                          ["oikonome:sync:T", "oikonome:sync-categorize:T",
-                          "oikonome:nightly:T", "oikonome:email:T",
+                          "oikonome:nightly:T", "oikonome:forecast:T",
+                          "oikonome:email:T",
                           "oikonome:snapshot:T", "oikonome:script-alert:T",
                           "oikonome:bills-detect:T", "oikonome:push:T"])
         # and each writer really holds the key the erasure waits on

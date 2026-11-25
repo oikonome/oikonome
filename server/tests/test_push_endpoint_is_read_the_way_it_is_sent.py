@@ -85,6 +85,13 @@ class SubscribeAndSendTests(unittest.TestCase):
             admin.close()
 
     def tearDown(self):
+        # a test here may store a signing key sealed under a master key
+        # nobody keeps; leave the singleton empty for the suites after
+        admin = tenancy.admin_connect()
+        try:
+            admin.execute("DELETE FROM push_vapid")
+        finally:
+            admin.close()
         if self._prev_mk is not None:
             os.environ["OIKONOME_MASTER_KEY"] = self._prev_mk
 

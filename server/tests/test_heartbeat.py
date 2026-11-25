@@ -243,6 +243,10 @@ class AccountsFreshnessTests(unittest.TestCase):
         self.assertIn("it1", heartbeat.revoked_tokens(self.conn))
         kinds = [a["kind"] for a in alerts.freshness(self.conn)]
         self.assertIn("collector-token-revoked", kinds)
+        # the collector is named as a name, capitalised
+        (said,) = [a["message"] for a in alerts.freshness(self.conn)
+                   if a["kind"] == "collector-token-revoked"]
+        self.assertTrue(said.startswith("The It1 collector's "), said)
         self._mint("it1-mirror")
         self.assertIsNone(self._script()["token_revoked_at"])
         self.assertNotIn("it1", heartbeat.revoked_tokens(self.conn))

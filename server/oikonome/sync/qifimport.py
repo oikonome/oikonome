@@ -42,7 +42,7 @@ import re
 
 from ..engine.compat import as_date
 from . import flowmap
-from .base import (FileImportIds, Transaction, check_split_accounts,
+from .base import (FileRowCount, FileImportIds, Transaction, check_split_accounts,
                    drop_before_history, ensure_split_account, held_forms,
                    split_former, tally_split,
                    upsert_transactions)
@@ -254,7 +254,7 @@ def import_qif(conn, account_id: str, text: str,
         by_acct: dict[str, list[dict]] = {}
         for r in rows:
             by_acct.setdefault(r.get("account") or "?", []).append(r)
-        total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
+        total = {"imported": 0, "matched": 0, "rows": 0, "skipped_duplicates": 0,
                  "split_accounts": {}}
         check_split_accounts(by_acct)
         run_ids: dict = {}          # one FileImportIds per target across the run
@@ -274,7 +274,7 @@ def import_qif(conn, account_id: str, text: str,
                                former=split_former("qif", qif_name, target),
                                ids=run_ids.setdefault(
                                    target, FileImportIds("qif", target)))
-            for k in ("imported", "rows", "skipped_duplicates"):
+            for k in ("imported", "matched", "rows", "skipped_duplicates"):
                 total[k] += out[k]
             tally_split(total["split_accounts"], qif_name,
                    out["imported"])
@@ -373,7 +373,9 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
-    added = upsert_transactions(conn, txns)
+    count = FileRowCount(conn, txns)
+    upsert_transactions(conn, txns)
+    added, matched = count.after()
     # never a row this import has just written: that is a cash record
     # whose id happens to equal a share-only record's old one. Read over
     # every row of the file, the ones the history window left out
@@ -382,7 +384,7 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
     no_cash_legacy = [p for p in no_cash_legacy if p[0] not in written]
     if no_cash_legacy:
         _retire_legacy_no_cash(conn, account_id, no_cash_legacy, written)
-    return {"imported": added, "rows": len(txns),
+    return {"imported": added, "matched": matched, "rows": len(txns),
             "skipped_duplicates": skipped_dupes,
             "skipped_older": skipped_older}
 

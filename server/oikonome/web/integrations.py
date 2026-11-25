@@ -43,6 +43,9 @@ from ..engine import budget, links, reporting
 from ..engine.compat import as_date
 from ..notify import webhooks
 from . import data, demoguard, security
+from .schemas import Ok, documented
+from .schemas import integrations as shapes
+from .schemas.access import StepUp
 from .security import limit
 
 router = APIRouter()
@@ -86,6 +89,29 @@ def _r2(v) -> float:
 
 
 # ---- the summary --------------------------------------------------------------
+
+def connection_freshness(conn) -> list[dict]:
+    """Every live connection and how fresh it is: when it last synced
+    without an error, and how many seconds ago that was (None for never)."""
+    conns = []
+    for r in conn.execute(
+            """SELECT i.id, i.institution_name, i.aggregator, i.status,
+                      (SELECT MAX(ran_at) FROM sync_log s
+                        WHERE s.item_id = i.id AND s.error IS NULL) AS last_ok
+                 FROM items i
+                WHERE COALESCE(i.status, '') <> 'archived'
+                ORDER BY i.institution_name""").fetchall():
+        age = None
+        if r["last_ok"] is not None:
+            age = int((dt.datetime.now(dt.timezone.utc) - r["last_ok"])
+                      .total_seconds())
+        conns.append({"id": r["id"], "name": r["institution_name"],
+                      "aggregator": r["aggregator"], "status": r["status"],
+                      "last_sync_at": (r["last_ok"].isoformat()
+                                       if r["last_ok"] else None),
+                      "last_sync_age_seconds": age})
+    return conns
+
 
 def summary(conn, today: dt.date | None = None, *, st: dict | None = None) -> dict:
     """Everything a sensor, a scraper or an assistant wants at a glance.
@@ -146,24 +172,7 @@ def summary(conn, today: dt.date | None = None, *, st: dict | None = None) -> di
             "bill forecast failed while building the summary")
         due, due_ok = [], False
 
-    # connections and how fresh each one is
-    conns = []
-    for r in conn.execute(
-            """SELECT i.id, i.institution_name, i.aggregator, i.status,
-                      (SELECT MAX(ran_at) FROM sync_log s
-                        WHERE s.item_id = i.id AND s.error IS NULL) AS last_ok
-                 FROM items i
-                WHERE COALESCE(i.status, '') <> 'archived'
-                ORDER BY i.institution_name""").fetchall():
-        age = None
-        if r["last_ok"] is not None:
-            age = int((dt.datetime.now(dt.timezone.utc) - r["last_ok"])
-                      .total_seconds())
-        conns.append({"id": r["id"], "name": r["institution_name"],
-                      "aggregator": r["aggregator"], "status": r["status"],
-                      "last_sync_at": (r["last_ok"].isoformat()
-                                       if r["last_ok"] else None),
-                      "last_sync_age_seconds": age})
+    conns = connection_freshness(conn)
 
     # the Transactions page's own counts: a linked card's second copy and
     # a hidden account's rows are not rows of this ledger, so they are not
@@ -198,7 +207,7 @@ def summary(conn, today: dt.date | None = None, *, st: dict | None = None) -> di
             "spent": _r2(day["day_spent"]),
             "by_bucket": {label: {"left": _r2(a["left_today"]),
                                   "allowance": _r2(a["today_allowance"])}
-                          for label, a in day["allow_tiles"]},
+                          for label, a in day["every_tile"]},
         },
         "month": {
             "budget": _r2(month_budget),
@@ -322,6 +331,7 @@ def metrics_text(s: dict) -> str:
 # ---- the read doors ---------------------------------------------------------------
 
 @router.get("/api/integrations/events")
+@documented(response=shapes.IntegrationEvents)
 def events_api(user: dict = Depends(_user())):
     """The webhook event catalogue — what a receiver can subscribe to."""
     return {"events": [{"name": k, "description": v}
@@ -329,6 +339,7 @@ def events_api(user: dict = Depends(_user())):
 
 
 @router.get("/api/integrations/summary", dependencies=_READ_LIMIT)
+@documented(response=shapes.IntegrationSummary)
 def summary_api(user: dict = Depends(_user())):
     conn = _conn(user)
     try:
@@ -348,6 +359,7 @@ def metrics_api(user: dict = Depends(_user())):
 
 
 @router.get("/api/integrations/accounts", dependencies=_QUERY_LIMIT)
+@documented(response=shapes.IntegrationAccounts)
 def accounts_api(user: dict = Depends(_user())):
     conn = _conn(user)
     try:
@@ -391,6 +403,7 @@ def _txn(r) -> dict:
 
 
 @router.get("/api/integrations/transactions", dependencies=_QUERY_LIMIT)
+@documented(response=shapes.IntegrationTransactions)
 def transactions_api(user: dict = Depends(_user()), q: str = "",
                      since: str = "", until: str = "", account: str = "",
                      category: str = "",
@@ -420,6 +433,7 @@ def transactions_api(user: dict = Depends(_user()), q: str = "",
 
 
 @router.get("/api/integrations/spending", dependencies=_QUERY_LIMIT)
+@documented(response=shapes.IntegrationSpending)
 def spending_api(user: dict = Depends(_user()),
                  months: int = Query(3, ge=1, le=SPENDING_MONTHS_MAX)):
     """Spend by category and by month over the last `months` complete
@@ -477,6 +491,7 @@ def spending_api(user: dict = Depends(_user()),
 
 
 @router.get("/api/integrations/bills", dependencies=_QUERY_LIMIT)
+@documented(response=shapes.IntegrationBills)
 def bills_api(user: dict = Depends(_user()),
               days: int = Query(30, ge=1, le=366)):
     """Unpaid bill occurrences due in the next `days` days, and the bill
@@ -513,6 +528,7 @@ def bills_api(user: dict = Depends(_user()),
 
 
 @router.get("/api/integrations/alerts", dependencies=_QUERY_LIMIT)
+@documented(response=shapes.IntegrationAlerts)
 def alerts_api(user: dict = Depends(_user())):
     """Active, undismissed alerts as the Today page shows them."""
     conn = _conn(user)
@@ -531,6 +547,7 @@ def alerts_api(user: dict = Depends(_user())):
 
 
 @router.get("/api/integrations/networth", dependencies=_QUERY_LIMIT)
+@documented(response=shapes.IntegrationNetWorthSeries)
 def networth_api(user: dict = Depends(_user()),
                  months: int = Query(12, ge=1, le=NETWORTH_MONTHS_MAX)):
     """Today's net worth and the recorded nightly series over the last
@@ -572,6 +589,7 @@ def _hook_id(raw) -> str:
 
 
 @router.get("/api/webhooks")
+@documented(response=shapes.Webhooks)
 def webhooks_list_api(user: dict = Depends(_user())):
     _owner_session(user)
     conn = _conn(user)
@@ -589,6 +607,7 @@ def webhooks_list_api(user: dict = Depends(_user())):
 
 
 @router.post("/api/webhooks", dependencies=[Depends(limit("webhooks", 20, 3600))])
+@documented(response=shapes.WebhookWithSecret, body=shapes.WebhookCreate)
 def webhooks_create_api(user: dict = Depends(_user()), body: dict = Body(...)):
     """Create one; the response carries the signing secret exactly once.
     A webhook sends the household's balances and rows to a URL, so it is
@@ -596,7 +615,10 @@ def webhooks_create_api(user: dict = Depends(_user()), body: dict = Body(...)):
     be able to point the ledger at a stranger's server."""
     demoguard.deny_shared_grant(user)
     _owner_session(user)
-    _destination_budget(user)
+    # the step-up first: the clients post once, are refused here and post
+    # again after the sheet, and a refusal must not spend the account's
+    # allowance — only a request that has passed it is counted, before the
+    # hostname lookup the allowance exists to bound
     from .app import _require_elevation, _still_signed_in_under_factor_lock
     _require_elevation(user, password=str(body.get("password") or ""),
                        totp_code=str(body.get("totp_code") or ""),
@@ -609,8 +631,9 @@ def webhooks_create_api(user: dict = Depends(_user()), body: dict = Body(...)):
     # control connection. The write repeats the check there from the
     # answer this one cached.
     try:
-        url = webhooks._check_url(url)
         webhooks.normalize_events(events)
+        _destination_budget(user)
+        url = webhooks._check_url(url)
     except webhooks.WebhookError as e:
         raise HTTPException(400, str(e))
     conn = _conn(user)
@@ -646,6 +669,7 @@ def _destination_budget(user: dict) -> None:
 
 @router.post("/api/webhooks/{hook_id}",
              dependencies=[Depends(limit("webhooks_update", 60, 3600))])
+@documented(response=shapes.Webhook, body=shapes.WebhookUpdate)
 def webhooks_update_api(hook_id: str, user: dict = Depends(_user()),
                         body: dict = Body(...)):
     """Edit: url, events, name, enabled. A new URL is a new destination
@@ -667,11 +691,12 @@ def webhooks_update_api(hook_id: str, user: dict = Depends(_user()),
         # a new or resumed destination is a durable channel, which the
         # shared demonstration login may not open (demoguard)
         demoguard.deny_shared_grant(user)
-        _destination_budget(user)
+        # counted only once the step-up has passed — see webhooks_create_api
         from .app import _require_elevation, _still_signed_in_under_factor_lock
         _require_elevation(user, password=str(body.get("password") or ""),
                            totp_code=str(body.get("totp_code") or ""),
                            recovery_code=str(body.get("recovery_code") or ""))
+        _destination_budget(user)
         if url is not None:
             # resolved now, with nothing held — see webhooks_create_api
             try:
@@ -711,6 +736,7 @@ def _enabled_flag(body: dict) -> bool | None:
 
 
 @router.post("/api/webhooks/{hook_id}/delete")
+@documented(response=Ok)
 def webhooks_delete_api(hook_id: str, user: dict = Depends(_user())):
     demoguard.deny_shared_grant(user)
     _owner_session(user)
@@ -725,6 +751,7 @@ def webhooks_delete_api(hook_id: str, user: dict = Depends(_user())):
 
 
 @router.post("/api/webhooks/{hook_id}/rotate")
+@documented(response=shapes.WebhookWithSecret, body=StepUp)
 def webhooks_rotate_api(hook_id: str, user: dict = Depends(_user()),
                         body: dict = Body(default={})):
     """A fresh signing secret, shown once. Step-up, like creation."""
@@ -748,6 +775,7 @@ def webhooks_rotate_api(hook_id: str, user: dict = Depends(_user()),
 
 @router.post("/api/webhooks/{hook_id}/test",
              dependencies=[Depends(limit("webhooks_test", 30, 3600))])
+@documented(response=shapes.WebhookTested)
 def webhooks_test_api(hook_id: str, user: dict = Depends(_user())):
     """Send a test.ping now and report what the receiver said."""
     demoguard.deny_shared_grant(user)
@@ -776,6 +804,7 @@ def webhooks_test_api(hook_id: str, user: dict = Depends(_user())):
 
 
 @router.get("/api/webhooks/{hook_id}/deliveries")
+@documented(response=shapes.WebhookDeliveries)
 def webhooks_deliveries_api(hook_id: str, user: dict = Depends(_user()),
                             limit_: int = Query(20, alias="limit", ge=1,
                                                 le=100)):

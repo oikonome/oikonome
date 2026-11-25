@@ -401,14 +401,15 @@ class SchedCSuggestTests(unittest.TestCase):
         self.assertEqual("merchant", s[b]["source"],
                          "a prior decision by this entity is the strong source")
 
-    def test_falls_back_to_category_with_a_weaker_source(self):
+    def test_the_bank_category_is_never_a_suggestion(self):
+        """The bank's category says what a row looks like to a consumer;
+        a business's line comes from the vendor's kind or the owner."""
         t = add_txn(self.conn, TODAY, 30.0, "SOME CAFE", account="bizchk",
                     primary="FOOD_AND_DRINK")
         self.conn.commit()
         s = self._suggest()
-        self.assertEqual("Meals", s[t]["suggested_line"])
-        self.assertEqual("category", s[t]["source"],
-                         "a category-derived guess must be marked weak")
+        self.assertIsNone(s[t]["suggested_line"])
+        self.assertIsNone(s[t]["source"])
 
     def test_unknown_merchant_and_category_suggests_nothing(self):
         """Silence beats a confident wrong line on a tax form."""
@@ -534,7 +535,7 @@ class YearEndPackageTests(unittest.TestCase):
         self.assertEqual(row[1:4], ["1500.00", "500.00", "1000.00"])
 
     def test_readme_says_what_this_is_not(self):
-        """Bookkeeping output, not a filed return — and unclassified rows
+        """Bookkeeping output, not a filed return — and rows with no line
         are called out, because they need a decision before filing."""
         import io
         import zipfile
@@ -543,7 +544,7 @@ class YearEndPackageTests(unittest.TestCase):
         z = zipfile.ZipFile(io.BytesIO(r.content))
         readme = z.read("README.txt").decode()
         self.assertIn("NOT tax advice", readme)
-        self.assertIn("Unclassified", readme)
+        self.assertIn("needs a line", readme)
 
     def test_download_filename_survives_a_non_latin_entity_name(self):
         """`_filename_safe` must not keep every Unicode-aware
@@ -609,11 +610,10 @@ class YearEndPackageTests(unittest.TestCase):
         self.assertEqual(404, r.status_code)
 
     def test_pnl_line_keys_are_formula_safe(self):
-        """An unclassified expense's Schedule-C line IS its
-        free-text category_override, used as a dict key and written into
-        profit-and-loss.csv — the one file in the ZIP that skipped
-        _csv_safe while ledger.csv three lines down guarded the same
-        strings. The ZIP is built to be opened by an accountant's Excel."""
+        """An unclassified expense's free-text category_override never
+        becomes a Schedule C line key in profit-and-loss.csv: it is summed
+        under the one "needs a line" key, so the formula never reaches the
+        file an accountant's Excel opens."""
         import io
         import zipfile
         payload = "=cmd|'/c calc.exe'!A1"
@@ -635,5 +635,5 @@ class YearEndPackageTests(unittest.TestCase):
             "profit-and-loss.csv").decode()
         self.assertNotIn("\n" + payload, pnl,
                          "a formula-leading line key reached the CSV raw")
-        self.assertIn("'" + payload, pnl,
-                      "the neutralized (quote-prefixed) key should appear")
+        self.assertNotIn(payload, pnl)
+        self.assertIn("Uncategorized — needs a line,120.00", pnl)

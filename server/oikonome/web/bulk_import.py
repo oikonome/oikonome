@@ -61,7 +61,7 @@ def _name_tokens(s: str) -> set[str]:
 
     Four letters and up, less the generic banking filler — with a fallback
     to the short words when NOTHING survives that. An account whose name is
-    an initialism plus filler ('ING Savings', 'IRA') otherwise matches no
+    an initialism plus filler ('ZZQ Savings', 'IRA') otherwise matches no
     filename at all, so every statement dropped for it silently creates a
     SECOND account beside the real one. The fallback is per string, so a
     name that has a long word still never matches on a short one, and pure
@@ -361,11 +361,18 @@ def _ynab_accounts(data: bytes) -> int:
 
 
 def hold_ledger_write_locks(conn) -> None:
-    """Take, for the rest of the caller's transaction, the two household
-    locks a file import meets on its way through upsert_transactions — the
+    """Take, for the rest of the caller's transaction, the household locks
+    a file import meets — the file-storage lock (an import that cannot
+    finish parks its upload: a CSV awaiting a mapping, a YNAB register of
+    several accounts, a file under a typed new-account name), the
     reimbursement-pairing lock (the waiting-receipt matcher) and the
     merchant-identity lock (the resolver) — BEFORE any account or
     transaction row is written.
+
+    Storage first, because a receipt snap reserves its bytes and then
+    finds its charge under the pairing lock (engine.receipts.add): an
+    import holding pairing that asked for storage only when it parked
+    would wait on that snap while the snap waited on it.
 
     Every other holder takes them before its rows: an edit takes the
     pairing lock and then the row it changes (reanchor.hold_pairing_lock),
@@ -380,16 +387,17 @@ def hold_ledger_write_locks(conn) -> None:
     Callers hold the sync lock and then the push writer lock
     (erasure.WRITER_LOCKS), then this, then rows — the order written down
     beside erasure.WRITER_LOCKS."""
-    from ..engine import merchant_identity
+    from ..engine import merchant_identity, storage_quota
     from ..sync.reanchor import hold_pairing_lock
+    storage_quota.hold_lock(conn)
     hold_pairing_lock(conn)
     merchant_identity._lock_identity(conn)
 
 
 def hold_restore_write_locks(conn) -> None:
     """The locks a full-export restore takes, for the rest of its one
-    transaction, before its first row: the household's file-storage lock,
-    then the two hold_ledger_write_locks takes.
+    transaction, before its first row: the ones hold_ledger_write_locks
+    takes — the household's file-storage lock, then pairing, then identity.
 
     A restore reserves room for every receipt it brings (the storage lock)
     and later re-keys accounts and re-ids rows under the pairing lock and
@@ -397,14 +405,7 @@ def hold_restore_write_locks(conn) -> None:
     takes storage, then pairing, then its row (engine.receipts.add). Asked
     for after the restore's rows, either lock closes a cycle with that
     snap or with any edit holding the pairing lock while it waits on a
-    restored row, and Postgres kills the restore. Storage is only ever
-    locked when a quota is set (storage_quota.reserve), so without one
-    nothing waits on it here either. The key is the one reserve takes."""
-    from ..engine import storage_quota
-    if storage_quota.quota_bytes() is not None:
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtext("
-            "'oikonome:storage:' || current_setting('app.tenant_id')))")
+    restored row, and Postgres kills the restore."""
     hold_ledger_write_locks(conn)
 
 
@@ -1057,7 +1058,10 @@ def _start_restores(tid: str, restore: list[int], staged: dict,
             row["error"] = (f"import failed ({type(e).__name__}) — "
                             f"upload this file again to retry")
         else:
-            if started.get("error"):
+            if started.get("erased"):
+                # nothing to upload again for: the household is going
+                row["error"] = started["error"]
+            elif started.get("error"):
                 # the plan's staged copy is already spent: a refusal here
                 # (busy server, a restore already running) needs the file
                 # uploaded again, not just a retry

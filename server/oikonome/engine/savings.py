@@ -8,13 +8,19 @@ the cash forecast as a scheduled outflow; a 'sweep'-mode plan contributes
 only at month end and only what the month's realized surplus covers, so
 it never reduces the plan surplus and never walks money out of the
 forecast that the month's numbers say cannot leave. The daily verdict
-never sees goals (it stays variable-spend-only). Milestone emails are
-edge-triggered
-(25/50/75/100% and falling off pace for a dated goal), state kept in
-tenant config `savings_goal_state`."""
+never sees goals (it stays variable-spend-only).
+
+A goal with a target and a target date is judged against its schedule,
+the straight line from the day that plan was set to the target on its
+date (`specs/savings-pace.md`): the verdict reads what is saved on each
+day and nothing about how the deposits arrive. Milestone emails are
+edge-triggered (25/50/75/100% and falling off pace for a dated goal);
+their state and each goal's plan are kept in tenant config
+`savings_goal_state`."""
 
 from __future__ import annotations
 
+import calendar
 import datetime as dt
 
 from .. import localtime
@@ -231,49 +237,111 @@ def _matched_where(conn, g: dict, since: dt.date | None,
     return f"WHERE {' AND '.join(where)}" + scope, params + scope_params
 
 
+def _tokens_of(g: dict) -> list[str]:
+    return [str(t).strip().lower() for t in (g.get("tokens") or [])
+            if str(t).strip()]
+
+
+def _siblings(conn, cfg: dict, g: dict, acc: str) -> tuple[list[dict], int]:
+    """The goals reading account `acc` now, in the household's own order,
+    and the position of `g` among them (found by identity, then by name; a
+    goal the config does not carry reads last). Two goals pinned to the two
+    sources of one linked account share it like any other pair."""
+    same = [s for s in goals(cfg) if _goal_account(conn, s) == acc]
+    for i, s in enumerate(same):
+        if s is g:
+            return same, i
+    for i, s in enumerate(same):
+        if str(s.get("name")) == str(g.get("name")):
+            return same, i
+    return same + [g], len(same)
+
+
+def _partition(conn, sibs: list[dict]) -> list[list[tuple]]:
+    """THE allocator of one account's rows among the goals that read it:
+    every contribution row (`_matched_where` without the words) goes to
+    exactly one goal, by row id — the first goal in `sibs` order whose
+    match words all appear in it, else the first goal with no match words,
+    else to none. Returns, per goal in `sibs`, its rows as (id, date,
+    amount). Every figure a goal shows — saved, a window's net, the pace's
+    days, the sweep line's evidence — sums these rows, so goals sharing an
+    account add up to what arrived and no row counts twice whatever words
+    overlap. Asked once per account per checkout."""
+    specs = repr([(str(s.get("account_id")), _tokens_of(s)) for s in sibs])
+    mkey = ("goal_partition", specs)
+    hit = getattr(conn, "memo_get", lambda k: None)(mkey)
+    if hit is not None:
+        return hit
+    # one pool per pinned account (its owner scope); one query in the
+    # usual case of every goal pinned to the same source
+    pools: dict[str, dict] = {}
+    for s in sibs:
+        pin = str(s.get("account_id"))
+        if pin in pools:
+            continue
+        cond, params = _matched_where(
+            conn, {"account_id": s.get("account_id")}, None, None)
+        pools[pin] = {
+            str(r["id"]): (str(r["id"]), as_date(r["d"]), float(r["amount"]),
+                           str(r["text"] or ""))
+            for r in conn.execute(
+                "SELECT t.id AS id, t.date AS d, t.amount AS amount, "
+                "LOWER(COALESCE(t.merchant_name,'') || ' ' || "
+                f"COALESCE(t.name,'')) AS text FROM transactions t {cond}",
+                params).fetchall()}
+    words = [_tokens_of(s) for s in sibs]
+    keep = next((i for i, w in enumerate(words) if not w), None)
+    out: list[list[tuple]] = [[] for _ in sibs]
+    for rid in sorted(set().union(*(p.keys() for p in pools.values()))):
+        owner = None
+        for i, s in enumerate(sibs):
+            row = pools[str(s.get("account_id"))].get(rid)
+            if row and words[i] and all(w in row[3] for w in words[i]):
+                owner = i
+                break
+        if owner is None and keep is not None:
+            if rid in pools[str(sibs[keep].get("account_id"))]:
+                owner = keep
+        if owner is not None:
+            row = pools[str(sibs[owner].get("account_id"))][rid]
+            out[owner].append(row[:3])
+    if hasattr(conn, "memo_put"):
+        from . import budget as _b   # late: avoid a circular import at load
+        conn.memo_put(mkey, out, *_b._LEDGER_TABLES)
+    return out
+
+
+def _own_rows(conn, cfg: dict, g: dict, since: dt.date | None = None,
+              until: dt.date | None = None) -> list[tuple] | None:
+    """The rows `_partition` gives `g`, as (id, date, amount), inside the
+    window; None for a goal with no account (it is never partitioned)."""
+    acc = _goal_account(conn, g)
+    if not acc:
+        return None
+    sibs, i = _siblings(conn, cfg, g, acc)
+    return [r for r in _partition(conn, sibs)[i]
+            if (since is None or r[1] >= since)
+            and (until is None or r[1] <= until)]
+
+
+def goal_row_ids(conn, cfg: dict, g: dict, since: dt.date | None = None,
+                 until: dt.date | None = None) -> set[str]:
+    """The ids of the rows a goal counts (see `_partition`)."""
+    return {r[0] for r in (_own_rows(conn, cfg, g, since, until) or [])}
+
+
 def matched_net(conn, cfg: dict, g: dict, since: dt.date | None = None,
                 until: dt.date | None = None) -> float:
-    """sibling-aware `_matched_net`. A token-scoped goal keeps
-    its own carve-out. A token-LESS goal sharing its destination account
-    with other goals would otherwise claim the account's ENTIRE transfer
-    net — every sibling counting the same dollars, MTD savings N×. The
-    account's un-tokened remainder (total minus tokened siblings' nets)
-    goes to the FIRST token-less goal in config order; later token-less
-    siblings read 0 (first-claim partition — deterministic, never
-    double-counts; give later goals tokens to scope them properly)."""
-    part = _net_parts(conn, cfg, g)
-    if part is None:
-        return 0.0                       # a sibling already claimed it
-    own, carved = part
-    if not carved and own is g:
+    """A goal's net contributions over the window: the sum of the rows the
+    account's one partition (`_partition`) gives it. Goals sharing an
+    account therefore add up to the account's net when one of them has no
+    match words, a transfer whose text carries two goals' words counts for
+    the first of them only, and later goals with no words read 0 (give them
+    words to scope them)."""
+    rows = _own_rows(conn, cfg, g, since, until)
+    if rows is None:
         return _matched_net(conn, g, since=since, until=until)
-    total = _matched_net(conn, own, since=since, until=until)
-    return round(total - sum(_matched_net(conn, s, since=since, until=until)
-                             for s in carved), 2)
-
-
-def _net_parts(conn, cfg: dict, g: dict) -> tuple[dict, list[dict]] | None:
-    """How `matched_net` partitions a goal's account: the predicate whose
-    rows it adds (`own`, for `_matched_where`) and the tokened siblings
-    whose rows it takes back out, or None when an earlier token-less
-    sibling claimed the account and the goal reads 0. Shared with the
-    pace's month test so both see the same rows as this goal's."""
-    acc = _goal_account(conn, g)
-    has_tokens = any(str(t).strip() for t in (g.get("tokens") or []))
-    if not acc or has_tokens:
-        return g, []
-    # siblings are goals reading the same account now: two goals pinned to
-    # the two sources of one linked account share it like any other pair
-    same = [s for s in goals(cfg) if _goal_account(conn, s) == acc]
-    tokenless = [s for s in same
-                 if not any(str(t).strip() for t in (s.get("tokens") or []))]
-    tokened = [s for s in same
-               if any(str(t).strip() for t in (s.get("tokens") or []))]
-    if len(tokenless) <= 1 and not tokened:
-        return g, []
-    if tokenless and str(tokenless[0].get("name")) != str(g.get("name")):
-        return None
-    return {"account_id": acc}, tokened
+    return round(sum(-a for _, _, a in rows), 2)
 
 
 def _checking_side_rows(conn, g: dict, plan: float,
@@ -355,19 +423,22 @@ def checking_side_out(conn, cfg: dict, g: dict, plan: float,
     infer from the checking leg, later token-less siblings read 0 until they
     are given tokens to scope them. Rows a TOKENED sibling already claims
     are removed by row id, so the tokened goal's own transfer cannot be
-    inferred a second time by an amount-matching neighbour."""
+    inferred a second time by an amount-matching neighbour. Between goals
+    WITH words the destination's order holds too: a checking leg whose
+    text carries two goals' words is the first one's (`_partition`)."""
     acc = _goal_account(conn, g)
-    has_tokens = any(str(t).strip() for t in (g.get("tokens") or []))
-    if not acc or has_tokens:
+    if not acc:
         return round(sum(a for _, a in _checking_side_rows(
             conn, g, plan, since, until)), 2)
-    siblings = [s for s in goals(cfg) if _goal_account(conn, s) == acc]
-    tokenless = [s for s in siblings
-                 if not any(str(t).strip() for t in (s.get("tokens") or []))]
-    tokened = [s for s in siblings
-               if any(str(t).strip() for t in (s.get("tokens") or []))]
-    if len(tokenless) > 1 and str(tokenless[0].get("name")) != str(g.get("name")):
-        return 0.0                       # a sibling already claimed it
+    siblings, pos = _siblings(conn, cfg, g, acc)
+    if _tokens_of(g):
+        # only the goals with words ahead of this one can claim its legs
+        tokened = [s for s in siblings[:pos] if _tokens_of(s)]
+    else:
+        tokenless = [s for s in siblings if not _tokens_of(s)]
+        if tokenless and tokenless[0] is not siblings[pos]:
+            return 0.0                   # a sibling already claimed it
+        tokened = [s for s in siblings if _tokens_of(s)]
     rows = _checking_side_rows(conn, g, plan, since, until)
     claimed: set[str] = set()
     for s in tokened:
@@ -387,7 +458,8 @@ def posted_for_plan(conn, cfg: dict, g: dict, since: dt.date,
     AGAIN and the cash graph counts the money zero times. The checking leg
     counts as fallback evidence, capped at the plan (destination rows are
     ledger truth; the checking side is inference and may not exceed what
-    the plan predicts). max — never both — so two posted legs of one
+    the plan predicts), and only while the destination has no rows of its
+    own in the window. max — never both — so two posted legs of one
     transfer still count once.
 
     `memo`: an optional dict scoped to ONE request. Today (and the daily
@@ -410,9 +482,18 @@ def posted_for_plan(conn, cfg: dict, g: dict, since: dt.date,
     if plan <= 0 or dest >= plan:
         out = dest
     else:
-        evidence = min(plan, checking_side_out(conn, cfg, g, plan,
-                                               since, until))
-        out = max(dest, evidence)
+        # The checking leg stands in only for a SILENT destination. When the
+        # destination has rows of its own in the window they are ledger
+        # truth whatever they net to: $500 in and $200 back out saved $300,
+        # and a month that took money out saved less than nothing. The rows
+        # are the ones matched_net adds (the account's one partition), so a
+        # sibling's transfer never counts.
+        if goal_row_ids(conn, cfg, g, since, until):
+            out = dest
+        else:
+            evidence = min(plan, checking_side_out(conn, cfg, g, plan,
+                                                   since, until))
+            out = max(dest, evidence)
     if memo is not None:
         memo[key] = out
     return out
@@ -425,11 +506,6 @@ def month_saved(conn, cfg: dict, g: dict, since: dt.date, until: dt.date,
     `posted_for_plan` over that window, so the month row and the sweep line
     beside it can never disagree."""
     return posted_for_plan(conn, cfg, g, since=since, until=until, memo=memo)
-
-
-# A goal's pace needs about a month of its account's ledger before
-# "off pace" is a claim about saving rather than about how new the feed is.
-PACE_MIN_DAYS = 30
 
 
 def _goal_first_date(conn, g: dict) -> dt.date | None:
@@ -457,6 +533,23 @@ def _covered_days(conn, g: dict, since: dt.date, today: dt.date) -> int:
     first = _goal_first_date(conn, g)
     lo = max(since, first) if first else since
     return max(0, (today - lo).days)
+
+
+def pace_since(today: dt.date) -> dt.date:
+    """The first day of a goal's pace window ("the last 3 months", 89 to
+    92 days, so never called a day count): the day after the same day
+    three calendar months back, so a monthly deposit is counted three
+    times however long those months are — Jan 1 to Apr 1 is 90 days, and
+    a window opening ON Jan 1 holds four. A month's last day
+    goes back to a month's last day: Jun 30 opens on Apr 1, not Mar 31,
+    or a month-end deposit lands four times."""
+    y, m = divmod(today.year * 12 + today.month - 1 - 3, 12)
+    back_len = calendar.monthrange(y, m + 1)[1]
+    if today.day == calendar.monthrange(today.year, today.month)[1]:
+        day = back_len
+    else:
+        day = min(today.day, back_len)
+    return dt.date(y, m + 1, day) + dt.timedelta(days=1)
 
 
 def _pace_months(conn, cfg: dict, g: dict, since: dt.date,
@@ -488,6 +581,21 @@ def _pace_months(conn, cfg: dict, g: dict, since: dt.date,
     return float(min(3, max(1, months)))
 
 
+def _contributed(conn, cfg: dict, g: dict, since: dt.date,
+                 until: dt.date | None) -> bool:
+    """Whether the goal's net counts a deposit in the window: a TRANSFER
+    into its account on the rows `matched_net` adds (the account's one
+    partition). Asked by row, not by sum, because a deposit and a larger
+    withdrawal net below zero and the deposit still happened."""
+    rows = _own_rows(conn, cfg, g, since, until)
+    if rows is None:
+        cond, params = _matched_where(conn, g, since, until)
+        return bool(conn.execute(
+            f"SELECT 1 FROM transactions t {cond} AND t.amount < 0 LIMIT 1",
+            params).fetchone())
+    return any(a < 0 for _, _, a in rows)
+
+
 def _has_contribution_this_month(conn, cfg: dict, g: dict,
                                  today: dt.date) -> bool:
     """Whether the month in progress holds a contribution the goal's net
@@ -497,32 +605,229 @@ def _has_contribution_this_month(conn, cfg: dict, g: dict,
     a withdrawal, which only lowers the net, and so would a sibling's own
     transfer, which the net already carves out — each halves the rate of a
     goal funded once."""
-    part = _net_parts(conn, cfg, g)
-    if part is None:
-        return False
-    own, carved = part
-    since = today.replace(day=1)
+    return _contributed(conn, cfg, g, today.replace(day=1), today)
 
-    def contributions(goal: dict) -> set:
-        cond, params = _matched_where(conn, goal, since, today)
-        rows = conn.execute(
-            f"SELECT t.id FROM transactions t {cond} AND t.amount < 0",
-            params).fetchall()
-        return {r["id"] for r in rows}
 
-    mine = contributions(own)
-    for s in carved:
-        if not mine:
-            break
-        mine -= contributions(s)
-    return bool(mine)
+# The schedule a dated goal is judged against (specs/savings-pace.md).
+# Late is "less saved today than the line asked for PACE_GRACE_DAYS ago":
+# one monthly cycle (31 days), stretched to the 35 a "fourth Thursday"
+# month can run, plus three days for a weekend or a slow posting. A goal
+# that has been late is on pace again once it is within PACE_RETURN_DAYS of
+# the line; the gap between the two keeps a saver a few percent short from
+# reading on at every deposit and off again days later. The target date
+# gets PACE_POSTING_DAYS for a finishing deposit that posts after a weekend.
+PACE_GRACE_DAYS = 38
+PACE_RETURN_DAYS = 7
+PACE_POSTING_DAYS = 3
+
+
+def schedule_days(nets: dict, base: float, plan_day: dt.date,
+                  start: float, target: float, target_date: dt.date,
+                  days: int):
+    """A goal's verdict on each of the `days` days after its plan day, in
+    order: True (on its schedule), False (off it), or None while there is
+    nothing to judge (the plan's first cycle, a funded goal).
+
+    The schedule is the straight line from (`plan_day`, `start`) to
+    (`target_date`, `target`). `nets` holds each later day's net
+    contributions and `base` what was saved on the plan day. The days are
+    replayed in order because being late and being back on pace use two
+    thresholds, so a day's answer depends on the days before it and on
+    nothing else. No rate, rhythm or deposit size is read.
+
+    Day offsets, not dates: a target date at the calendar's far end must
+    not overflow date arithmetic."""
+    span = (target_date - plan_day).days
+    by_offset: dict[int, float] = {}
+    for d, v in nets.items():
+        n = (d - plan_day).days
+        if 0 < n <= days:
+            by_offset[n] = by_offset.get(n, 0.0) + v
+    gap = target - start
+    saved, verdict = base, None
+    for n in range(1, days + 1):
+        if n in by_offset:
+            saved += by_offset[n]
+        if saved >= target - 0.005:
+            verdict = True             # funded: nothing to be late for
+            yield None
+            continue
+        if n - span > PACE_POSTING_DAYS:
+            verdict = False            # the date passed with money left
+        elif n <= PACE_GRACE_DAYS:
+            verdict = None
+        else:
+            back = PACE_RETURN_DAYS if verdict is False else PACE_GRACE_DAYS
+            m = n - back
+            if span <= 0:              # the date had passed when it was set
+                due = target if m >= span else start
+            else:
+                due = start + gap * min(1.0, max(0.0, m / span))
+            verdict = saved >= due - 0.005
+        yield verdict
+
+
+def schedule_verdict(nets: dict, base: float, plan_day: dt.date,
+                     start: float, target: float, target_date: dt.date,
+                     today: dt.date) -> bool | None:
+    """`schedule_days` for one day: the verdict on `today`, None on or
+    before the plan day."""
+    verdict = None
+    for verdict in schedule_days(nets, base, plan_day, start, target,
+                                 target_date, (today - plan_day).days):
+        pass
+    return verdict
+
+
+def _target_date(g: dict) -> dt.date | None:
+    """A goal's target date, or None when it has none or it is not one."""
+    try:
+        return dt.date.fromisoformat(str(g.get("target_date") or ""))
+    except ValueError:
+        return None
+
+
+def _plan_terms(g: dict) -> list:
+    """What a goal's plan was made for. A change to any of these is a new
+    plan: the target and date move the line, and the account, match words
+    and starting balance move what counts as saved. The name is left out,
+    so a renamed goal keeps its plan."""
+    return [round(float(g.get("target") or 0), 2),
+            str(g.get("target_date") or ""),
+            str(g.get("account_id") or ""),
+            [str(t).strip().lower() for t in (g.get("tokens") or [])
+             if str(t).strip()],
+            round(float(g.get("start_balance") or 0), 2)]
+
+
+def _stored_plan(cfg: dict, g: dict) -> dict | None:
+    """The plan stored for a goal, if it was made for the goal as it is
+    now: its own entry, or the entry of a name no goal carries any more
+    when the terms match (the goal was renamed)."""
+    state = cfg.get("savings_goal_state") or {}
+    if not isinstance(state, dict):
+        return None
+    terms = _plan_terms(g)
+
+    def usable(entry) -> dict | None:
+        plan = entry.get("plan") if isinstance(entry, dict) else None
+        if (isinstance(plan, dict) and plan.get("for") == terms
+                and plan.get("day")):
+            return plan
+        return None
+
+    own = usable(state.get(str(g.get("name"))))
+    if own:
+        return own
+    names = {str(x.get("name")) for x in goals(cfg)}
+    for name, entry in state.items():
+        if name not in names and usable(entry):
+            return usable(entry)
+    return None
+
+
+def _day_nets(conn, g: dict, since: dt.date, until: dt.date) -> dict:
+    """One goal predicate's net contributions per day over a window."""
+    cond, params = _matched_where(conn, g, since, until)
+    sql = ("SELECT t.date AS d, COALESCE(SUM(-t.amount), 0) AS net "
+           f"FROM transactions t {cond} GROUP BY t.date")
+    mkey = ("goal_day_nets", sql, repr(params))
+    hit = getattr(conn, "memo_get", lambda k: None)(mkey)
+    if hit is not None:
+        return hit
+    out = {as_date(r["d"]): float(r["net"])
+           for r in conn.execute(sql, params).fetchall()}
+    if hasattr(conn, "memo_put"):
+        from . import budget as _b   # late: avoid a circular import at load
+        conn.memo_put(mkey, out, *_b._LEDGER_TABLES)
+    return out
+
+
+def _net_by_day(conn, cfg: dict, g: dict, since: dt.date,
+                until: dt.date) -> dict:
+    """`matched_net`, day by day: the same rows, the same partition between
+    goals sharing an account, so the schedule and the saved total can never
+    count different money."""
+    if since > until:
+        return {}
+    rows = _own_rows(conn, cfg, g, since, until)
+    if rows is None:
+        return dict(_day_nets(conn, g, since, until))
+    out: dict = {}
+    for _, d, a in rows:
+        out[d] = out.get(d, 0.0) - a
+    return out
+
+
+def _schedule_on_pace(conn, cfg: dict, g: dict, plan: dict | None,
+                      today: dt.date) -> bool | None:
+    """A dated goal's verdict under its stored plan; None without one."""
+    td = _target_date(g)
+    if td is None:
+        return None
+    if (today - td).days > PACE_POSTING_DAYS:
+        return False                   # true of any plan, and of none
+    if not plan:
+        return None
+    try:
+        plan_day = dt.date.fromisoformat(str(plan.get("day")))
+        start = float(plan.get("saved") or 0)
+    except (TypeError, ValueError):
+        return None
+    if today <= plan_day:
+        return None
+    # what is saved on the plan day is read from the ledger as it is now, so
+    # a row that arrives later with an earlier date still counts as saved;
+    # the line keeps the starting point it was drawn from
+    base = (float(g.get("start_balance") or 0)
+            + matched_net(conn, cfg, g, until=plan_day))
+    nets = _net_by_day(conn, cfg, g, plan_day + dt.timedelta(days=1), today)
+    return schedule_verdict(nets, base, plan_day, start,
+                            float(g.get("target") or 0), td, today)
+
+
+def _plan_tonight(conn, cfg: dict, g: dict, today: dt.date,
+                  prev: dict, adopted: bool) -> tuple[dict | None, bool]:
+    """The plan a dated goal carries after tonight, and whether it was
+    started tonight from an earlier day.
+
+    A goal keeps the plan made for its terms. A goal whose terms changed,
+    or a new goal, starts its plan tonight with what is saved tonight. A
+    goal that was being saved toward before any plan was recorded (its
+    stored entry has no plan field, or nothing here has one) has its line
+    drawn from PACE_GRACE_DAYS back, at what the ledger shows saved on that
+    day, so it is judged from tomorrow instead of going five weeks without
+    a verdict; never from before its account's first row."""
+    if float(g.get("target") or 0) <= 0 or _target_date(g) is None:
+        return None, False
+    stored = _stored_plan(cfg, g)
+    if stored:
+        return dict(stored), False
+    day = today
+    existing = ("plan" not in prev) if prev else not adopted
+    if existing:
+        first = _goal_first_date(conn, g)
+        if first and first < today:
+            day = max(today - dt.timedelta(days=PACE_GRACE_DAYS), first)
+    saved = round(float(g.get("start_balance") or 0)
+                  + matched_net(conn, cfg, g, until=day), 2)
+    plan = {"day": day.isoformat(), "saved": saved, "for": _plan_terms(g)}
+    # a line drawn from an earlier day gives no credit for being ahead of
+    # it before then, so an off-pace verdict under it may be the change of
+    # measure and not the saver: nothing is mailed until the goal has read
+    # on pace under this line once
+    if day < today:
+        plan["quiet"] = True
+    return plan, day < today
 
 
 def progress(conn, cfg: dict, today: dt.date | None = None,
              memo: dict | None = None) -> list[dict]:
-    """Per-goal progress + pace. Pace projects from the trailing 3 months
-    of actual contributions; with a target_date it reports on/off pace,
-    without one it estimates the arrival month. `memo` is the optional
+    """Per-goal progress + pace. `saved_90d` is the net of the last 3
+    months (`pace_since`), the figure the goal line prints; `rate_90d` is that net per month
+    the window covers, and the arrival date projects from it; a goal
+    with a target date is instead judged on/off pace against its schedule
+    (`schedule_verdict`), which reads neither. `memo` is the optional
     request-scoped cache described on `posted_for_plan`.
 
     Saved is the goal's original measure, start_balance plus the
@@ -543,8 +848,10 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
                 "target": round(float(g.get("target") or 0), 2),
                 "target_date": g.get("target_date") or None,
                 "monthly_plan": round(float(g.get("monthly_plan") or 0), 2),
-                "saved": None, "rate_90d": None, "pct": None,
-                "eta": None, "on_pace": None, "plan_only": True,
+                "saved": None, "rate_90d": None, "saved_90d": None,
+                "pct": None,
+                "eta": None, "on_pace": None, "contributed_90d": None,
+                "plan_only": True,
                 "needs_account": needs_account(g),
                 "mode": mode, "swept_this_month": None,
                 "sweep_satisfied": None,
@@ -552,13 +859,17 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
             continue
         saved = round(float(g.get("start_balance") or 0)
                       + matched_net(conn, cfg, g), 2)
-        # The pace window is the trailing 90 days, divided by the months
+        # The pace window is the last 3 months (pace_since), divided by the months
         # the goal's ledger actually covers inside it: a goal funded for a
         # month is not a third of a three-month window, which would read
         # it "off pace" and put its ETA three times too far.
-        since = today - dt.timedelta(days=90)
+        since = pace_since(today)
         cover = _pace_months(conn, cfg, g, since, today)
-        rate = round(matched_net(conn, cfg, g, since=since) / cover, 2)
+        # the goal line prints the window's own net ("$X in the last 3
+        # months"), which is literally what was saved; the per-month figure
+        # stays in the payload for released apps and drives the ETA
+        net_90d = matched_net(conn, cfg, g, since=since)
+        rate = round(net_90d / cover, 2)
         target = float(g.get("target") or 0)
         remaining = max(0.0, target - saved)
         eta = None
@@ -574,15 +885,12 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
             days = min(30.44 * remaining / rate, 365.0 * 100)
             eta = (today + dt.timedelta(days=days)).isoformat()
         on_pace = None
-        # under a month of ledger there is no rate to judge a pace by
-        if (target > 0 and g.get("target_date") and remaining > 0
-                and _covered_days(conn, g, since, today) >= PACE_MIN_DAYS):
-            try:
-                td = dt.date.fromisoformat(str(g["target_date"]))
-                months_left = max(0.1, (td - today).days / 30.44)
-                on_pace = rate * months_left >= remaining - 0.005
-            except ValueError:
-                pass
+        if target > 0 and g.get("target_date") and remaining > 0:
+            on_pace = _schedule_on_pace(conn, cfg, g, _stored_plan(cfg, g),
+                                        today)
+        # a rate at or below zero has two causes the clients word apart:
+        # nothing arrived, or withdrawals outweighed what did
+        contributed = rate > 0 or _contributed(conn, cfg, g, since, None)
         # a sweep goal's month is satisfied by the SAME matched-transfer
         # evidence progress runs on — the ledger seeing the transfer (or
         # its checking leg) is what marks the month done, so the forecast
@@ -601,9 +909,11 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
             "target_date": g.get("target_date") or None,
             "monthly_plan": round(plan, 2),
             "saved": saved, "rate_90d": rate,
+            "saved_90d": round(net_90d, 2),
             "pct": (round(min(100.0, 100 * saved / target), 1)
                     if target > 0 else None),
-            "eta": eta, "on_pace": on_pace, "plan_only": False,
+            "eta": eta, "on_pace": on_pace, "contributed_90d": contributed,
+            "plan_only": False,
             "needs_account": False,
             "mode": mode, "swept_this_month": swept,
             "sweep_satisfied": satisfied,
@@ -614,13 +924,42 @@ def progress(conn, cfg: dict, today: dt.date | None = None,
 def check_milestones(conn, cfg: dict, today: dt.date | None = None):
     """Edge-triggered transitions since the last check: crossed milestones
     and on→off pace flips for dated goals. Returns (messages, new_state);
-    the caller persists new_state to config `savings_goal_state` and emails
-    the messages (nightly sweep)."""
-    state = dict(cfg.get("savings_goal_state") or {})
+    the caller emails the messages (nightly sweep) and persists new_state
+    to config `savings_goal_state`.
+
+    Each entry of new_state also carries the goal's plan (None for a goal
+    without a target date). The caller stores the plans whether or not the
+    mail went out (`plans_of`): a verdict that waits for a retry is
+    recomputed tomorrow, but a plan that was not stored would start again
+    from tomorrow's balance."""
+    today = today or localtime.now_local(cfg).date()
+    state = cfg.get("savings_goal_state") or {}
+    state = dict(state) if isinstance(state, dict) else {}
+    adopted = any(isinstance(e, dict) and "plan" in e for e in state.values())
+    plans: dict = {}
+    started_back: set = set()
+    by_name = {str(g["name"]): g for g in goals(cfg)}
+    for name, g in by_name.items():
+        if is_plan_only(g):
+            plans[name] = None
+            continue
+        prev = state.get(name)
+        prev = prev if isinstance(prev, dict) else {}
+        plans[name], back = _plan_tonight(conn, cfg, g, today, prev, adopted)
+        if back:
+            started_back.add(name)
+    # tonight's verdicts are read under tonight's plans
+    judged = dict(cfg)
+    judged["savings_goal_state"] = {
+        **state, **{n: {**(state.get(n) if isinstance(state.get(n), dict)
+                           else {}), "plan": pl}
+                    for n, pl in plans.items()}}
     msgs: list[str] = []
     new_state: dict = {}
-    for p in progress(conn, cfg, today):
-        prev = state.get(p["name"]) or {}
+    for p in progress(conn, judged, today):
+        prev = state.get(p["name"])
+        prev = prev if isinstance(prev, dict) else {}
+        plan = plans.get(p["name"])
         crossed = max((m for m in MILESTONES
                        if p["pct"] is not None and p["pct"] >= m),
                       default=0)
@@ -629,12 +968,88 @@ def check_milestones(conn, cfg: dict, today: dt.date | None = None):
                 f"{p['name']}: {crossed}% funded — "
                 f"${p['saved']:,.0f} of ${p['target']:,.0f}"
                 + (f" (ETA {p['eta']})" if p["eta"] and crossed < 100 else ""))
-        if (p["on_pace"] is False and prev.get("on_pace") is not False
+        on_pace = p["on_pace"]
+        if p["name"] in started_back:
+            # no verdict exists yet under a line drawn tonight; the stored
+            # one stands for the night rather than reading as a change
+            on_pace = prev.get("on_pace")
+        elif plan and plan.get("quiet"):
+            if on_pace is True:
+                plan = {k: v for k, v in plan.items() if k != "quiet"}
+        elif (on_pace is False and prev.get("on_pace") is not False
                 and prev):
-            msgs.append(
-                f"{p['name']}: off pace for {p['target_date']} — "
-                f"${p['rate_90d']:,.0f}/mo recently vs "
-                f"${p['target'] - p['saved']:,.0f} still to go")
-        new_state[p["name"]] = {"milestone": crossed,
-                                "on_pace": p["on_pace"]}
+            msgs.append(_off_pace_message(p, plan, today))
+        new_state[p["name"]] = {"milestone": crossed, "on_pace": on_pace,
+                                "plan": plan}
     return msgs, new_state
+
+
+def _off_pace_message(p: dict, plan: dict | None, today: dt.date) -> str:
+    """The off-pace line of the milestone mail. It quotes the balance and
+    the schedule the verdict was read from, never the monthly rate, so the
+    mail cannot say one thing and its own numbers another."""
+    left = p["target"] - p["saved"]
+    td = dt.date.fromisoformat(str(p["target_date"]))
+    if today > td:
+        return (f"{p['name']}: off pace — {p['target_date']} has passed "
+                f"with ${left:,.0f} still to go")
+    text = (f"{p['name']}: off pace for {p['target_date']} — "
+            f"${p['saved']:,.0f} saved")
+    try:
+        plan_day = dt.date.fromisoformat(str((plan or {}).get("day")))
+        start = float((plan or {}).get("saved") or 0)
+        span = (td - plan_day).days
+        if span > 0:
+            due = start + (p["target"] - start) * min(
+                1.0, max(0.0, (today - plan_day).days / span))
+            text += (f"; the straight line to ${p['target']:,.0f} asked "
+                     f"for ${due:,.0f} by now")
+    except (TypeError, ValueError):
+        pass
+    days_left = (td - today).days
+    if days_left > 30:
+        text += (f". ${left / (days_left / 30.44):,.0f}/mo from here "
+                 "gets there")
+    return text
+
+
+def plans_of(state: dict, new_state: dict) -> dict:
+    """`state` with each goal's plan taken from `new_state` and nothing
+    else changed: what the nightly sweep stores on a night the milestone
+    mail was not delivered, when the milestones and verdicts must wait for
+    the retry but the plans must not."""
+    out = dict(state) if isinstance(state, dict) else {}
+    for name, entry in new_state.items():
+        kept = out.get(name)
+        plan = entry.get("plan") if isinstance(entry, dict) else None
+        if plan is None and not isinstance(kept, dict):
+            continue                   # nothing of this goal's to keep yet
+        kept = dict(kept) if isinstance(kept, dict) else {}
+        kept["plan"] = plan
+        out[name] = kept
+    return out
+
+
+def undelivered_state(state: dict, new_state: dict) -> dict:
+    """What the nightly sweep stores on a night the milestone mail was not
+    delivered: every goal's plan (`plans_of`), and tonight's verdict for
+    each goal whose verdict was not news. Only a fall onto off pace is
+    mailed (`check_milestones`), so only that verdict waits for the retry;
+    any other, held back, would leave an old verdict standing (one read
+    under an earlier rule, say) and a later real fall would find no edge
+    and never be mailed. Milestones always wait."""
+    out = plans_of(state, new_state)
+    for name, entry in new_state.items():
+        if not isinstance(entry, dict):
+            continue
+        prev = state.get(name) if isinstance(state, dict) else None
+        prev = prev if isinstance(prev, dict) else {}
+        on_pace = entry.get("on_pace")
+        if on_pace is False and prev.get("on_pace") is not False and prev:
+            continue                   # the news the retry must carry
+        if on_pace == prev.get("on_pace"):
+            continue
+        kept = dict(out.get(name)) if isinstance(out.get(name), dict) else {}
+        kept["on_pace"] = on_pace
+        out[name] = kept
+    return out

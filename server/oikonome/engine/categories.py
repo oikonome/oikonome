@@ -109,11 +109,24 @@ def part_net(net_expr: str) -> str:
     is the whole row's net (budget.NET_AMOUNT or reporting's joined form);
     an unsplit row is its net, a part is its own amount when nothing was
     netted (the common case, kept exact rather than multiplied and divided
-    back through a double) and otherwise its pro-rata share, rounded to the
-    cent so the parts of a netted row still add up."""
+    back through a double) and otherwise its pro-rata share rounded to the
+    cent, with the rounding remainder on the largest part (the first such
+    line on a tie) so the parts of a netted row add up to its net exactly.
+    Correlated subqueries, not a window, so the expression stays legal
+    inside the SUM of every category rollup that reads it."""
+    share = "ROUND(({amt} * ({net}) / t.amount)::numeric, 2)"
+    mine = share.format(amt="sp.amount", net=net_expr)
+    others = share.format(amt="s2.amount", net=net_expr)
+    same = ("FROM transaction_splits s2 WHERE s2.tenant_id = sp.tenant_id "
+            "AND s2.txn_id = sp.txn_id")
+    largest = (f"(SELECT s2.line {same} "
+               "ORDER BY ABS(s2.amount) DESC, s2.line LIMIT 1)")
+    rest = (f"ROUND(({net_expr})::numeric - COALESCE((SELECT SUM({others}) "
+            f"{same} AND s2.line <> sp.line), 0), 2)")
     return (f"CASE WHEN sp.line IS NULL THEN {net_expr} "
             f"WHEN ({net_expr}) = t.amount OR t.amount = 0 THEN sp.amount "
-            f"ELSE ROUND((sp.amount * ({net_expr}) / t.amount)::numeric, 2)::float8 END")
+            f"WHEN sp.line = {largest} THEN {rest}::float8 "
+            f"ELSE {mine}::float8 END")
 
 # Plaid confidences we treat as authoritative for sharp labels.
 PLAID_TRUSTED = frozenset({"HIGH", "VERY_HIGH"})
@@ -156,3 +169,29 @@ def plaid_is_trusted(confidence: str | None) -> bool:
 
 def effective(override: str | None, primary: str | None) -> str | None:
     return override or primary
+
+
+# ---- how a category reads on a page ------------------------------------
+
+# the joining words a title leaves small ("Food and Drink")
+_SMALL_WORDS = frozenset({"and", "or", "of", "the", "to", "in", "for", "a",
+                          "an", "at", "on"})
+
+
+def display_label(stored: str | None) -> str:
+    """A category as people read it: the bank's `FOOD_AND_DRINK` (or the
+    spaced `FOOD AND DRINK` the reports carry) as "Food and Drink". A name
+    somebody typed — anything with a lower-case letter in it — is theirs
+    and passes through untouched; "no category" reads as that. The clients
+    carry the same rule as catLabel."""
+    s = (stored or "").replace("_", " ").strip()
+    if not s or s == "?":
+        return "Uncategorized"
+    if s != s.upper() or s == s.lower():
+        return s
+    words = s.lower().split(" ")
+    # a joining word stays small between two words, never as the last one
+    # ("Transfer In" beside "Transfer Out")
+    return " ".join(w if i and i < len(words) - 1 and w in _SMALL_WORDS
+                    else w[:1].upper() + w[1:]
+                    for i, w in enumerate(words))

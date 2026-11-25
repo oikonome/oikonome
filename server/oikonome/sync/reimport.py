@@ -61,16 +61,33 @@ def same_line_raw(stored_raw, new_raw, name, merchant) -> bool:
     return a is not None and b is not None and a == b
 
 
-def batch_owners(raw) -> set[str]:
-    """The import batches that own a stored row: its `_batches` array, or
-    the single `_batch` tag rows carried before the array existed."""
+def batch_owner_list(raw) -> list[str]:
+    """The import batches that own a stored row, in the order they own it
+    — the one reading every owner check follows (batches.py's SQL spells
+    the same three cases):
+
+    - `_batches` is a list: its batch ids. An empty list is a row NO batch
+      owns (stored before batches, or by an import without one, and since
+      written by imports that only matched it) and stays owned by nobody.
+    - `_batches` is absent: a row from before owner lists, owned by the
+      single `_batch` tag it carries, if any.
+    - `_batches` is anything else: owned by nobody. Reading it as absent
+      would hand the row to whichever import last wrote it, and undoing
+      that import would delete a row it never added."""
     if not isinstance(raw, dict):
-        return set()
-    arr = raw.get("_batches")
-    if isinstance(arr, list):
-        return {str(b) for b in arr if isinstance(b, str) and b}
-    one = raw.get("_batch")
-    return {one} if isinstance(one, str) and one else set()
+        return []
+    if "_batches" not in raw:
+        one = raw.get("_batch")
+        return [one] if isinstance(one, str) and one else []
+    arr = raw["_batches"]
+    if not isinstance(arr, list):
+        return []
+    return list(dict.fromkeys(b for b in arr if isinstance(b, str) and b))
+
+
+def batch_owners(raw) -> set[str]:
+    """`batch_owner_list` as a set."""
+    return set(batch_owner_list(raw))
 
 
 def stored(conn, account_id: str, ids) -> dict[str, dict]:

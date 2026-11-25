@@ -24,7 +24,10 @@ import { conversationGone, followUpGone, groupThreads, type HistoryCursor,
          RESTARTED_NOTE, sharedLogDenied, type Thread, threadDoorMissing,
          threadKey, threadMissing, type TurnNotes, turnMissing } from "../lib/answer-pure";
 import { type AssistantTurn, errText } from "../lib/api";
+import { EmptyState, FailedLine } from "../components/loaded";
+import { EMPTY_LINES } from "../lib/pure";
 import { useMe, useViewer } from "../lib/viewer";
+import { fieldA11y } from "../components/field";
 
 /** a question in flight (or one that failed); `thread` is the
  *  conversation it continues, null for a new one; `note` says why it
@@ -52,6 +55,9 @@ const rowKey = (t: Turn) => "local" in t ? t.key : t.id;
 
 /** what is on screen: the list, a fresh conversation, or an open one's key */
 const NEW = "new";
+// Settings opened on its AI section, where the model endpoint is set (the
+// web's /settings/ai): the search words only that section answers to
+const SETTINGS_AI = "/settings?find=ai%20assistant";
 
 export default function Assistant() {
   const { client } = useSession();
@@ -300,11 +306,10 @@ export default function Assistant() {
   if (status.data && !status.data.available) {
     return (
       <View style={s.wrap}>
-        <Text style={s.center}>
-          The assistant isn&apos;t enabled on this server — it needs an
-          AI backend. Add one under Settings → AI (self-host installs
-          can use the bundled Ollama).
-        </Text>
+        {/* the web's line and its one way to set it up: Settings opened
+            on its AI section (the search the section answers to) */}
+        <EmptyState title={EMPTY_LINES.assistantOff} to={SETTINGS_AI}
+                    action={EMPTY_LINES.assistantAction} />
       </View>
     );
   }
@@ -320,8 +325,7 @@ export default function Assistant() {
   // "nothing leaves the box" only on the server's word, read on this
   // visit: loading, a cached reading or an error is not local
   const sure = status.isFetchedAfterMount && status.isSuccess;
-  const whereLine = status.isError
-    ? `couldn't check where answers come from: ${errText(status.error)}`
+  const whereLine = status.isError ? ""
     : !sure ? "read-only tools — checking where answers come from…"
     : status.data?.local
       ? "answered on this instance — read-only tools, nothing leaves the box"
@@ -341,9 +345,10 @@ export default function Assistant() {
           ? (<>
               <Text style={{ color: C.bad }}>{t.err}</Text>
               <View style={{ flexDirection: "row", gap: 14, marginTop: 6 }}>
-                <Pressable onPress={() => submit(t.q, t.thread)} hitSlop={8}>
+                <Pressable accessibilityRole="button"
+                           onPress={() => submit(t.q, t.thread)} hitSlop={8}>
                   <Text style={s.act}>try again</Text></Pressable>
-                <Pressable hitSlop={8}
+                <Pressable accessibilityRole="button" hitSlop={8}
                            onPress={() => setPending((p) => p.filter((x) => x.key !== t.key))}>
                   <Text style={s.act}>dismiss</Text></Pressable>
               </View>
@@ -356,21 +361,20 @@ export default function Assistant() {
   const composer = (placeholder: string) => (
     <View style={s.compose}>
       <View style={s.inputRow}>
-        <TextInput style={s.input} placeholder={placeholder}
+        <TextInput {...fieldA11y("Ask about your money")} style={s.input} placeholder={placeholder}
                    placeholderTextColor={C.mut} value={q} multiline
                    onChangeText={setQ} submitBehavior="blurAndSubmit"
                    onSubmitEditing={() => submit(q)} returnKeyType="send" />
-        <Pressable style={[s.send, (!q.trim() || ask.isPending) && { opacity: 0.5 }]}
+        <Pressable accessibilityRole="button"
+                   style={[s.send, (!q.trim() || ask.isPending) && { opacity: 0.5 }]}
                    disabled={!q.trim() || ask.isPending} onPress={() => submit(q)}>
           <Text style={s.sendText}>Send</Text>
         </Pressable>
       </View>
-      <Text style={{ color: status.isError ? C.bad : C.mut, fontSize: 11, marginTop: 4 }}>
-        {whereLine}</Text>
-      {status.isError && (
-        <Pressable onPress={() => void status.refetch()} hitSlop={8}>
-          <Text style={s.act}>try again</Text></Pressable>
-      )}
+      {status.isError
+        ? <FailedLine q={status} what="the assistant's status" />
+        : <Text style={{ color: C.mut, fontSize: 11, marginTop: 4 }}>
+            {whereLine}</Text>}
     </View>
   );
 
@@ -379,7 +383,7 @@ export default function Assistant() {
     return (
       <View style={s.wrap}>
         <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 12, gap: 8 }}>
-          <Pressable style={s.newBtn} onPress={() => setOpenKey(NEW)}>
+          <Pressable accessibilityRole="button" style={s.newBtn} onPress={() => setOpenKey(NEW)}>
             <Text style={s.sendText}>+ New conversation</Text>
           </Pressable>
           {threads.length > 0 && (
@@ -390,7 +394,7 @@ export default function Assistant() {
                   : ownOnly ? "Your conversations"
                   : "Conversations — shared with the household"}</Text>
               {canEdit && !noLog && (
-                <Pressable hitSlop={8} disabled={clear.isPending}
+                <Pressable accessibilityRole="button" hitSlop={8} disabled={clear.isPending}
                            onPress={() => Alert.alert("Clear every conversation?", "",
                              [{ text: "Cancel", style: "cancel" },
                               { text: "Clear", style: "destructive",
@@ -402,7 +406,8 @@ export default function Assistant() {
           )}
           {denied && <Text style={{ color: C.mut, fontSize: 12 }}>{denied}</Text>}
           {threads.map((th) => (
-            <Pressable key={th.key} style={s.row} onPress={() => setOpenKey(th.key)}>
+            <Pressable accessibilityRole="button"
+                       key={th.key} style={s.row} onPress={() => setOpenKey(th.key)}>
               <Text style={s.rowQ} numberOfLines={1}>{th.partial ? "… " : ""}{title(th)}</Text>
               <Text style={s.rowM}>{when(th.last_at)} · {th.turns.length}{" "}
                 {th.turns.length === 1 ? "question" : "questions"}
@@ -411,12 +416,7 @@ export default function Assistant() {
           ))}
           {history.isPending && history.fetchStatus !== "idle" && <LogoSpinner color={C.mut} />}
           {history.isError && !noLog && (
-            <View style={{ alignItems: "center", gap: 6 }}>
-              <Text style={{ color: C.bad, textAlign: "center" }}>
-                Couldn&apos;t load the history: {errText(history.error)}</Text>
-              <Pressable onPress={() => void history.refetch()} hitSlop={8}>
-                <Text style={s.act}>try again</Text></Pressable>
-            </View>
+            <FailedLine q={history} what="the history" />
           )}
           {!history.isPending && (!history.isError || noLog) && threads.length === 0 && (
             <Text style={s.center}>
@@ -426,7 +426,7 @@ export default function Assistant() {
             </Text>
           )}
           {cursor && (
-            <Pressable onPress={() => more.mutate(cursor)} hitSlop={8}
+            <Pressable accessibilityRole="button" onPress={() => more.mutate(cursor)} hitSlop={8}
                        disabled={more.isPending} style={{ alignSelf: "center" }}>
               <Text style={s.act}>{more.isPending ? "loading…" : "older conversations"}</Text>
             </Pressable>
@@ -441,7 +441,7 @@ export default function Assistant() {
     return (
       <View style={s.wrap}>
         <View style={s.head}>
-          <Pressable onPress={() => setOpenKey(null)} hitSlop={8}>
+          <Pressable accessibilityRole="button" onPress={() => setOpenKey(null)} hitSlop={8}>
             <Text style={s.act}>‹ Conversations</Text></Pressable>
           <Text style={s.headT} numberOfLines={1}>New conversation</Text>
         </View>
@@ -461,7 +461,8 @@ export default function Assistant() {
               <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                              justifyContent: "center", marginTop: 6 }}>
                 {EXAMPLES.map((ex) => (
-                  <Pressable key={ex} style={s.chip} disabled={ask.isPending}
+                  <Pressable accessibilityRole="button"
+                             key={ex} style={s.chip} disabled={ask.isPending}
                              onPress={() => submit(ex, null)}>
                     <Text style={{ color: C.mut, fontSize: 12 }}>{ex}</Text>
                   </Pressable>
@@ -479,14 +480,16 @@ export default function Assistant() {
   return (
     <View style={s.wrap}>
       <View style={s.head}>
-        <Pressable onPress={() => setOpenKey(null)} hitSlop={8}>
+        <Pressable accessibilityRole="button" onPress={() => setOpenKey(null)} hitSlop={8}>
           <Text style={s.act}>‹ Conversations</Text></Pressable>
         <Text style={s.headT} numberOfLines={1}>{title(open)}</Text>
-        <Pressable onPress={() => void save(open)} hitSlop={8} disabled={saving}>
+        <Pressable accessibilityRole="button"
+                   onPress={() => void save(open)} hitSlop={8} disabled={saving}>
           <Text style={s.act}>{saving ? "saving…" : "save as report"}</Text>
         </Pressable>
         {canEdit && (
-          <Pressable onPress={() => remove(open)} hitSlop={8} disabled={forget.isPending}>
+          <Pressable accessibilityRole="button"
+                     onPress={() => remove(open)} hitSlop={8} disabled={forget.isPending}>
             <Text style={[s.act, { color: C.mut }]}>remove</Text>
           </Pressable>
         )}
@@ -546,7 +549,7 @@ const s = StyleSheet.create({
           paddingVertical: 8, borderBottomColor: C.border, borderBottomWidth: 1,
           backgroundColor: C.card },
   headT: { color: C.text, fontWeight: "600", flex: 1 },
-  newBtn: { backgroundColor: C.accent, borderRadius: 10, paddingVertical: 10,
+  newBtn: { backgroundColor: C.btn, borderRadius: 10, paddingVertical: 10,
             alignItems: "center" },
   row: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1, borderRadius: 10,
          paddingHorizontal: 12, paddingVertical: 9 },
@@ -560,12 +563,12 @@ const s = StyleSheet.create({
   act: { color: C.accent, fontSize: 12 },
   compose: { padding: 10, borderTopColor: C.border, borderTopWidth: 1, backgroundColor: C.card },
   inputRow: { flexDirection: "row", gap: 8, alignItems: "flex-end" },
-  input: { flex: 1, backgroundColor: C.bg, borderColor: C.border,
+  input: { flex: 1, backgroundColor: C.bg, borderColor: C.field,
            borderWidth: 1, borderRadius: 10, color: C.text, fontSize: 15,
            paddingHorizontal: 12, paddingVertical: 9, maxHeight: 120 },
-  send: { backgroundColor: C.accent, borderRadius: 10,
+  send: { backgroundColor: C.btn, borderRadius: 10,
           paddingHorizontal: 18, paddingVertical: 10, justifyContent: "center" },
-  sendText: { color: "#fff", fontSize: 15, fontWeight: "600" },
+  sendText: { color: C.text, fontSize: 15, fontWeight: "600" },
   chip: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
           borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
 });

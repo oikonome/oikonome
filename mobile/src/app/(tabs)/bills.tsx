@@ -8,8 +8,9 @@ import PullRefresh from "../../components/pull-refresh";
 import Sheet from "../../components/sheet";
 
 import CalendarSection from "../../components/calendar-section";
-import StaleBanner from "../../components/stale-banner";
-import { Card, H, HelpLink, KV, Meter, Pill } from "../../components/ui";
+import { EmptyState, FailedLine, StaleLine } from "../../components/loaded";
+import { OfflineNote, offlineGrey, useOffline } from "../../components/offline";
+import { Card, H, HelpLink, KV, Meter, Pill, Skeleton, Note } from "../../components/ui";
 import { ApiError, errText, Bill, BillsData, Proposal, SettingsView }
   from "../../lib/api";
 import { patchDismissedHint, patchList, patchQuery, removeFromList,
@@ -35,39 +36,43 @@ export const ymLabel = (ym: string) => {
 };
 import { useMe, useOwner, useViewer } from "../../lib/viewer";
 import { C, mmddyy, money } from "../../lib/theme";
+import { disclosure } from "../../lib/a11y";
 import { ADD_CADENCES, CUSTOM_UNITS, catLabel, customCadence, customMax,
          filterCategories, missedBillPill,
          proposalSuperseded, scanAlreadyRunning,
-         SCAN_RUNNING_RETRY_MS, householdDay } from "../../lib/pure";
+         SCAN_RUNNING_RETRY_MS, householdDay, EMPTY_LINES, approveAllWords,
+         billCycleDays }
+  from "../../lib/pure";
+import { fieldA11y } from "../../components/field";
 
 // the web row's status column, ported whole: a quiet row IS the ✓ —
 // only a bill wanting a decision says anything
+type DueWords = { label: string | null; text: string | null;
+                  tone: Bill["due_tone"]; frac: number | null };
 const DAY = 86_400_000;
-// counted from the household's day (/api/me timezone): the day the server,
-// Today and the mail judge "due today" / "1 day late" by
-function daysUntil(iso: string, zone?: string): number {
+// A server older than the row's due words: the device counts them from
+// the household's day (/api/me timezone), as that server's web did.
+function olderDueWords(b: Bill, zone: string | undefined): DueWords {
+  if (!b.due_on) return { label: null, text: null, tone: null, frac: null };
   const today = householdDay(new Date(), zone);
-  return Math.round(
-    (new Date(iso + "T00:00:00").getTime() - today.getTime()) / DAY);
-}
-const dueText = (n: number, income?: boolean) =>
-  n === 0 ? (income ? "today" : "due today")
-  : n === 1 ? (income ? "tomorrow" : "due tomorrow")
-  : n === -1 ? "1 day late"
-  : n < 0 ? `${-n} days late`
-  : `in ${n} days`;
-// the cycle bar turns amber this close to the due date — same rule and
-// colours as the web's Cycle column, where the words beside the bar carry
-// the same colour as the fill
-const SOON_DAYS = 3;
-// list rows carry the human cadence label; recover cycle length from it
-function cycleDays(label: string): number {
-  const units: Record<string, number> = {
-    da: 1, week: 7, month: 30.44, year: 365.25 };
-  const m = /^every (\d+) (da|week|month|year)/.exec(label);
-  if (m) return units[m[2]] * parseInt(m[1], 10);
-  return { daily: 1, weekly: 7, monthly: 30.44,
-           yearly: 365.25 }[label] ?? 0;
+  const n = Math.round(
+    (new Date(b.due_on + "T00:00:00").getTime() - today.getTime()) / DAY);
+  const cyc = onSeveralDays(b.by_month_day)
+    // the row's cadence value, as the web reads it — never the label
+    ? billCycleDays("MONTHLY:1") / b.by_month_day.length
+    : billCycleDays(b.cadence_value);
+  const frac = cyc <= 0 ? 0 : Math.min(1, Math.max(0, 1 - n / cyc));
+  const label = n === 0 ? "today" : n === 1 ? "tomorrow" : mmddyy(b.due_on);
+  if (b.occurrences > 0 && b.paid >= b.occurrences)
+    return { label, text: null, tone: null, frac };
+  const text = n === 0 ? (b.income ? "today" : "due today")
+    : n === 1 ? (b.income ? "tomorrow" : "due tomorrow")
+    : n === -1 ? "1 day late"
+    : n < 0 ? `${-n} days late`
+    : `in ${n} days`;
+  const tone = n < 0 ? (b.withdrawn_on ? "withdrawn" : "late")
+    : n <= 3 ? "soon" : "ok";
+  return { label, text, tone, frac };
 }
 // only these are problems worth a pill — off-ledger is a way of life
 // for cash/manual bills, and ok is silence
@@ -86,23 +91,30 @@ function BillRow({ b, onPress, onHint, past }: {
   const envelope = b.used !== null;
   const isAnnualEnv = envelope && b.period_months === 12;
   const zone = useMe().data?.timezone;
-  const daysTo = !past && !envelope && b.due_on ? daysUntil(b.due_on, zone) : null;
+  // the row's due date, countdown, its colour and the cycle bar's fill are
+  // the server's (api_bills.due_words), as on the web
+  const due: DueWords = b.due_text === undefined
+    // older-server path: stands in for `due_label` / `due_text` / `due_tone` / `cycle_frac`
+    ? (past || envelope ? { label: null, text: null, tone: null, frac: null }
+                        : olderDueWords(b, zone))
+    : { label: b.due_label ?? null, text: b.due_text, tone: b.due_tone ?? null,
+        frac: b.cycle_frac ?? null };
   const settled = b.occurrences > 0 && b.paid >= b.occurrences;
   const missed = !!past && !settled && b.occurrences > 0;
-  const overdue = !settled && daysTo !== null && daysTo < 0;
-  const soon = !settled && daysTo !== null && daysTo >= 0 && daysTo <= SOON_DAYS;
-  const cyc = onSeveralDays(b.by_month_day)
-    ? cycleDays("monthly") / b.by_month_day.length : cycleDays(b.cadence);
-  const cycleFrac = daysTo === null || cyc <= 0 ? null
-    : Math.min(1, Math.max(0, 1 - daysTo / cyc));
+  const overdue = due.tone === "late" || due.tone === "withdrawn";
+  const soon = due.tone === "soon";
+  const cycleFrac = due.frac;
 
   let status: React.ReactNode;
   if (envelope) {
-    const left = b.period_left ?? b.amount - (b.used ?? 0);
+    // what is left of the pool is the server's (period_left), as on the
+    // web; an older server sends none and the word is left out
+    const left = b.period_left;
     status = (b.overflow ?? 0) > 0.005
       ? <Pill text={`over +${money(b.overflow!, false)}`} tone="bad" />
+      : left == null ? null
       : left <= b.amount * 0.001
-        ? <Pill text="full" tone="warn" />
+        ? <Pill text={`used up${isAnnualEnv ? " this year" : ""}`} tone="warn" />
         : <Text style={s.mut}>
             {money(left, false)} left{isAnnualEnv ? " this year" : ""}
           </Text>;
@@ -114,59 +126,88 @@ function BillRow({ b, onPress, onHint, past }: {
           : <Pill text={b.income ? "not received" : "missed"} tone="bad" />)
       : <Text style={s.mut}>not due</Text>;
   } else if (b.income) {
+    // the paid words are the server's ("received 05/15", "1 of 2
+    // received"); an older server sends none and they are left out
     status = settled
-      ? <Text style={{ color: C.good, fontSize: 12 }}>
-          received ✓{b.paid > 1 ? ` ×${b.paid}` : ""}
-        </Text>
-      : daysTo !== null
-        ? <Text style={[s.mut, { color: soon ? C.warn : C.good }]}>{dueText(daysTo, true)}</Text>
+      ? <Text style={{ color: C.good, fontSize: 12 }}>{b.paid_text ?? ""}</Text>
+      : due.text
+        ? <Text style={[s.mut, { color: soon ? C.warn : C.good }]}>
+            {b.paid_text ? `${b.paid_text} · ` : ""}{due.text}</Text>
         : <Pill text="awaiting" />;
   } else {
     status = settled
-      ? <Text style={s.mut}>paid ✓</Text>
+      ? <Text style={s.mut}>{b.paid_text ?? ""}</Text>
       : overdue
         // a charge the bank feed withdrew is a warning, not a missed payment
         ? <Pill text={missedBillPill(b.withdrawn_on).text}
                 tone={missedBillPill(b.withdrawn_on).tone} />
-        : daysTo !== null
-          ? <Text style={[s.mut, { color: soon ? C.warn : C.good }]}>{dueText(daysTo)}</Text>
+        : due.text
+          ? <Text style={[s.mut, { color: soon ? C.warn : C.good }]}>
+              {b.paid_text ? `${b.paid_text} · ` : ""}{due.text}</Text>
           : <Pill text="awaiting" />;
   }
+  // the server's sum of the bill and its fees (amount_with_fees); an
+  // older server sends none and the row prints no amount
+  const amountText = (b.income ? "+" : "")
+    // older-server path: stands in for `amount_with_fees`
+    + money(b.amount_with_fees ?? b.amount + (b.fee_total || 0));
+  // a past month on view prints the server's unpaid date for that month
+  // (next_unpaid), the date the web's "Due" column shows for the same bill
+  const when = b.cadence + (past
+    ? (b.next_unpaid ? ` · due ${mmddyy(b.next_unpaid)}` : "")
+    : due.label ? ` · due ${due.label}`
+    : b.next_unpaid ? ` · next ${mmddyy(b.next_unpaid)}` : "");
+  // The row's press target lies BENEATH its content, as a sibling, so the
+  // ✕ and ↺ flags on the row are buttons of their own a screen reader can
+  // reach (a touchable inside another is reachable only through the outer
+  // one). The content passes touches through to it; the flags take
+  // theirs. The target speaks the row; status pills follow it.
+  const hidden = { importantForAccessibility: "no-hide-descendants" as const,
+                   accessibilityElementsHidden: true };
   return (
-    <Pressable style={({ pressed }) => [s.bill,
-                 pressed && onPress ? { backgroundColor: C.hover } : null]}
-               onPress={onPress}>
-      <View style={s.billTop}>
+    <View style={s.bill}>
+      <Pressable style={({ pressed }) => [s.billPress,
+                   pressed && onPress ? { backgroundColor: C.hover } : null]}
+                 onPress={onPress} disabled={!onPress}
+                 accessibilityRole="button"
+                 accessibilityLabel={`${b.payee}, ${amountText}${b.fee_total
+                   ? ` incl. ${money(b.fee_total)} fee` : ""}, ${when}`} />
+      <View style={s.billTop} pointerEvents="none" {...hidden}>
         <Text style={s.payee} numberOfLines={1}>{b.payee}</Text>
         <Text style={[s.amount, b.income && { color: C.good }]}>
-          {b.income ? "+" : ""}{money(b.amount + (b.fee_total || 0))}
+          {amountText}
           {b.fee_total
             ? <Text style={{ color: C.mut, fontSize: 11 }}>
                 {"  incl. "}{money(b.fee_total)}{" fee"}</Text> : null}
         </Text>
       </View>
-      <View style={s.billSub}>
-        <Text style={s.mut}>
-          {b.cadence}
-          {b.due_on ? ` · due ${mmddyy(b.due_on)}`
-            : b.next_unpaid ? ` · next ${mmddyy(b.next_unpaid)}` : ""}
-        </Text>
+      <View style={s.billSub} pointerEvents="box-none">
+        <View pointerEvents="none" {...hidden}>
+          <Text style={s.mut}>{when}</Text>
+        </View>
         <View style={{ flexDirection: "row", alignItems: "center",
-                       gap: 6 }}>
-          {status}
-          {b.disabled && <Pill text="disabled" />}
+                       gap: 6 }} pointerEvents="box-none">
+          {(status || b.disabled) && (
+            <View style={s.passRow} pointerEvents="none">
+              {status}
+              {b.disabled && <Pill text="disabled" />}
+            </View>
+          )}
           {!b.disabled && b.health && !b.health_dismissed
             && HEALTH_PILL[b.health] ? (
             <>
-              <Pill text={b.health === "mismatch" && b.last_seen
-                ? `mismatch · ledger ${money(b.last_seen.amount)} on ${mmddyy(b.last_seen.date)}`
-                : b.health} tone={HEALTH_PILL[b.health]} />
+              <View pointerEvents="none">
+                <Pill text={b.health === "mismatch" && b.last_seen
+                  ? `mismatch · ledger ${money(b.last_seen.amount)} on ${mmddyy(b.last_seen.date)}`
+                  : b.health} tone={HEALTH_PILL[b.health]} />
+              </View>
               {/* dismiss — it returns only if the problem changes */}
               {onHint && (
-                <Text style={{ color: C.mut, fontSize: 12 }}
-                      onPress={() => onHint(b.payee, "dismiss", "health")}>
-                  ✕
-                </Text>
+                <Pressable accessibilityRole="button" accessibilityLabel="Dismiss"
+                           onPress={() => onHint(b.payee, "dismiss", "health")}>
+                  <Text style={{ color: C.mut, fontSize: 14, paddingHorizontal: 14,
+                                 paddingVertical: 12 }}>✕</Text>
+                </Pressable>
               )}
             </>
           ) : null}
@@ -178,15 +219,16 @@ function BillRow({ b, onPress, onHint, past }: {
               out the date (missedBillPill). */}
           {!b.disabled && b.health === "withdrawn"
             && !(overdue && b.withdrawn_on) ? (
-            <Pill text="withdrawn" tone="warn" />
+            <View pointerEvents="none"><Pill text="withdrawn" tone="warn" /></View>
           ) : null}
           {/* the way back from a dismissed health flag */}
           {!b.disabled && b.health && b.health_dismissed
             && HEALTH_PILL[b.health] && onHint ? (
-            <Text style={{ color: C.mut, fontSize: 12 }}
-                  onPress={() => onHint(b.payee, "restore", "health")}>
-              ↺
-            </Text>
+            <Pressable accessibilityRole="button" accessibilityLabel="Restore this flag"
+                       hitSlop={10}
+                       onPress={() => onHint(b.payee, "restore", "health")}>
+              <Text style={{ color: C.mut, fontSize: 12 }}>↺</Text>
+            </Pressable>
           ) : null}
           {/* the ledger disagrees with this bill — the 💡 opens the
               history, where "edit with these values" applies the fit */}
@@ -195,24 +237,34 @@ function BillRow({ b, onPress, onHint, past }: {
                 || b.fit_diverges)
             ? (
             <>
-              <Text style={{ fontSize: 12 }}>💡</Text>
+              <View pointerEvents="none">
+                <Text style={{ fontSize: 12 }}
+                      accessibilityLabel="The ledger disagrees with this bill">💡</Text>
+              </View>
               {onHint && (
-                <Text style={{ color: C.mut, fontSize: 12 }}
-                      onPress={() => onHint(b.payee, "dismiss", "fit")}>
-                  ✕
-                </Text>
+                <Pressable accessibilityRole="button" accessibilityLabel="Dismiss this hint"
+                           hitSlop={10}
+                           onPress={() => onHint(b.payee, "dismiss", "fit")}>
+                  <Text style={{ color: C.mut, fontSize: 12 }}>✕</Text>
+                </Pressable>
               )}
             </>
           ) : null}
         </View>
       </View>
-      {envelope && b.pool ? (
-        <Meter frac={(b.period_used ?? 0) / (b.pool || 1)}
-               tone={b.overflow ? "bad" : undefined} />
-      ) : cycleFrac !== null && !settled ? (
-        <Meter frac={cycleFrac} tone={overdue ? "bad" : soon ? "warn" : undefined} />
-      ) : null}
-    </Pressable>
+      <View pointerEvents="none">
+        {/* the envelope's fill is the server's period_frac, the web's own
+            bar; a server without it draws none */}
+        {envelope && (b.period_frac != null
+                      || (b.period_frac === undefined && !!b.pool)) ? (
+          // older-server path: stands in for `period_frac`
+          <Meter frac={b.period_frac ?? (b.period_used ?? 0) / (b.pool || 1)}
+                 tone={b.overflow ? "bad" : undefined} />
+        ) : cycleFrac !== null && !settled ? (
+          <Meter frac={cycleFrac} tone={overdue ? "bad" : soon ? "warn" : undefined} />
+        ) : null}
+      </View>
+    </View>
   );
 }
 
@@ -266,8 +318,12 @@ function NightlyFinderSwitch({ onError }: { onError: (m: string) => void }) {
     },
   });
   // absent means on — only an explicit false stops it
-  const on = settings.data ? settings.data.bill_detection_auto !== false
-    : true;
+  // An unread setting is neither on nor off: nothing while it loads, the
+  // failed line when it failed — never a switch that reads "on" by default.
+  if (settings.data === undefined)
+    return settings.isError
+      ? <FailedLine q={settings} what="the nightly search setting" /> : null;
+  const on = settings.data.bill_detection_auto !== false;
   if (!owner)
     return settings.data ? (
       <View style={{ marginHorizontal: 12, marginTop: 8 }}>
@@ -308,6 +364,8 @@ export default function Bills() {
   const router = useRouter();
   const viewer = useViewer();
   const qc = useQueryClient();
+  // offline, the writes here are greyed with "You're offline." beside them
+  const offline = useOffline();
   // the month on view: null = this month (the live key every write
   // patches); a past month has its own key, so stepping back never
   // overwrites the live list in the cache
@@ -380,11 +438,9 @@ export default function Bills() {
     },
   });
   const approveAll = useMutation({
-    mutationFn: () => client!.billsApproveAll(),
+    mutationFn: (pids: string[]) => client!.billsApproveAll(pids),
     onSuccess: (r) => {
-      setNotice((r.failed.length
-        ? `Approved ${r.approved}; ${r.failed.length} stayed pending.`
-        : `Approved all ${r.approved} proposal${r.approved === 1 ? "" : "s"}.`)
+      setNotice(approveAllWords(r)
         // an approve that cleared a pin says so, per bill
         + (r.notes?.length
           ? ` — ${r.notes.map((n) => `${n.payee}: ${n.note}`).join("; ")}` : ""));
@@ -392,7 +448,7 @@ export default function Bills() {
       qc.setQueryData<BillsData>(["bills"], (old) => old && {
         ...old,
         proposals: old.proposals.filter(
-          (p) => r.failed.some((f) => f.pid === p.id)),
+          (p) => r.failed.some((f) => f.pid === p.id && !f.superseded)),
       });
       refetchSchedule();
       qc.invalidateQueries({ queryKey: ["budgets-suggest"] });
@@ -577,22 +633,23 @@ export default function Bills() {
                                           qc.invalidateQueries(
                                             { queryKey: ["calendar"] })]);
                                       }} />}>
-      <StaleBanner query={query} />
+      <StaleLine query={query} />
       {/* step back through the months: the per-bill paid/received are
           the month on view, as it ended; the schedule stays live */}
       <View style={[s.toolRow, { alignItems: "center" }]}>
-        <Pressable style={s.tool} accessibilityLabel="Previous month"
+        <Pressable accessibilityRole="button" style={s.tool} accessibilityLabel="Previous month"
                    onPress={() => setYm(shiftYm(shownYm, -1))}>
           <Text style={s.toolText}>‹</Text>
         </Pressable>
         <Text style={{ color: C.text, fontWeight: "700" }}>{ymLabel(shownYm)}</Text>
-        <Pressable style={[s.tool, !isPast && { opacity: 0.4 }]} disabled={!isPast}
+        <Pressable accessibilityRole="button"
+                   style={[s.tool, !isPast && { opacity: 0.4 }]} disabled={!isPast}
                    accessibilityLabel="Next month"
                    onPress={() => { const n = shiftYm(shownYm, 1); setYm(n >= curYm ? null : n); }}>
           <Text style={s.toolText}>›</Text>
         </Pressable>
         {isPast ? (
-          <Pressable style={s.tool} onPress={() => setYm(null)}>
+          <Pressable accessibilityRole="button" style={s.tool} onPress={() => setYm(null)}>
             <Text style={s.toolText}>This month</Text>
           </Pressable>
         ) : null}
@@ -604,11 +661,13 @@ export default function Bills() {
       ) : null}
       {!viewer && (
       <View style={s.toolRow}>
-        <Pressable style={s.tool} onPress={() => setAdding(true)}>
+        <Pressable accessibilityRole="button"
+                   disabled={offline} style={[s.tool, offlineGrey(offline)]} onPress={() => setAdding(true)}>
           <Text style={s.toolText}>＋ Add a bill</Text>
         </Pressable>
-        <Pressable style={[s.tool, detect.isPending && { opacity: 0.5 }]}
-                   disabled={detect.isPending}
+        <Pressable accessibilityRole="button"
+                   style={[s.tool, detect.isPending && { opacity: 0.5 }, offlineGrey(offline)]}
+                   disabled={detect.isPending || offline}
                    onPress={() => detect.mutate()}>
           <Text style={s.toolText}>
             {detect.isPending ? "Scanning…" : "⌕ Find bills & income"}
@@ -616,6 +675,7 @@ export default function Bills() {
         </Pressable>
       </View>
       )}
+      {!viewer && <OfflineNote style={{ marginHorizontal: 12 }} />}
       <NightlyFinderSwitch onError={setNotice} />
       {detect.data && (() => {
         const nInc = detect.data.proposed_income ?? 0;
@@ -637,24 +697,28 @@ export default function Bills() {
           </Text>
         );
       })()}
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      {query.isPending && <Skeleton />}
+      {/* a failed first read says so under the stepper, which stays: the
+          month that failed is one tap from the one before it */}
+      {d === undefined && query.isError && (
+        <FailedLine q={query} what={isPast ? `bills for ${ymLabel(shownYm)}`
+                                           : "bills"} />)}
       {d?.totals && (
         <Card>
-          <KV k="Monthly bill load" v={money(d.totals.bills_monthly, false)} />
-          <KV k={d.totals.income_basis === "actual"
-                  ? `Monthly income (${d.totals.income_months ?? 12}-month average)`
-                  : "Monthly income"}
-              v={money(d.totals.income_monthly, false)}
-              tone="good" />
-          {/* the difference is what the variable budget and savings
-              actually have to work with (matches the web hero) */}
-          <KV k="Left for spending & savings"
-              v={money(d.totals.income_monthly - d.totals.bills_monthly,
-                       false)}
-              tone={d.totals.income_monthly - d.totals.bills_monthly >= 0
-                      ? "good" : "bad"} />
-          <KV k="Due this week"
-              v={`${money(d.totals.week_total, false)} · ${d.totals.week_count} bill${d.totals.week_count === 1 ? "" : "s"}`} />
+          {/* the month in the plan's terms, figure and words from the
+              server (bills_hero) — the web's tiles, in the same order;
+              nothing is added up here */}
+          {(d.totals.hero ?? []).map((t) => (
+            <View key={t.key}>
+              <KV k={t.label} v={money(t.amount, false)}
+                  tone={t.tone === "pos" ? "good" : t.tone === "neg" ? "bad"
+                        : undefined} />
+              <Text style={[s.mut, { marginTop: -2, marginBottom: 4 }]}>
+                {t.note}</Text>
+            </View>
+          ))}
+          {d.totals.week_text ? (
+            <KV k="Next 7 days" v={d.totals.week_text} />) : null}
           {d.proposals.length > 0 && (
             <KV k="Proposals to review" v={String(d.proposals.length)}
                 tone="warn" />)}
@@ -674,7 +738,8 @@ export default function Bills() {
                     || (accept.isPending
                         && accept.variables?.b.payee === b.payee)
                     || (hint.isPending
-                        && hint.variables?.payee === b.payee)}
+                        && hint.variables?.payee === b.payee)
+                    || offline}
               onReview={() => router.push({
                 pathname: "/bill-history",
                 params: { payee: b.payee } } as never)}
@@ -699,25 +764,41 @@ export default function Bills() {
                       undoAct.act(); setUndoAct(null); }}>
                 Undo</Text>
               <Text style={{ color: C.mut, fontSize: 12 }}
+                    accessibilityRole="button" accessibilityLabel="Dismiss"
                     onPress={() => setUndoAct(null)}>✕</Text>
             </View>
           )}
         </Card>
       )}
       {notice && (
-        <Text style={[s.mut, { textAlign: "center" }]}>{notice}</Text>
+        <Note style={[s.mut, { textAlign: "center" }]}>{notice}</Note>
+      )}
+      {/* income first, then the proposed changes, then the bills — the
+          web page's order: money in before money out.
+          A row opens the payee's HISTORY (the web's name link); the
+          editor lives one tap further, like the web's ✎ expander. */}
+      {income.length > 0 && (
+        <Card>
+          <H>Income</H>
+          {income.map((b) => (
+            <BillRow key={b.payee} b={b} onHint={onHint} past={isPast}
+              onPress={() => router.push({ pathname: "/bill-history",
+                params: { payee: b.payee } } as never)} />
+          ))}
+        </Card>
       )}
       {d && d.proposals.length > 0 && (
         <Card>
           <View style={{ flexDirection: "row", alignItems: "center",
                          justifyContent: "space-between", gap: 8 }}>
-            <H>Proposals</H>
+            <H>Proposed changes</H>
             {/* one click for the common case, as on the web — the
                 finder's first pass over a fresh history is usually right */}
             {!viewer && d.proposals.length > 1 && (
-              <Pressable style={s.pBtn}
-                         disabled={approveAll.isPending || act.isPending}
-                         onPress={() => approveAll.mutate()}>
+              <Pressable accessibilityRole="button" style={[s.pBtn, offlineGrey(offline)]}
+                         disabled={approveAll.isPending || act.isPending || offline}
+                         onPress={() => approveAll.mutate(
+                           d.proposals.map((p) => p.id))}>
                 <Text style={s.pBtnText}>
                   {approveAll.isPending ? "Approving…"
                     : `Approve all ${d.proposals.length}`}
@@ -733,7 +814,7 @@ export default function Bills() {
             // this row's own decision in flight — never the whole list —
             // or Approve all, which is deciding this row too
             const busy = approveAll.isPending
-              || (act.isPending && act.variables?.pid === p.id);
+              || (act.isPending && act.variables?.pid === p.id) || offline;
             return (
             <View key={p.id} style={s.proposal}>
               <View style={{ flex: 1 }}>
@@ -747,12 +828,11 @@ export default function Bills() {
                           params: { payee: p.payee } } as never)}>
                     {p.payee}
                   </Text>
-                  {/* kind pill always, in the web's tones: remove is
-                      red, add is green, drift stays amber */}
-                  {p.kind ? (
-                    <Pill text={p.kind === "attach" ? "fee"
-                            : p.kind === "merchant" ? "add merchant"
-                            : p.kind === "amount_change" ? "amount change" : p.kind}
+                  {/* the server's words for what approving does, in the
+                      web's tones: remove is red, add is green, the rest
+                      amber; an older server sends none and shows none */}
+                  {p.change_text ? (
+                    <Pill text={p.change_text}
                           tone={p.kind === "remove" ? "bad"
                             : p.kind === "add" ? "good" : "warn"} />
                   ) : null}
@@ -762,25 +842,22 @@ export default function Bills() {
                   {p.kind === "merchant" && p.bill_payee ? (
                     <Text style={{ color: C.mut, fontSize: 12 }}>
                       add to bill “{p.bill_payee}”</Text>) : null}
-                  {p.bill_type === "envelope"
-                    ? <Pill text="envelope" /> : null}
-                  {p.income ? <Pill text="income" tone="good" /> : null}
-                  {p.llm_tag ? <Pill text={p.llm_tag} /> : null}
                 </View>
                 <Text style={s.mut}>
-                  {money(p.amount)} · {p.cadence}
-                  {p.next_due ? ` · next ${mmddyy(p.next_due)}` : ""}
-                  {p.summary ? ` · ${p.summary}` : ""}
+                  {[money(p.amount), p.cadence_text,
+                    p.upcoming_due ? `next ${mmddyy(p.upcoming_due)}` : null,
+                    p.tag_text, p.summary].filter(Boolean).join(" · ")}
                 </Text>
               </View>
               {!viewer && (<>
-              <Pressable style={[s.pBtn, busy && { opacity: 0.5 }]}
+              <Pressable accessibilityRole="button" style={[s.pBtn, busy && { opacity: 0.5 }]}
                          disabled={busy}
                          onPress={() => act.mutate({ pid: p.id,
                                                      action: "approve" })}>
                 <Text style={s.pBtnText}>Approve</Text>
               </Pressable>
-              <Pressable style={[s.pBtn, s.pBtnQuiet, busy && { opacity: 0.5 }]}
+              <Pressable accessibilityRole="button"
+                         style={[s.pBtn, s.pBtnQuiet, busy && { opacity: 0.5 }]}
                          disabled={busy}
                          onPress={() => act.mutate({ pid: p.id,
                                                      action: "reject" })}>
@@ -795,19 +872,6 @@ export default function Bills() {
               {errText(act.error)}
             </Text>
           ) : null}
-        </Card>
-      )}
-      {/* income first, like the web page — money in before money out.
-          A row opens the payee's HISTORY (the web's name link); the
-          editor lives one tap further, like the web's ✎ expander. */}
-      {income.length > 0 && (
-        <Card>
-          <H>Income</H>
-          {income.map((b) => (
-            <BillRow key={b.payee} b={b} onHint={onHint} past={isPast}
-              onPress={() => router.push({ pathname: "/bill-history",
-                params: { payee: b.payee } } as never)} />
-          ))}
         </Card>
       )}
       {GROUP_ORDER.filter((g) => !g.includes("envelope")).map((g) => {
@@ -863,21 +927,20 @@ export default function Bills() {
           </Card>
         );
       })()}
-      {d && bills.length > 0 && (
-        <Text style={[s.mut, { textAlign: "center", marginTop: 4 }]}>
-          A healthy bill carries no status pill — a quiet row is the ✓.
-        </Text>
-      )}
       {d && d.bills.length === 0 && d.proposals.length === 0
         && !query.isPending && (
-        <Text style={s.center}>
-          No recurring bills yet. Import or connect your bank, then hit
-          Find recurring bills — or add one by hand.
-        </Text>
+        // the action is the button's own name, and only for those who may
+        // run it (a viewer has none) — the web's line
+        <EmptyState title={EMPTY_LINES.bills}
+          action={!viewer && !detect.isPending && !offline
+            ? EMPTY_LINES.billsAction : undefined}
+          onAction={() => detect.mutate()} />
       )}
       {(d?.archived ?? []).length > 0 && (
         <Card>
-          <Pressable onPress={() => setShowArch((x) => !x)}>
+          <Pressable onPress={() => setShowArch((x) => !x)}
+                     {...disclosure(showArch, `Archived — ${d!.archived.length} removed `
+                       + `bill${d!.archived.length === 1 ? "" : "s"} (history kept)`)}>
             <Text style={[s.mut, { fontWeight: "600" }]}>
               {showArch ? "▾" : "▸"} Archived — {d!.archived.length}{" "}
               removed bill{d!.archived.length === 1 ? "" : "s"} (history
@@ -907,9 +970,9 @@ export default function Bills() {
                   && delForever.variables === b.payee;
                 // either write in flight holds both: a restore racing a
                 // purge leaves the row in whichever state lands last
-                const rowBusy = restoring || deleting;
+                const rowBusy = restoring || deleting || offline;
                 return (<>
-                <Pressable style={[s.pBtn, s.pBtnQuiet,
+                <Pressable accessibilityRole="button" style={[s.pBtn, s.pBtnQuiet,
                              rowBusy && { opacity: 0.5 }]}
                            disabled={rowBusy}
                            onPress={() => restore.mutate(b.payee)}>
@@ -939,7 +1002,12 @@ export default function Bills() {
       {/* the 5-week calendar closes the page, like the web's Bills —
           gated on the UNFILTERED list (the web's rule): an income-only
           household still has paychecks to show on the grid */}
-      {(d?.bills ?? []).length > 0 && <CalendarSection />}
+      {(d?.bills ?? []).length > 0 && (isPast
+        ? (d?.month_calendar
+            ? <CalendarSection month={{ ym: shownYm, title: ymLabel(shownYm),
+                                         days: d.month_calendar }} />
+            : null)
+        : <CalendarSection />)}
 
       <Sheet visible={adding} onClose={() => setAdding(false)}
              title="Add a bill">
@@ -968,11 +1036,14 @@ function archivedClash(e: unknown): boolean {
     && (e.body as { archived?: unknown } | undefined)?.archived === true;
 }
 
-function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
+function AddBillFields({ pending: sending, error, archived, onAdd, onCancel }: {
   pending: boolean; error: string | null; archived: boolean;
   onAdd: (f: AddBillForm) => void; onCancel: () => void;
 }) {
   const { client } = useSession();
+  // offline, Add and Restore are greyed with "You're offline." beside them
+  const offline = useOffline();
+  const pending = sending || offline;
   const [nPayee, setNPayee] = useState("");
   const [nAmount, setNAmount] = useState("");
   const [nCadence, setNCadence] = useState("MONTHLY:1");
@@ -1005,20 +1076,21 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
     : [];
   return (
     <>
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("Merchant — pick a known one or type a new name")} style={s.input}
                  placeholder="merchant — pick a known one or type a new name"
                  placeholderTextColor={C.mut} value={nPayee}
                  onChangeText={setNPayee} />
       {payeeSuggestions.length > 0 && (
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
           {payeeSuggestions.map((m) => (
-            <Pressable key={m} style={s.chip} onPress={() => setNPayee(m)}>
+            <Pressable accessibilityRole="button"
+                       key={m} style={s.chip} onPress={() => setNPayee(m)}>
               <Text style={{ color: C.accent, fontSize: 12 }}>{m}</Text>
             </Pressable>
           ))}
         </View>
       )}
-      <TextInput style={s.input} placeholder="amount"
+      <TextInput {...fieldA11y("Amount")} style={s.input} placeholder="amount"
                  placeholderTextColor={C.mut} value={nAmount}
                  onChangeText={setNAmount} keyboardType="decimal-pad" />
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
@@ -1028,7 +1100,7 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
             + Custom: no invented options. */}
         {([...ADD_CADENCES, ["CUSTOM", "custom interval…"],
           ] as [string, string][]).map(([v, l]) => (
-          <Pressable key={v}
+          <Pressable accessibilityRole="button" key={v}
                      style={[s.chip, nCadence === v && s.chipOn]}
                      onPress={() => setNCadence(v)}>
             <Text style={{ color: nCadence === v ? C.text : C.mut,
@@ -1043,13 +1115,13 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
           <Text style={{ color: C.mut, fontSize: 12 }}>every</Text>
           {/* the cap depends on the unit (about 20 years of it), so the
               field clamps as it is typed rather than at a fixed length */}
-          <TextInput style={[s.input, { width: 60 }]}
+          <TextInput {...fieldA11y("Repeats every")} style={[s.input, { width: 60 }]}
                      keyboardType="number-pad" value={nCustomN} maxLength={4}
                      onChangeText={(t) => setNCustomN(
                        Number(t) > customMax(nCustomUnit)
                          ? String(customMax(nCustomUnit)) : t)} />
           {CUSTOM_UNITS.map(([u, label]) => (
-            <Pressable key={u}
+            <Pressable accessibilityRole="button" key={u}
                        style={[s.chip, nCustomUnit === u && s.chipOn]}
                        onPress={() => setNCustomUnit(u)}>
               <Text style={{ color: nCustomUnit === u
@@ -1062,7 +1134,7 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
       )}
       {nIsEnv && (
         <>
-          <TextInput style={s.input}
+          <TextInput {...fieldA11y("Envelope category (optional)")} style={s.input}
                      placeholder="envelope category (optional — counts that category's spend toward the pool)"
                      placeholderTextColor={C.mut}
                      autoCapitalize="none"
@@ -1082,7 +1154,7 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
                 .filter((c) => c !== nCategory)
                 .slice(0, 8)
                 .map((c) => (
-                  <Pressable key={c} style={s.chip}
+                  <Pressable accessibilityRole="button" key={c} style={s.chip}
                              onPress={() => setNCategory(c)}>
                     <Text style={{ color: C.accent, fontSize: 12 }}>
                       {catLabel(c)}
@@ -1093,7 +1165,7 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
           )}
         </>
       )}
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("Next due (YYYY-MM-DD, optional)")} style={s.input}
                  placeholder="next due (YYYY-MM-DD, optional)"
                  placeholderTextColor={C.mut} value={nDue}
                  onChangeText={setNDue} autoCapitalize="none" />
@@ -1102,7 +1174,9 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
         <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
           This is income
         </Text>
-        <Switch value={nIncome} onValueChange={setNIncome}
+        <Switch value={nIncome}
+                accessibilityLabel="This is income"
+                onValueChange={setNIncome}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
@@ -1112,36 +1186,39 @@ function AddBillFields({ pending, error, archived, onAdd, onCancel }: {
           <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
             Pin to Today (its own card + daily email)
           </Text>
-          <Switch value={nPinned} onValueChange={setNPinned}
+          <Switch value={nPinned}
+                  accessibilityLabel="Pin to Today"
+                  onValueChange={setNPinned}
                   trackColor={{ true: C.accent, false: C.hover }}
                   thumbColor={C.text} />
         </View>
       )}
       {error ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}>{error}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}>{error}</Note>
       ) : null}
       <View style={{ flexDirection: "row", gap: 8,
                      justifyContent: "center" }}>
         {/* an archived bill holds this name: bring it back with the
             values entered here */}
         {archived && (
-          <Pressable style={[s.pBtn, pending && { opacity: 0.5 }]}
+          <Pressable accessibilityRole="button" style={[s.pBtn, pending && { opacity: 0.5 }]}
                      disabled={pending}
                      onPress={() => onAdd({ ...form(), restore: true })}>
             <Text style={s.pBtnText}>Restore</Text>
           </Pressable>
         )}
-        <Pressable style={[s.pBtn,
+        <Pressable accessibilityRole="button" style={[s.pBtn,
                      (!nPayee.trim() || !nAmount || pending)
                        && { opacity: 0.5 }]}
                    disabled={!nPayee.trim() || !nAmount || pending}
                    onPress={() => onAdd(form())}>
           <Text style={s.pBtnText}>Add</Text>
         </Pressable>
-        <Pressable style={[s.pBtn, s.pBtnQuiet]} onPress={onCancel}>
+        <Pressable accessibilityRole="button" style={[s.pBtn, s.pBtnQuiet]} onPress={onCancel}>
           <Text style={[s.pBtnText, { color: C.mut }]}>Cancel</Text>
         </Pressable>
       </View>
+      <OfflineNote />
     </>
   );
 }
@@ -1151,7 +1228,11 @@ const s = StyleSheet.create({
   center: { color: C.mut, textAlign: "center", padding: 20 },
   bill: { borderTopColor: C.border, borderTopWidth: StyleSheet.hairlineWidth,
           paddingVertical: 8 },
+  // the row's press target, under the row's content
+  billPress: { position: "absolute", top: 0, right: 0, bottom: 0, left: 0 },
   billTop: { flexDirection: "row", justifyContent: "space-between", gap: 8 },
+  // the status and its pills, which pass a press through to the row
+  passRow: { flexDirection: "row", alignItems: "center", gap: 6 },
   billSub: { flexDirection: "row", justifyContent: "space-between",
              alignItems: "center", gap: 8, marginTop: 2 },
   payee: { color: C.text, fontSize: 14, fontWeight: "600", flexShrink: 1 },
@@ -1161,16 +1242,18 @@ const s = StyleSheet.create({
               borderTopColor: C.border,
               borderTopWidth: StyleSheet.hairlineWidth,
               paddingVertical: 8 },
-  pBtn: { backgroundColor: C.accent, borderRadius: 8,
+  pBtn: { backgroundColor: C.btn, borderRadius: 8,
           paddingHorizontal: 12, paddingVertical: 7 },
   pBtnQuiet: { backgroundColor: C.hover },
   pBtnText: { color: C.text, fontSize: 13, fontWeight: "600" },
   toolRow: { flexDirection: "row", gap: 8, marginHorizontal: 12,
              marginTop: 10 },
   tool: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
-          borderRadius: 999, paddingHorizontal: 14, paddingVertical: 7 },
+          borderRadius: 999, paddingHorizontal: 14, paddingVertical: 7,
+          minHeight: 44, minWidth: 44, alignItems: "center",
+          justifyContent: "center" },
   toolText: { color: C.accent, fontSize: 13, fontWeight: "600" },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 15,
            paddingHorizontal: 10, paddingVertical: 8 },
   chip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
@@ -1185,15 +1268,9 @@ function attnRow(b: Bill): boolean {
     .includes(b.health ?? "") && !b.health_dismissed && !b.disabled;
 }
 
-// One line of the triage queue: severity dot, the story the ledger tells,
-// and the ONE action the server's evidence supports (copy mirrors the
-// web's AttentionLine — the client never invents an action or a number).
-function AttentionLine({ b, viewer, busy, onReview, onAccept, onDisable,
-                         onDismiss }: {
-  b: Bill; viewer: boolean; busy: boolean; onReview: () => void;
-  onAccept: (amt: number) => void; onDisable: () => void;
-  onDismiss: () => void;
-}) {
+// A server older than the queue's words: the story built from the fields
+// the row carries, as that server's web built it.
+function olderAttentionWords(b: Bill): string {
   const sug = b.suggestion;
   const plusDays = (iso: string, days: number) => {
     const t = new Date(iso + "T00:00:00Z");
@@ -1205,7 +1282,7 @@ function AttentionLine({ b, viewer, busy, onReview, onAccept, onDisable,
   const lastSeen = b.last_seen?.date
     && (!b.last_match || b.last_seen.date > b.last_match)
     ? b.last_seen.date : b.last_match;
-  const story =
+  return (
     b.health === "stale"
       ? `missed its${lastSeen && b.cycle_days
           ? ` ~${mmddyy(plusDays(lastSeen, b.cycle_days))}` : ""}` +
@@ -1220,9 +1297,25 @@ function AttentionLine({ b, viewer, busy, onReview, onAccept, onDisable,
             `bill says ${money(b.amount)} — amounts vary`)
     : b.health === "drifting"
       ? "amount wandering — auto-corrects tonight"
-      : "payments match, but the due-date anchor is off the real draft day";
+      : "payments match, but the due-date anchor is off the real draft day");
+}
+
+// One line of the triage queue: severity dot, the story the ledger tells,
+// and the ONE action the server's evidence supports (copy mirrors the
+// web's AttentionLine — the client never invents an action or a number).
+function AttentionLine({ b, viewer, busy, onReview, onAccept, onDisable,
+                         onDismiss }: {
+  b: Bill; viewer: boolean; busy: boolean; onReview: () => void;
+  onAccept: (amt: number) => void; onDisable: () => void;
+  onDismiss: () => void;
+}) {
+  const sug = b.suggestion;
+  // the story is the server's (attention_text, api_bills.attention_words)
+  const story = b.attention_text === undefined
+    // older-server path: stands in for `attention_text`
+    ? olderAttentionWords(b) : (b.attention_text ?? "");
   const btn = (label: string, onPress: () => void, primary = false) => (
-    <Pressable onPress={onPress} disabled={busy}
+    <Pressable accessibilityRole="button" onPress={onPress} disabled={busy}
         style={{ paddingVertical: 3, paddingHorizontal: 9, borderRadius: 7,
                  borderWidth: 1, opacity: busy ? 0.5 : 1,
                  borderColor: primary ? C.accent : C.border,
@@ -1233,7 +1326,7 @@ function AttentionLine({ b, viewer, busy, onReview, onAccept, onDisable,
   );
   return (
     <View style={{ paddingVertical: 6, gap: 6 }}>
-      <Pressable onPress={onReview}
+      <Pressable accessibilityRole="button" onPress={onReview}
                  style={{ flexDirection: "row", gap: 8,
                           alignItems: "center" }}>
         <View style={{ width: 8, height: 8, borderRadius: 4,

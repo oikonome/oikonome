@@ -17,6 +17,7 @@ so a later recurrence shows again — recurrence is news.
 """
 
 import datetime as dt
+import re
 from urllib.parse import quote
 
 from . import links
@@ -105,7 +106,9 @@ def freshness(conn, jobs: list[tuple[str, str, int]] | None = None,
         for source, when in _hb.revoked_tokens(conn).items():
             out.append({"kind": "collector-token-revoked", "severity": "warn",
                         "link": settings_link("connections"),
-                        "message": f"The {source} collector's script token "
+                        # the source is a slug ("mybank"): said as a name
+                        "message": f"The {source[:1].upper()}{source[1:]} "
+                                   f"collector's script token "
                                    f"was revoked {_mmdd(when.date().isoformat())}"
                                    f" — mint a new one under Settings → "
                                    f"Connections → Script tokens and update "
@@ -184,6 +187,27 @@ def reimb_pending(conn) -> dict | None:
             "oldest": min(r["date"] for r in open_)}
 
 
+def reimb_owed(conn) -> float:
+    """What is still owed back across every flagged charge — reimb_pending's
+    `total`, $0 when nothing is outstanding: the Reimbursements page's
+    headline, the Today strip and the email state one figure."""
+    rp = reimb_pending(conn)
+    return rp["total"] if rp else 0.0
+
+
+def reimb_received_pct(amount: float, expected: float | None,
+                       received: float | None) -> int:
+    """How much of a flagged charge has come back, as the row's "got $A of
+    $B (P%)" prints it: what was received over what is expected back (the
+    charge itself when nothing narrower was given), in whole percent
+    rounded halves up, never past 100."""
+    import math
+    expect = expected if expected is not None else abs(amount)
+    if expect <= 0:
+        return 0
+    return min(100, int(math.floor((received or 0) / expect * 100 + 0.5)))
+
+
 # ---- the strip ---------------------------------------------------------
 
 
@@ -240,6 +264,7 @@ def build(status: dict) -> list[dict]:
         # (kind, message) identity used for logging and dismissal — retargeting
         # a link must not resurrect a dismissed alert.
         a = {"kind": kind, "severity": severity, "message": message}
+        link = link or KIND_LINK.get(kind)
         if link:
             a["link"] = link
         out.append(a)
@@ -256,9 +281,11 @@ def build(status: dict) -> list[dict]:
             f"${ev['funding_ytd_total']:,.0f} year to date (excl. major "
             f"purchases).",
             link="/networth")
+    from . import anomalies
     for a in status.get("anomalies") or []:
+        # opens Transactions on the charge the line names
         add("anomaly", "warn", a,
-            link="/transactions")
+            link=anomalies.link_for(a, on=status.get("today")))
     rp = status.get("reimb_pending")
     if rp:
         oldest = rp.get("oldest") or ""
@@ -287,9 +314,12 @@ def build(status: dict) -> list[dict]:
     if mo:
         # worded from the batch, not the live queue, so working through the
         # offers does not resurrect a dismissed line (merchant_merge.notice)
+        # "new", because the Merchants page counts every offer still
+        # waiting and the two figures must not read as one count
         n = mo["batch"]
         add("merges", "info",
-            f"{n} merchant pair{'s' if n > 1 else ''} look like one business "
+            f"{n} new merchant pair{'s' if n > 1 else ''} "
+            f"look{'' if n > 1 else 's'} like one merchant "
             f"(found {_mmdd(mo['found'])}) — review on the Merchants page.",
             link="/merchants")
     for dr in status.get("recurring_drifts") or []:
@@ -308,9 +338,13 @@ def build(status: dict) -> list[dict]:
             f"one-time asset purchase, not counted in the shortfall metric.")
     if ev.get("bonus"):
         total = sum(a for _, a in ev["bonus"])
+        # its days, with their year: a yearly bonus of the same amount
+        # would otherwise be worded the same next year, and the log keys
+        # a line on its words
+        days = " + ".join(_mmdd(d) for d, _ in ev["bonus"])
         add("bonus", "info",
-            f"Bonus received: ${total:,.0f} — excluded from all budget "
-            f"math by design (savings, not monthly income).")
+            f"Bonus received: ${total:,.0f} on {days} — excluded from all "
+            f"budget math by design (savings, not monthly income).")
     out.extend(status.get("stale_pulls") or [])
     # auto-removed connections pending reconnect (reaped_connections)
     out.extend(status.get("reaped_items") or [])
@@ -319,6 +353,113 @@ def build(status: dict) -> list[dict]:
     rank = {"bad": 0, "warn": 1, "good": 2, "info": 3}
     out.sort(key=lambda a: rank.get(a["severity"], 9))   # stable: worst first
     return out
+
+
+# ---- lines logged in an older build's words --------------------------
+# A charge line's days and a bonus line's days carry their year since the
+# log keys a line on its words (the same fee a year later was otherwise
+# the same row). A row logged before that says "on 03/14" or names no day
+# at all; for the SAME event it is the same alert, so it is reworded in
+# place — its dismissal, its mute and its raise kept — never raised anew.
+_DAY_YY = re.compile(r"\b(\d{2})/(\d{2})/(\d{2})\b")
+_CHARGE_LINES = ("Possible double charge: ", "Fee charged: ",
+                 "Interest charged: ")
+_BONUS_DAYS = re.compile(r"^(Bonus received: \$[\d,]+) on [\d/ +]+ — ")
+
+
+def legacy_words(kind: str, message: str) -> str | None:
+    """The words an older build logged this line in (its days without
+    their year; a bonus without its days), or None where the line's words
+    did not change."""
+    message = message or ""
+    if kind == "anomaly" and message.startswith(_CHARGE_LINES):
+        old = _DAY_YY.sub(r"\1/\2", message)
+    elif kind == "bonus":
+        old = _BONUS_DAYS.sub(r"\1 — ", message, count=1)
+    else:
+        return None
+    return old if old != message else None
+
+
+def _same_event(kind: str, message: str, legacy: str,
+                first_seen: dt.date) -> bool:
+    """Whether a row logged as `legacy` on `first_seen` is about the event
+    `message` names: a charge line's days, given the year of the day the
+    row was written (anomalies' own rule), are the same days; a bonus was
+    first raised in the month its days fall in."""
+    days = []
+    for mm, dd, yy in _DAY_YY.findall(message):
+        try:
+            days.append(dt.date(2000 + int(yy), int(mm), int(dd)))
+        except ValueError:
+            return False
+    if not days:
+        return False
+    if kind == "bonus":
+        return (first_seen.year, first_seen.month) == (days[0].year,
+                                                       days[0].month)
+    from . import anomalies
+    old = [anomalies._day_before(f"{d:%m/%d}", first_seen) for d in days]
+    return old == days and not _DAY_YY.search(legacy)
+
+
+def _adopt_legacy_row(conn, kind: str, message: str,
+                      was_active: set) -> None:
+    """Reword in place a row logged in an older build's words for the same
+    event (lock held), so the upsert that follows finds it as itself."""
+    legacy = legacy_words(kind, message)
+    if legacy is None:
+        return
+    row = conn.execute(
+        "SELECT id, first_seen, active FROM alerts_log "
+        "WHERE kind=%s AND message=%s", (kind, legacy)).fetchone()
+    if row is None or not _same_event(kind, message, legacy,
+                                      row["first_seen"]):
+        return
+    twin = conn.execute(
+        "SELECT id FROM alerts_log WHERE kind=%s AND message=%s",
+        (kind, message)).fetchone()
+    if twin is None:
+        conn.execute("UPDATE alerts_log SET message=%s WHERE id=%s",
+                     (message, row["id"]))
+    else:
+        _merge_into(conn, twin["id"], row["id"])
+    if (kind, legacy) in was_active:
+        was_active.discard((kind, legacy))
+        was_active.add((kind, message))
+
+
+def _merge_into(conn, keep: int, gone: int) -> None:
+    """Fold row `gone` (an alert's older words) into `keep` (the same
+    alert in today's words, e.g. both landed from an older archive): one
+    row, live if either was, spanning both. Its dismissal is the person's
+    LATEST choice: the row whose mute last flipped (`mute_changed_at`,
+    stamped by the trigger on every dismiss and restore) decides; with
+    neither ever flipped, dismissed if either was. Lock held."""
+    rows = {r["id"]: r for r in conn.execute(
+        "SELECT id, dismissed, mute_changed_at FROM alerts_log "
+        "WHERE id IN (%s,%s)", (keep, gone))}
+    stamped = [r for r in rows.values() if r["mute_changed_at"] is not None]
+    if stamped:
+        last = max(stamped, key=lambda r: r["mute_changed_at"])
+        dismissed, stamp = last["dismissed"], last["mute_changed_at"]
+    else:
+        dismissed = max(r["dismissed"] for r in rows.values())
+        stamp = None
+    conn.execute(
+        """UPDATE alerts_log k SET
+               dismissed  = %s,
+               active     = GREATEST(k.active, g.active),
+               first_seen = LEAST(k.first_seen, g.first_seen),
+               last_seen  = GREATEST(k.last_seen, g.last_seen),
+               seen_at    = GREATEST(k.seen_at, g.seen_at)
+             FROM alerts_log g WHERE k.id=%s AND g.id=%s""",
+        (dismissed, keep, gone))
+    # set apart: the trigger stamps now() on a dismissal flip above, and
+    # the merge is not the person changing the mute
+    conn.execute("UPDATE alerts_log SET mute_changed_at=%s WHERE id=%s",
+                 (stamp, keep))
+    conn.execute("DELETE FROM alerts_log WHERE id=%s", (gone,))
 
 
 def log(conn, alerts: list[dict], today: dt.date, *, partial: bool = False,
@@ -370,6 +511,8 @@ def log(conn, alerts: list[dict], today: dt.date, *, partial: bool = False,
         # and the email all show as gone.
         was_active = {(r["kind"], r["message"]) for r in conn.execute(
             "SELECT kind, message FROM alerts_log WHERE active=1").fetchall()}
+        for a in alerts:
+            _adopt_legacy_row(conn, a["kind"], a["message"], was_active)
         for a in alerts:
             now_active = conn.execute(
                 """INSERT INTO alerts_log (kind, severity, message, first_seen,
@@ -444,6 +587,154 @@ def log(conn, alerts: list[dict], today: dt.date, *, partial: bool = False,
                 "date": today})
 
 
+# ---- the history, one line per subject --------------------------------
+# Where each kind is fixed, what the history calls it, and which of the
+# page's chips lists it. Read-time maps, never stored: the log keeps kind +
+# message only, so retargeting a link cannot resurrect a dismissed alert and
+# rows already logged follow the map as it is today.
+KIND_LINK = {
+    "stale-pull": "/accounts", "connection-removed": "/accounts",
+    "source-failover": "/accounts",
+    "collector-token-revoked": settings_link("connections"),
+    "setup": "/bills", "proposals": "/bills", "drift": "/bills",
+    "merges": "/merchants", "reimb": "/reimburse", "funding": "/networth",
+    "transfer": "/transactions", "anomaly": "/transactions",
+    "bonus": "/transactions", "llm-backend": "/doctor",
+}
+KIND_LABEL = {
+    "stale-pull": "sync", "connection-removed": "connection",
+    "source-failover": "account source",
+    "collector-token-revoked": "script token", "setup": "bills setup",
+    "proposals": "bill proposals", "drift": "bill amount",
+    "merges": "merchant pairs", "reimb": "reimbursement",
+    "funding": "investment funding", "transfer": "large transfer",
+    "anomaly": "charge", "bonus": "bonus", "llm-backend": "AI model",
+}
+KIND_GROUP = {
+    "stale-pull": "connection", "connection-removed": "connection",
+    "source-failover": "connection", "collector-token-revoked": "connection",
+    "llm-backend": "connection", "setup": "bills", "proposals": "bills",
+    "drift": "bills", "merges": "merchants", "funding": "cash",
+    "transfer": "cash", "bonus": "cash", "anomaly": "cash", "reimb": "cash",
+}
+# Kinds the household has at most one of at a time — a count or a total
+# that is re-worded as it moves ("19 proposed changes", "18 …"). Every
+# wording of one of these is the same subject.
+_ONE_AT_A_TIME = frozenset({"proposals", "merges", "reimb", "funding",
+                            "setup", "transfer", "bonus", "llm-backend"})
+# One-at-a-time kinds that are events OF A MONTH (budget.cash_events reads
+# the month in progress): inside the month the total is re-worded as it
+# grows, but March's bonus and December's are two events, each a fact with
+# its own amount. The month is the one the line was first raised in —
+# `first_seen`, the household day the snapshot wrote it.
+_PER_MONTH = frozenset({"bonus", "transfer", "funding"})
+# What moves in a line while its subject stays the same: its days ("01/04",
+# "01/04/26", a double charge's "01/20 + 01/21"), a count ("×3") and an amount. Nothing else — a number inside
+# a name (an account's last four, a street number) is part of the name.
+_DAY = r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b"
+_DATES = re.compile(rf"{_DAY}(?: \+ {_DAY})*")       # "01/20 + 01/21" is one
+_COUNT = re.compile(r"×\d+")
+_MONEY = re.compile(r"\$[\d,]+(?:\.\d+)?")
+# kinds whose amount IS what the line is about: a double charge of $30.00
+# and one of $45.00 at the same merchant are two charges, however alike
+# their words; only their days and their count move as one grows
+_AMOUNT_IS_SUBJECT = frozenset({"anomaly"})
+
+
+def subject(kind: str, message: str) -> str:
+    """What an alert is ABOUT, so the history can say each thing once. A
+    one-at-a-time kind is its own subject; any other line is its words with
+    its days and counts taken out, and its amounts too unless the amount is
+    the subject — "City Power plan updated $440 → $370" and "… $370 →
+    $380" are one bill's subject; two charges at two merchants, or two
+    double charges of different amounts at one, are two."""
+    if kind in _ONE_AT_A_TIME:
+        return kind
+    words = _COUNT.sub("#", _DATES.sub("#", message or ""))
+    if kind not in _AMOUNT_IS_SUBJECT:
+        words = _MONEY.sub("#", words)
+    return kind + "|" + words
+
+
+def link_for(kind: str, message: str,
+             on: dt.date | None = None) -> str | None:
+    """Where the line is acted on: a charge opens on that charge (`on`,
+    the day the line was logged, gives its days their year), a bill's
+    drift on its history, everything else on its kind's page."""
+    if kind == "anomaly":
+        from . import anomalies
+        return anomalies.link_for(message, on=on)
+    if kind == "drift":
+        payee = (message or "").split(" plan updated ", 1)[0]
+        if payee and payee != message:
+            return "/bills/history?payee=" + quote(payee)
+    return KIND_LINK.get(kind)
+
+
+# An older build's wording of the merchant-pair notice: "N merchant
+# pair(s) look like one business (found …) — …". Logged rows keep the
+# words they were raised in; the history prints today's.
+_OLD_MERGES = re.compile(
+    r"^(\d+) merchant pairs? look like one business (\(found [^)]*\))")
+
+
+def current_words(kind: str, message: str) -> str:
+    """A logged line in the words the current build writes for its kind,
+    where an older build worded the same subject another way (only the
+    merchant-pair notice so far); any other line as logged."""
+    m = _OLD_MERGES.match(message or "") if kind == "merges" else None
+    if m is None:
+        return message
+    n = int(m.group(1))
+    return (f"{n} merchant pair{'s' if n > 1 else ''} "
+            f"look{'' if n > 1 else 's'} like one merchant {m.group(2)}"
+            + message[m.end():])
+
+
+def history_lines(conn, limit: int = 200) -> list[dict]:
+    """The Alerts page's history: ONE line per subject, carrying the
+    latest wording, the first day the subject was ever seen and the last,
+    where it is acted on, its name and its chip. Active lines first, then
+    newest. An active row is never folded into another active row (the bell
+    and the dismiss button count and act on each live alert), and a
+    subject's line is its live row when it has one, so a dismissal acts on
+    what the strip shows."""
+    rows = conn.execute(
+        """SELECT kind, severity, message, first_seen, last_seen, active,
+                  dismissed
+             FROM alerts_log ORDER BY active DESC, last_seen DESC, id DESC
+            LIMIT 5000""").fetchall()
+    lines: list[dict] = []
+    by_subject: dict[str, dict] = {}
+    for r in rows:
+        key = subject(r["kind"], r["message"])
+        if r["kind"] in _PER_MONTH:
+            key += "|" + r["first_seen"].strftime("%Y-%m")
+        elif r["kind"] in _AMOUNT_IS_SUBJECT:
+            # the same charge alert in another month is another charge:
+            # keyed by its first day (with the year the row was raised in)
+            from . import anomalies
+            key += "|" + (anomalies.occurrence(r["message"], r["first_seen"])
+                          or "")
+        line = by_subject.get(key)
+        if line is not None and not (r["active"] and line["active"]):
+            line["first_seen"] = min(line["first_seen"], r["first_seen"])
+            line["last_seen"] = max(line["last_seen"], r["last_seen"])
+            continue
+        line = dict(r)
+        # `message` stays the words as logged — the key dismiss and
+        # restore match on; `text` is what the history prints, in the
+        # words the current build writes for the subject
+        line["text"] = current_words(r["kind"], r["message"])
+        line["link"] = link_for(r["kind"], r["message"], on=r["last_seen"])
+        line["kind_label"] = KIND_LABEL.get(
+            r["kind"], (r["kind"] or "").replace("-", " "))
+        line["group"] = KIND_GROUP.get(r["kind"])
+        by_subject.setdefault(key, line)
+        lines.append(line)
+    return lines[:limit]
+
+
 def history(conn, limit: int = 200) -> list:
     return conn.execute(
         """SELECT kind, severity, message, first_seen, last_seen, active, dismissed
@@ -492,13 +783,67 @@ def retire(conn, kind: str) -> int:
             (kind,)).rowcount
 
 
+# what a moving line's words share before their first day or dash: the
+# prefix the old-words lookup narrows by (find_row)
+_FIRST_MOVING = re.compile(r"\d{2}/\d{2}| — ")
+
+
+def find_row(conn, kind: str, message: str, cols: str = "id"):
+    """The alerts_log row `message` names: the row in those words, else
+    the row still in their older words (legacy_words), else a row
+    reworded FROM them — a tab, a phone or a mailed button holding a line
+    from before the reword. Newest live row first when several were
+    reworded from the same older words. None when no row matches. The
+    last search reads the household's rows of the kind whose words start
+    as the given line's do (up to its first day), all of them: no window
+    a household's history could outgrow."""
+    sql = f"SELECT {cols} FROM alerts_log WHERE kind=%s AND message=%s"
+    row = conn.execute(sql, (kind, message)).fetchone()
+    if row is not None:
+        return row
+    legacy = legacy_words(kind, message)
+    if legacy is not None:
+        row = conn.execute(
+            f"SELECT {cols}, first_seen AS _first FROM alerts_log "
+            "WHERE kind=%s AND message=%s", (kind, legacy)).fetchone()
+        # the same event only: another year's line in the old words is
+        # another alert
+        if row is not None and _same_event(kind, message, legacy,
+                                           row["_first"]):
+            return row
+    if kind not in ("anomaly", "bonus"):
+        return None
+    m = _FIRST_MOVING.search(message or "")
+    prefix = (message or "")[:m.start()] if m else (message or "")
+    like = (prefix.replace("\\", "\\\\").replace("%", "\\%")
+            .replace("_", "\\_") + "%")
+    for r in conn.execute(
+            f"SELECT {cols}, message AS _words FROM alerts_log "
+            "WHERE kind=%s AND message LIKE %s ESCAPE '\\' "
+            "ORDER BY active DESC, last_seen DESC, id DESC",
+            (kind, like)).fetchall():
+        if legacy_words(kind, r["_words"]) == message:
+            return r
+    return None
+
+
+def _set_dismissed(conn, kind: str, message: str, value: int) -> int:
+    """One decision under the alerts lock: the row the words name
+    (find_row), updated by its id, so a reword running beside it cannot
+    leave the request matching nothing."""
+    with conn.transaction():
+        _lock(conn)
+        row = find_row(conn, kind, message)
+        if row is None:
+            return 0
+        return conn.execute(
+            "UPDATE alerts_log SET dismissed=%s WHERE id=%s",
+            (value, row["id"])).rowcount
+
+
 def dismiss(conn, kind: str, message: str) -> int:
-    return conn.execute(
-        "UPDATE alerts_log SET dismissed=1 WHERE kind=%s AND message=%s",
-        (kind, message)).rowcount
+    return _set_dismissed(conn, kind, message, 1)
 
 
 def restore(conn, kind: str, message: str) -> int:
-    return conn.execute(
-        "UPDATE alerts_log SET dismissed=0 WHERE kind=%s AND message=%s",
-        (kind, message)).rowcount
+    return _set_dismissed(conn, kind, message, 0)

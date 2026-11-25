@@ -17,6 +17,27 @@ ledger, thirty named items behind it.
   can carry its own dedicated vision model), a
   background pass reads the receipt and extracts merchant, date,
   total, tax, tip, and the individual line items.
+- **How the lines are counted.** Each line counts what it cost in all:
+  where the receipt's total shows a line was read as a unit price ("4 ×
+  $6.25"), it counts $25. The line naming how you paid (the card,
+  "payment", change) is not an item. One slip counts once (next point).
+  When the lines, tax and
+  tip don't add up to the charge, the receipt says by how much (usually a
+  discount or fee the reading missed).
+- **One slip, counted once.** The same file attached twice — to one
+  charge, to two charges (a slip paid with two cards), or once on a
+  charge and once waiting — is one receipt, and its lines count once. The
+  copy that is not counted says *the same receipt as …* and shows its
+  lines greyed; on the Receipts page they read *not counted*. If those
+  are really two purchases, tap **Two purchases**.
+- **Two receipts that read alike are yours to settle.** A second photo
+  of a slip, or two coffees at one cafe on one day for one price, read
+  the same store, day and total but are different files. The app never
+  decides those are one receipt: both count, and each says *looks like
+  the same receipt as …* with **Same receipt** and **Two purchases**. On
+  the Receipts page and the itemized expense report their lines say *may
+  be counted twice*, and so does the total they are in, until you
+  answer. Your answer is kept; you are not asked again.
 - **No LLM configured?** The receipt still stores and displays —
   attachment-only mode. It parses automatically whenever a vision
   model is configured later; nothing is lost. A receipt snapped before
@@ -28,8 +49,8 @@ You don't have to wait for the charge to reach the ledger. **📷 Receipt**
 — at the top of the Transactions page, on the Receipts page, or beside
 Filter in the app — takes a photo right at the
 till, or takes one you already have: a phone browser asks camera, photo
-library or files, a desktop opens a file picker, and the app's Snap button
-asks camera, photo library or PDF. The receipt is read as usual and **waits** on the
+library or files, a desktop opens a file picker, and in the app the **📷 Receipt**
+button asks camera, photo library or PDF. The receipt is read as usual and **waits** on the
 Receipts page under *Waiting receipts*, showing the store, total and date
 read off it, and *waiting for a transaction*.
 
@@ -83,12 +104,29 @@ posted copy count as one). You can still match them by hand. A receipt on
 a transaction says *matched automatically* or *matched by hand*, with
 **unmatch** beside it.
 
-A pending charge that matched keeps its receipt when it posts, tip and
-all. If a pending charge disappears without a posted twin the app can
-find, a receipt the app paired with it goes back to waiting and meets the
-posted charge instead. One **you** matched by hand goes back to waiting
-too, marked *was matched by hand — that charge was removed*, and the app
-leaves it for you: pick its charge again.
+A pending charge keeps its receipt when it posts, tip and all, whether
+the app matched it or you attached it from the charge itself. If a pending
+charge disappears without a posted twin the app can find, its receipt goes
+back to waiting: the app pairs it with the store's posted charge when its
+own rules find one (the same store, a tip on top), and otherwise it waits
+for you to pick. A receipt you attached from the charge yourself is given
+two weeks first, because a charge that drops out of the feed usually
+comes back and then still has its receipt, note and category; and if two
+charges could be its twin the app leaves the choice to you. If you have
+meanwhile put the same file on the posted charge, it is counted once and
+the first copy stays where it was. If you put a second photo of the slip
+on that card's posted charge (a tip often makes the posted charge
+different enough that the app cannot tell it was this pending one), the
+first copy also stays where it was, counting nothing, as long as the app
+has no other charge it could be; the posted charge's receipt asks
+whether the two are the same receipt. **Same receipt** settles it;
+**Two purchases** sends the first copy back to waiting at once,
+counted, for the app or you to pair with its charge. One **you** matched by hand from the waiting list goes
+back to waiting too, marked *was matched by hand — that charge was
+removed*, and the app leaves it for you: pick its charge again. Either
+way the receipt's lines stay on the **Receipts** page the whole time,
+though they are left out of its totals while their charge is off the
+ledger.
 
 **A receipt that never matches** stays waiting — nothing is ever deleted
 for you. After **30 days** it is marked *no charge has matched in 30
@@ -109,7 +147,7 @@ a receipt on a transaction offers no **parse now** button — just a
 **The AI got it wrong, or couldn't read it?** A receipt marked *couldn't
 read* shows the same form; on one it did read, **fix total** opens it with
 what was read filled in. What you type replaces the total, date and store
-it read (a store left blank keeps the one it read). From then on the
+it read (empty the store field to clear a store it misread). From then on the
 receipt says *total and date entered by hand*, and no later reading —
 not **retry**, not the nightly pass — writes over what you typed.
 
@@ -151,6 +189,10 @@ store and date read off it (*Unknown store* if none was), marked
 *waiting* — and can be tagged like any other; they move to the charge's
 date and name once it matches.
 
+A return slip attached to its refund counts its items as money back:
+an item you bought and returned adds up to nothing on the Receipts page
+and on the expense report.
+
 The model **extracts only** — it never guesses categories or tags for
 you (small vision models read receipts well but mis-label what they
 read, so items are searchable and groupable instead of auto-filed).
@@ -160,7 +202,7 @@ read, so items are searchable and groupable instead of auto-filed).
 A written check's ledger row is just "CHECK #1234" — the attachment can
 say who it was for. Use **attach check image** on a transaction to
 upload a photo or scan of the check's front (in the app: take a photo,
-**choose a check photo** from the library, or **attach a check PDF**); instead of line items, the
+**Choose check photo** from the library, or **Attach check PDF**); instead of line items, the
 parse reads the **check number, payee** (the pay-to-the-order-of line),
 **amount, date, memo**, and bank name, and the panel shows them under
 the attachment (dates as MM/DD/YY).
@@ -249,7 +291,11 @@ then documents what the parts were.
   `OIKONOME_RECEIPT_PARSE_CONCURRENCY` / `OIKONOME_RECEIPT_PARSE_WAIT_S`
   (photo decoding) and `OIKONOME_RECEIPT_READ_SLOTS` /
   `OIKONOME_RECEIPT_READ_WAIT_S` (reads waiting on the model; each slot
-  holds a database connection while the model answers).
+  holds a database connection while the model answers). The slots are
+  shared fairly: a free one goes to the household using the fewest (per
+  server process). The nightly sweep stops starting new reads for a
+  household after about five minutes and leaves the rest for the next
+  night, so one household's backlog cannot hold up the others.
 - A check parse only auto-categorizes when the payee is a real
   merchant; transfer-like payees are left to the normal transfer
   handling.

@@ -169,11 +169,10 @@ class IncomeIsWhatActuallyLanded(unittest.TestCase):
             self.conn, budget.load_config(self.conn), TODAY), 3200.0, places=2)
 
     def test_a_pending_payday_check_is_counted_once_without_an_available_balance(self):
-        """Payday at a bank that reports no available balance: the forecast
-        re-dates the unposted occurrence to tomorrow (the walk starts from
-        the current balance, which a pending credit is not in), but the
-        month's income already holds the pending row as landed — the
-        still-due half must not count it again."""
+        """Payday at a bank that reports no available balance: the cash
+        figures start from the current balance, which a pending credit is
+        not in, so the pending check is still due, not landed — counted
+        once, in the still-due half, and never in both halves."""
         self.conn.execute(
             "UPDATE accounts SET balance_available = NULL WHERE id = 'chk'")
         add_txn(self.conn, TODAY.replace(day=1), -3200.0, "NORTHWIND PAYROLL",
@@ -181,6 +180,27 @@ class IncomeIsWhatActuallyLanded(unittest.TestCase):
         self._series(3200.0, next_due=TODAY)
         add_txn(self.conn, TODAY, -3200.0, "NORTHWIND PAYROLL",
                 primary="INCOME", account="chk", pending=1)
+        st = budget.month_status(self.conn, TODAY)
+        self.assertAlmostEqual(st["income_received"], 3200.0, places=2)
+        self.assertAlmostEqual(st["income_expected"], 6400.0, places=2)
+        self.assertAlmostEqual(st["income"], 9600.0, places=2)
+
+    def test_a_pending_check_in_another_account_is_judged_by_that_account(self):
+        """The cash figures start from primary checking. A check pending
+        in a savings account is in no balance they read, posted or not —
+        so it lands the way a posted one there does, whatever primary
+        checking's available-balance flag says."""
+        self.conn.execute(
+            "UPDATE accounts SET balance_available = NULL WHERE id = 'chk'")
+        self.conn.execute(
+            "INSERT INTO accounts (id,item_id,name,type,subtype,"
+            "balance_current) VALUES ('sav2','it1','Invented Savings',"
+            "'depository','savings',900)")
+        add_txn(self.conn, TODAY.replace(day=1), -3200.0, "NORTHWIND PAYROLL",
+                primary="INCOME", account="chk")
+        self._series(3200.0, next_due=TODAY)
+        add_txn(self.conn, TODAY, -3200.0, "NORTHWIND PAYROLL",
+                primary="INCOME", account="sav2", pending=1)
         st = budget.month_status(self.conn, TODAY)
         self.assertAlmostEqual(st["income_received"], 6400.0, places=2)
         self.assertAlmostEqual(st["income_expected"], 3200.0, places=2)

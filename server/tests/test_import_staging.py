@@ -139,13 +139,11 @@ class StagingStoreTests(unittest.TestCase):
         release = threading.Event()
 
         def holder():
-            # plays request A: takes the staging lock, inserts 800 bytes,
+            # plays request A: takes the storage lock, inserts 800 bytes,
             # and holds the transaction open while B races the check
             with rival.transaction():
-                rival.execute(
-                    "SELECT pg_advisory_xact_lock(hashtext("
-                    "'oikonome:staging:' "
-                    "|| current_setting('app.tenant_id')))")
+                from oikonome.engine import storage_quota
+                storage_quota.hold_lock(rival)
                 rival.execute(
                     "INSERT INTO import_staging (token, idx, kind, data) "
                     "VALUES ('racer', 0, 'bulk', %s)", (b"x" * 800,))

@@ -2,18 +2,25 @@
 // the overall verdict, a re-run button, and the host-side collectors
 // table (expected-hours + email-when-stale, self-host only).
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Redirect } from "expo-router";
 import { useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card, H, HelpLink } from "../components/ui";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, H, HelpLink, Skeleton } from "../components/ui";
 import { useSession } from "../lib/session";
 import { errText } from "../lib/api";
 import { removeFromList } from "../lib/cache";
+import { scriptStatusTone, type ScriptTone } from "../lib/pure";
 import { C, mmddyy, money } from "../lib/theme";
 import { DownloadButton } from "./settings";
 import { useOwner } from "../lib/viewer";
+import { fieldA11y } from "../components/field";
+
+// the web's status pill colours: an unwatched ("off") source is plain text
+const SCRIPT_TONE: Record<ScriptTone, string> = {
+  good: C.good, warn: C.warn, plain: C.text };
 
 // the business equity list's names for the two kinds
 const KIND_LABEL: Record<string, string> = {
@@ -153,16 +160,20 @@ export default function Doctor() {
       </ScrollView>
     );
   }
+  // With nothing of the household's to show, a hosted instance has no
+  // System health screen (More hides it too): the host runs the box, and
+  // "managed by the host" was a dead end. A stale link lands on Settings.
+  // only a list that ANSWERED empty sends the screen away: a failed read
+  // is not "nothing of the household's here"
   if (me.data?.hosted) {
-    return (
-      <ScrollView style={s.wrap}>
-        <Text style={s.center}>
-          System health is managed by the host on this instance.
-        </Text>
-        {/* the household's own records, so they show on hosted too */}
-        <UnlinkedCapital viewer={viewer} />
-      </ScrollView>
-    );
+    if (unlinked.isPending) return null;
+    if (unlinked.data === undefined)
+      return (
+        <ScrollView style={s.wrap}>
+          <FailedLine q={unlinked} what="the unlinked records" />
+        </ScrollView>
+      );
+    return <Redirect href={"/settings" as never} />;
   }
   const checks = query.data?.checks ?? [];
   const sections = [...new Set(checks.map((c) => c.section))];
@@ -172,19 +183,24 @@ export default function Doctor() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
-      <StaleBanner query={query} />
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      <StaleLine query={query} />
+      {query.isPending && <Skeleton />}
+      {query.data === undefined && query.isError && (
+        <FailedLine q={query} what="the health checks" />
+      )}
       {query.data && (
         <Card>
           <View style={{ flexDirection: "row", alignItems: "center",
                          gap: 8 }}>
             <Text style={{ color: query.data.ok ? C.good : C.warn,
-                           fontSize: 16, fontWeight: "700", flex: 1 }}>
+                           fontSize: 16, fontWeight: "700", flex: 1,
+                           // the last check's verdict, kept: greyed
+                           opacity: query.isError ? 0.55 : undefined }}>
               {query.data.ok ? "All checks pass."
                 : `${bad.length} check${bad.length === 1 ? "" : "s"} `
                   + "need attention."}
             </Text>
-            <Pressable style={[s.btn,
+            <Pressable accessibilityRole="button" style={[s.btn,
                          query.isRefetching && { opacity: 0.5 }]}
                        disabled={query.isRefetching}
                        onPress={() => query.refetch()}>
@@ -193,11 +209,12 @@ export default function Doctor() {
               </Text>
             </Pressable>
           </View>
-          <Text style={s.mut}>
-            auto-refreshes — checked{" "}
-            {new Date(query.dataUpdatedAt).toLocaleTimeString()}
-            {query.isFetching ? " ⟳" : ""}
-          </Text>
+          {!query.isError && (
+            <Text style={s.mut}>
+              auto-refreshes — checked{" "}
+              {new Date(query.dataUpdatedAt).toLocaleTimeString()}
+              {query.isFetching ? " ⟳" : ""}
+            </Text>)}
           {/* the bundle is what bug reports ask for (the web's link); it
               is JSON, so it is saved under the web's name */}
           <DownloadButton path="/api/doctor/bundle"
@@ -247,10 +264,8 @@ export default function Doctor() {
                 <Text style={{ color: C.text, fontSize: 13,
                                fontWeight: "600" }}>
                   {/* the web's status pill: fresh / stale / off */}
-                  <Text style={{ color: sc.status === "fresh" ? C.good
-                                   : sc.status === "stale" ? C.warn
-                                   : sc.ok ? C.good : C.bad }}>
-                    ● {sc.status ?? (sc.ok ? "fresh" : "stale")}{"  "}
+                  <Text style={{ color: SCRIPT_TONE[scriptStatusTone(sc.status)] }}>
+                    ● {sc.status}{"  "}
                   </Text>
                   {sc.label || sc.source}
                   {sc.label && sc.label !== sc.source ? (
@@ -269,7 +284,8 @@ export default function Doctor() {
                   when stale
                 </Text>
               </View>
-              <TextInput style={s.hours} keyboardType="number-pad"
+              <TextInput {...fieldA11y(`${sc.label || sc.source}: warn after how many hours`)}
+                         style={s.hours} keyboardType="number-pad"
                          placeholder="hrs" placeholderTextColor={C.mut}
                          value={hoursDraft[sc.source]
                            ?? (sc.expected_hours != null
@@ -287,6 +303,7 @@ export default function Doctor() {
                                  parseInt(v || "0", 10) || 0 } });
                          }} />
               <Switch value={!!sc.alerts} disabled={viewer}
+                      accessibilityLabel={`Email me when ${sc.label || sc.source} is stale`}
                       onValueChange={(v) => upd.mutate({
                         source: sc.source, body: { alerts: v } })}
                       trackColor={{ true: C.accent, false: C.hover }}
@@ -307,10 +324,10 @@ const s = StyleSheet.create({
   row: { flexDirection: "row", gap: 10, alignItems: "flex-start",
          borderTopColor: C.border, borderTopWidth: StyleSheet.hairlineWidth,
          paddingVertical: 7 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 7 },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },
-  hours: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  hours: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 13, width: 52,
            paddingHorizontal: 8, paddingVertical: 5,
            textAlign: "center" },

@@ -11,7 +11,7 @@ import unittest
 
 from oikonome.web import lens_email
 
-from .util import TODAY, add_txn, make_db, write_config
+from .util import TODAY, add_txn, make_db, write_config, freeze_month
 
 
 def _cell(m, verdict=None, variance=None, income=None, spend=None,
@@ -54,6 +54,10 @@ def _month(**over):
          "budget_source": "snapshot", "bills_source": "snapshot",
          "first_year": 2024}
     d.update(over)
+    # the month's net as lenses.month_summary sends it
+    inc = d["income"]["actual"]
+    d.setdefault("net", round(inc - d["spend_total"], 2)
+                 if inc is not None else None)
     return d
 
 
@@ -149,10 +153,12 @@ class MonthMailContextTests(unittest.TestCase):
         self.assertEqual(list(rows), ["Bills", "Food", "Everything else",
                                       "Car repairs"])
         car = rows["Car repairs"]
-        # the fixture's used (180) already exceeds the cap; whole swipe = 210
-        self.assertEqual((car["actual_text"], car["plan_text"]), ("$210", "$150"))
+        # the bar is what the cap absorbed; the $30 spill is everyday
+        # spending, said in the note and in the red bar
+        self.assertEqual((car["actual_text"], car["plan_text"]), ("$180", "$150"))
         self.assertEqual(car["bar"], "#e0695d")
-        self.assertEqual(car["note"], "envelope · $30 spilled past the cap")
+        self.assertEqual(car["note"], "monthly pool · $30 past the pool, "
+                                      "counted in spending")
         # Bills without the pinned envelope's share: 4790−180 of 4850−150
         self.assertEqual((rows["Bills"]["actual_text"], rows["Bills"]["plan_text"]),
                          ("$4,610", "$4,700"))
@@ -186,8 +192,8 @@ class MonthMailContextTests(unittest.TestCase):
     def test_an_envelope_cap_is_its_own_bar_largest_cap_first(self):
         d = _month()
         d["bills"]["envelopes"] = [
-            # used stops at the cap; the spill is carried separately, so the
-            # bar's actual is the whole swipe and the bar runs red
+            # used stops at the cap; the spill is carried separately and is
+            # everyday spending, so the bar stops at the cap and runs red
             {"payee": "Pottery class", "used": 400.0, "monthly": 400.0,
              "overflow": 160.0, "pool": 400.0, "period_months": 1,
              "period_used": 400.0, "period_left": 0.0, "show_today": True},
@@ -209,11 +215,33 @@ class MonthMailContextTests(unittest.TestCase):
                for r in ctx["rows"][3:]]
         self.assertEqual(env, [
             ("Dog walker", "$1,200", "$1,500", "#5cb56b",
-             "envelope · $300 of the cap left"),
-            ("Pottery class", "$560", "$400", "#e0695d",
-             "envelope · $160 spilled past the cap"),
+             "monthly pool · $300 left"),
+            ("Pottery class", "$400", "$400", "#e0695d",
+             "monthly pool · $160 past the pool, counted in spending"),
             ("Furnace service", "$228", "$300", "#5cb56b",
-             "12-month envelope · $72 of the cap left")])
+             "yearly pool · $72 left")])
+
+    def test_the_bars_add_up_to_what_went_out_with_an_envelope_spill(self):
+        """An envelope's spill past its cap is everyday spending: the
+        Everything else bar already counts it. The envelope's bar must stop
+        at the cap, or the bars add up to more than the month's out by
+        exactly the spill."""
+        d = _month(spend_total=2860.0)
+        d["buckets"]["fixed"].update(actual=2000.0)
+        d["buckets"]["food"].update(actual=500.0)
+        # 300 of ordinary spend plus the envelope's 60 spill
+        d["buckets"]["other"].update(actual=360.0)
+        d["bills"].update(posted=2000.0, planned=2100.0, awaiting=0.0)
+        d["bills"]["envelopes"] = [
+            {"payee": "Tutor", "used": 400.0, "monthly": 400.0,
+             "overflow": 60.0, "pool": 400.0, "period_months": 1,
+             "period_used": 400.0, "period_left": 0.0, "show_today": True}]
+        ctx = lens_email.month_mail_context(d, _year(), 2026, 9)
+        self.assertEqual(sum(r["actual"] for r in ctx["rows"]), 2860.0)
+        tutor = [r for r in ctx["rows"] if r["label"] == "Tutor"][0]
+        self.assertEqual(tutor["actual"], 400.0)
+        self.assertIn("$60 past the pool, counted in spending",
+                      tutor["note"])
 
     def test_bills_over_their_plan_are_a_red_bar(self):
         d = _month()
@@ -222,6 +250,17 @@ class MonthMailContextTests(unittest.TestCase):
         bills = ctx["rows"][0]
         self.assertEqual(bills["bar"], "#e0695d")
         self.assertIn("$220 over the plan", bills["note"])  # 5100−180 vs 4850−150
+
+    def test_a_closed_month_over_its_bill_plan_says_so_beside_a_bill_not_paid(self):
+        # the page's Bills row keeps "over by" when the month paid more than
+        # its plan, so the mail keeps its "over the plan" beside the lines
+        d = _month()
+        d["bills"].update(posted=5100.0, planned=4850.0, awaiting=0.0,
+                          notes=["not paid: Gym Pass $50"])
+        ctx = lens_email.month_mail_context(d, _year(), 2026, 9)
+        note = ctx["rows"][0]["note"]
+        self.assertIn("$220 over the plan", note)
+        self.assertIn("not paid: Gym Pass $50", note)
 
     def test_categories_are_the_everyday_spend_with_the_bills_by_kind(self):
         # the fixture's paid rows carry no category, so the bills stay one
@@ -243,7 +282,7 @@ class MonthMailContextTests(unittest.TestCase):
         self.assertEqual(ctx["cat_total_text"], "$5,990")
         self.assertAlmostEqual(sum(sh for _, _, sh in ctx["cat_slices"]), 1.0)
         self.assertIsNone(ctx["cat_pie"], "the pie is drawn by the mail build")
-        self.assertIn("the bills under their categories", ctx["pie_sub"])
+        self.assertIn("the bills under their categories, an envelope under its name", ctx["pie_sub"])
 
     def test_bills_split_into_their_categories_and_join_the_everyday_ones(self):
         # the mortgage, the power and the water are one housing slice,
@@ -318,7 +357,7 @@ class MonthMailContextTests(unittest.TestCase):
         for s in ("Net for September: +$1,280", "Year to date net: +$3,525",
                   "Bills: $4,610 of $4,700",
                   "Food: $1,062 of $1,000 — $62 over", "Sep +$1,280",
-                  "GROCERIES"):
+                  "Groceries"):
             self.assertIn(s, plain)
         self.assertNotIn("<", plain)
         self.assertNotIn("$9,400", plain, "the month's income total is not shown")
@@ -354,6 +393,7 @@ class MonthlyMailRendersTests(unittest.TestCase):
         add_txn(self.conn, last.replace(day=17), 260.0, "BIRCHWOOD PHYSIO",
                 primary="MEDICAL")
         from oikonome.web import lenses
+        freeze_month(self.conn, last.year, last.month)
         d = lenses.month_summary(self.conn, last.year, last.month, today=TODAY)
         spill = [t for t in d["biggest_variable"] if "Birchwood Physio" in t["payee"]]
         self.assertEqual(len(spill), 1, d["biggest_variable"])
@@ -361,8 +401,10 @@ class MonthlyMailRendersTests(unittest.TestCase):
         self.assertIn("over envelope", spill[0]["payee"])
         self.assertNotIn(260.0, [t["amount"] for t in d["biggest_variable"]])
         cats = dict((c[0], c[1]) for c in d["by_category_variable"])
-        self.assertAlmostEqual(cats.get("envelope overflow", 0), 10.0)
-        self.assertNotIn("MEDICAL", cats)
+        # the spill counts under the purchase's own category, never under
+        # a composed "envelope overflow" (budget.listed_category)
+        self.assertNotIn("envelope overflow", cats)
+        self.assertAlmostEqual(cats.get("MEDICAL", 0), 10.0)
 
     def test_a_matched_costco_receipt_lists_its_lines(self):
         last = TODAY.replace(day=1) - dt.timedelta(days=1)
@@ -386,13 +428,17 @@ class MonthlyMailRendersTests(unittest.TestCase):
         self.assertEqual(row["items"], ["Bulk Oats", "Bananas"])
 
     def test_the_mail_has_every_section(self):
+        last = TODAY.replace(day=1) - dt.timedelta(days=1)
+        freeze_month(self.conn, last.year, last.month)
         subject, plain, html = lens_email.build_monthly(self.conn, TODAY)
         self.assertRegex(subject, r"report card: (ON|OVER|UNDER) budget \(")
         last = TODAY.replace(day=1) - dt.timedelta(days=1)
         for s in ("Year to date net", f"Net for {last:%B}",
-                  "Monthly budget", ">Bills<", ">Food<", ">Everything else<",
+                  "Monthly budget", ">Food<", ">Everything else<",
                   "Spending by category", 'src="data:image/png'):
             self.assertIn(s, html, s)
+        # the household has no dated bill: no Bills bar
+        self.assertNotIn(">Bills<", html)
         self.assertNotIn("Largest variable", html)
         # the daily's shell: brand header and the dark card style baked in
         self.assertIn("Oikonome</span>", html)

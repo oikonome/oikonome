@@ -27,14 +27,30 @@ What it deliberately is NOT:
     million IPs cannot spread out of.
 
 Token discipline matches ``password_resets``: opaque 256-bit link token, sha256
-at rest, hash lookup (no timing channel on the bytes), one use, and minting
-burns older live tokens for the user.
+at rest, hash lookup (no timing channel on the bytes), one use. Minting does
+NOT burn the address's other live links: anyone can ask for a link to any
+address, so burning would let a stranger's request kill the one the owner
+is about to open. The per-address hourly cap bounds how many are live.
+
+The exemption is NOT a bearer on the address. Opened, it would be spendable
+by whoever reached a sign-in door first with the account's email — and a
+stranger polling the door with junk passwords would spend every unlock the
+owner confirmed, keeping them out while turning each one into an
+unchallenged guess. So each unlock has a PROOF, and only a sign-in carrying
+it can spend that unlock. The proof exists only for whoever proved the
+mailbox: the confirm step sets it in that browser and shows its short form
+(the sign-in code) for the app. Asking for a link yields nothing — asking
+is open to anyone. The proof is never stored — it is an HMAC, under the
+instance master key, of the row id and the link token's hash, so nothing in
+the row alone yields it. A sign-in without it leaves every row as it was.
 """
 
 from __future__ import annotations
 
 import datetime as dt
 import hashlib
+import hmac
+import os
 import secrets
 
 # The link is short-lived: it exists to get someone through a challenge they
@@ -52,6 +68,45 @@ def _h(token: str) -> str:
     return hashlib.sha256(token.encode()).hexdigest()
 
 
+def _proof_key() -> bytes:
+    # No master key is the dev / plaintext mode the rest of the crypto layer
+    # also passes through; the link token's hash in the message still keeps
+    # the proof out of reach of anyone who has not read the table.
+    mk = os.environ.get("OIKONOME_MASTER_KEY") or ""
+    return hashlib.sha256(mk.encode() + b"|login-unlock-proof").digest()
+
+
+def proof_for(row_id, token_hash: str) -> str:
+    """The proof that spends the unlock `row_id`. Derived, never stored."""
+    msg = f"login-unlock|{row_id}|{token_hash}".encode()
+    return hmac.new(_proof_key(), msg, hashlib.sha256).hexdigest()
+
+
+# The sign-in code: the proof's short form, typed into the app by someone
+# who confirmed the link in a browser. 10 base32 characters = 50 bits. It
+# answers only for its own account, only inside that unlock's 10-minute
+# window, and every guess goes through the sign-in doors' own limits.
+CODE_LEN = 10
+_B32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+# what a person reading the code off a screen is likely to type instead
+_LOOKALIKE = str.maketrans({"0": "O", "1": "I", "8": "B"})
+
+
+def code_for(row_id, token_hash: str) -> str:
+    """The sign-in code for the unlock `row_id`, as XXXXX-XXXXX."""
+    msg = f"login-unlock-code|{row_id}|{token_hash}".encode()
+    d = int.from_bytes(hmac.new(_proof_key(), msg, hashlib.sha256).digest(),
+                       "big")
+    raw = "".join(_B32[(d >> (5 * i)) & 31] for i in range(CODE_LEN))
+    return raw[:5] + "-" + raw[5:]
+
+
+def _norm_code(value: str) -> str:
+    v = "".join(ch for ch in value.upper().translate(_LOOKALIKE)
+                if ch.isalnum())
+    return v[:5] + "-" + v[5:] if len(v) == CODE_LEN else ""
+
+
 def recent_sends(conn, user_id) -> int:
     """Links minted for this user in the last hour — the per-address cap."""
     return conn.execute(
@@ -64,8 +119,8 @@ def create(conn, user_id) -> str | None:
     """Mint an unlock token; returns the RAW token for the link, or None if
     this address has already been mailed its hourly allowance.
 
-    Minting burns older live links for the user (same rule as resets):
-    otherwise every click leaves another working key under the mat.
+    Older live links stay live (see the module docstring): the cap, not a
+    burn, bounds them.
     """
     token = secrets.token_urlsafe(32)
     with conn.transaction():
@@ -77,9 +132,6 @@ def create(conn, user_id) -> str | None:
                      "'oikonome:login-unlock:' || %s))", (str(user_id),))
         if recent_sends(conn, user_id) >= SEND_MAX_PER_HOUR:
             return None
-        conn.execute(
-            "UPDATE login_unlocks SET used_at=now() "
-            "WHERE user_id=%s AND used_at IS NULL", (user_id,))
         conn.execute(
             """INSERT INTO login_unlocks (user_id, token_hash, expires_at)
                VALUES (%s,%s,%s)""",
@@ -110,7 +162,8 @@ def peek(conn, token: str) -> dict | None:
 
 def follow(conn, token: str) -> dict | None:
     """Consume the LINK and open the exemption window. Returns the row (with
-    the user's email) or None if the token is unknown, expired or spent."""
+    the user's email, the `proof` that spends this unlock and its short
+    sign-in `code`) or None if the token is unknown, expired or spent."""
     if not token:
         return None
     row = conn.execute(
@@ -121,7 +174,23 @@ def follow(conn, token: str) -> dict | None:
              AND u.used_at IS NULL AND u.expires_at > now()
            RETURNING u.id, u.user_id, usr.email""",
         (UNLOCK_TTL, _h(token))).fetchone()
-    return row
+    if row is None:
+        return None
+    return {**row, "proof": proof_for(row["id"], _h(token)),
+            "code": code_for(row["id"], _h(token))}
+
+
+def end_for_user(conn, user_id) -> None:
+    """Void every link and open exemption this account holds. A link was
+    mailed to the address the account had then; once the login address
+    moves, opening it would name the new address and answer the check for
+    an account that mailbox no longer controls."""
+    conn.execute(
+        """UPDATE login_unlocks SET used_at = coalesce(used_at, now()),
+                  consumed_at = coalesce(consumed_at, now()),
+                  unlocked_until = least(unlocked_until, now())
+           WHERE user_id = %s
+             AND (used_at IS NULL OR consumed_at IS NULL)""", (user_id,))
 
 
 def is_unlocked(conn, email: str) -> bool:
@@ -136,7 +205,7 @@ def is_unlocked(conn, email: str) -> bool:
     return row is not None
 
 
-def refund(conn, email: str, ids=None) -> None:
+def refund(conn, email: str, ids) -> None:
     """Un-spend an exemption consumed MOMENTS ago by a sign-in step that
     could not possibly finish — password verified, but the account needs a
     second factor the same request does not carry (totp_required /
@@ -151,36 +220,68 @@ def refund(conn, email: str, ids=None) -> None:
     spends for good — so the exemption still buys a single attempt.
 
     `ids`: the unlocks the asking request itself spent (`consume`'s
-    return). Given, only those can be refunded — a concurrent attempt's
-    spend inside the same 90 seconds is that attempt's, not this one's."""
-    if not email:
+    return), and only those. There is no refund by address: a concurrent
+    attempt's spend inside the same 90 seconds is that attempt's, not this
+    one's, and re-arming it would hand the stranger's attempt back."""
+    if not email or not ids:
         return
-    scope = "" if ids is None else "AND u.id = ANY(%s)"
-    params = ((email.strip().lower(),) if ids is None
-              else (email.strip().lower(), list(ids)))
     conn.execute(
-        f"""UPDATE login_unlocks u SET consumed_at = NULL, refunded_at = now()
+        """UPDATE login_unlocks u SET consumed_at = NULL, refunded_at = now()
            FROM users usr
-           WHERE usr.id = u.user_id AND lower(usr.email) = %s {scope}
+           WHERE usr.id = u.user_id AND lower(usr.email) = %s
+             AND u.id = ANY(%s)
              AND u.consumed_at IS NOT NULL
              AND u.consumed_at > now() - interval '90 seconds'
              AND u.refunded_at IS NULL
              AND u.unlocked_until IS NOT NULL
-             AND u.unlocked_until > now()""", params)
+             AND u.unlocked_until > now()""",
+        (email.strip().lower(), list(ids)))
 
 
-def consume(conn, email: str) -> list:
-    """Spend the exemption — ONE sign-in attempt, not a ten-minute pass for
-    unlimited guessing. Returns the ids of the unlocks spent (empty, so
-    falsy, when there was none): a request that later has to give its
-    spend back names exactly these rows, never another attempt's."""
+def live_ids(conn, email: str) -> list:
+    """The account's opened, unspent unlocks (ids)."""
+    return [r["id"] for r in _live(conn, email)]
+
+
+def _live(conn, email: str) -> list:
     if not email:
+        return []
+    return conn.execute(
+        """SELECT u.id, u.token_hash FROM login_unlocks u
+           JOIN users usr ON usr.id = u.user_id
+           WHERE lower(usr.email)=%s AND u.consumed_at IS NULL
+             AND u.unlocked_until IS NOT NULL AND u.unlocked_until > now()""",
+        (email.strip().lower(),)).fetchall()
+
+
+def consume_ids(conn, ids) -> list:
+    """Spend exactly these unlocks, each only if still open and unspent —
+    so two requests naming the same row cannot both pass. Returns the ids
+    actually spent."""
+    if not ids:
         return []
     rows = conn.execute(
         """UPDATE login_unlocks u SET consumed_at=now()
-           FROM users usr
-           WHERE usr.id = u.user_id AND lower(usr.email)=%s
-             AND u.consumed_at IS NULL
+           WHERE u.id = ANY(%s) AND u.consumed_at IS NULL
              AND u.unlocked_until IS NOT NULL AND u.unlocked_until > now()
-           RETURNING u.id""", (email.strip().lower(),)).fetchall()
+           RETURNING u.id""", (list(ids),)).fetchall()
     return [r["id"] for r in rows]
+
+
+def consume(conn, email: str, proof: str) -> list:
+    """Spend the exemption the PROOF (or its sign-in code) names — ONE
+    sign-in attempt, not a ten-minute pass for unlimited guessing. Returns
+    the ids of the unlocks spent (empty, so falsy, when there was none): a
+    request that later has to give its spend back names exactly these
+    rows, never another attempt's.
+
+    Without the proof nothing is touched: knowing the address is not
+    enough to spend — or burn — the owner's unlock."""
+    if not email or not proof or not proof.isascii():
+        return []
+    code = _norm_code(proof)
+    match = [r["id"] for r in _live(conn, email)
+             if hmac.compare_digest(proof_for(r["id"], r["token_hash"]), proof)
+             or (code and hmac.compare_digest(
+                 code_for(r["id"], r["token_hash"]), code))]
+    return consume_ids(conn, match)

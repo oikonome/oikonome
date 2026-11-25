@@ -60,10 +60,19 @@ candidate deposits — opposite-direction transactions, narrowed by the
 **filter by merchant…** box. A deposit other charges have already
 used up is not offered, and one they have partly used is matched on
 what is left of it. Pick one or several and link; one
-insurance check often covers many charges in one shot. **undo match**
+insurance check often covers many charges in one shot. The line beside
+the link button — "selected $45.00 of $55.00 — $10.00 stays as spend" —
+is worked out by trying the link and undoing it, so it says exactly what
+linking will do; nothing is linked until you press the button. It is
+worked out once you pause ticking, and with more than 50 deposits ticked
+no line is shown (the button still links every one). **undo match**
 on a linked pair restores each side's original category — the one it had
 before the link — unless you have set a new category on that row since,
-which is kept. The **Matched** list shows the newest pairs first; **show
+which is kept. The **Matched** list is sorted by the charge's date, newest first,
+and each row says what it nets — the charge, or "$30 of $80" for a
+partial pair, what came back of the charge. A deposit dated more than
+three days before the charge it repays (money sent ahead, or a wrong
+pick) says how far ahead it came — "9 days before the charge"; **show
 more** pages back, and **find a pair by merchant…** searches either side,
 so an older pair can still be undone.
 

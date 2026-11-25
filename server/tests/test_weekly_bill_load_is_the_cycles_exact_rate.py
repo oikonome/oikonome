@@ -73,6 +73,28 @@ class WeeklyCycleLoadTests(unittest.TestCase):
         # Jan + Feb Thursdays only: 5 + 4
         self.assertAlmostEqual(load, 9 * 100.0 / 12, places=2)
 
+class ASeriesEndsOnItsEndDate(unittest.TestCase):
+    """A rule's dates after endOn inside its final month are not the
+    series' — not expected, not counted in its monthly load."""
+
+    def _bill(self, rec, anchor):
+        return {"payee": "Lawn Service", "amount": -100.0, "anchor": anchor,
+                "recurrence": rec, "raw": {"recurrence": rec}}
+
+    def test_a_weekly_rule_stops_mid_month(self):
+        b = self._bill({"frequency": "WEEKLY", "interval": 1,
+                        "endOn": "2026-02-14"}, dt.date(2026, 1, 1))
+        self.assertEqual(budget._occurrences_in_month(b, 2026, 2),
+                         [dt.date(2026, 2, 5), dt.date(2026, 2, 12)])
+        self.assertEqual(budget._occurrences_in_month(b, 2026, 3), [])
+
+    def test_a_twice_monthly_rule_stops_on_the_15th(self):
+        b = self._bill({"frequency": "MONTHLY", "interval": 1,
+                        "byMonthDay": [15, -1], "endOn": "2026-03-15"},
+                       dt.date(2026, 1, 15))
+        self.assertEqual(budget._occurrences_in_month(b, 2026, 3),
+                         [dt.date(2026, 3, 15)])
+
 
 if __name__ == "__main__":
     unittest.main()

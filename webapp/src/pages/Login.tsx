@@ -1,6 +1,7 @@
 import { startAuthentication } from "@simplewebauthn/browser";
 import { useEffect, useState } from "react";
 import { api, busyText, BusyError, errText } from "../api/client";
+import Note from "../components/Note";
 
 // passkeys are offered in hosted mode and need a secure context
 // (https). Self-hosted LAN installs run over http, so this is already
@@ -143,15 +144,15 @@ export default function Login({ onDone }: { onDone: () => void }) {
           {brand}
           <p className="sub" style={{ margin: "0 0 .6rem" }}>
             This account signs in with a passkey.</p>
-          {error && <div className="note bad">{error}</div>}
+          {error && <Note tone="bad">{error}</Note>}
           <button className="pri" style={{ width: "100%" }} disabled={busy}>
             {busy ? "…" : "Use your passkey"}</button>
           <p className="sub" style={{ margin: ".7rem 0 0" }}>
             On a different device?{" "}
-            <a href="#" onClick={(e) => {
+            <button type="button" className="as-link" onClick={(e) => {
               e.preventDefault();
               setPasskeyOnly(false); setNeedTotp(true); setRecovery(true);
-            }}>Use a recovery code</a> or{" "}
+            }}>Use a recovery code</button> or{" "}
             <a href="/forgot">email yourself a link</a>.</p>
         </form>
       </div>
@@ -169,7 +170,7 @@ export default function Login({ onDone }: { onDone: () => void }) {
             Synthetic household, resets hourly. Credentials are filled in
             for you.</div>
         )}
-        {error && <div className="note bad">{error}</div>}
+        {error && <Note tone="bad">{error}</Note>}
         {/* Step 1: email+password. Step 2: code only (creds stay in state). */}
         {!needTotp ? (
           <>
@@ -188,11 +189,11 @@ export default function Login({ onDone }: { onDone: () => void }) {
                 mistyped email cost a page reload. */}
             <div className="sub" style={{ marginBottom: ".5rem" }}>
               Signing in as <b style={{ color: "var(--ink)" }}>{email}</b> ·{" "}
-              <a href="#" onClick={(e) => {
+              <button type="button" className="as-link" onClick={(e) => {
                 e.preventDefault();
                 setNeedTotp(false); setRecovery(false);
                 setTotp(""); setPassword(""); setError("");
-              }}>not you?</a>
+              }}>not you?</button>
             </div>
             <p style={{ margin: "0 0 .5rem" }}>
               <input style={{ width: "100%",
@@ -229,12 +230,12 @@ export default function Login({ onDone }: { onDone: () => void }) {
           <p className="sub" style={{ margin: ".7rem 0 0" }}>
             Lost your authenticator?{" "}
             {recovery ? (
-              <a href="#" onClick={(e) => {
+              <button type="button" className="as-link" onClick={(e) => {
                 e.preventDefault(); setRecovery(false); setTotp("");
                 setError("");
-              }}>Use your authenticator code</a>
+              }}>Use your authenticator code</button>
             ) : (
-              <a href="#" onClick={(e) => {
+              <button type="button" className="as-link" onClick={(e) => {
                 // clear the field with the mode. Leaving the typed
                 // authenticator digits behind would leave the placeholder
                 // saying "recovery code" over a stale 6-digit string —
@@ -243,12 +244,13 @@ export default function Login({ onDone }: { onDone: () => void }) {
                 // to suspect the box was never reset.
                 e.preventDefault(); setRecovery(true); setTotp("");
                 setError("");
-              }}>Use a recovery code</a>
+              }}>Use a recovery code</button>
             )}
             {passkeysAvailable() && !demo && (<>
               {" · "}
-              <a href="#" onClick={(e) => { e.preventDefault(); void passkey(); }}
-              >use a passkey instead</a>
+              <button type="button" className="as-link"
+                      onClick={(e) => { e.preventDefault(); void passkey(); }}
+              >use a passkey instead</button>
             </>)}
             <br />
             {/* the door for someone with nothing left, stated where the

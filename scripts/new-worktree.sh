@@ -26,7 +26,7 @@ DIR="../oikonome-wt-$NAME"
 BRANCH="wt/$NAME"
 # the name lands in CREATE DATABASE unquoted, where a hyphen is a syntax
 # error — fold anything that isn't a word character to underscore
-DB="oikonome_test_$(printf '%s' "$NAME" | tr -c 'a-zA-Z0-9_' '_')"
+DB="oikonome_test_$(printf '%s' "$NAME" | tr -c 'a-zA-Z0-9_' '_' | tr 'A-Z' 'a-z')"
 
 if [ -e "$DIR" ]; then
   echo "$DIR already exists — pick another name or remove it with:" >&2

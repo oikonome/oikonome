@@ -2,7 +2,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useState } from "react";
 import { api, errText } from "../api/client";
 import { SETTINGS_SAVES, saveSettings } from "../api/cache";
-import { isPlanSavingsGoal, parseMoneyDraft } from "../moneymath";
+import { planSaved } from "../checklist";
+import { inputPhase, isPlanSavingsGoal, parseMoneyDraft, plannerWaits,
+         SAVE_WAITS_FAILED, UNKNOWN_FIGURE } from "../moneymath";
 
 // The budgets step on the hand-entry path. The household said it would set
 // its own numbers, so a first visit starts blank and the history-based
@@ -10,7 +12,8 @@ import { isPlanSavingsGoal, parseMoneyDraft } from "../moneymath";
 // the step before, evened out to a month, and savings is what is left — the
 // same money model as the full planner, in four boxes.
 //
-// A budget that is already stored (budgets_set) is shown, never hidden
+// A budget the household saved (planSaved — never the first-run seed the
+// server may have stored) is shown, never hidden
 // behind blank boxes: a blank box would otherwise save as $0 and wipe a
 // figure the person could not see. For the same reason a box left blank
 // over a stored figure keeps that figure rather than sending zero.
@@ -33,7 +36,7 @@ export default function ManualBudgets({ onSaved }: { onSaved?: () => void }) {
   // household with no budget starts blank
   useEffect(() => {
     if (init || !s.data || !ob.data) return;
-    if (ob.data.wizard_steps?.budgets === "done" || ob.data.budgets_set) {
+    if (ob.data.wizard_steps?.budgets === "done" || planSaved(ob.data)) {
       const str = (v: number | null | undefined) => (v && v > 0 ? String(v) : "");
       setIncome(str(s.data.budgeted_income_monthly));
       setFood(str(s.data.food_monthly));
@@ -44,19 +47,23 @@ export default function ManualBudgets({ onSaved }: { onSaved?: () => void }) {
 
   const num = (v: string) => parseMoneyDraft(v) ?? 0;
   // what a box left blank (or at zero) resolves to: the stored figure when
-  // there is a budget to protect, else nothing. Without a stored budget the
-  // settings view can carry the app's provisional seed, which is not the
+  // there is a budget to protect, else nothing. Without a saved budget the
+  // settings view can carry the app's first-run seed, which is not the
   // household's and must not be counted as kept.
   const keptOf = (stored: number | null | undefined, has: boolean) =>
     has && stored && stored > 0 ? stored : 0;
-  const hasBudget = !!ob.data?.budgets_set;
+  const hasBudget = !!ob.data && planSaved(ob.data);
   const keepIncome = keptOf(s.data?.budgeted_income_monthly, true);
   const keepFood = keptOf(s.data?.food_monthly, hasBudget);
   const keepOther = keptOf(s.data?.other_monthly, hasBudget);
   const eff = (v: string, kept: number) => (num(v) > 0 ? num(v) : kept);
-  const bills = sug.data?.avg_bills_monthly ?? 0;
-  const savings = Math.round(eff(income, keepIncome) - bills
-    - eff(food, keepFood) - eff(other, keepOther));
+  // Bills come from the suggestion read: until it has answered there is
+  // no Bills figure, no savings worked out from it, and no save
+  const waits = plannerWaits(inputPhase(sug), "ready");
+  const bills = sug.data ? sug.data.avg_bills_monthly : null;
+  const savings = bills === null ? null
+    : Math.round(eff(income, keepIncome) - bills
+                 - eff(food, keepFood) - eff(other, keepOther));
   const n = sug.data?.months?.length ?? 0;
   const basis = n ? ` from ${n} month${n === 1 ? "" : "s"}` : "";
   const sugg = sug.data?.suggestions;
@@ -64,12 +71,14 @@ export default function ManualBudgets({ onSaved }: { onSaved?: () => void }) {
   const save = useMutation({
     scope: SETTINGS_SAVES,
     mutationFn: async (): Promise<boolean> => {
+      // a savings plan worked out from a missing Bills figure is never saved
+      if (bills === null) throw new Error(waits ?? SAVE_WAITS_FAILED);
       // the goals list is replaced wholesale on save: carry every other
       // goal through from the server's current copy, and keep the stored
       // Savings goal's own spelling and target. Whether a budget is stored
       // is read fresh too — it decides whether a blank box keeps a figure.
       const [cur, o] = await Promise.all([api.settings(), api.onboarding()]);
-      const has = !!o.budgets_set;
+      const has = planSaved(o);
       const others = (cur.savings_goals ?? [])
         .filter((g) => !isPlanSavingsGoal(g.name));
       const goal = (cur.savings_goals ?? [])
@@ -95,7 +104,7 @@ export default function ManualBudgets({ onSaved }: { onSaved?: () => void }) {
         { ...(goal ?? { name: "Savings", target: 0, tokens: [],
                         start_balance: 0 }),
           monthly_plan: Math.max(0, Math.round(inc - bills - f - ot)) }];
-      await saveSettings(qc, body);
+      await saveSettings(qc, body, cur);
       // "Saved" is only true when the step's own gate now passes; read it
       // back rather than assume, and hand the wizard the fresh answer
       const after = await api.onboarding();
@@ -123,9 +132,18 @@ export default function ManualBudgets({ onSaved }: { onSaved?: () => void }) {
     save.mutate();
   };
 
+  if (!init && ((!s.data && s.isError) || (!ob.data && ob.isError)))
+    return (
+      <p className="mut">{SAVE_WAITS_FAILED}{" "}
+        <button type="button"
+                onClick={() => { void s.refetch(); void ob.refetch(); }}>
+          Try again</button></p>
+    );
   if (!init) return <span className="mut">loading…</span>;
-  const field = (label: ReactNode, val: string, set0: (v: string) => void,
-                 suggestion?: number, kept = 0) => {
+  // `name` is the field's spoken name: the label's words, without the
+  // suggestion chip that shares its line
+  const field = (label: ReactNode, name: string, val: string,
+                 set0: (v: string) => void, suggestion?: number, kept = 0) => {
     // an edit makes the last save's line stale
     const set = (v: string) => { set0(v); setMsg(null); };
     return (
@@ -137,7 +155,7 @@ export default function ManualBudgets({ onSaved }: { onSaved?: () => void }) {
               onClick={() => set(String(Math.round(suggestion)))}>
             suggested {whole(suggestion)}{basis}</button></>)}
       </span>
-      <input inputMode="decimal"
+      <input aria-label={name} inputMode="decimal"
              placeholder={kept > 0 ? `${whole(kept)} (kept)` : "$"}
              value={val} onChange={(e) => set(e.target.value)} />
     </div>
@@ -145,28 +163,33 @@ export default function ManualBudgets({ onSaved }: { onSaved?: () => void }) {
   };
   return (
     <div>
-      {field("Income (approved paychecks)", income, setIncome,
+      {field("Income (approved paychecks)", "Income (approved paychecks)",
+             income, setIncome,
              sugg?.income_monthly, keepIncome)}
       <div className="wiz-field">
         <span>Bills (approved)</span>
-        <input value={whole(bills)} disabled aria-label="Bills per month" />
+        <input value={bills === null ? UNKNOWN_FIGURE : whole(bills)} disabled
+               aria-label="Bills per month" />
       </div>
-      {field(<b>Food &amp; drink</b>, food, setFood, sugg?.food_monthly,
+      {field(<b>Food &amp; drink</b>, "Food & drink", food, setFood,
+             sugg?.food_monthly,
              keepFood)}
-      {field(<b>Everything else</b>, other, setOther,
+      {field(<b>Everything else</b>, "Everything else", other, setOther,
              sugg?.other_monthly, keepOther)}
       <div className="wiz-field">
         <span>Savings (what's left)</span>
-        <input value={whole(savings)} disabled aria-label="Savings per month" />
+        <input value={savings === null ? UNKNOWN_FIGURE : whole(savings)}
+               disabled aria-label="Savings per month" />
       </div>
-      {savings < 0 && (
+      {savings !== null && savings < 0 && (
         <p className="neg" style={{ fontSize: 13, margin: ".3rem 0 0" }}>
           The plan is {whole(-savings)} over income.</p>)}
       <div style={{ marginTop: ".6rem", display: "flex", gap: ".6rem",
                     alignItems: "center", flexWrap: "wrap" }}>
-        <button className="pri" disabled={save.isPending}
+        <button className="pri" disabled={save.isPending || !!waits}
                 onClick={submit}>
           {save.isPending ? "saving…" : "Save budgets"}</button>
+        {waits && <span className="mut">{waits}</span>}
         {msg && <span className={msg.bad ? "neg" : "mut"}>{msg.text}</span>}
       </div>
     </div>

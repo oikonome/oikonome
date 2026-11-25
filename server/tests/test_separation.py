@@ -568,16 +568,23 @@ class TransientOfflineTests(unittest.TestCase):
         self.assertIn("refetchOnReconnect: true", m)
         # a few retries with backoff — but not for a 4xx, which is an
         # answer, not a dropped radio
-        self.assertRegex(m, r"retry: \(n: number, e: unknown\) => \{\s*"
-                            r"if \(n >= 3\) return false;",
-                         "one retry is not enough for a phone waking up")
+        # The rule is shared with the phone (retryRead in the
+        # screen-states twin block, whose case table runs on both): at most
+        # three attempts, never a 4xx, which is an answer, not a dropped
+        # radio.
+        self.assertIn("retry: retryRead,", m,
+                      "one retry is not enough for a phone waking up")
+        mm = self._src("moneymath.ts")
+        rule = mm[mm.index("export function retryRead("):]
+        rule = rule[:rule.index("\n}\n")]
+        self.assertIn("if (failures >= 3) return false;", rule)
         # The status is read from the error's leading "NNN: " prefix only.
         # Scanning the whole message for a 4xx-looking number would stop
         # retrying a 5xx whose body happens to say "450". The prefix regex
         # is lifted from the source and applied here, so the invariant is
         # checked on real messages, not on the wording.
-        pat = re.search(r"/(\^\(\\d\{3\}\): )/\.exec\(e\.message\)", m)
-        self.assertIsNotNone(pat, "httpStatus must read the leading status")
+        pat = re.search(r"/(\^\(\\d\{3\}\): )/\.exec\(e\.message\)", mm)
+        self.assertIsNotNone(pat, "failureStatus must read the leading status")
         prefix = re.compile(pat.group(1))
 
         def status(msg):
@@ -587,12 +594,12 @@ class TransientOfflineTests(unittest.TestCase):
         self.assertEqual(status("502: upstream timed out after 450 ms"), 502)
         self.assertEqual(status("404: not found"), 404)
         self.assertIsNone(status("Failed to fetch (450 bytes)"))
-        self.assertIn("if (e instanceof AuthError) return 401;", m,
+        client = self._src("api/client.ts")
+        self.assertIn("readonly status = 401;", client,
                       "a lost session is a 4xx answer, not a network blip")
-        # retried: no status (network), any 5xx, 429 and 408; every other
+        # retried: no status (network), any 5xx and 408; every other
         # 4xx is an answer and returns at once
-        self.assertRegex(m, r"return s === null \|\| s >= 500 "
-                            r"\|\| s === 408;")
+        self.assertIn("return s === null || s >= 500 || s === 408;", rule)
 
         def retried(msg):
             s_ = status(msg)
@@ -719,16 +726,14 @@ class OverviewDashboardTests(unittest.TestCase):
         self.assertIn("bizSuggestions", b)
         self.assertIn("/suggestions", c)
 
-    def test_month_profit_respects_the_sign_convention(self):
-        """positive = money out, house-wide. Getting this backwards would
-        show a profitable month as a loss."""
+    def test_month_profit_is_the_servers(self):
+        """The month figure under the year's profit is books.period_profit
+        on the P&L reply; the page works out no profit of its own."""
         b = self._src("pages/Business.tsx")
         i = b.index("monthProfit")
-        self.assertIn("bizPeriodProfit", b[i:i + 400])
-        m = self._src("bizmath.ts")
-        j = m.index("export function bizPeriodProfit")
-        self.assertIn("if (t.amount < 0)", m[j:j + 1400])
-        self.assertIn("revenue += -net", m[j:j + 1400])
+        self.assertIn("this_month", b[i:i + 400])
+        self.assertNotIn("bizPeriodProfit", b)
+        self.assertNotIn("bizPeriodProfit", self._src("bizmath.ts"))
 
 
 class BusinessSettingsTabTests(unittest.TestCase):
@@ -750,7 +755,8 @@ class BusinessSettingsTabTests(unittest.TestCase):
         self.assertNotIn('key: "settings"', b,
                          "Settings must stay OUT of BIZ_TABS — it is "
                          "de-emphasized, not a peer of the work tabs")
-        self.assertIn('onTab("settings")', b, "…but must still be reachable")
+        self.assertIn('options={[{ value: "settings" as BizTab, label: "Settings" }]}',
+                      b, "…but must still be reachable, as its own control")
 
     def test_config_sections_are_behind_settings(self):
         b = self._src("pages/Business.tsx")
@@ -803,7 +809,7 @@ class ReviewQueueTests(unittest.TestCase):
         i = b.index("function ReviewQueue")
         block = b[i:i + 4000]
         self.assertIn('s.source === "merchant"', block)
-        self.assertIn('s.source === "category"', block)
+        self.assertIn('s.source === "kind"', block)
 
     def test_nothing_commits_without_a_chosen_line(self):
         # the button also gates on the viewer role now — the invariant
@@ -848,8 +854,13 @@ class TaxSetAsideTests(unittest.TestCase):
         """A flat 25% would be a downgrade from the real computation."""
         b = self._src("pages/Business.tsx")
         block = _component(b, "TaxSetAside")
-        self.assertIn("owed / profit", block)
+        self.assertIn("rate_of_profit", block)
         self.assertNotIn("0.25", block)
+        import inspect
+
+        from oikonome.engine import selfemploy
+        self.assertIn("owed / profit",
+                      inspect.getsource(selfemploy.tax_set_aside))
 
     def test_the_card_says_which_question_it_is_answering(self):
         """"Saved" means one of two different things, and the card must say

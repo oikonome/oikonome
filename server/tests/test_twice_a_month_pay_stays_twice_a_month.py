@@ -9,6 +9,7 @@ unless it was asked to change it.
 import calendar
 import datetime as dt
 import unittest
+from unittest import mock
 
 from oikonome.engine import bills as rd
 from oikonome.engine import budget, forecast
@@ -132,6 +133,15 @@ class _PayrollFixture(unittest.TestCase):
         self.conn.commit()
 
     def approve_the_offer(self, today):
+        """Detection runs on `today` and the person approves its offer the
+        same day: the approval's roll of a passed due date reads the
+        household's day, which is pinned to `today` so the bill's next date
+        follows from the fixture's dates, whatever the date the suite runs."""
+        with mock.patch("oikonome.localtime.household_day",
+                        return_value=today):
+            return self._approve(today)
+
+    def _approve(self, today):
         rd.run(self.conn, today=today)
         offers = self.conn.execute(
             "SELECT * FROM bill_proposals WHERE status='pending' "
@@ -215,8 +225,8 @@ class DetectionToTheMonthsIncome(_PayrollFixture):
             "SELECT evidence FROM bill_proposals WHERE status='pending' "
             "AND kind='add'").fetchone()
         self.assertEqual(as_dict(offer["evidence"])["by_month_day"], [1, 15])
-        self.assertEqual(budget._pending_expense_monthly(self.conn),
-                         (1600.0, 1))
+        self.assertEqual(budget._pending_expense_monthly(
+            self.conn, dt.date(2026, 11, 5)), (1600.0, 1))
 
 
 class ABiweeklyBillAlreadyApprovedIsOfferedTheRealShape(_PayrollFixture):

@@ -233,6 +233,31 @@ class DemoGeneratorTests(unittest.TestCase):
             "SELECT COUNT(*) n FROM transactions WHERE entity_id IS NOT NULL "
             "AND account_id <> 'demo-biz'").fetchone()["n"], 0)
 
+    def test_the_demo_business_is_the_primary_earners_and_nets_their_w2(self):
+        """The demo cannot save a setting, so the business is seeded as the
+        primary earner's: a finished year says why its seeded W-2 is not
+        netted, the running year (no W-2 can exist for it yet) says so, and
+        neither asks the visitor to set anything."""
+        from oikonome.engine import selfemploy
+        e = self.conn.execute(
+            "SELECT id, owner FROM business_entity").fetchone()
+        self.assertEqual(e["owner"], "primary")
+        last = selfemploy.estimated_tax(self.conn, str(e["id"]),
+                                        TODAY.year - 1, today=TODAY)
+        # a primary earner's W-2 is never netted: nothing stored tells it
+        # from one an older app filed there without asking
+        self.assertTrue((last["ss_wages_note"] or "").startswith(
+            "This business is set as the primary earner's, but their "
+            f"{TODAY.year - 1} W-2 wages are not counted"),
+            last["ss_wages_note"])
+        now = selfemploy.estimated_tax(self.conn, str(e["id"]), TODAY.year,
+                                       today=TODAY)
+        self.assertTrue((now["ss_wages_note"] or "").startswith(
+            "This business is set as the primary earner's, but no "
+            f"{TODAY.year} W-2 of theirs is on file yet"), now["ss_wages_note"])
+        for note in (last["ss_wages_note"], now["ss_wages_note"]):
+            self.assertNotIn("does not say whose it is", note)
+
     def test_business_bills_are_not_proposed_as_personal(self):
         """The seed assigns the business account and then detects bills on
         the same connection. The business account's payees must not come

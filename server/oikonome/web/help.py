@@ -14,6 +14,9 @@ import json
 
 from fastapi import APIRouter, Depends, Request, Response
 
+from .schemas import documented
+from .schemas.exports import HelpTopics
+
 router = APIRouter(prefix="/api")
 
 
@@ -49,16 +52,27 @@ _ORDER = ["faq", "quickstart", "importing", "troubleshooting",
 # then the pages, then the trust/admin topics.
 # Same order as the app's navigation: Debt sits under Cash Flow, Business
 # just above Accounts.
-_GUIDE_ORDER = ["today", "lenses", "concepts", "budget", "bills",
+_GUIDE_ORDER = ["today", "forecast-record", "lenses", "concepts", "budget", "bills",
                 "money-map", "cash-flow", "debt", "transactions", "merchants",
                 "rules", "net-worth", "retirement", "business", "accounts",
                 "owners", "reimbursements", "receipts", "alerts",
                 "assistant", "security", "continuity-packet", "import-history"]
 
-# root docs split into sidebar groups; guides are group "guides"
-_SETUP = {"quickstart", "importing", "collectors", "community-scripts",
-          "integrations",
-          "reverse-proxy", "deployment-modes"}
+# root docs split into sidebar groups; guides are group "guides".
+# "setup" is getting a household's own history in; "selfhost" is running
+# and extending an instance — the server, its proxy, its keys, the
+# collectors and the doors other programs use. The Help page folds the
+# self-hosting group away so a household reading its guides is not handed
+# the operator's manual; everything else is "reference" (the FAQ).
+_SETUP = {"importing", "tax-documents"}
+_SELFHOST = {"quickstart", "deployment-modes", "reverse-proxy", "master-key",
+             "troubleshooting", "collectors", "community-scripts",
+             "integrations"}
+
+
+def _root_group(stem: str) -> str:
+    return ("setup" if stem in _SETUP
+            else "selfhost" if stem in _SELFHOST else "reference")
 
 
 def _user():
@@ -103,13 +117,13 @@ def _load(folder: Path, group_of) -> dict:
 
 
 @router.get("/help")
+@documented(response=HelpTopics)
 def help_topics(request: Request, user: dict = Depends(_user())):
     """Every topic, in reading order. The document is the same for every
     caller until the docs on disk or the support address change, so it
     carries a weak ETag: the clients re-ask hourly and a match costs
     nothing on the wire (the body is a third of a megabyte)."""
-    docs = _load(DOCS_DIR,
-                 lambda s: "setup" if s in _SETUP else "reference")
+    docs = _load(DOCS_DIR, _root_group)
     guides = _load(DOCS_DIR / "guides", lambda s: "guides")
     ordered = [docs.pop(k) for k in _ORDER if k in docs]
     ordered += [docs[k] for k in sorted(docs)]

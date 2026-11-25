@@ -15,7 +15,7 @@ the device.
   run.
 - **Native UI, shared contract.** Expo / React Native with real native
   navigation — the web SPA's components do not carry over, but the API
-  client, types, and each page's agreed design do. A page's design is the
+  client, types, and each page's design do. A page's design is the
   spec for both its web and native builds.
 - **Login-only.** Accounts exist on the server; the app authenticates
   against one — there is no signup in the app. The account section of
@@ -115,8 +115,12 @@ Implementation (server `notify/push_native.py`, relay `relay/`):
   browser push and posts `{token, platform, event, badge}` batches to
   `OIKONOME_PUSH_RELAY_URL` + `/v1/push`. Unset URL = channel off (the
   self-host default). Events are a fixed enum (`daily`, `weekly`,
-  `monthly`, `yearly`, `alert`, `test`) — free text is refused on both
-  ends, which is what makes the content-free property structural.
+  `monthly`, `yearly`, `alert`, `security`, `test`) — free text is
+  refused on both ends, which is what makes the content-free property
+  structural. `security` (an account-security change: the relay's fixed
+  line names nothing, a tap opens Security) falls back once to `alert`
+  when the relay answers 400 `unknown event`, so an instance newer than
+  its relay is still heard.
 - The relay (`uvicorn oikonome.relay.app:app`, same image, its own
   container) validates the same shape, caps batches, rate-limits per
   source AND per instance key (an open relay, configured with no keys,

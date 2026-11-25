@@ -163,8 +163,50 @@ def validate(obj) -> dict | None:
         if any(n is None for n in nums):
             return None
         out_series.append({"name": name, "values": nums})
-    return {"kind": kind, "title": title, "labels": labs,
-            "series": out_series}
+    out = {"kind": kind, "title": title, "labels": labs,
+           "series": out_series}
+    if kind == "pie":
+        # decided here even when a client sent figures back: the report
+        # door re-validates what it is given
+        out["shown"] = ring_figures(labs, out_series[0]["values"])
+    return out
+
+
+def ring_figures(labels: list, values: list) -> dict:
+    """What a ring ("pie") prints: the centre total and, for each drawn
+    (positive) part in order, its whole dollars and whole-percent share.
+    The dollars add up to the centre and the shares to 100, both by
+    largest remainder (reporting.shown_dollars / shown_shares), so a row
+    may be a dollar or a point off its own rounding. A part that is not
+    positive is not drawn and not listed."""
+    from .reporting import shown_dollars, shown_shares, whole_dollars
+    drawn = [(lab, float(v)) for lab, v in zip(labels, values)
+             if isinstance(v, (int, float)) and not isinstance(v, bool)
+             and round(float(v), 2) > 0]
+    vals = [v for _l, v in drawn]
+    total = round(sum(vals), 2)
+    return {"total": whole_dollars(total),
+            "rows": [{"label": lab, "dollars": d, "share": p}
+                     for (lab, _v), d, p in zip(drawn,
+                                                shown_dollars(vals, total),
+                                                shown_shares(vals))]}
+
+
+def with_ring_figures(blocks) -> list:
+    """Stored blocks as a client reads them: every ring carries `shown`,
+    worked out from its values on read for an answer saved before rings
+    carried it (the stored values are the input; the figures are never
+    trusted from the store)."""
+    out = []
+    for b in blocks or []:
+        if isinstance(b, dict) and b.get("kind") == "pie" \
+                and isinstance(b.get("series"), list) and b["series"] \
+                and isinstance(b["series"][0], dict):
+            b = {**b, "shown": ring_figures(b.get("labels") or [],
+                                            b["series"][0].get("values")
+                                            or [])}
+        out.append(b)
+    return out
 
 
 # what a reader sees where a chart the model wrote cannot be drawn: an
@@ -515,7 +557,9 @@ def render_block(b: dict) -> str:
                 f'{_table_html(b["columns"], b["rows"])}</div>')
     if kind == "pie":
         segs = list(zip(b["labels"], b["series"][0]["values"]))
-        return (f'<div class="card">{head}{charts.donut(segs)}</div>')
+        # every block here passed validate, which attached its figures
+        return (f'<div class="card">{head}'
+                f'{charts.donut(segs, b["shown"])}</div>')
     if kind == "line":
         return (f'<div class="card">{head}{_svg_line(b)}'
                 f'{_legend(b["series"])}{_data_table(b)}</div>')

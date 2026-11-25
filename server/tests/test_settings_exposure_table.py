@@ -25,6 +25,10 @@ URL_PW = "url-pass-9f8e7d"
 QS_KEY = "qs-key-5a4b3c"
 API_KEY = "sk-invented-123456"
 SMTP_PW = "smtp-pass-invented"
+LLM_HOST = "llm-endpoint.household.example"
+LLM_MODEL = "house-model-7b"
+BUNDLED_HOST = "bundled-ollama.local"
+BUNDLED_MODEL = "bundled-model-3b"
 SECRETS = (TOKEN, URL_PW, QS_KEY, API_KEY, SMTP_PW, "plaid-secret-x",
            "mx-key-x", "body-token-x")
 
@@ -59,6 +63,19 @@ def _view(cfg: dict) -> dict:
     v["demo_read_only"] = True
     return v
 
+
+# the household's setup, the owner's alone to read
+OWNER_SETUP = frozenset({
+    "smtp_host", "smtp_port", "smtp_from", "smtp_starttls",
+    "email_recipients", "email_muted", "email_schedule", "email_send_hour_utc",
+    "llm_url", "llm_model", "llm_vision_model", "llm_backends", "llm_roles",
+    "llm_extra_body", "taxdocs_allow_remote_llm",
+    "plaid_client_id", "plaid_env", "mx_client_id", "mx_env",
+    "plaid_enrich_cap", "plaid_recurring",
+    # the same endpoint and model read back through the resolver, and
+    # whether the trained classifier runs ahead of it
+    "llm_effective", "llm_bundled", "categorizer_active",
+})
 
 _SECRET_SHAPED = re.compile(r"//[^/@\s]*:[^*/@\s][^/@\s]*@")   # user:pw@
 
@@ -126,8 +143,28 @@ class NoCredentialReachesAViewer(unittest.TestCase):
     def test_the_household_data_still_reaches_a_viewer(self):
         out = se.view_for("viewer", _view(_rich_cfg()))
         self.assertEqual(out["food_monthly"], 500)
-        self.assertEqual(out["smtp_host"], "smtp.postmarkapp.example")
-        self.assertEqual(out["plaid_client_id"], "client-id-public")
+        self.assertIn("timezone", out)    # every screen dates by it
+
+    def test_the_households_setup_is_the_owners_to_read(self):
+        # where the mail goes and when, the AI endpoint, the bank-connection
+        # keys and billed cross-checks: the owner's alone;
+        # a member and a viewer get none of them
+        view = _view(_rich_cfg())
+        for role in ("member", "viewer"):
+            with self.subTest(role=role):
+                out = se.view_for(role, view)
+                self.assertEqual(sorted(set(out) & OWNER_SETUP), [])
+        owner = se.view_for("owner", view)
+        self.assertEqual(owner["smtp_host"], "smtp.postmarkapp.example")
+        self.assertEqual(owner["plaid_client_id"], "client-id-public")
+        self.assertEqual(owner["email_recipients"], ["a@household.example"])
+
+    def test_every_owner_only_write_but_timezone_is_owner_read(self):
+        # the save's owner-only list and the read agree: a key only the
+        # owner may change is one only the owner reads, but the clock
+        readable = sorted(k for k in permissions.OWNER_ONLY_SETTINGS
+                          if k in se.TABLE and se.TABLE[k].read == "viewer")
+        self.assertEqual(readable, ["timezone"])
 
 
 class NoCredentialRidesTheExport(unittest.TestCase):
@@ -185,7 +222,9 @@ class TheSettingsDoorAppliesTheTable(unittest.TestCase):
             seed_accounts(conn)
             write_config(conn, smtp_host="smtp.postmarkapp.example",
                          smtp_port=587, smtp_user=TOKEN,
-                         smtp_from="budget@household.example")
+                         smtp_from="budget@household.example",
+                         llm_url=f"https://{LLM_HOST}/v1",
+                         llm_model=LLM_MODEL)
         finally:
             conn.close()
         inv = cls.owner.post("/api/invites", json={
@@ -197,6 +236,47 @@ class TheSettingsDoorAppliesTheTable(unittest.TestCase):
             "email": f"sxv-{uuid.uuid4().hex[:8]}@example.dev",
             "password": "family-member-pass"})
         assert r.status_code == 200, r.text
+        inv = cls.owner.post("/api/invites", json={
+            "label": "partner", "role": "member",
+            "password": "correct-horse-battery"}).json()
+        cls.member = TestClient(appmod.app)
+        r = cls.member.post("/api/invite/claim", json={
+            "token": inv["url"].rsplit("token=", 1)[1],
+            "email": f"sxm-{uuid.uuid4().hex[:8]}@example.dev",
+            "password": "family-member-pass"})
+        assert r.status_code == 200, r.text
+
+    def _read(self, client) -> str:
+        # the operator's bundled endpoint too, as a self-hosted install has
+        from unittest import mock
+        with mock.patch.dict("os.environ", {
+                "OIKONOME_LLM_URL": f"http://{BUNDLED_HOST}:11434",
+                "OIKONOME_LLM_MODEL": BUNDLED_MODEL}):
+            r = client.get("/api/settings")
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.text
+
+    def test_no_non_owner_reads_the_ai_endpoint_or_its_model(self):
+        # the endpoint and model are the owner's to read; the views of them
+        # the AI card works from (llm_effective, llm_bundled) are the same
+        # setup and must not hand them to anyone else
+        for who, client in (("member", self.member),
+                            ("viewer", self.viewer)):
+            with self.subTest(role=who):
+                self.assertEqual(client.get("/api/me").json()["role"], who)
+                text = self._read(client)
+                for value in (LLM_HOST, LLM_MODEL, BUNDLED_HOST,
+                              BUNDLED_MODEL):
+                    self.assertNotIn(value, text)
+                body = json.loads(text)
+                for key in OWNER_SETUP:
+                    self.assertNotIn(key, body)
+
+    def test_the_owner_reads_which_endpoint_answers(self):
+        body = json.loads(self._read(self.owner))
+        self.assertIn(LLM_HOST, json.dumps(body["llm_effective"]))
+        self.assertEqual(body["llm_bundled"]["model"], BUNDLED_MODEL)
+        self.assertIn("categorizer_active", body)
 
     def test_a_viewer_reads_that_a_relay_user_is_set_not_what_it_is(self):
         self.assertEqual(self.viewer.get("/api/me").json()["role"], "viewer")

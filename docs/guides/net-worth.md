@@ -9,17 +9,36 @@ multiple sources of one real account count once (see the Accounts
 guide). Beside the total, **+$X this month** is the change in that
 total since the end of last month — property included, so a mortgage
 payment counts only the interest it cost, not the whole payment that
-left your checking account. Two tiles split it into **Financial
+left your checking account. Under it, one line says what the change is
+made of (**crypto −$600 · retirement −$300 · cash +$50**: only the parts
+that moved, adding up to the figure), once the app has a nightly record
+of last month's end to compare with. If you withdrew money from a crypto
+account this month and no linked bank account has received it, a second
+line says so (**$250 withdrawn 03/02 has not shown up in a linked
+account**), so money on its way to a bank the app cannot see does not
+read as a loss. Two tiles split it into **Financial
 accounts** (cash + investments − card debt), whose own **this month**
 line is the change in the financial accounts alone, and **Property &
-vehicles, net** (after the mortgage payoff). The property layer's past
+vehicles, net** (after the mortgage payoff), which shows the rest of the
+month's change, so the two tiles' changes add up to the headline's. The
+two rings draw only what is owned: card debt, or an institution whose
+accounts net below zero, is listed under the ring as **not drawn**, with
+the **Net** that matches the Financial accounts tile. The property layer's past
 values come from its nightly record, or for a connected loan from the
 principal paid on it: rows the lender marks as principal, or each
 payment split by the principal-paid-this-year figure the lender
 reports. A loan whose history shows only whole payments, with neither,
 leaves the months the nightly record does not cover unknown, so no
 headline change shows until the record covers last month. Manual assets hold
-their value until you edit them.
+their value until you edit them. Each also has an **Owned since** date:
+the month it enters the trend. A new item takes the day you add it, an
+upgrade fills it in for items saved before the field existed from the
+date their value was last stated, and only this field moves it — editing
+the value restamps when the value was stated but never makes the item
+look newly owned. The list is saved as a whole: an edit is
+merged onto what another device saved in the meantime, and only if the
+list moves again during that save does it stop with *"Changed on another
+device. Reloaded the latest; make your change again."*
 
 A connected loan account typed as a **mortgage** moves into the
 property layer alongside your real estate and, once linked, takes the
@@ -27,12 +46,18 @@ place of any manual mortgage entry you had typed in — you do not need
 to delete the manual one. Other loans (auto, student) stay where they
 were and never displace it.
 
+A mortgage balance you typed in stays at the figure you typed: the app
+cannot see your payments' principal. So the row, and the **mortgage
+payoff** line on the tile above, say when it was entered (**entered
+06/26**), and once a quarter has passed they turn amber and read
+**entered 06/26 — update**. Open **Edit assets**, type the balance from
+your latest statement and save; the date resets.
+
 ## Net worth over time
 
-The chart draws **financial accounts only** (cash + investments − card
-debt); property and its loan are left out, so its **This month** pill
-matches the Financial accounts figure above, not the headline's change,
-which includes property. The trend line is a **reconstruction, not a
+The chart draws the same total as the headline — financial accounts
+plus property, vehicles and their loans — so its **This month** pill
+matches the headline's change. The trend line is a **reconstruction, not a
 recorded history**. Every
 account is anchored to its exact current value and walked backward:
 investment accounts through their share-level transaction history
@@ -49,12 +74,21 @@ way. Transfers between your own accounts are netted out, so a
 round-trip does not read as a bump. Where recorded month-end snapshots
 exist, they pin the line.
 
+Property enters the line on its own date, not as far back as the ledger
+goes: a hand-entered item from its **Owned since** month, a linked loan
+from its first transaction. Months before that show the financial
+accounts alone, so a house recorded this year does not read as owned for
+decades — and a mortgage linked beside a house that entered later leaves
+those months with it. A month whose property figure was recorded that
+night keeps its recording.
+
 Everything before the first recorded month is drawn dashed with a faint
 tint, and the solid line takes over at that boundary; there is no
 graduated shading, and an old stretch is not drawn any softer than a
 recent one. Expect the recorded tail to be exact and the reconstructed
 years to be approximate. **This month / 1m / 3m / 6m / 1y / 3y / 5y /
-All** pills pick the window, and the window's gain shows in both dollars
+All** pills pick the window (the page opens on **1y**, like every
+over-time toggle), and the window's gain shows in both dollars
 and percent. The series is one point per month, so the two short windows
 are two points each: **This month** is the change since the last
 month-end, and **1m** is the last complete month's change on its own.
@@ -68,8 +102,17 @@ provider with a blended **Total**, and the headline gain rides the
 title row. A Coinbase connection gets its own table — **Cash in
 (bank)**, **Cash out**, **Value now**, **P/L**, **Return** — anchored to
 the money that actually left and returned to your bank, so transfers
-between wallets do not count as new money. Either section stays hidden
-when there is nothing to show.
+between wallets do not count as new money. In both, **Value now** is the
+account's balance — the same figure the net-worth total counts — not a
+sum of positions the feed may have priced on another day. A brokerage
+account's gain is still taken at one moment — its holdings' value
+against their cost basis — and whatever the balance holds beyond its
+holdings (deposits since the holdings were reported, uninvested cash)
+counts as money in at no gain. When an account's holdings are more than
+two days older than its balance, a line under the table names it: *"…:
+gain counted to its holdings of 11/02/26; what the balance moved since
+counts as money in."* Either section stays hidden when there is nothing
+to show.
 
 ## The retirement projection
 
@@ -127,9 +170,9 @@ Deleted/removed transactions are excluded.
   or rebated fee arrives with the opposite sign and nets off the total
   rather than adding to it.
 - The **Investment fees** table (by **Platform**) groups by the institution of the account each
-  charge posted to, with the count of matched transactions. On an
-  estimated advisory line that count is the number of **years**
-  estimated, not transactions.
+  charge posted to, and says what it counted beside each: the number of
+  **charges** matched, or on an estimated advisory line the number of
+  **years** estimated.
 - **Fees by year** is the same sum bucketed by calendar year.
 
 It is computed fresh on every page load from your current ledger —

@@ -37,7 +37,7 @@ class OverBudgetRecoveryLine(unittest.TestCase):
         self.assertIsNotNone(rec)
         # the spend is today's, past today's allowance: the caps are the
         # tiles' own rates, over the 15 days after today
-        self.assertIn("last 15 days", rec)
+        self.assertIn("the 15 days left", rec)
         # floor((930-700)/15) = 15 ; floor((930-620)/15) = 20
         self.assertIn("$15/day on Food", rec)
         self.assertIn("$20/day on Everything else", rec)

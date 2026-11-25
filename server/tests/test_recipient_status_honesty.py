@@ -16,8 +16,8 @@ import oikonome
 class RecipientStatusTests(unittest.TestCase):
 
     def setUp(self):
-        self.src = (pathlib.Path(oikonome.__file__).parent / "web"
-                    / "api.py").read_text()
+        from .util import api_sources
+        self.src = api_sources()
 
     def test_the_no_list_fallback_is_modelled(self):
         self.assertIn("implied = ([m[\"email\"] for m in members.values()",
@@ -51,7 +51,16 @@ class RecipientStatusSpaTests(unittest.TestCase):
             self.skipTest("webapp/ not present")
 
     def test_the_reason_reaches_the_client(self):
-        self.assertIn('via?: "owner" | "member" | "invited"', self.client)
+        # the server documents why each address is on the list, the
+        # generated type both clients compile against carries it, and the
+        # settings document the web reads is that generated shape
+        from oikonome.web.schemas.settings import RecipientStatus
+
+        from .generated_types import aliases, ts_field
+        self.assertIn("via", RecipientStatus.model_fields)
+        self.assertEqual(ts_field("web", "RecipientStatus", "via"),
+                         '?("owner" | "member" | "invited") | null')
+        self.assertTrue(aliases("web", "Settings", "SettingsView"))
 
     def test_a_member_row_says_what_it_is(self):
         self.assertIn('status.via === "member"', self.spa)

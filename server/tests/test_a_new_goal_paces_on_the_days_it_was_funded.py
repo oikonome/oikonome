@@ -1,10 +1,11 @@
 """A savings goal's monthly rate divides its trailing-90-day net by the
 months its account's ledger covers inside that window, not by a fixed
 three. A goal funded for a month is not a third of its real rate: read
-that way it shows "off pace" and an arrival three times too far. Under
-about a month of ledger there is no rate to judge a pace by, so the goal
-gives no on/off-pace verdict at all."""
+that way its arrival date is three times too far. The on/off-pace verdict
+does not come from this rate (it is read against the goal's schedule), so
+a goal with no plan stored yet has none."""
 
+import calendar
 import datetime as dt
 import unittest
 
@@ -42,11 +43,10 @@ class NewGoalPaceTests(unittest.TestCase):
         self._fund(30)
         p = self._progress()
         self.assertEqual(p["rate_90d"], 500.0)
-        self.assertTrue(p["on_pace"])
         eta = dt.date.fromisoformat(p["eta"])
         self.assertLess((eta - TODAY).days, 365)       # ~11 months, not ~33
 
-    def test_under_a_month_of_ledger_gives_no_pace_verdict(self):
+    def test_a_goal_with_no_plan_stored_gives_no_pace_verdict(self):
         self._fund(10)
         p = self._progress()
         self.assertIsNone(p["on_pace"])
@@ -61,7 +61,6 @@ class NewGoalPaceTests(unittest.TestCase):
         goal = dict(GOAL, target=9000.0)               # needs ~$667/mo
         p = savings.progress(self.conn, {"savings_goals": [goal]}, TODAY)[0]
         self.assertAlmostEqual(p["rate_90d"], 500.0, delta=1)
-        self.assertFalse(p["on_pace"])
 
     def test_a_full_window_still_divides_by_three(self):
         self._fund(100)                                 # ledger predates it
@@ -96,6 +95,47 @@ class NewGoalPaceTests(unittest.TestCase):
         p = self._rate_on([D(2026, 1, 1), D(2026, 2, 1), D(2026, 3, 1)],
                           D(2026, 3, 1))
         self.assertEqual(p["rate_90d"], 500.0)
+
+    def test_a_full_window_counts_three_months_of_deposits_not_four(self):
+        # Jan 1 to Apr 1 of a non-leap year is exactly 90 days: a window
+        # reaching back 90 days inclusive holds four monthly deposits and
+        # divides them by three
+        D = dt.date
+        p = self._rate_on([D(2026, m, 1) for m in (10, 11, 12)]
+                          + [D(2027, m, 1) for m in (1, 2, 3, 4)],
+                          D(2027, 4, 1))
+        self.assertEqual(p["rate_90d"], 500.0)
+        self.assertEqual(p["saved_90d"], 1500.0)
+
+    def _month_ends(self, first, n):
+        y, m = first.year, first.month
+        out = []
+        for _ in range(n):
+            out.append(dt.date(y, m, calendar.monthrange(y, m)[1]))
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+        return out
+
+    def test_a_month_end_deposit_read_on_a_month_end_counts_three_times(self):
+        # a 30-day month (or February) read on its last day, with a 31-day
+        # month three back: the window must not open on that month's last
+        # day and hold a fourth month-end deposit
+        D = dt.date
+        for today in (D(2026, 6, 30), D(2026, 11, 30), D(2028, 2, 29),
+                      D(2027, 2, 28), D(2026, 4, 30)):
+            with self.subTest(today=today):
+                self.conn.execute("DELETE FROM transactions")
+                first = D(today.year - 1, today.month, 1)
+                deps = [d for d in self._month_ends(first, 13) if d <= today]
+                p = self._rate_on(deps, today)
+                self.assertEqual(p["saved_90d"], 1500.0)
+                self.assertEqual(p["rate_90d"], 500.0)
+
+    def test_the_pace_window_mid_month_is_the_day_after_three_months_back(self):
+        D = dt.date
+        self.assertEqual(savings.pace_since(D(2026, 7, 15)), D(2026, 4, 16))
+        self.assertEqual(savings.pace_since(D(2027, 4, 1)), D(2027, 1, 2))
+        self.assertEqual(savings.pace_since(D(2026, 5, 30)), D(2026, 3, 1))
+        self.assertEqual(savings.pace_since(D(2026, 6, 30)), D(2026, 4, 1))
 
     def test_interest_in_the_month_in_progress_is_not_a_month_of_saving(self):
         # one $500 transfer on Sep 15, a cents interest credit on Oct 1,
@@ -169,6 +209,18 @@ class NewGoalPaceTests(unittest.TestCase):
         p = savings.progress(self.conn, {"savings_goals": [cushion, trip]},
                              D(2026, 10, 16))[0]
         self.assertEqual(p["rate_90d"], 600.0)
+
+    def test_a_goal_past_its_target_date_is_not_on_pace(self):
+        # $5,900 of $6,000 saved at $1,000/mo, but the date passed a week
+        # ago: the goal missed it, however little is left
+        for days in (80, 50, 20):
+            add_txn(self.conn, TODAY - dt.timedelta(days=days), -1000.0,
+                    "TO SAVINGS", account="sav", primary="TRANSFER_IN")
+        goal = dict(GOAL, start_balance=2900.0,
+                    target_date=(TODAY - dt.timedelta(days=7)).isoformat())
+        p = savings.progress(self.conn, {"savings_goals": [goal]}, TODAY)[0]
+        self.assertGreater(p["rate_90d"], 0)
+        self.assertIs(p["on_pace"], False)
 
 
 if __name__ == "__main__":

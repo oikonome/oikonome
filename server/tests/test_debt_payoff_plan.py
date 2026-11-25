@@ -159,6 +159,131 @@ class ArithmeticTests(unittest.TestCase):
             debt.simulate([], method="fastest", start=TODAY)
 
 
+class PaymentDayConventionTests(unittest.TestCase):
+    """The servicer's maturity or payoff date is the day of the LAST
+    payment, and a month's payment is still due through its payment day.
+    Read the other way, the plan drops a payment: on the payment day the
+    loan already looks paid for the month, and on the maturity day itself
+    it looks paid off with its final instalment still owed."""
+
+    def test_the_maturity_day_itself_still_carries_the_last_payment(self):
+        raw = {"maturity_date": "2031-03-15"}
+        day = dt.date(2031, 3, 15)
+        self.assertEqual(debt.remaining_term_months(raw, day), 1)
+        self.assertTrue(debt.payment_still_due(raw, day))
+        # the last instalment is the balance plus its month of interest,
+        # paid that day: the loan ends on its maturity, not a month later
+        pay = debt.mortgage_principal_and_interest(raw, 4000.0, 6.0, day)
+        self.assertEqual(pay, 4020.0)
+        r = debt.simulate([_d("m", 4000.0, 6.0, pay, kind="mortgage",
+                              due_now=True)],
+                          start=day, rollover=False)
+        self.assertEqual(r["debt_free"], "2031-03-15")
+        self.assertEqual(r["debts"][0]["paid_off"], "2031-03-15")
+        self.assertEqual(r["months"], 0)
+        after = dt.date(2031, 3, 16)
+        self.assertIsNone(debt.remaining_term_months(raw, after))
+        self.assertFalse(debt.payment_still_due(raw, after))
+
+    def test_this_months_payment_is_due_through_its_payment_day(self):
+        raw = {"maturity_date": "2030-05-20"}
+        self.assertEqual(
+            debt.remaining_term_months(raw, dt.date(2027, 5, 20)), 37)
+        self.assertTrue(debt.payment_still_due(raw, dt.date(2027, 5, 20)))
+        self.assertEqual(
+            debt.remaining_term_months(raw, dt.date(2027, 5, 21)), 36)
+        self.assertFalse(debt.payment_still_due(raw, dt.date(2027, 5, 21)))
+        # a payment day past the month's end falls on its last day
+        end = {"maturity_date": "2030-05-31"}
+        self.assertTrue(debt.payment_still_due(end, dt.date(2027, 4, 30)))
+        self.assertEqual(
+            debt.remaining_term_months(end, dt.date(2027, 4, 30)), 38)
+
+    def test_a_payoff_date_counts_the_payoff_month_itself(self):
+        raw = {"expected_payoff_date": "2034-07-28"}
+        # July 2026 through July 2034, both ends included
+        self.assertEqual(
+            debt.remaining_term_months(raw, dt.date(2026, 7, 15)), 97)
+        self.assertEqual(
+            debt.remaining_term_months(raw, dt.date(2026, 7, 29)), 96)
+        # origination plus term: the last payment is the term's month on
+        # the origination's day
+        term = {"origination_date": "2024-07-10", "loan_term": "84 months"}
+        self.assertEqual(
+            debt.remaining_term_months(term, dt.date(2026, 7, 10)), 61)
+        self.assertEqual(
+            debt.remaining_term_months(term, dt.date(2026, 7, 11)), 60)
+
+    def test_a_payment_still_due_today_is_walked_this_month(self):
+        r = debt.simulate([_d("a", 1000, 0.0, 250, kind="loan",
+                              due_now=True)], start=TODAY)
+        self.assertEqual(r["series"][0], (TODAY.isoformat(), 1000.0))
+        self.assertEqual(r["debt_free"], "2026-10-01")
+        self.assertEqual(r["months"], 3)
+        self.assertEqual(r["total_paid"], 1000.0)
+
+
+class ServicerDatesDecideThisMonthTests(unittest.TestCase):
+    """When the servicer says when the payment was made or is next due,
+    that — not the maturity date's day of the month, which is often not
+    the due day — decides whether this month's payment is still owed.
+    Read from the maturity day alone, a payment already in the balance is
+    paid a second time and the loan is planned paid off a month early."""
+
+    TODAY = dt.date(2026, 11, 8)
+
+    def test_a_payment_made_this_month_is_not_paid_again(self):
+        raw = {"expected_payoff_date": "2031-06-30",
+               "last_payment_date": "2026-11-05",
+               "next_payment_due_date": "2026-12-05",
+               "minimum_payment_amount": 250}
+        # December 2026 through June 2031
+        self.assertEqual(debt.remaining_term_months(raw, self.TODAY), 55)
+        self.assertFalse(debt.payment_still_due(raw, self.TODAY))
+        loan = _d("s", 12_000, 6.0, 250, kind="loan",
+                  due_now=debt.payment_still_due(raw, self.TODAY))
+        r = debt.simulate([loan], start=self.TODAY, rollover=False)
+        # one payment by December's first: a month's interest, then $250
+        self.assertEqual(r["series"][1], ("2026-12-01", 11810.0))
+        # $250 leaves $6.10 after the payoff month's payment: the reported
+        # minimum, not the term, sets the last cents (paid twice in the
+        # first month, the walk would say June)
+        self.assertEqual(r["series"][-2], ("2031-06-01", 6.1))
+        self.assertEqual(r["debt_free"], "2031-07-01")
+
+    def test_a_payment_due_later_this_month_is_still_owed(self):
+        raw = {"expected_payoff_date": "2031-06-02",
+               "next_payment_due_date": "2026-11-20"}
+        # the maturity day (the 2nd) has passed, the due day has not
+        self.assertTrue(debt.payment_still_due(raw, self.TODAY))
+        self.assertEqual(debt.remaining_term_months(raw, self.TODAY), 56)
+        today_due = {**raw, "next_payment_due_date": "2026-11-08"}
+        self.assertTrue(debt.payment_still_due(today_due, self.TODAY))
+
+    def test_a_due_date_still_ahead_this_month_is_owed_whatever_was_paid(self):
+        """An extra principal payment, a late one for last month or half
+        of a biweekly pair lands this month too, yet the servicer still
+        lists this month's due date ahead: that payment is still owed."""
+        raw = {"maturity_date": "2031-06-28",
+               "last_payment_date": "2026-11-03",
+               "next_payment_due_date": "2026-11-28"}
+        self.assertTrue(debt.payment_still_due(raw, self.TODAY))
+        self.assertEqual(debt.remaining_term_months(raw, self.TODAY), 56)
+
+    def test_a_next_due_date_in_a_later_month_means_this_month_is_paid(self):
+        raw = {"maturity_date": "2031-06-30",
+               "next_payment_due_date": "2026-12-30"}
+        self.assertFalse(debt.payment_still_due(raw, self.TODAY))
+        self.assertEqual(debt.remaining_term_months(raw, self.TODAY), 55)
+
+    def test_dates_that_do_not_read_as_dates_fall_back_to_the_maturity_day(self):
+        raw = {"maturity_date": "2031-06-30",
+               "last_payment_date": "not a date",
+               "next_payment_due_date": 20261205}
+        self.assertTrue(debt.payment_still_due(raw, self.TODAY))
+        self.assertEqual(debt.remaining_term_months(raw, self.TODAY), 56)
+
+
 class IssuerFieldTests(unittest.TestCase):
     def test_a_cards_purchase_apr_wins(self):
         raw = {"aprs": [
@@ -333,8 +458,10 @@ class LoadDebtsTests(unittest.TestCase):
                           1500.0))
         auto = rows["auto"]
         self.assertEqual((auto["kind"], auto["apr_source"], auto["min_source"]),
-                         ("loan", "none", "estimate"))
-        self.assertEqual(auto["min_payment"], 150.0)     # 9000 / 60 at 0%
+                         ("loan", "typical", "estimate"))
+        # no rate from the bank or the household: a car loan's typical one
+        self.assertEqual(auto["apr"], debt.TYPICAL_APR["auto"])
+        self.assertEqual(auto["min_payment"], 180.34)    # 9000 over 60 at it
         self.assertEqual(auto["mask"], "0001")
         self.assertEqual(auto["institution"], "Test Bank")
 
@@ -378,8 +505,8 @@ class LoadDebtsTests(unittest.TestCase):
         cfg = budget.load_config(self.conn)
         card = {d["id"]: d for d in debt.load_debts(self.conn, cfg)}["card"]
         self.assertEqual((card["apr_source"], card["min_source"]),
-                         ("none", "estimate"))
-        self.assertEqual(card["min_payment"], 25.0)
+                         ("typical", "estimate"))
+        self.assertEqual(card["apr"], debt.TYPICAL_APR["card"])
 
     def _mortgage(self, **raw):
         self.conn.execute("UPDATE accounts SET balance_current = 300000 "
@@ -403,8 +530,8 @@ class LoadDebtsTests(unittest.TestCase):
         mort = self._mortgage(maturity_date=maturity.isoformat())
         self.assertEqual((mort["min_payment"], mort["min_source"],
                           mort["payment_reported"]),
-                         (1896.21, "issuer", 2496.0))
-        self.assertEqual(mort["min_issuer"], 1896.21)
+                         (1894.51, "issuer", 2496.0))
+        self.assertEqual(mort["min_issuer"], 1894.51)
         r = debt.simulate([mort], extra=0, start=TODAY, rollover=False)
         self.assertEqual(r["months"], 360)
         self.assertGreater(r["total_interest"], 380_000)
@@ -413,8 +540,10 @@ class LoadDebtsTests(unittest.TestCase):
         orig = TODAY.replace(year=TODAY.year - 5)
         mort = self._mortgage(origination_date=orig.isoformat(),
                               loan_term="30 year")
-        # 25 years left: the rate amortized over the 300 payments to go
-        self.assertEqual(mort["min_payment"], 2025.63)     # rounded up
+        # 25 years left, and this month's payment (today is the
+        # origination's day) still to make: the rate amortized over the
+        # 301 payments to go
+        self.assertEqual(mort["min_payment"], 2022.94)     # rounded up
         self.assertEqual(mort["min_source"], "issuer")
 
     def test_an_origination_at_the_end_of_the_calendar_does_not_fail_the_plan(self):
@@ -456,14 +585,15 @@ class LoadDebtsTests(unittest.TestCase):
 
     def test_a_known_maturity_without_a_rate_still_ends_on_that_date(self):
         """No rate sent, but the maturity is ten years out: the balance
-        over the 120 payments left, not over a fresh 360 that would plan a
-        payoff twenty years after the loan actually ends."""
+        over the 121 payments left (this month's is still due), not over a
+        fresh 360 that would plan a payoff twenty years after the loan
+        actually ends."""
         mort = self._raw_mortgage(150_000, {
             "next_monthly_payment": 2100,
             "maturity_date": TODAY.replace(year=TODAY.year + 10).isoformat()})
-        self.assertEqual(mort["apr_source"], "none")
-        self.assertEqual((mort["min_payment"], mort["min_source"]),
-                         (1250.0, "issuer"))
+        self.assertEqual(mort["apr_source"], "typical")
+        self.assertEqual(mort["min_source"], "issuer")
+        self.assertLess(mort["min_payment"], 2100.0)
         r = debt.simulate([mort], extra=0, start=TODAY, rollover=False)
         self.assertEqual(r["months"], 120)
 
@@ -482,7 +612,7 @@ class LoadDebtsTests(unittest.TestCase):
     def test_a_mortgage_with_no_reported_payment_still_ends_on_its_maturity(self):
         """The servicer sent the maturity and the rate but no monthly
         payment. The plan must amortize the balance over the payments left
-        to that maturity, never over a fresh 30 years: on 240 payments left
+        to that maturity, never over a fresh 30 years: on 241 payments left
         that would plan the payoff ten years late and quote tens of
         thousands of interest that will never be charged."""
         mort = self._raw_mortgage(200_000, {
@@ -490,7 +620,7 @@ class LoadDebtsTests(unittest.TestCase):
             "maturity_date": TODAY.replace(year=TODAY.year + 20).isoformat()})
         self.assertEqual((mort["min_payment"], mort["min_source"],
                           mort["payment_reported"]),
-                         (1432.87, "estimate", None))
+                         (1429.79, "estimate", None))
         r = debt.simulate([mort], extra=0, start=TODAY, rollover=False)
         self.assertEqual(r["months"], 240)
 
@@ -520,7 +650,7 @@ class LoadDebtsTests(unittest.TestCase):
         loan = self._raw_loan(12_000, {
             "maturity_date": TODAY.replace(year=TODAY.year + 3).isoformat()},
             subtype="auto")
-        self.assertEqual(loan["min_payment"], 333.34)
+        self.assertEqual(loan["min_payment"], 364.28)
         orig = TODAY.replace(year=TODAY.year - 2)
         loan = self._raw_loan(12_000, {"origination_date": orig.isoformat(),
                                        "loan_term": "84 months"},
@@ -540,7 +670,58 @@ class LoadDebtsTests(unittest.TestCase):
     def test_a_loan_with_no_term_keeps_the_five_year_estimate(self):
         loan = self._raw_loan(6_000, {}, subtype="auto")
         self.assertEqual((loan["min_payment"], loan["min_source"]),
-                         (100.0, "estimate"))
+                         (120.23, "estimate"))
+
+    def test_an_unknown_rate_never_outruns_a_known_payment(self):
+        """A typical rate is a guess and the payment is a fact: a loan
+        whose reported payment is below a month's interest at the typical
+        rate is still walked to an end, at the rate that payment fits."""
+        mort = self._raw_mortgage(300_000, {"next_monthly_payment": 1300})
+        self.assertEqual(mort["apr_source"], "typical")
+        self.assertLess(mort["apr"], debt.TYPICAL_APR["mortgage"])
+        r = debt.simulate([mort], extra=0, start=TODAY, rollover=False)
+        self.assertIsNotNone(r["debt_free"])
+        self.assertGreater(r["total_interest"], 0)
+
+    def test_a_long_loan_with_a_known_payment_keeps_its_typical_rate(self):
+        """A car loan with more than five years left pays less a month
+        than a five-year schedule would: its payment still covers the
+        typical rate's interest, so the rate stands and interest accrues."""
+        write_config(self.conn, debt_plan={
+            "debts": {"auto": {"min_payment": 100}}})
+        auto = {d["id"]: d for d in debt.load_debts(
+            self.conn, budget.load_config(self.conn))}["auto"]
+        self.assertEqual((auto["apr"], auto["apr_source"], auto["min_source"]),
+                         (debt.TYPICAL_APR["auto"], "typical", "you"))
+        r = debt.simulate([auto], extra=0, start=TODAY, rollover=False)
+        self.assertGreater(r["total_interest"], 0)
+
+    def test_a_card_with_a_small_known_minimum_still_accrues(self):
+        """A statement minimum under 1% of today's balance leaves nothing
+        for principal at any rate; the card is still not walked at 0%."""
+        self.assertGreater(
+            debt._rate_within_payment("card", 8000.0, 50.0, 22.0), 0.0)
+        # a payment that covers the typical rate's interest keeps it
+        self.assertEqual(
+            debt._rate_within_payment("card", 1400.0, 35.0, 22.0), 22.0)
+        # no jump at 1% of the balance: a cent either side is the same rate
+        lo = debt._rate_within_payment("card", 8000.0, 80.0, 22.0)
+        hi = debt._rate_within_payment("card", 8000.0, 80.01, 22.0)
+        self.assertLess(abs(hi - lo), 0.05)
+        # a payment that would not clear the debt in thirty years at 0% is
+        # no evidence of a low rate: the typical one stands
+        self.assertEqual(
+            debt._rate_within_payment("card", 8000.0, 20.0, 22.0), 22.0)
+
+    def test_an_unknown_rate_is_never_walked_at_zero(self):
+        """A debt nobody has given a rate for still accrues interest in
+        the plan, so the debt-free date and the interest total are not the
+        good news a 0% walk would print."""
+        loan = self._raw_loan(6_000, {}, subtype="student")
+        self.assertEqual((loan["apr"], loan["apr_source"]),
+                         (debt.TYPICAL_APR["student"], "typical"))
+        r = debt.simulate([loan], extra=0, start=TODAY, rollover=False)
+        self.assertGreater(r["total_interest"], 0)
 
     def test_a_typed_payment_still_wins_for_a_mortgage(self):
         write_config(self.conn, debt_plan={

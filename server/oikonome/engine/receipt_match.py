@@ -571,6 +571,186 @@ def match_receipt(conn, receipt_id: str,
             today)
 
 
+# A receipt on a row that left the ledger. A hold a PERSON retired is not
+# one: that retirement is reversible by design and keeps what is on the row.
+_ON_A_RETIRED_ROW = ("t.id = r.txn_id AND t.removed <> 0"
+                     " AND t.retired_at IS NULL")
+# Put there from the charge itself (no matcher, no hand match off the
+# waiting list). A check image is read against its transaction and cannot
+# wait.
+_ATTACHED_DIRECTLY = "r.match_method IS NULL AND r.kind = 'receipt'"
+
+
+def _unplaced_rows(conn, today: dt.date) -> list[str]:
+    """Retired rows carrying a receipt attached from the charge itself
+    that have waited out the reconcile window and that the re-anchor says
+    have NO twin.
+
+    Patience first. A retired row often comes back under its own id (the
+    feed reports it again, a statement is restated), and a hold can be
+    dropped a sync before its posted charge arrives; the settlement carry
+    and the re-anchor then move everything on the row together, and a
+    receipt taken off early would be parted from its note and category.
+    So the row must have been gone longer than `adopt.RECONCILE_DAYS`, the
+    wait the re-anchor gives a withdrawn pair, counted from when it left
+    the ledger (`transactions.removed_at`, which every path that retires a
+    row writes: specs/receipts.md, "When a row left the ledger"). A
+    retired row with no such time is never old enough. The receipt must
+    also have been on it that long.
+
+    Left where they are (counting nothing, as before the wait):
+    - a row two look-alikes could be the twin of, which the re-anchor
+      would not choose between: releasing would hand the choice to the
+      matcher;
+    - a row carrying a receipt whose slip (`receipt_identity`, the stored
+      label: the same image, or a person's "Same receipt") has another
+      copy on the ledger or waiting with lines: the slip counts there,
+      and released this copy would only wait beside it (a copy not read
+      yet counts nothing, so it holds nothing back); and one not yet
+      decided, whose slip is not known;
+    - a row held by a look-alike (`_held_by_a_look_alike`). Judged from
+      the rows as they are tonight and never stored."""
+    from ..sync import adopt, reanchor
+    wait = adopt.RECONCILE_DAYS
+    ids = [r["txn_id"] for r in conn.execute(
+        f"""SELECT r.txn_id FROM receipts r, transactions t
+             WHERE {_ON_A_RETIRED_ROW} AND {_ATTACHED_DIRECTLY}
+               AND t.removed_at < now() - make_interval(days => %s)
+             GROUP BY r.txn_id
+            HAVING max(r.created_at) < now() - make_interval(days => %s)""",
+        (wait, wait)).fetchall()]
+    if not ids:
+        return []
+    held = {r["txn_id"] for r in conn.execute(
+        """SELECT DISTINCT r.txn_id FROM receipts r
+            WHERE r.txn_id = ANY(%s)
+              AND (r.slip_decided_at IS NULL OR EXISTS (
+                  SELECT 1 FROM receipts o
+                    LEFT JOIN transactions ot ON ot.id = o.txn_id
+                   WHERE o.id <> r.id
+                     AND COALESCE(o.slip_id, o.id)
+                         = COALESCE(r.slip_id, r.id)
+                     AND (o.txn_id IS NULL OR ot.removed = 0)
+                     AND EXISTS (SELECT 1 FROM receipt_items x
+                                  WHERE x.receipt_id = o.id)))""",
+        (ids,)).fetchall()}
+    held |= _held_by_a_look_alike(conn, [i for i in ids if i not in held])
+    return [row["id"] for row in reanchor.stranded(conn, ids)
+            if row["id"] not in held
+            and reanchor.find_twin(conn, row)[1] == "no_twin"]
+
+
+def _held_by_a_look_alike(conn, ids: list[str]) -> set[str]:
+    """The retired rows of `ids` whose receipt is very likely the slip
+    photographed again for the posted charge: a receipt it carries (read)
+    reads exactly like a receipt on a LIVE charge of the same account
+    (`receipt_identity.read_alike`) that is not its slip and that no
+    person has called another purchase, and the matcher has no other
+    charge it could be (`candidates`: in its amount band and window,
+    carrying no receipt, not one a person took it off, not plainly
+    another store). Released, it would only wait beside its look-alike
+    and count the purchase twice.
+
+    A hold-back, never a join: nothing is stored, so it is judged again
+    every night from the rows as they are then. The moment the matcher
+    has a charge for it (a second same-price purchase posts), or a person
+    answers "Two purchases", it is released and counts; "Same receipt"
+    makes the two one slip and the slip's own rule keeps it. Both count
+    nothing more than they did on the retired row meanwhile, and the
+    person is asked on the live copy's panel (`receipt_identity
+    .suspected`) the whole time."""
+    if not ids:
+        return set()
+    from . import receipt_identity as ri
+    rows = conn.execute(
+        f"""SELECT DISTINCT ON (r.id) r.txn_id, r.id, r.kind, r.status,
+                   r.parsed, r.created_at, r.unmatched_txn_ids,
+                   r.match_method
+              FROM receipts r
+              JOIN transactions t ON t.id = r.txn_id
+              JOIN receipts o ON o.id <> r.id
+              JOIN transactions ot ON ot.id = o.txn_id AND ot.removed = 0
+                               AND ot.account_id = t.account_id
+             WHERE r.txn_id = ANY(%s) AND {_ATTACHED_DIRECTLY}
+               AND {ri.read_alike("r", "o")}
+               AND COALESCE(o.slip_id, o.id) <> COALESCE(r.slip_id, r.id)
+               AND NOT {ri.refused("r", "o")}
+             ORDER BY r.id""", (ids,)).fetchall()
+    if not rows:
+        return set()
+    rows = [dict(r) for r in rows]
+    held = set()
+    for row, cands in zip(rows, candidates_for(conn, rows)):
+        if not any(c["merchant_match"] != "different" for c in cands):
+            held.add(row["txn_id"])
+    return held
+
+
+def release_unplaced(conn, today: dt.date | None = None) -> int:
+    """The nightly's last word on a receipt a person attached from a
+    charge that then left the ledger for good: back to waiting.
+
+    Run once a night AFTER the re-anchor has had its turn, never by a
+    sync: see `_unplaced_rows` for the wait and for what is left alone.
+    Waiting, the receipt is on the list where a person can pair it by
+    hand whether or not it was ever read (an unread photo or PDF is
+    listed there too, with its candidates); a read one the matcher pairs
+    by its ordinary rules, the store's charge with a tip on top among
+    them. Being released is not a refusal and is remembered as none. A
+    second run finds nothing to do."""
+    today = today or _household_day(conn)
+    # the hold-back reads the stored slips, so the backlog is decided
+    # first, before this release takes the pairing lock (each decision
+    # takes it for itself, and the backlog is bounded); a receipt still
+    # undecided once the lock is held holds its row back (_unplaced_rows)
+    from . import receipt_identity
+    receipt_identity.decide_backlog(conn)
+    with conn.transaction():
+        _lock(conn)
+        unplaced = _unplaced_rows(conn, today)
+        if not unplaced:
+            return 0
+        return conn.execute(
+            f"""UPDATE receipts r SET txn_id = NULL, matched_at = NULL
+                  FROM transactions t
+                 WHERE {_ON_A_RETIRED_ROW} AND {_ATTACHED_DIRECTLY}
+                   AND t.id = ANY(%s)""", (unplaced,)).rowcount
+
+
+def release_refused(conn, receipt_ids) -> list[str]:
+    """A person said two receipts are two purchases: each of the two that
+    sits on a row that left the ledger goes back to waiting at once, so
+    it counts and the matcher or the person can place it. Whatever kept
+    it there — the look-alike hold-back, or a re-anchor that sees two
+    charges it could be — was waiting on exactly that answer. Left alone
+    are a row a PERSON retired (it keeps what is on it) and a copy whose
+    slip counts elsewhere (the same image on the ledger or waiting, with
+    lines): that one is counted already. A hand-paired one keeps its
+    'manual' mark, as `release_stranded` keeps it. Runs inside the
+    caller's transaction, under the pairing lock it holds. Returns the
+    receipts released."""
+    ids = [str(i) for i in receipt_ids if i]
+    if not ids:
+        return []
+    return [r["id"] for r in conn.execute(
+        f"""UPDATE receipts r
+               SET txn_id = NULL, matched_at = NULL,
+                   match_method = CASE WHEN r.match_method = 'manual'
+                                       THEN 'manual' END
+              FROM transactions t
+             WHERE r.id = ANY(%s::uuid[]) AND {_ON_A_RETIRED_ROW}
+               AND NOT EXISTS (
+                   SELECT 1 FROM receipts o
+                     LEFT JOIN transactions ot ON ot.id = o.txn_id
+                    WHERE o.id <> r.id
+                      AND COALESCE(o.slip_id, o.id)
+                          = COALESCE(r.slip_id, r.id)
+                      AND (o.txn_id IS NULL OR ot.removed = 0)
+                      AND EXISTS (SELECT 1 FROM receipt_items x
+                                   WHERE x.receipt_id = o.id))
+            RETURNING r.id::text AS id""", (ids,)).fetchall()]
+
+
 def release_stranded(conn) -> int:
     """A matched receipt whose charge was retired goes back to waiting.
 
@@ -583,7 +763,8 @@ def release_stranded(conn) -> int:
     matcher off it: the person chose that pairing, and a different charge
     picked by the rules would silently overrule them — the list offers the
     candidates for them to choose again. Receipts attached from the
-    transaction itself are the re-anchor's business and stay put."""
+    transaction itself are the re-anchor's business first, and the
+    nightly's after a wait (`release_unplaced`)."""
     return conn.execute(
         """UPDATE receipts r
               SET txn_id = NULL, matched_at = NULL,
@@ -649,6 +830,12 @@ def match_waiting(conn, today: dt.date | None = None) -> dict:
     waits — one indexed probe — which is the answer on nearly every sync.
     One receipt that cannot be read is logged and passed over; it never
     stops the rest."""
+    # a receipt a writer that does not decide stored (an older build,
+    # a writer that copies a row whole) is decided first: one bounded pass, before
+    # the pairing lock below
+    from . import receipt_identity
+    if receipt_identity.has_pending(conn):
+        receipt_identity.decide_pending(conn)
     probe = conn.execute(
         """(SELECT 1 FROM receipts WHERE txn_id IS NULL LIMIT 1)
            UNION ALL
@@ -783,6 +970,8 @@ def waiting(conn, today: dt.date | None = None, *,
              FROM receipts WHERE txn_id IS NULL
             ORDER BY created_at DESC, id LIMIT %s OFFSET %s""",
         (limit, offset)).fetchall()
+    from . import receipt_identity
+    slip = receipt_identity.twins(conn, [str(r["id"]) for r in rows])
     parsed_rows = [r for r in rows if r["status"] == "parsed"]
     by_id = dict(zip((r["id"] for r in parsed_rows),
                      candidates_for(conn, parsed_rows)))
@@ -794,7 +983,9 @@ def waiting(conn, today: dt.date | None = None, *,
         try:
             why = (decide(cands, closed=window_closed(f["date"], today))[1]
                    if cands else "none")
-            stale = bool(f["date"]
+            # several charges fit is its own sentence ("pick the right
+            # one"); "no charge has matched" beside it says two things
+            stale = bool(why != "tie" and f["date"]
                          and (today - f["date"]).days >= STALE_DAYS)
         except Exception:                              # noqa: BLE001
             # still listed, so the person can fix or delete it
@@ -818,6 +1009,10 @@ def waiting(conn, today: dt.date | None = None, *,
                        and r["parsed"].get("source") == "manual"),
             "stale": stale,
             "candidates": [_offer(c) for c in cands[:OFFER_LIMIT]],
+            # which slip it is (specs/receipts.md, "A receipt is one slip")
+            "counts": slip.get(str(r["id"]), {}).get("counts", True),
+            "slip_twins": slip.get(str(r["id"]), {}).get("slip_twins", []),
+            "suspected": slip.get(str(r["id"]), {}).get("suspected", []),
         })
     recent = conn.execute(
         f"""SELECT r.id, r.mime, r.parsed, r.matched_at, r.match_method,

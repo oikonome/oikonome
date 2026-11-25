@@ -43,6 +43,14 @@ account. The packet is a map of the money, not a key to it — that is
 what makes it safe to print and leave where the other person will look.
 The note is where you say *where* the keys are.
 
+## Who can read the note
+
+Only you, the household owner. Members and viewers do not see the
+continuity card at all, and the server never sends them the note's
+text: asked directly, it says only that a note is written. The shared
+demonstration login and script tokens are treated the same way. Like the
+PDF, the note is yours to read, write and print.
+
 ## Printing it
 
 Fill in **Prepared for** (optional — it goes in the title) and the
@@ -62,11 +70,11 @@ confirmation as the download. Where it may go depends on the instance:
 
 - **Self-hosted**: any address the instance's mail relay will carry.
 - **Hosted**: only an address with an account on this household — the
-  same rule as the daily email. Invite the person under Settings → Users
+  same rule as the daily email. Invite the person under Settings → Household
   first, or download the PDF and hand it over.
 
 Each download and each emailed copy is written to the household's
-activity log (Settings → Users → Activity), so everyone can see when a
+activity log (Settings → Household → Activity), so everyone can see when a
 copy left the instance and where it went.
 
 ## Gotchas
@@ -80,7 +88,7 @@ copy left the instance and where it went.
   and drift from there. The institutions, bills and logins are what to
   act on; the reader gets today's balances by signing in.
 - **A survivor still needs a login.** Give them a viewer account now
-  (Settings → Users → invite) so "Who can sign in" lists them; the packet
+  (Settings → Household → invite) so "Who can sign in" lists them; the packet
   points at Oikonome but does not open it.
 - **Email is not configured** on every self-hosted instance. When it is
   not, the card says so and the download is the way.

@@ -155,19 +155,26 @@ def _find_alert(conn, tok: dict):
     """The newest alerts_log row a mute token names, with its message, or
     None. Tokens minted before mute buttons carried a digest name the alert
     by its message; they are still matched that way until they expire."""
+    # A token minted over a line's older words (alerts.legacy_words: a
+    # charge's days before they carried their year) still names the row
+    # those words were reworded into.
+    from ..engine.alerts import find_row, legacy_words
     kind, v = tok["target"], tok["value"]
+    cols = "id, message, dismissed, active, mute_changed_at"
     if v.startswith(_ALERT_REF):
+        # a digest can only be matched by hashing each row's words: every
+        # row of the kind, as before the rewording
         for r in conn.execute(
-                "SELECT message, dismissed, active, mute_changed_at "
-                "FROM alerts_log WHERE kind=%s ORDER BY last_seen DESC",
-                (kind,)).fetchall():
-            if hmac.compare_digest(
-                    alert_ref(tok["tenant_id"], kind, r["message"]), v):
-                return r
-    return conn.execute(
-        "SELECT message, dismissed, active, mute_changed_at FROM alerts_log "
-        "WHERE kind=%s AND message=%s ORDER BY last_seen DESC LIMIT 1",
-        (kind, v)).fetchone()
+                f"SELECT {cols} FROM alerts_log WHERE kind=%s "
+                "ORDER BY last_seen DESC", (kind,)).fetchall():
+            for words in (r["message"], legacy_words(kind, r["message"])):
+                if words is not None and hmac.compare_digest(
+                        alert_ref(tok["tenant_id"], kind, words), v):
+                    return r
+        return None
+    # a raw message: the indexed lookup, with the old-words match both
+    # ways (alerts.find_row)
+    return find_row(conn, kind, v, cols)
 
 
 def url(base: str, tenant_id, email: str, action: str, target: str,
@@ -243,8 +250,9 @@ def _standing(tok: dict) -> dict | None:
 # ---- what there is to act on -------------------------------------------
 
 def _label(stored: str) -> str:
-    # the SPA's catLabel: the stored key with its underscores opened up
-    return (stored or "").replace("_", " ")
+    # the SPA's catLabel
+    from ..engine.categories import display_label
+    return display_label(stored) if stored else ""
 
 
 def _suggest(conn, row: dict, house_top: list[str]) -> list[tuple[str, str]]:
@@ -290,7 +298,7 @@ def gather(conn, d: dict) -> dict:
     out: dict = {"proposals": [], "more_proposals": 0,
                  "uncategorized": [], "alerts": list(d.get("alerts") or [])}
     try:
-        pend = bills.pending_proposals(conn)
+        pend = bills.pending_proposals(conn, d.get("today"))
         for p in pend[:MAX_PROPOSALS]:
             ev = as_dict(p["evidence"]) or {}
             income = bool(ev.get("income"))
@@ -710,13 +718,21 @@ def apply(tok: dict) -> dict:
                                 "the app."}
         if a == "mute":
             from ..engine import alerts
-            # dismiss() reports rows MATCHED, not rows changed — a second
-            # tap on the same button would otherwise say "muted" again
-            r = _find_alert(conn, tok)
-            moot = _mute_moot(tok, r)
-            if moot is not None:
-                return moot
-            alerts.dismiss(conn, t, r["message"])
+            # the find and the mute are one decision under the alerts lock,
+            # by the row's id: a reword of the row (alerts.log) cannot land
+            # between them and leave the mute matching nothing
+            with conn.transaction():
+                alerts._lock(conn)
+                r = _find_alert(conn, tok)
+                moot = _mute_moot(tok, r)
+                if moot is not None:
+                    return moot
+                n = conn.execute(
+                    "UPDATE alerts_log SET dismissed=1 "
+                    "WHERE id=%s AND dismissed=0", (r["id"],)).rowcount
+            if n == 0:
+                return {"state": "already",
+                        "sentence": "That alert has already cleared."}
             return {"state": "done",
                     "sentence": "Muted. It stays out of the email and the "
                                 "Today page while the condition lasts."}

@@ -25,8 +25,12 @@ class AccountsShapeTests(unittest.TestCase):
             self.skipTest("webapp/ not present")
 
     def test_the_hero_states_totals_and_freshness(self):
-        self.assertIn("const liveTotal", self.src)
-        self.assertIn("institution{instCount === 1", self.src)
+        """The hero is the server's Financial accounts figure under its
+        label, with the server's counts (specs/counted-figures.md)."""
+        self.assertIn("money(totals.financial_total)", self.src)
+        self.assertIn("{totals.label}", self.src)
+        self.assertIn("totals.institution_count === 1", self.src)
+        self.assertNotIn("signedBalance", self.src)
         self.assertIn("{lastSync && <span>{lastSync}</span>}", self.src)
 
     def test_connecting_has_exactly_one_home(self):
@@ -58,8 +62,9 @@ class AccountsShapeTests(unittest.TestCase):
 
     def test_the_aggregator_badge_leaves_healthy_rows(self):
         """plaid/simplefin on a working row is provenance nobody acts on;
-        a community script or a manual account still says so."""
-        self.assertIn("{(script || !g.conn) && (", self.src)
+        a community script or a manual account still says so — and an
+        account is called manual only once the connections read answered."""
+        self.assertIn("{(script || (!g.conn && connsKnown)) && (", self.src)
 
     def test_explainers_became_subtitles_and_the_sort_key_is_gone(self):
         self.assertNotIn("Keep an entity's money genuinely separate", self.src)

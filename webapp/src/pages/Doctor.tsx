@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
+import { Navigate } from "react-router";
 import { api, errText, mmdd, money, req, toast,
          type ScriptHeartbeat } from "../api/client";
 import { patchList, removeFromList } from "../api/cache";
 import { isOwner } from "../role";
+import { FailedLine, StaleLine } from "../components/Loaded";
 
 function age(hours: number): string {
   if (hours < 1) return `${Math.round(hours * 60)}m ago`;
@@ -56,7 +58,8 @@ function ScriptRow({ s, viewer }: { s: ScriptHeartbeat; viewer: boolean }) {
       </td>
       <td style={{ whiteSpace: "nowrap" }}>
         every{" "}
-        <input type="number" min={0} max={2160} style={{ width: "4.5em" }}
+        <input aria-label={`${s.label ?? s.source}: expected every how many hours`}
+               type="number" min={0} max={2160} style={{ width: "4.5em" }}
           defaultValue={s.expected_hours ?? 0}
           disabled={save.isPending || viewer}
           onBlur={(e) => {
@@ -178,17 +181,31 @@ export default function Doctor({ embedded = false }:
   if (me.data?.hosted && !embedded
       && (unlinked.data?.movements.length ?? 0) > 0)
     return <UnlinkedCapital viewer={viewer} asPage />;
-  if (me.data?.hosted)
-    return embedded ? null : (<>
-      <div className="card">System health is managed by the host on this
-        instance.</div>
-      <UnlinkedCapital viewer={viewer} />
-    </>);
+  // With nothing of the household's to show, a hosted /doctor has no page
+  // at all — the host runs the box, and a one-sentence "managed by the
+  // host" was a dead end. Old links, alerts and bookmarks land on Settings.
+  // Only a list that ANSWERED empty sends the page away: a failed read is
+  // not "nothing of the household's here", so it says so in place.
+  if (me.data?.hosted) {
+    if (embedded || unlinked.isPending) return null;
+    if (unlinked.data === undefined)
+      return (<>
+        <h1>System health</h1>
+        <FailedLine q={unlinked} what="the unlinked records" />
+      </>);
+    return <Navigate to="/settings" replace />;
+  }
 
   if (q.isPending)
-    return <div className="centered"><span className="mut">running checks…</span></div>;
+    return (<>
+      {!embedded && <h1>System health</h1>}
+      <div className="centered"><span className="mut">running checks…</span></div>
+    </>);
   if (q.isLoadingError)
-    return <div className="card">Couldn't run the checks: {String(q.error)}</div>;
+    return (<>
+      {!embedded && <h1>System health</h1>}
+      <FailedLine q={q} what="the health checks" />
+    </>);
 
   const d = q.data;
   const sections: { title: string; rows: typeof d.checks }[] = [];
@@ -205,16 +222,20 @@ export default function Doctor({ embedded = false }:
                     flexWrap: "wrap" }}>
         {!embedded &&
           <h1 style={{ marginBottom: 0 }}>System health</h1>}
-        <span className="mut" style={{ fontSize: 13 }}>
+        <span className="mut" style={{ fontSize: 13,
+                                       opacity: q.isError ? 0.55 : undefined }}>
           {d.ok ? "all checks pass"
             : `${d.checks.filter((c) => !c.ok).length} check${
                 d.checks.filter((c) => !c.ok).length === 1 ? "" : "s"
               } need${d.checks.filter((c) => !c.ok).length === 1
                 ? "s" : ""} attention`}
-          {updated && <> · auto-refreshes — checked {updated}</>}
+          {updated && !q.isError && <> · auto-refreshes — checked {updated}</>}
           {q.isFetching && " ⟳"}
         </span>
       </div>
+      {/* a poll that failed after the first answer: these results are
+          from the last check that ran, not a claim that all is well now */}
+      <StaleLine query={q} />
 
       {sections.map((s) => (
         <div className="card" key={s.title}>

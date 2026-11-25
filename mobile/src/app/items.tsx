@@ -7,21 +7,26 @@ import { useEffect, useState } from "react";
 import { Modal, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card, H, KV } from "../components/ui";
+import { EmptyState, FailedLine, StaleLine } from "../components/loaded";
+import { EMPTY_LINES } from "../lib/pure";
+import { Card, H, KV, Skeleton } from "../components/ui";
 import WaitingReceiptsCard from "../components/waiting-receipts";
-import { UNKNOWN_STORE } from "../lib/api";
+import { errText, UNKNOWN_STORE } from "../lib/api";
 import { patchList } from "../lib/cache";
 import { useRefetchWhenShown } from "../lib/focus";
 import { useSession } from "../lib/session";
 import { C, mmddyy, money } from "../lib/theme";
 import { useViewer } from "../lib/viewer";
 import { WAITING_KEY, useWaitingReceipts } from "../lib/waiting";
+import SegmentedControl from "../components/segmented-control";
+import { fieldA11y } from "../components/field";
+import { useSheetAnimation } from "../lib/a11y";
 
 interface TagTarget { receipt_id: string; line: number;
                       description: string; tag: string }
 
 export default function Items() {
+  const sheetAnim = useSheetAnimation();
   const { client } = useSession();
   const qc = useQueryClient();
   const viewer = useViewer();
@@ -86,39 +91,45 @@ export default function Items() {
                                       onRefresh={() => Promise.all([
                                         waiting.refetch(), query.refetch()])} />}>
       <WaitingReceiptsCard />
-      <TextInput style={s.search} placeholder="search items…"
+      <TextInput {...fieldA11y("Search items")} style={s.search} placeholder="search items…"
                  placeholderTextColor={C.mut} autoCapitalize="none"
                  value={qText} onChangeText={setQText} />
-      <StaleBanner query={query} />
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      <StaleLine query={query} />
+      {query.isPending && <Skeleton />}
       {query.isError && !d && (
-        <Text style={[s.center, { color: C.bad }]}>
-          Couldn't reach the server — pull down to retry.
-        </Text>
+        <FailedLine q={query} what="line items" />
       )}
       {d && d.groups.length > 0 && (
         <Card>
           <View style={{ flexDirection: "row", alignItems: "center",
                          justifyContent: "space-between" }}>
             <H>By {group}</H>
-            <View style={{ flexDirection: "row", gap: 6 }}>
-              {(["item", "store", "month"] as const).map((g) => (
-                <Pressable key={g}
-                           style={[s.gchip, group === g && s.gchipOn]}
-                           onPress={() => setGroup(g)}>
-                  <Text style={{ color: group === g ? C.text : C.mut,
-                                 fontSize: 12 }}>{g}</Text>
-                </Pressable>
-              ))}
-            </View>
+            <SegmentedControl label="Group items" size="sm" value={group}
+              onChange={setGroup} style={{ alignSelf: "center" }}
+              options={(["item", "store", "month"] as const).map((g) => (
+                { value: g, label: `By ${g}` }))} />
           </View>
           {(allGroups ? d.groups : d.groups.slice(0, GROUP_CAP))
             .map((g) => (
             <KV key={g.key ?? "\u0000unknown"}
                 k={`${g.key ?? UNKNOWN_STORE}${g.last_date
                     ? ` · last bought ${mmddyy(g.last_date)}` : ""}`}
-                v={`${money(g.total, false)} total · ${g.n}×`}
+                // the web's two columns: how many were bought, and on
+                // how many receipts (receipts.search_items)
+                // an older server sends neither: its line, from the count
+                v={g.bought == null || g.receipts == null
+                   ? `${money(g.total, false)} total · ${g.n}×`
+                   : `${money(g.total, false)} total · bought ${g.bought}`
+                     + ` · receipts ${g.receipts}`}
                 tone="mut" />
+          ))}
+          {/* a total that may hold a purchase twice says so, in the
+              server's words (the web's line under the table) */}
+          {d.groups.filter((g) => g.note).map((g) => (
+            <Text key={`note-${g.key ?? "\u0000unknown"}`}
+                  style={{ color: C.mut, fontSize: 12, marginTop: 4 }}>
+              {g.key ?? UNKNOWN_STORE}: {g.note}
+            </Text>
           ))}
           {!allGroups && d.groups.length > GROUP_CAP && (
             <Text style={{ color: C.accent, fontSize: 13, marginTop: 6 }}
@@ -132,7 +143,8 @@ export default function Items() {
         <Card>
           <H>Line items</H>
           {d.rows.slice(0, rowLimit).map((r) => (
-            <Pressable key={`${r.receipt_id}-${r.line}`} style={s.row}
+            <Pressable accessibilityRole="button" key={`${r.receipt_id}-${r.line}`}
+                       style={[s.row, r.counts === false && { opacity: 0.55 }]}
                        onPress={viewer ? undefined
                                        : () => { setTagging(r);
                                                  setTagText(r.tag ?? ""); }}>
@@ -146,6 +158,9 @@ export default function Items() {
                   {r.txn_id == null ? " · waiting" : ""}
                   {r.qty != null && r.qty !== 1 ? ` · ×${r.qty}` : ""}
                   {r.tag ? ` · ${r.tag}` : ""}
+                  {/* listed, never added up, or possibly counted
+                      twice: the server's words (specs/receipts.md) */}
+                  {r.note ? ` · ${r.note}` : ""}
                 </Text>
               </View>
               <Text style={{ color: C.text, fontSize: 13,
@@ -154,14 +169,11 @@ export default function Items() {
               </Text>
             </Pressable>
           ))}
-          {d.rows.length === 0 && (
-            <Text style={s.center}>
-              No parsed line items yet — every line item from parsed
-              receipts lands here. Snap a receipt above, or attach one from
-              any transaction (📎); items also match the Transactions
-              search.
-            </Text>
-          )}
+          {/* a search miss is not an empty catalog (the web's words) */}
+          {d.rows.length === 0 && (q
+            ? <EmptyState title={EMPTY_LINES.filtered} />
+            : <EmptyState title={EMPTY_LINES.lineItems} to="/(tabs)/transactions"
+                          action={EMPTY_LINES.lineItemsAction} />)}
           {d.rows.length > rowLimit && (
             <Text style={{ color: C.accent, fontSize: 13, marginTop: 6 }}
                   onPress={() => setRowLimit((n) => n + 100)}>
@@ -175,7 +187,7 @@ export default function Items() {
           )}
         </Card>
       )}
-      <Modal visible={!!tagging} animationType="slide" transparent
+      <Modal visible={!!tagging} animationType={sheetAnim} transparent
              onRequestClose={() => setTagging(null)}>
         <View style={s.sheetWrap}>
           <View style={s.sheet}>
@@ -186,23 +198,25 @@ export default function Items() {
               Tags group items across receipts ("kids", "supplements"…)
               and feed the tag report.
             </Text>
-            <TextInput style={s.search} placeholder="tag (blank clears)"
+            <TextInput {...fieldA11y("Tag (blank clears)")}
+                       style={s.search} placeholder="tag (blank clears)"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        value={tagText} onChangeText={setTagText} />
             {tag.isError ? (
               <Text style={{ color: C.bad, fontSize: 12 }}>
-                {String(tag.error)}
+                {errText(tag.error)}
               </Text>
             ) : null}
             <View style={{ flexDirection: "row", gap: 8,
                            justifyContent: "center" }}>
-              <Pressable style={[s.btn, tag.isPending && { opacity: 0.5 }]}
+              <Pressable accessibilityRole="button"
+                         style={[s.btn, tag.isPending && { opacity: 0.5 }]}
                          disabled={tag.isPending}
                          onPress={() => tag.mutate({ target: tagging!,
                                                      text: tagText.trim() })}>
                 <Text style={s.btnText}>Save</Text>
               </Pressable>
-              <Pressable style={[s.btn, { backgroundColor: C.hover }]}
+              <Pressable accessibilityRole="button" style={[s.btn, { backgroundColor: C.hover }]}
                          onPress={() => setTagging(null)}>
                 <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
               </Pressable>
@@ -217,10 +231,7 @@ export default function Items() {
 const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   center: { color: C.mut, textAlign: "center", padding: 20 },
-  gchip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
-           borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4 },
-  gchipOn: { borderColor: C.accent, backgroundColor: C.hover },
-  search: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
+  search: { backgroundColor: C.card, borderColor: C.field, borderWidth: 1,
             borderRadius: 10, color: C.text, fontSize: 14,
             marginHorizontal: 12, marginTop: 10,
             paddingHorizontal: 12, paddingVertical: 8 },
@@ -232,7 +243,7 @@ const s = StyleSheet.create({
   sheet: { backgroundColor: C.card, borderTopLeftRadius: 16,
            borderTopRightRadius: 16, padding: 16, gap: 10 },
   sheetTitle: { color: C.text, fontSize: 15, fontWeight: "700" },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 18, paddingVertical: 9 },
   btnText: { color: C.text, fontSize: 14, fontWeight: "600" },
 });

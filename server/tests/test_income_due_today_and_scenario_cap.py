@@ -75,6 +75,22 @@ class PaycheckDueTodayIsStillComing(unittest.TestCase):
         self.assertEqual(self._upcoming(),
                          [("Acme Payroll", TODAY + dt.timedelta(days=1))])
 
+    def test_a_paycheck_pending_in_another_account_is_not_walked_in(self):
+        """The walk starts from primary checking; a paycheck pending in a
+        savings account is in no balance it reads, posted or not, so it is
+        not re-dated in — primary checking's available-balance flag says
+        nothing about it."""
+        self.conn.execute(
+            "UPDATE accounts SET balance_available = NULL WHERE id = 'chk'")
+        self.conn.execute(
+            "INSERT INTO accounts (id,item_id,name,type,subtype,"
+            "balance_current) VALUES ('sav2','it1','Invented Savings',"
+            "'depository','savings',900)")
+        add_txn(self.conn, TODAY, -2000.0, "ACME PAYROLL", primary="INCOME",
+                account="sav2", pending=1)
+        self.conn.commit()
+        self.assertEqual(self._upcoming(), [])
+
     def test_a_series_already_moved_past_today_adds_no_paycheck_today(self):
         """When the series' own next payday is already two weeks out,
         today's occurrence is a back-projection of a deposit the series

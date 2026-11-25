@@ -23,7 +23,8 @@ import { useEffect, useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import { Card, SharedLock } from "../components/ui";
+import { Card, SharedLock, Note } from "../components/ui";
+import { FailedLine } from "../components/loaded";
 import { CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "../components/verify-email-card";
 import type { Account, Entity } from "../lib/api";
@@ -33,8 +34,10 @@ import { bankAwaitsConfirm, bizSetupEntity, bizWizardEntryStep }
   from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
+import { checkbox } from "../lib/a11y";
 import { useMe, useOwner, useSharedLock } from "../lib/viewer";
 import { errText } from "../lib/api";
+import { fieldA11y } from "../components/field";
 
 const kindIs = (a: { kind: string }, ...types: string[]) =>
   types.some((t) => (a.kind || "").startsWith(t));
@@ -100,7 +103,7 @@ export default function BusinessWizardRoute() {
             Not retrying automatically: if you already have a business,
             continuing from here would create a second one.
           </Text>
-          <Pressable style={s.btn} onPress={() => summary.refetch()}>
+          <Pressable accessibilityRole="button" style={s.btn} onPress={() => summary.refetch()}>
             <Text style={s.btnText}>Try again</Text>
           </Pressable>
         </Card>
@@ -320,20 +323,20 @@ function BusinessWizard({ resume, owner, flagged }: {
         <Text style={s.h1}>{step.title}</Text>
         {!!step.blurb && <Text style={s.mut}>{step.blurb}</Text>}
         {err && (
-          <Text style={{ color: C.bad, fontSize: 12, marginTop: 4 }}>
+          <Note bad style={{ color: C.bad, fontSize: 12, marginTop: 4 }}>
             {err}
-          </Text>
+          </Note>
         )}
 
         {step.key === "what" && (
           <>
-            <TextInput style={s.input} placeholder="Acme LLC"
+            <TextInput {...fieldA11y(step.title)} style={s.input} placeholder="Acme LLC"
                        placeholderTextColor={C.mut} value={name}
                        onChangeText={setName} />
             <View style={{ flexDirection: "row", flexWrap: "wrap",
                            gap: 6, marginTop: 6 }}>
               {STRUCTURES.map(([v, l]) => (
-                <Pressable key={v}
+                <Pressable accessibilityRole="button" key={v}
                            style={[s.chip, structure === v && s.chipOn]}
                            onPress={() => setStructure(v)}>
                   <Text style={{ color: structure === v ? C.text : C.mut,
@@ -346,18 +349,19 @@ function BusinessWizard({ resume, owner, flagged }: {
 
         {step.key === "when" && (
           <>
-            <TextInput style={s.input} placeholder="State (optional) — CA"
+            <TextInput {...fieldA11y("State (optional)")}
+                       style={s.input} placeholder="State (optional) — CA"
                        placeholderTextColor={C.mut} autoCapitalize="characters"
                        value={usState} onChangeText={setUsState} />
-            <TextInput style={s.input}
+            <TextInput {...fieldA11y("EIN (optional, stored encrypted)")} style={s.input}
                        placeholder="EIN (optional, stored encrypted) — 12-3456789"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        value={ein} onChangeText={setEin} />
-            <TextInput style={s.input}
+            <TextInput {...fieldA11y("Formation date (optional)")} style={s.input}
                        placeholder="Formation date (optional) — YYYY-MM-DD"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        value={formation} onChangeText={setFormation} />
-            <TextInput style={s.input}
+            <TextInput {...fieldA11y("Business start date (optional)")} style={s.input}
                        placeholder="Business start date (optional) — YYYY-MM-DD"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        value={started} onChangeText={setStarted} />
@@ -379,9 +383,13 @@ function BusinessWizard({ resume, owner, flagged }: {
               net worth. Only pick accounts the business actually owns.
               You can change this any time on the Accounts page.
             </Text>
-            <TextInput style={s.input} placeholder="search accounts"
+            <TextInput {...fieldA11y("Search accounts")}
+                       style={s.input} placeholder="search accounts"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        value={acctQ} onChangeText={setAcctQ} />
+            {/* a failed read is not an empty picker */}
+            {accounts.data === undefined && accounts.isError && (
+              <FailedLine q={accounts} what="your accounts" />)}
             {allEligible.length !== live.length && (
               <Text style={{ color: C.accent, fontSize: 12, marginTop: 4 }}
                     onPress={() => setShowAll((x) => !x)}>
@@ -392,6 +400,8 @@ function BusinessWizard({ resume, owner, flagged }: {
             )}
             {eligible.map((a) => (
               <Pressable key={a.id}
+                         {...checkbox(picked.has(a.id), (a.institution_name
+                           ? `${a.institution_name} — ` : "") + `${a.name}, ${a.kind}`)}
                          style={{ flexDirection: "row", gap: 8,
                                   alignItems: "center",
                                   paddingVertical: 5 }}
@@ -422,7 +432,7 @@ function BusinessWizard({ resume, owner, flagged }: {
                 {confirmFirst && (
                   <VerifyEmailCard me={me.data} note={CONFIRM_TO_CONNECT} />)}
                 <SharedLock note={credentialLock}>
-                <Pressable style={[s.btn, (busy || confirmFirst)
+                <Pressable accessibilityRole="button" style={[s.btn, (busy || confirmFirst)
                                           && { opacity: 0.5 }]}
                            disabled={busy || !!credentialLock || confirmFirst}
                            accessibilityHint={confirmFirst ? CONFIRM_TO_CONNECT
@@ -454,12 +464,12 @@ function BusinessWizard({ resume, owner, flagged }: {
             </Text>
             <View style={{ flexDirection: "row", gap: 6,
                            alignItems: "center" }}>
-              <TextInput style={[s.input, { flex: 1 }]}
+              <TextInput {...fieldA11y("Manual account name")} style={[s.input, { flex: 1 }]}
                          placeholder="Acme LLC Checking"
                          placeholderTextColor={C.mut} value={newName}
                          onChangeText={setNewName} />
               {(["checking", "savings", "credit"] as const).map((k) => (
-                <Pressable key={k}
+                <Pressable accessibilityRole="button" key={k}
                            style={[s.chip, newKind === k && s.chipOn]}
                            onPress={() => setNewKind(k)}>
                   <Text style={{ color: newKind === k ? C.text : C.mut,
@@ -467,7 +477,7 @@ function BusinessWizard({ resume, owner, flagged }: {
                 </Pressable>
               ))}
             </View>
-            <Pressable style={[s.btn, (busy || !newName.trim())
+            <Pressable accessibilityRole="button" style={[s.btn, (busy || !newName.trim())
                          && { opacity: 0.5 }]}
                        disabled={busy || !newName.trim()}
                        onPress={() => addAcct.mutate()}>
@@ -516,7 +526,7 @@ function BusinessWizard({ resume, owner, flagged }: {
         <View style={{ flexDirection: "row", gap: 8, marginTop: 12,
                        flexWrap: "wrap", alignItems: "center" }}>
           {step.key === "what" && (
-            <Pressable style={[s.btn, !name.trim() && { opacity: 0.5 }]}
+            <Pressable accessibilityRole="button" style={[s.btn, !name.trim() && { opacity: 0.5 }]}
                        disabled={!name.trim()}
                        onPress={() => { setErr(null); go(1); }}>
               <Text style={s.btnText}>Continue</Text>
@@ -526,7 +536,7 @@ function BusinessWizard({ resume, owner, flagged }: {
             <>
               {/* the name is collected a step earlier and is required by
                   the server, so a blank one must not be offerable here */}
-              <Pressable style={[s.btn, (busy || !name.trim())
+              <Pressable accessibilityRole="button" style={[s.btn, (busy || !name.trim())
                            && { opacity: 0.5 }]}
                          disabled={busy || !name.trim()}
                          onPress={() => create.mutate()}>
@@ -546,7 +556,7 @@ function BusinessWizard({ resume, owner, flagged }: {
           )}
           {step.key === "accounts" && (
             <>
-              <Pressable style={[s.btn, (busy || picked.size === 0)
+              <Pressable accessibilityRole="button" style={[s.btn, (busy || picked.size === 0)
                            && { opacity: 0.5 }]}
                          disabled={busy || picked.size === 0}
                          onPress={() => assign.mutate()}>
@@ -567,7 +577,7 @@ function BusinessWizard({ resume, owner, flagged }: {
           {step.key === "startup" && (
             <>
               {flagged > 0 && (
-                <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
+                <Pressable accessibilityRole="button" style={[s.btn, busy && { opacity: 0.5 }]}
                            disabled={busy}
                            onPress={() => importFlags.mutate()}>
                   <Text style={s.btnText}>
@@ -585,7 +595,7 @@ function BusinessWizard({ resume, owner, flagged }: {
                   Skip
                 </Text>
               ) : (
-                <Pressable style={s.btn}
+                <Pressable accessibilityRole="button" style={s.btn}
                            onPress={() => { setErr(null);
                              mark.mutate({ startup: "done" }); setI(4); }}>
                   <Text style={s.btnText}>Continue</Text>
@@ -594,7 +604,7 @@ function BusinessWizard({ resume, owner, flagged }: {
             </>
           )}
           {step.key === "done" && (
-            <Pressable style={s.btn}
+            <Pressable accessibilityRole="button" style={s.btn}
                        onPress={() => { mark.mutate({ finish: "done" });
                                         finish(entityId); }}>
               <Text style={s.btnText}>Open the Business page</Text>
@@ -617,13 +627,13 @@ const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   h1: { color: C.text, fontSize: 17, fontWeight: "700", marginTop: 2 },
   mut: { color: C.mut, fontSize: 12, lineHeight: 17, marginTop: 4 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8, marginTop: 6 },
   chip: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
           borderRadius: 14, paddingHorizontal: 10, paddingVertical: 4 },
   chipOn: { borderColor: C.accent, backgroundColor: C.hover },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8, marginTop: 8,
          alignSelf: "flex-start" },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

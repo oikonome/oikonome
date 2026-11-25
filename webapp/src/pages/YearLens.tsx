@@ -3,11 +3,14 @@
 // Data: /api/lens/year (web/lenses.py).
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router";
-import { api, money, type YearLensData, catLabel } from "../api/client";
+import { api, money, type Change, type YearLensData, catLabel }
+  from "../api/client";
 import MoneyMap from "../components/MoneyMap";
-import { planRows } from "../components/PlanBars";
+import { sentPlanRows, sentPlanTotal } from "../components/PlanBars";
 import { VERDICT } from "./Today";
-import { isPlanSavingsGoal } from "../moneymath";
+import { changeLook, netSign, signedMoney, signedPct } from "../moneymath";
+import PageSkeleton from "../components/PageSkeleton";
+import { FailedLine, StaleLine } from "../components/Loaded";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -20,33 +23,27 @@ function priorYearLabel(d: YearLensData): string {
   return m ? `${d.y - 1} (to ${MONTHS[m - 1]} ${day})` : `${d.y - 1}`;
 }
 
-/** The plan savings goal as the lens payload carries it. */
-type LensGoal = { monthly_plan: number; rate_90d: number | null } | null;
-
 export default function YearLens({ y, onMonth }: {
   y: number; onMonth: (m: number) => void;
 }) {
   const q = useQuery({ queryKey: ["lens-year", y],
-                       queryFn: () => api.lensYear(y) });
-  // the money map's Savings row: the lens payload names the plan goal
-  // (savings_goal; null = none). Only an older server's payload, which
-  // lacks the key, sends the page to the Today payload for it — the
-  // costliest request the server answers, for one field.
-  const lensGoal = (q.data as { savings_goal?: LensGoal } | undefined)
-    ?.savings_goal;
-  const today = useQuery({ queryKey: ["today", "now"],
-                           queryFn: () => api.todayFull(),
-                           enabled: q.isSuccess && lensGoal === undefined });
-  if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
-  if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
+                       queryFn: () => api.lensYear(y),
+                       // a step to another period keeps this one on screen,
+                       // dimmed, until it answers (the phone's lens rule)
+                       placeholderData: (prev) => prev });
+  if (q.isPending) return <PageSkeleton />;
+  if (q.data === undefined) return <FailedLine q={q} what="the year" />;
   const d: YearLensData = q.data;
-  const goal = lensGoal !== undefined ? lensGoal
-    : (today.data?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   const t = d.totals, pt = d.prev_totals;
   const prevLabel = priorYearLabel(d);
+  // the left over's sign as printed: $0 is even, untoned, with no rate
+  const leftSign = t.dollars.saved !== null ? netSign(t.dollars.saved) : null;
 
   return (
-    <>
+    <div style={q.isPlaceholderData ? { opacity: 0.5, pointerEvents: "none" } : undefined}>
+      {/* a failed refetch says the year below is from before it (the
+          phone's line) */}
+      <StaleLine query={q} />
       {/* ---- 12-cell verdict grid. "net" cells are months with no
            budget snapshot: they show the month's net cash flow (income −
            spending) — a fact, not a verdict — styled muted so the two
@@ -57,16 +54,23 @@ export default function YearLens({ y, onMonth }: {
             ? VERDICT[c.verdict as keyof typeof VERDICT] ?? VERDICT["ON BUDGET"]
             : null;
           const isNet = c.status === "net";
+          // the server's words for a cell (lenses.cell_words): the pill
+          // of a cell that is not a verdict, the figure under it, and the
+          // note on a month whose income the bank feed does not measure
+          const toneCls = c.tone === "pos" ? "pos" : c.tone === "neg" ? "neg" : "mut";
           return (
             <button key={c.m} className="ycell" disabled={c.status === "future"}
                     onClick={() => onMonth(c.m)}
+                    style={c.note ? { opacity: 0.6 } : undefined}
                     title={c.status === "future" ? ""
                       : isNet
-                        ? `${MONTHS[c.m - 1]} — no budget set; `
+                        ? `${MONTHS[c.m - 1]} — ${c.label ?? "net"}`
+                          + (c.figure ? ` ${c.figure}` : "")
                           + (c.income != null
-                             ? `income ${money(c.income)} − spent ${money(c.spend)}`
-                             : `spent ${money(c.spend ?? 0)} (income unknown)`)
-                        : `${MONTHS[c.m - 1]} — spent ${money(c.variable_actual)} of ${money(c.variable_budget)}`}>
+                             ? `; income ${money(c.income)} − spent ${money(c.spend)}` : "")
+                          + (c.note ? ` (${c.note})` : "")
+                        : `${MONTHS[c.m - 1]} — spent ${money(c.variable_actual)} of ${money(c.variable_budget)}`
+                          + (c.note ? ` (${c.note})` : "")}>
               <div style={{ display: "flex", justifyContent: "space-between",
                             alignItems: "baseline" }}>
                 <b>{MONTHS[c.m - 1]}</b>
@@ -75,20 +79,22 @@ export default function YearLens({ y, onMonth }: {
               {v ? (
                 <>
                   <span className={`pill ${v.cls}`} style={{ marginTop: 4 }}>{v.label}</span>
-                  <div className={`sub ${c.variance! > 0 ? "neg" : "pos"}`}
-                       style={{ marginTop: 3, fontVariantNumeric: "tabular-nums" }}>
-                    {c.variance! > 0 ? "+" : "−"}{money(Math.abs(c.variance!))}
-                  </div>
+                  {/* the margin in the server's words ("over by $300"):
+                      on this page only a net carries a sign */}
+                  {c.figure && (
+                    <div className={`sub ${toneCls}`}
+                         style={{ marginTop: 3, fontVariantNumeric: "tabular-nums" }}>
+                      {c.figure}
+                    </div>)}
                 </>
               ) : isNet ? (
                 <>
-                  <span className="pill m" style={{ marginTop: 4 }}>net</span>
-                  <div className={`sub ${c.net != null ? (c.net >= 0 ? "pos" : "neg") : "mut"}`}
+                  <span className="pill m" style={{ marginTop: 4 }}>{c.label ?? "net"}</span>
+                  {/* the server's figure and tone; nothing of our own */}
+                  <div className={`sub ${toneCls}`}
                        style={{ marginTop: 3, fontVariantNumeric: "tabular-nums" }}>
-                    {c.net != null
-                      ? `${c.net >= 0 ? "+" : "−"}${money(Math.abs(c.net))}`
-                      : money(c.spend ?? 0)}
-                  </div>
+                    {c.figure ?? "—"}</div>
+                  {c.note && <div className="mut" style={{ fontSize: 10 }}>{c.note}</div>}
                 </>
               ) : (
                 <div className="mut" style={{ marginTop: 8 }}>—</div>
@@ -108,59 +114,50 @@ export default function YearLens({ y, onMonth }: {
 
       {/* ---- year money map: elapsed-months plan aggregates
            on one dollar scale ---- */}
-      {d.buckets_annual && (() => {
-        // excess covers the same elapsed BUDGETED months buckets_annual
-        // sums — "net" months had no plan, so they don't scale the map
-        const elapsed = d.cells.filter(
-          (c) => c.status === "final" || c.status === "projected").length;
-        if (elapsed === 0) return null;   // nothing was ever budgeted
-        return (
-          <div className="card">
-            <h2>Yearly budget</h2>
-            <MoneyMap
-              rows={planRows(
-                { food: d.buckets_annual.food, other: d.buckets_annual.other },
-                { // a label opens the year's bucket: the same months this
-                  // map summed, as one listing
-                  period: { y: d.y },
-                  fixedActual: d.buckets_annual.fixed.actual,
-                  fixedBudget: d.buckets_annual.fixed.month_budget,
-                  // Savings — standing monthly plan × the same
-                  // elapsed months every other row here covers.
-                  // actual prefers the lens's ledger-verified YTD
-                  // (saved_ytd, matched transfers over the budgeted
-                  // months). Without it (an older server, or no budgeted
-                  // month to measure) the only figure is rate_90d ×
-                  // elapsed, and the row says it is an estimate.
-                  savings: goal && elapsed > 0
-                    ? (typeof d.saved_ytd === "number"
-                      ? { plan: goal.monthly_plan * elapsed,
-                          saved: d.saved_ytd }
-                      : { plan: goal.monthly_plan * elapsed,
-                          saved: goal.rate_90d === null ? null
-                            : goal.rate_90d * elapsed,
-                          estimated: goal.rate_90d !== null }) : null,
-                  excess: d.plan_surplus !== null && elapsed > 0
-                    ? d.plan_surplus * elapsed : null })} />
-          </div>
-        );
-      })()}
+      {/* the server's rows over the elapsed budgeted months
+          (lenses.year_summary → plan_rows; null: nothing was budgeted) */}
+      {d.plan_rows && (
+        <div className="card">
+          <h2>Yearly budget</h2>
+          {/* the server's words for which months the card covers */}
+          {d.plan_caption && <div className="sub" style={{ marginBottom: ".4rem" }}>
+            {d.plan_caption}</div>}
+          <MoneyMap rows={sentPlanRows(d.plan_rows)}
+                    total={d.plan_total ? sentPlanTotal(d.plan_total) : null}
+                    footnote={d.excess_text && (
+                      // the server's sentence: what an ordinary month
+                      // leaves, absent under a year over budget
+                      <div className="sub" style={{ fontSize: 12, marginTop: ".5rem" }}>
+                        {d.excess_text}</div>)} />
+        </div>
+      )}
 
       {/* ---- annual totals ---- */}
       <div className="card">
         <h2>{d.y} totals</h2>
         <div style={{ display: "flex", gap: "1.8rem", flexWrap: "wrap" }}>
-          <div><div className="kpi sm">{money(t.income)}</div><div className="sub">income</div></div>
-          <div><div className="kpi sm">{money(t.spend)}</div><div className="sub">spend</div></div>
-          <div><div className={`kpi sm ${t.saved !== null ? (t.saved >= 0 ? "pos" : "neg") : ""}`}>
-              {money(t.saved)}</div><div className="sub">saved</div></div>
-          <div><div className="kpi sm">{t.rate !== null ? `${t.rate}%` : "·"}</div>
+          {/* the server's whole dollars (lenses.totals_dollars): left
+              over is the printed income less the printed spend */}
+          <div><div className="kpi sm">{money(t.dollars.income)}</div><div className="sub">income</div></div>
+          <div><div className="kpi sm">{money(t.dollars.spend)}</div><div className="sub">spend</div></div>
+          <div><div className={`kpi sm ${leftSign === 1 ? "pos" : leftSign === -1 ? "neg" : ""}`}>
+              {t.dollars.saved !== null ? signedMoney(t.dollars.saved, money, true) : money(null)}</div>
+            <div className="sub">left over</div></div>
+          <div><div className="kpi sm">{t.rate !== null && leftSign !== 0 ? signedPct(t.rate) : "·"}</div>
             <div className="sub">savings rate</div></div>
         </div>
-        {t.income === null && (
+        {/* the server's words when a month's income is incomplete:
+            income, left over and the rate then count the other months */}
+        {t.incomplete_text && (
+          <div className="sub" style={{ marginTop: ".4rem", fontSize: 11 }}>
+            {t.incomplete_text}</div>)}
+        {d.dating === "bill_month" && (
+          <div className="sub" style={{ marginTop: ".4rem", fontSize: 11 }}>
+            the sum of the months above; a bill counts in the month it
+            belongs to — Cash Flow dates spending by the day it was paid</div>)}
+        {t.unknown_text && (
           <div className="sub" style={{ marginTop: ".4rem" }}>
-            Income isn't known for every month of {d.y} (no bank account
-            feeds part of it) — income and savings are unknown, not $0.
+            {t.unknown_text}
           </div>
         )}
       </div>
@@ -171,10 +168,14 @@ export default function YearLens({ y, onMonth }: {
         {d.categories.length === 0 && <p className="sub">No spending.</p>}
         {d.categories.length > 0 && (
           <table>
+            {/* the heading names the prior year's window, so its column
+                says the year alone (the window wrapped it into three lines
+                at phone width); the change is the table's point and shows
+                at every width */}
             <thead><tr><th>Category</th><th className="num">{d.y}</th>
-              <th className="num">{prevLabel}</th><th className="num hide-m">Δ</th></tr></thead>
+              <th className="num">{d.y - 1}</th><th className="num">Δ</th></tr></thead>
             <tbody>
-              {d.categories.map(([cat, cur, prev, key]) => (
+              {d.categories.map(([cat, cur, prev, key], i) => (
                 <tr key={cat}>
                   {/* the label opens the year's rows in that category. The
                       filter matches the STORED key, which the row carries
@@ -188,8 +189,7 @@ export default function YearLens({ y, onMonth }: {
                     : catLabel(cat)}</td>
                   <td className="num">{money(cur)}</td>
                   <td className="num mut">{money(prev)}</td>
-                  <td className={`num hide-m ${cur - prev > 0 ? "neg" : "pos"}`}>
-                    {cur - prev >= 0 ? "+" : "−"}{money(Math.abs(cur - prev))}</td>
+                  <YearChange ch={d.changes.categories[i]} />
                 </tr>
               ))}
               {pt.spend > 0 && (
@@ -197,14 +197,25 @@ export default function YearLens({ y, onMonth }: {
                   <td><b>Total spend</b></td>
                   <td className="num"><b>{money(t.spend)}</b></td>
                   <td className="num mut">{money(pt.spend)}</td>
-                  <td className={`num hide-m ${t.spend - pt.spend > 0 ? "neg" : "pos"}`}>
-                    {t.spend - pt.spend >= 0 ? "+" : "−"}{money(Math.abs(t.spend - pt.spend))}</td>
+                  <YearChange ch={d.changes.spend} />
                 </tr>
               )}
             </tbody>
           </table>
         )}
       </div>
-    </>
+    </div>
+  );
+}
+
+/** One "Δ" cell: the server's change from last year (reporting.change,
+ *  the printed figure minus the printed figure), "unchanged" at $0. */
+function YearChange({ ch }: { ch: Change | null }) {
+  const c = changeLook(ch, true);
+  if (!c) return <td className="num" />;
+  if (c.unchanged) return <td className="num mut">unchanged</td>;
+  return (
+    <td className={`num ${c.good ? "pos" : "neg"}`}>
+      {c.sign}{money(c.dollars)}</td>
   );
 }

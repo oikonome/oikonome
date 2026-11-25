@@ -147,11 +147,22 @@ def _reference_match(rows, occurrences):
             gap = abs((d - occ["due"]).days)
             if gap > occ["window"]:
                 continue
-            candidates.append((gap, budget.amount_gap(budget._bands_of(occ["bill"]),
-                                                      r["amount"]), ridx, oidx))
+            # an exact tie goes by the bill's stable identity, then the
+            # row's own — never by the order either was read in
+            b = occ["bill"]
+            made = b.get("created_on")
+            candidates.append((gap, budget.amount_gap(budget._bands_of(b),
+                                                      r["amount"]),
+                               (made is not None, made or dt.date.min,
+                                str(b.get("payee") or "").casefold(),
+                                str(b.get("uid") or ""),
+                                str(b.get("id") or ""), occ["due"]),
+                               (d or dt.date.min, str(r.get("txn_id") or ""),
+                                str(r.get("split_line") or "")),
+                               ridx, oidx))
     candidates.sort()
     taken, used, matched = set(), set(), set()
-    for _, _, ridx, oidx in candidates:
+    for _, _, _, _, ridx, oidx in candidates:
         if ridx in taken or oidx in used:
             continue
         taken.add(ridx)

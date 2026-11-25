@@ -76,6 +76,8 @@ class EquityTests(unittest.TestCase):
         equity.record_movement(self.conn, self.ent["id"], kind="contribution",
                                amount=1000, date=TODAY)
         # $5,000 of revenue and $1,000 of cost on the entity's own account
+        # (a cost on a personal card would count as a contribution too)
+        entities.assign_account(self.conn, "card", self.ent["id"])
         rev = add_txn(self.conn, TODAY, -5000.0, "CLIENT INVOICE",
                       account="card", primary="INCOME")
         exp = add_txn(self.conn, TODAY, 1000.0, "SUPPLIES", account="card")

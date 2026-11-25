@@ -65,7 +65,10 @@ class TaxdocIdTests(unittest.TestCase):
 
     def test_sequential_commits_get_distinct_ids(self):
         taxdocs.commit(self.conn, _token(self.conn), [dict(W2_ROW)])
-        taxdocs.commit(self.conn, _token(self.conn), [dict(W2_ROW)])
+        # another employer's: the same W-2 again would replace itself
+        taxdocs.commit(self.conn, _token(self.conn),
+                       [dict(W2_ROW, employer="Birch Diner",
+                             ein="98-7654321")])
         self.assertEqual(self._doc_ids(), [1, 2])
 
     def test_lost_race_retries_onto_the_next_id(self):

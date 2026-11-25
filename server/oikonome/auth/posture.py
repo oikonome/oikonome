@@ -32,7 +32,10 @@ The footholds, and which level closes which:
 The in-session levels (SHEET, FACTOR, CREDENTIAL) keep the caller's own
 session, device and push subscription. REVERT touches no factor and keeps
 the sheet: the old inbox may be why the owner moved away from it, so the
-reset it mails still asks for a recovery code. MOVE_OUT leaves the
+reset it mails still asks for a recovery code. It also records when it ran
+(`users.reverted_at`), and for `REVERT_HOLD` afterwards the account
+refuses a factor-clearing reset request, the one road on which that inbox
+alone could clear the factors the undo kept. MOVE_OUT leaves the
 household's settings alone: the person is leaving it, not losing it.
 
 The sheet. SHEET always mints a new one. FACTOR and CREDENTIAL mint one
@@ -71,6 +74,7 @@ Lock order, which every door keeps by calling `rotate` and writing its own
 
 from __future__ import annotations
 
+import datetime as dt
 import logging
 
 from fastapi import HTTPException
@@ -124,6 +128,21 @@ LEVELS: dict[str, frozenset] = {
 # the levels a signed-in caller runs, which spare that caller's own
 # session, device and push subscription
 KEEPS_CALLER = frozenset({SHEET, FACTOR, CREDENTIAL})
+
+# How long after a REVERT the account refuses a factor-clearing reset
+# request (auth/factor_reset). An undone address change is the account
+# saying someone else held it a moment ago, and that someone knows the
+# address and may still reach its inbox — the old inbox may be why the
+# owner moved away from it. REVERT keeps every factor for exactly that
+# reason, so that reading the restored inbox is not owning the account;
+# the cooling-off reset is the one road where inbox control plus a quiet
+# week clears them all, and asked for in the days right after a hijack it
+# would hand back what the undo kept, while the owner is busiest putting
+# the account right and least likely to read one more notice. A week is
+# the cooling-off's own length: the hold outlasts any clock the hijacker
+# could have started from the moment of the undo. The owner is not shut
+# out meanwhile: a recovery code or the operator's clear still works.
+REVERT_HOLD = dt.timedelta(days=7)
 
 
 def lock_user_factors(conn, user_id) -> None:
@@ -214,8 +233,8 @@ def rotate(conn, batch, user, level: str, *, mint: bool = False,
     recovery records as having ended it.
 
     Writes no `users` row of this user except RECOVERY's authenticator
-    clear, which is last: the door writes its own change after this
-    returns."""
+    clear and REVERT's undone-change stamp (`REVERT_HOLD`), each last: the
+    door writes its own change after this returns."""
     if level not in LEVELS:
         raise ValueError(f"no posture level {level!r}")
     closes = LEVELS[level]
@@ -336,6 +355,12 @@ def rotate(conn, batch, user, level: str, *, mint: bool = False,
                          "totp_last_counter=NULL WHERE id=%s", (uid,))
             # and the members, whose rows are users rows too
             rep.members = reset_mod._remove_members(conn, invitees)
+        if level == REVERT:
+            # last of this user's own rows, like RECOVERY's clear above:
+            # the stamp that holds off a factor-clearing reset for
+            # REVERT_HOLD (refuse_during_revert_hold)
+            conn.execute("UPDATE users SET reverted_at=now() WHERE id=%s",
+                         (uid,))
         if level == CREDENTIAL and held and not _has_a_factor(conn, uid):
             # no factor left: a code would work again the moment a passkey
             # is re-enrolled, and there is no factor to show a new sheet for
@@ -346,6 +371,39 @@ def rotate(conn, batch, user, level: str, *, mint: bool = False,
             rep["recovery_codes"] = batch.issue(uid)
     rep["members_removed"] = members_public(rep.members)
     return rep
+
+
+def revert_hold_until(conn, user_id):
+    """When the hold a REVERT put on this account ends, or None when no
+    undo is that recent (or none ever ran)."""
+    row = conn.execute(
+        "SELECT reverted_at + make_interval(days => %s) AS until "
+        "FROM users WHERE id=%s AND reverted_at IS NOT NULL "
+        "AND reverted_at > now() - make_interval(days => %s)",
+        (REVERT_HOLD.days, user_id, REVERT_HOLD.days)).fetchone()
+    return row["until"] if row else None
+
+
+def refuse_during_revert_hold(conn, user_id) -> None:
+    """403 while `REVERT_HOLD` runs, in the structured refusal shape the
+    other posture refusals use (`error` plus the fields a client words
+    its answer from), with the reason spelled out for the owner."""
+    until = revert_hold_until(conn, user_id)
+    if until is None:
+        return
+    days = REVERT_HOLD.days
+    raise HTTPException(403, detail={
+        "error": "recently_reverted",
+        "hold_days": days,
+        "until": until.isoformat(),
+        "message": (
+            f"This account's login address was changed back less than "
+            f"{days} days ago, so a reset that removes its second factor "
+            f"cannot be requested until "
+            f"{until.strftime('%b %d, %Y at %H:%M UTC')}. "
+            f"Sign in with your authenticator, a passkey or a recovery "
+            f"code, or contact support."),
+    })
 
 
 def _has_a_factor(conn, user_id) -> bool:
@@ -383,9 +441,13 @@ def end_pending_recoveries(conn, user_id, reason: str = "rotation") -> None:
     afterwards and take away what the owner just put on. Voided together
     so a door cannot remember one and forget the other. Also run alone by
     a door that adds a factor beside another (a second passkey) and by a
-    login-address move."""
+    login-address move — which is why the emailed sign-in unlocks go here
+    too: each was mailed to the address the account had when it was
+    asked for."""
     conn.execute("UPDATE password_resets SET used_at=now() "
                  "WHERE user_id=%s AND used_at IS NULL", (user_id,))
+    from . import login_unlock
+    login_unlock.end_for_user(conn, user_id)
     from . import factor_reset
     if factor_reset.cancel_for_user(conn, user_id, reason=reason):
         log.info("pending factor reset cancelled by a credential rotation")

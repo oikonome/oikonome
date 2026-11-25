@@ -32,8 +32,9 @@ class ComplianceTests(unittest.TestCase):
     def test_state_annual_report_due_end_of_anniversary_month(self):
         # the first report falls in the anniversary month of the year AFTER
         # formation, on that month's last day
-        obls = compliance.obligations(self.conn, self.ent,
-                                      today=dt.date(2026, 7, 22))
+        obls = [o for o in compliance.obligations(
+            self.conn, self.ent, today=dt.date(2026, 7, 22))
+            if o["source"] == "state"]
         self.assertEqual(len(obls), 1)
         o = obls[0]
         self.assertEqual(o["title"], "Nevada LLC annual list")
@@ -42,8 +43,9 @@ class ComplianceTests(unittest.TestCase):
         self.assertEqual(o["source"], "state")
 
     def test_state_report_rolls_to_next_year_once_past(self):
-        obls = compliance.obligations(self.conn, self.ent,
-                                      today=dt.date(2027, 11, 15))
+        obls = [o for o in compliance.obligations(
+            self.conn, self.ent, today=dt.date(2027, 11, 15))
+            if o["source"] == "state"]
         self.assertEqual(obls[0]["due"], "2028-10-31")
 
     def test_a_state_the_table_does_not_know_has_no_derived_rule(self):
@@ -51,15 +53,17 @@ class ComplianceTests(unittest.TestCase):
             self.conn, name="OR Co", structure="sole_prop", state="OR",
             formation_date="2026-01-01")
         self.assertEqual(
-            compliance.obligations(self.conn, other,
-                                   today=dt.date(2026, 7, 22)), [])
+            [o for o in compliance.obligations(self.conn, other,
+                                               today=dt.date(2026, 7, 22))
+             if o["source"] != "federal"], [])
 
     def test_custom_obligation_and_ordering(self):
         compliance.add_obligation(self.conn, self.ent["id"],
                                   title="Federal Form 1040-SE",
                                   due_date=dt.date(2027, 4, 15))
-        obls = compliance.obligations(self.conn, self.ent,
-                                      today=dt.date(2026, 7, 22))
+        obls = [o for o in compliance.obligations(
+            self.conn, self.ent, today=dt.date(2026, 7, 22))
+            if o["source"] != "federal"]
         # soonest first: the October annual report before the April federal filing
         self.assertEqual([o["title"] for o in obls],
                          ["Nevada LLC annual list", "Federal Form 1040-SE"])
@@ -72,7 +76,11 @@ class ComplianceTests(unittest.TestCase):
         # the reminder ladder (30 + 7 days before)
         self.assertIn("TRIGGER:-P30D", ics)
         self.assertIn("TRIGGER:-P7D", ics)
-        self.assertEqual(ics.count("BEGIN:VALARM"), 6)  # 3 occurrences × 2
+        # two alarms on every event: the state report's three occurrences
+        # and the federal dates beside them
+        self.assertEqual(ics.count("BEGIN:VALARM"),
+                         2 * ics.count("BEGIN:VEVENT"))
+        self.assertEqual(ics.count("SUMMARY:Nevada LLC annual list"), 3)
 
     def test_ics_neutralizes_carriage_return_injection(self):
         """A bare CR in owner-controlled title/note is a line terminator to

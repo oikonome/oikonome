@@ -69,6 +69,30 @@ def deadlocks_since(before: int, settle: float = 5.0) -> int:
         time.sleep(0.1)
 
 
+def stuck_backends(observer) -> list[str]:
+    """Every other backend of this database left idle inside a transaction,
+    or idle while it holds an advisory lock: a pooled connection in either
+    state hands its locks to whoever borrows it next
+    (specs/invariants-and-fuzzing.md, L6 and F5). `observer` is an admin
+    connection; each entry reads "<pid> <state> advisory=<keys> <query>"."""
+    rows = observer.execute(
+        """SELECT a.pid, a.state,
+                  (SELECT string_agg(l.classid || ':' || l.objid, ',')
+                     FROM pg_locks l
+                    WHERE l.pid = a.pid
+                      AND l.locktype = 'advisory') AS advisory,
+                  left(a.query, 80) AS q
+             FROM pg_stat_activity a
+            WHERE a.datname = current_database()
+              AND a.pid <> pg_backend_pid()
+              AND a.backend_type = 'client backend'""").fetchall()
+    return [f"{r['pid']} {r['state']} advisory={r['advisory']} {r['q']}"
+            for r in rows
+            if r["state"] in ("idle in transaction",
+                              "idle in transaction (aborted)")
+            or (r["state"] == "idle" and r["advisory"])]
+
+
 class Side(threading.Thread):
     """Run `fn(conn)` on its own connection to the household, recording
     its result or the exception it raised."""

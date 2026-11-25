@@ -236,9 +236,11 @@ class AnalyzeCommitTests(unittest.TestCase):
         through POST /api/settings, and the SPA renders a control for it."""
         import pathlib as _p
         root = _p.Path(__file__).resolve().parents[2]
-        api_src = (root / "server" / "oikonome" / "web" / "api.py").read_text()
+        from .util import api_sources
+        api_src = api_sources()
         # a write path exists in the settings handler
-        self.assertIn('if "taxdocs_allow_remote_llm" in body:', api_src)
+        self.assertIn('if fields.present("taxdocs_allow_remote_llm"):',
+                      api_src)
         # ...and it is readable back, so the SPA can show its current state
         self.assertIn('"taxdocs_allow_remote_llm"', api_src)
         spa = (root / "webapp" / "src" / "pages" / "Settings.tsx").read_text()
@@ -343,7 +345,7 @@ class CommitIsAllOrNothingTests(unittest.TestCase):
     def tearDownClass(cls):
         cls.conn.close()
 
-    def _staged(self, kind="irs"):
+    def _staged(self, kind="transcript"):
         from oikonome.db import staging
         return staging.put(self.conn, "taxdoc", files=[("t.txt", b"x")],
                            meta={"kind": kind})
@@ -389,8 +391,8 @@ class EinIsNotKeptTests(unittest.TestCase):
         cls.conn.close()
 
     def test_only_the_last_four_are_stored(self):
-        taxdocs._insert_income_document(
-            self.conn, 2021, "ACME INC", "12-3456789", 50000.0, "{}")
+        taxdocs._store_w2(self.conn, 2021, "primary", None, "ACME INC",
+                          "12-3456789", 50000.0, "{}")
         r = self.conn.execute(
             "SELECT ein, ein_last4 FROM income_documents "
             "WHERE year=2021").fetchone()
@@ -570,9 +572,9 @@ class VisionRoleConsentAgreementTests(unittest.TestCase):
                                    {"year": 2023, "agi": 1.0})) as chat:
             rows = taxdocs.parse_1040_text(self.conn, "x")
         self.assertEqual(rows[0]["year"], 2023)
-        self.assertEqual(roles, ["vision", "vision"],
-                         "both the consent gate and the call itself must "
-                         "resolve the vision role")
+        self.assertEqual(set(roles), {"vision"},
+                         "the backend the consent gate judges and the one "
+                         "the call goes to are both the vision role's")
         self.assertEqual(chat.call_args.kwargs["backend"]["url"],
                          self.LOCAL_URL)
 
@@ -610,10 +612,10 @@ class CommitRefusesOutOfRangeInputTests(unittest.TestCase):
         self._refused("w2", [{"year": 2024, "boxes": {"1": 10 ** 400}}])
 
     def test_a_huge_integer_annual_amount_is_refused(self):
-        self._refused("irs", [{"year": 2024, "wages": 10 ** 400}])
+        self._refused("transcript", [{"year": 2024, "wages": 10 ** 400}])
 
     def test_an_infinite_year_is_refused(self):
-        self._refused("irs", [{"year": float("inf"), "agi": 1.0}])
+        self._refused("transcript", [{"year": float("inf"), "agi": 1.0}])
 
     def test_an_object_employer_is_refused(self):
         self._refused("w2", [{"year": 2024, "employer": {"x": 1},
@@ -624,7 +626,7 @@ class CommitRefusesOutOfRangeInputTests(unittest.TestCase):
                               "boxes": {"1": 10.0}}])
 
     def test_rows_that_are_not_a_list_are_refused(self):
-        token = self._staged("irs")
+        token = self._staged("transcript")
         with self.assertRaises(ValueError):
             taxdocs.commit(self.conn, token, 5)
 

@@ -312,7 +312,8 @@ class HistoryRouteTests(unittest.TestCase):
         the model are one read: an owner turn committed between them must
         not reach the model. The turn is written right after the first
         statement of the follow-up that reads the thread."""
-        from oikonome.web import api as api_mod
+        # the module whose handlers look `_conn` up (the assistant routes)
+        from oikonome.web import api_assistant as api_mod
         self.addCleanup(self.owner.delete, "/api/assistant/history")
         viewer = self._claim("viewer")
         r = self._ask(viewer, "viewer-race-q", "viewer-race-a")
@@ -320,6 +321,7 @@ class HistoryRouteTests(unittest.TestCase):
         thread = viewer.get("/api/assistant/history").json()["turns"][0][
             "thread_id"]
         real_conn = api_mod._conn
+        fired = []
 
         class _Racing:
             def __init__(self, conn):
@@ -332,6 +334,7 @@ class HistoryRouteTests(unittest.TestCase):
                 cur = self._c.execute(sql, *a, **k)
                 if not self._fired and "assistant_turns" in str(sql):
                     self._fired = True
+                    fired.append(True)
                     self._c.execute(
                         "INSERT INTO assistant_turns (id, thread_id, "
                         "asked_by_id, asked_by, question, answer, blocks, "
@@ -343,6 +346,8 @@ class HistoryRouteTests(unittest.TestCase):
         with mock.patch.object(api_mod, "_conn",
                                lambda user: _Racing(real_conn(user))):
             r, sent = self._follow_up(viewer, thread, "and then?")
+        # a patch that missed the handler would pass without any race
+        self.assertTrue(fired, "the racing connection was never used")
         self.assertNotIn("owner-race-q", sent)
         self.assertNotIn("owner-race-a", sent)
 

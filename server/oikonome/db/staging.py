@@ -37,10 +37,13 @@ def put(conn, kind: str, files: list[tuple[str, bytes]] | None = None,
     # before either writes, and both fit under a budget only one of them
     # actually leaves room for — the exact "park gigabytes on a shared
     # node" the budget exists to stop, just needing parallel requests.
+    # The lock is the household's file-storage lock, not one of its own:
+    # every staged byte is a stored byte too, and a second byte lock would
+    # be one more lock to order against the pairing lock an import parking
+    # its upload already holds (storage_quota.hold_lock has the order).
+    from ..engine import storage_quota
     with conn.transaction():
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtext("
-            "'oikonome:staging:' || current_setting('app.tenant_id')))")
+        storage_quota.hold_lock(conn)
         # A folder import moves its bytes out of the stage into its job
         # (bulk_import_files) and keeps them until each file has run; they
         # count here too, or moving an upload into a job would free its
@@ -60,7 +63,6 @@ def put(conn, kind: str, files: list[tuple[str, bytes]] | None = None,
                 f"smaller batches")
         # and the household's file-storage quota, which every kept upload
         # (receipts above all) shares with the stage
-        from ..engine import storage_quota
         storage_quota.reserve(conn, incoming)
         for i, (name, data) in enumerate(files):
             conn.execute(

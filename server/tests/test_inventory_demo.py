@@ -109,6 +109,13 @@ DEMO_GUARDED = {
     "POST /api/import/rollback",
     "POST /api/import/taxdoc/analyze",
     "POST /api/import/taxdoc/commit",
+    "DELETE /api/import/taxdoc/w2s/{doc_id}",
+    "POST /api/import/taxdoc/w2s/{doc_id}/owner",
+    # a stranger on the shared demo must not take the household's
+    # stored documents away (or put them back)
+    "DELETE /api/import/taxdoc/stored/{upload_id}",
+    "POST /api/import/taxdoc/stored/{upload_id}/restore",
+    "POST /api/import/taxdoc/stored/{upload_id}/payer",
     "POST /api/invites",
     "POST /api/jobs/email",
     "POST /api/jobs/sync",
@@ -183,6 +190,12 @@ def guards_demo(route) -> bool:
     """
     src = handler_source(route)
     if "demoguard.deny" in src:
+        # an async door hands the refusal to the threadpool: the hand-off
+        # must be awaited, or the coroutine is never run and the door opens
+        if inspect.iscoroutinefunction(route.endpoint):
+            handed = re.findall(r"(\bawait\s+)?run_in_threadpool\(\s*demoguard\.deny", src)
+            if handed and any(not aw for aw in handed):
+                return False
         return True
     module = sys.modules.get(route.endpoint.__module__)
     if module is None:

@@ -48,12 +48,16 @@ class EstimatedTaxNoteTests(unittest.TestCase):
                 dt.date(2026, 2, 1))
             self.assertNotIn("nominated", rows[0]["note"], repr(empty))
 
-    def test_the_row_still_needs_an_opted_in_rate(self):
-        """The whole obligation only appears once the entity has set an
-        assumed rate — the nomination must not smuggle it in."""
-        rows = compliance._estimated_tax(
+    def test_the_federal_estimate_is_a_date_whether_or_not_a_rate_is_set(self):
+        """The quarterly estimate is a federal date every business sees
+        beside the state ones; a nomination only adds where it is paid
+        from, it never decides whether the date appears."""
+        bare = compliance._estimated_tax({}, dt.date(2026, 2, 1))
+        nominated = compliance._estimated_tax(
             {"tax_reserve_account_id": "acct-1"}, dt.date(2026, 2, 1))
-        self.assertEqual(rows, [])
+        self.assertEqual(len(bare), 1)
+        self.assertEqual([r["due"] for r in bare],
+                         [r["due"] for r in nominated])
 
 
 class UnknownSettingsSectionTests(unittest.TestCase):
@@ -68,7 +72,8 @@ class UnknownSettingsSectionTests(unittest.TestCase):
 
     def test_the_branch_exists_and_is_rendered(self):
         self.assertIn("const missingSec =", self.src)
-        self.assertIn("{missingSec && (", self.src)
+        self.assertIn("const missingNote = missingSec && (", self.src)
+        self.assertIn("{missingNote}", self.src)
 
     def test_an_old_deep_link_still_redirects_rather_than_erroring(self):
         """OLD_SEC exists so links minted in old emails still land
@@ -77,7 +82,7 @@ class UnknownSettingsSectionTests(unittest.TestCase):
         self.assertIn("!OLD_SEC[secParam]", self.src[i:i + 220])
 
     def test_it_names_which_setup_the_section_belongs_to(self):
-        i = self.src.index("{missingSec && (")
+        i = self.src.index("const missingNote = missingSec && (")
         self.assertIn("self-hosted", self.src[i:i + 500])
         self.assertIn("hosted", self.src[i:i + 500])
 

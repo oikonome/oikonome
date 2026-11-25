@@ -374,7 +374,7 @@ class WizardGateWiringTests(unittest.TestCase):
     def test_step_two_waits_for_the_backfill(self):
         w = self._src("pages/Welcome.tsx")
         # the auto pane carries the scan; it must not mount until the gate opens
-        self.assertIn("<BackfillGate><AutoBillsPane /></BackfillGate>", w,
+        self.assertIn("<BackfillGate><AutoBillsPane scan={scanAsk} /></BackfillGate>", w,
                       "detection must not mount until the gate opens")
         self.assertIn("onboardingBackfill", w)
 
@@ -424,9 +424,10 @@ class WizardGateWiringTests(unittest.TestCase):
                       re.S)
         self.assertIsNotNone(m, "the auto-scan guard is gone")
         self.assertIn("q.isSuccess", m.group(1))
-        # the wizard's own auto pane runs the same scan under the same guard
+        # the wizard's own auto pane runs an asked-for scan under the same
+        # guard
         wb = self._src("components/WizardBills.tsx")
-        self.assertRegex(wb, r"if \(q\.isSuccess && !ran\.current\)")
+        self.assertRegex(wb, r"if \(q\.isSuccess && scan > ran\.current\)")
 
     def test_gate_keeps_nudging_while_it_waits(self):
         # one nudge on mount is not enough: the link-time pull is still

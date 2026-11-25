@@ -8,7 +8,7 @@
 // one-liners for that; mirrors webapp/src/api/cache.ts.
 import type { QueryClient, QueryKey } from "@tanstack/react-query";
 import type { Client, SettingsView } from "./api";
-import { smsPauseSentence } from "./pure";
+import { saveWholeLists, SettingsMovedError, smsPauseSentence } from "./pure";
 
 /** Shallow-merge `partial` into a cached object (no-op if nothing cached). */
 export function patchQuery<T extends object>(
@@ -84,19 +84,32 @@ export function invalidateAiRoute(qc: QueryClient): void {
 const movesAiRoute = (body: Record<string, unknown>): boolean =>
   Object.keys(body).some((k) => k.startsWith("llm_"));
 
+/** `basis` is the settings view the body was built from — the fresh read
+ *  a list editor merged onto; left out, the cached view. A body carrying
+ *  a whole-list setting names that view's list versions, so a list
+ *  another device saved since is re-merged rather than erased
+ *  (pure saveWholeLists). Mirrors the web's. */
 export function saveSettings(
   qc: QueryClient, client: Client, body: Record<string, unknown>,
+  basis?: SettingsView | null,
 ): Promise<SettingsView> {
+  // the view this edit was made against, taken before anything can move it
+  const was = basis ?? qc.getQueryData<SettingsView>(["settings"]);
   // a read already in flight answers from before the write; cancelled
   // before the save is sent, it cannot land after the saved copy and put
   // old values back, and a read another change starts later still lands
   return qc.cancelQueries({ queryKey: ["settings"] })
-    .then(() => client.settingsSave(body))
+    .then(() => saveWholeLists(body, was, client.settingsSave,
+                               client.settingsFull))
     .then((v) => {
+      // the reply's list_versions ride along: the next save is based on it
       seedSettings(qc, v);
       if (movesAiRoute(body)) invalidateAiRoute(qc);
       return v;
     }, (e) => {
+      // moved twice: what is stored now goes on screen at once
+      if (e instanceof SettingsMovedError && e.latest)
+        seedSettings(qc, e.latest as SettingsView);
       // the cancelled read must still happen when the save does not
       void qc.invalidateQueries({ queryKey: ["settings"] });
       throw e;

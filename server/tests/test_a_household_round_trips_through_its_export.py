@@ -37,8 +37,9 @@ IMAGE = b"\x89PNG\r\n\x1a\n" + b"invented receipt bytes"
 # members a row count cannot be compared on: the settings document (one
 # row, merged over the destination's), the control-plane recipients
 # (written over the admin connection, tested on their own), and the name
-# bills had before they were bills
-NOT_ROWS = {"tenant_settings", "recipient_invites", "recurring"}
+# bills and their offers had before they were bills
+NOT_ROWS = {"tenant_settings", "recipient_invites", "recurring",
+            "recurring_proposals"}
 
 
 def fill_every_table(conn) -> None:
@@ -138,13 +139,24 @@ def fill_every_table(conn) -> None:
       " VALUES ('2026-06', 5000, 'manual')")
     x("INSERT INTO networth_snapshot (date, total) VALUES (%s, 5000)",
       (TODAY,))
+    x("""INSERT INTO forecast_nights (as_of, model, checking_id,
+             start_checking, fresh, walks, pace, inputs)
+         VALUES (%s, 'w3', 'chk', 4100, true, %s, %s, %s)""",
+      (TODAY, jsonb({"usual": {"at": [410000, 395000, 380000, 371000,
+                                      362000], "min": 350000}}),
+       jsonb({"daily": 61.5}), jsonb({"events": []})))
     x("""INSERT INTO budget_snapshots (year, month, config, source)
          VALUES (2026, 6, %s, 'close')""", (jsonb({"food_monthly": 900, "other_monthly": 700}),))
     x("INSERT INTO income_annual (year, total_income, joint)"
       " VALUES (2025, 60000, 0)")
+    x("""INSERT INTO income_uploads (id, kind, filename)
+         VALUES (1, 'transcript', 'invented-transcript.pdf'),
+                (2, 'w2', 'invented-w2.pdf')""")
+    x("""INSERT INTO income_upload_values (upload_id, year, fields)
+         VALUES (1, 2025, '{"total_income": 60000}')""")
     x("""INSERT INTO income_documents (id, year, form, owner, payer,
-                                       primary_amount)
-         VALUES (1, 2025, 'W-2', 'primary', 'Invented Employer', 60000)""")
+                                       primary_amount, upload_id)
+         VALUES (1, 2025, 'W-2', 'primary', 'Invented Employer', 60000, 2)""")
     x("""INSERT INTO merchant_canonical (raw_merchant, canonical, method)
          VALUES ('INVENTED GROCER #12', 'Invented Grocer', 'manual')""")
     x("""INSERT INTO merchant_renames (raw_merchant, from_canonical,

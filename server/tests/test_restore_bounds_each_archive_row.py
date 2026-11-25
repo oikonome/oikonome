@@ -16,7 +16,7 @@ parsed. An ordinary archive, receipt photos included, still restores.
 """
 
 import io
-import time
+import os
 import tracemalloc
 import unittest
 import zipfile
@@ -24,6 +24,15 @@ import zipfile
 from oikonome.sync import restore
 
 from .util import make_db, write_config
+
+
+def cpu_seconds() -> float:
+    """CPU this process and its reaped children have spent. A bound on the
+    work a refusal costs is a bound on CPU, not on the wall clock: on a
+    loaded host the same work takes several times as long to finish, and
+    a wall-clock bound measures the machine instead of the code."""
+    t = os.times()
+    return t.user + t.system + t.children_user + t.children_system
 
 
 def _zip(files: dict[str, str]) -> zipfile.ZipFile:
@@ -47,13 +56,13 @@ class ArchiveRowBoundTests(unittest.TestCase):
                          under=128 * 1024 * 1024):
         tracemalloc.start()
         try:
-            t0 = time.monotonic()
+            t0 = cpu_seconds()
             with self.assertRaises(ValueError) as e:
                 _read(z, name)
             peak = tracemalloc.get_traced_memory()[1]
         finally:
             tracemalloc.stop()
-        self.assertLess(time.monotonic() - t0, 5)
+        self.assertLess(cpu_seconds() - t0, 5)
         self.assertLess(peak, under, f"peak {peak:,} bytes")
         self.assertIn(name, str(e.exception))
         return str(e.exception)

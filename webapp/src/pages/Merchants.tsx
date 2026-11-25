@@ -16,14 +16,18 @@
 // typo cannot fork a merchant. The proposer's offers are a queue above the
 // list ("Needs a look"), one line each, the evidence behind a click.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router";
 import { api, errText, mmdd, money as money$, catLabel } from "../api/client";
 import type { MerchantDetail, MergeProposal, MergeSideFacts } from "../api/client";
 import { removeFromList } from "../api/cache";
 import { canEdit } from "../role";
-import { localYmd } from "../moneymath";
+import { EMPTY_LINES, failureStatus } from "../moneymath";
 import MerchantAvatar from "../components/MerchantAvatar";
+import { useDialog } from "../components/useDialog";
+import { FailedLine, StaleLine } from "../components/Loaded";
+import SegmentedControl from "../components/SegmentedControl";
+import { ShowAllButton, useShowMore } from "../components/ShowMore";
 const money = (v: number | null | undefined) => money$(v, false);
 
 // the server caps the catalog at its 200 most frequent merchants;
@@ -43,8 +47,8 @@ const variantCount = (m: { variants: string[]; variant_count?: number }) =>
 type Catalog = Awaited<ReturnType<typeof api.merchantCatalog>>;
 type Row = Catalog["merchants"][number];
 
-// the server orders by count or name; the two spend/recency orders are
-// cut from the loaded page here
+// the orders the server sorts by (count and name through `order`, spend
+// and recency through `sort`)
 export const ORDERS = [
   ["count", "most frequent"], ["alpha", "a → z"],
   ["spend", "biggest spend"], ["recent", "recently seen"],
@@ -59,13 +63,12 @@ export const FILTERS = [
   ["all", "all"], ["oneoff", "one-off"], ["unnamed", "unnamed"], ["month", "seen this month"],
 ] as const;
 type Filter = typeof FILTERS[number][0];
-// a name the aggregator never resolved: digits run, a terminal's * or #,
-// or an all-caps string that no one would call a name
-export const looksUnnamed = (name: string) =>
-  /\d{3,}|[*#]/.test(name) || (/[A-Z]{4,}/.test(name) && name === name.toUpperCase());
 
 const toast = (msg: string) =>
   window.dispatchEvent(new CustomEvent("oiko-toast", { detail: msg }));
+
+// merchants the catalog shows before "Show all"
+const MERCHANTS_SHORT = 25;
 
 export default function Merchants({ embedded = false }:
                                   { embedded?: boolean } = {}) {
@@ -145,8 +148,9 @@ export default function Merchants({ embedded = false }:
     onError: (e) => toast(`Couldn't undo — ${errText(e)}`),
   });
   const decide = useMutation({
-    mutationFn: ({ pid, action }: { pid: string; action: "approve" | "reject" }) =>
-      api.merchantMerge(pid, action),
+    mutationFn: ({ pid, action, into_id }:
+        { pid: string; action: "approve" | "reject"; into_id: string }) =>
+      api.merchantMerge(pid, action, into_id),
     onSuccess: (_r, v) => {
       removeFromList<Catalog, MergeProposal>(qc, key, "merges", (x) => x.id === v.pid);
       // a merge moved rows and wrote a journal entry the page shows
@@ -162,38 +166,46 @@ export default function Merchants({ embedded = false }:
       qc.invalidateQueries({ queryKey: ["today"] });
       toast(v.action === "approve" ? "Merged." : "Kept apart.");
     },
-    onError: (e) => toast(`Couldn't decide — ${errText(e)}`),
+    onError: (e) => {
+      // a sync turned the offer since it was listed: nothing merged, and
+      // the list comes back with the offer as it now stands
+      if (failureStatus(e) === 409) {
+        qc.invalidateQueries({ queryKey: ["merchants"] });
+        toast("This suggestion changed — showing it again.");
+        return;
+      }
+      toast(`Couldn't decide — ${errText(e)}`);
+    },
   });
   // "merge all" walks the queue one decision at a time: each is its own
-  // journal entry, so a wrong one is undone alone
+  // journal entry, so a wrong one is undone alone. An earlier approve can
+  // settle a later offer or re-point it into a pair that only shares a
+  // word; the server answers that 409 and the batch skips it, leaving it
+  // for the refetched list to show on its own.
   const decideAll = useMutation({
-    mutationFn: async (pids: string[]) => {
-      let n = 0;
-      for (const pid of pids) { await api.merchantMerge(pid, "approve"); n += 1; }
-      return n;
+    mutationFn: async (offers: { id: string; into_id: string }[]) => {
+      let n = 0, skipped = 0;
+      for (const o of offers) {
+        try { await api.merchantMerge(o.id, "approve", o.into_id, true); n += 1; }
+        catch (e) {
+          if (failureStatus(e) !== 409) throw e;
+          skipped += 1;
+        }
+      }
+      return { n, skipped };
     },
-    onSuccess: (n) => done(`Merged ${n} pair${n === 1 ? "" : "s"}.`),
+    onSuccess: ({ n, skipped }) => done(`Merged ${n} pair${n === 1 ? "" : "s"}.`
+      + (skipped ? ` ${skipped} changed on the way — check ${skipped === 1 ? "it" : "them"} below.` : "")),
     onError: (e) => { done(`Stopped — ${errText(e)}`); },
   });
 
-  // the server owns count/alpha; spend and recency are cut here, and the
-  // filters too. Memoised: the page re-renders on every keystroke and
-  // re-sorting up to five hundred rows each time is work it does not need.
-  const rows = useMemo(() => {
-    let r = list.data?.merchants ?? [];
-    if (flt === "oneoff") r = r.filter((m) => m.rows === 1);
-    else if (flt === "unnamed") r = r.filter((m) => looksUnnamed(m.display));
-    else if (flt === "month") {
-      // the local month: the UTC one is already next month on the
-      // evening of the last day west of Greenwich, and "this month" empties
-      const m0 = localYmd(new Date()).slice(0, 7);
-      r = r.filter((m) => (m.last ?? "").slice(0, 7) >= m0);
-    }
-    if (order === "alpha") r = [...r].sort((a, b) => a.display.localeCompare(b.display));
-    else if (order === "spend") r = [...r].sort((a, b) => b.total - a.total);
-    else if (order === "recent") r = [...r].sort((a, b) => (b.last ?? "").localeCompare(a.last ?? ""));
-    return r;
-  }, [list.data, order, flt]);
+  // the server filters and sorts — "seen this month" by the household's
+  // own month, "unnamed" by its own test — and the list is printed in the
+  // order it came (the phone does the same)
+  const rows = list.data?.merchants ?? [];
+  // the catalog opens on its first few; the rest is one tap away (a
+  // search narrows the list itself, and every hit stays within reach)
+  const more = useShowMore(rows, MERCHANTS_SHORT);
   const recent = list.data?.recent ?? [];
   const merges = list.data?.merges ?? [];
   const openRow = rows.find((m) => m.display === open)
@@ -229,25 +241,26 @@ export default function Merchants({ embedded = false }:
                   onChange={(e) => setOrder(e.target.value as Order)}>
             {ORDERS.map(([v, label]) => <option key={v} value={v}>{label}</option>)}
           </select>
-          <div style={{ display: "flex", gap: ".35rem", flexWrap: "wrap" }}>
-            {FILTERS.map(([v, label]) => (
-              <button key={v} type="button" className={"chip" + (flt === v ? " on" : "")}
-                      onClick={() => setFlt(v)}>{label}</button>
-            ))}
-          </div>
+          <SegmentedControl label="Show" size="sm" value={flt} onChange={setFlt}
+            options={FILTERS.map(([v, label]) => ({
+              value: v, label: label[0].toUpperCase() + label.slice(1) }))} />
         </div>
       </div>
 
       {merges.length > 0 && (
         <NeedsALook merges={merges} mayEdit={mayEdit} demo={demo}
                     busy={decide.isPending || decideAll.isPending}
-                    onDecide={(pid, action) => decide.mutate({ pid, action })}
-                    onMergeAll={() => decideAll.mutate(merges.map((p) => p.id))}
+                    onDecide={(pid, action) => decide.mutate({
+                      pid, action,
+                      into_id: merges.find((p) => p.id === pid)?.into_id ?? "" })}
+                    onMergeAll={() => decideAll.mutate(
+                      merges.filter((p) => p.bulk)
+                        .map((p) => ({ id: p.id, into_id: p.into_id })))}
                     onOpen={setOpen} />
       )}
 
       {recent.length > 0 && (
-        <details className="card fold">
+        <details className="card disclosure">
           <summary>
             <b style={{ fontSize: 13 }}>Recent changes</b>
             <span className="mut" style={{ fontSize: 12, marginLeft: 8 }}>
@@ -260,11 +273,12 @@ export default function Merchants({ embedded = false }:
                   <td className="mut" style={{ width: "1%", whiteSpace: "nowrap" }}>
                     {mmdd(r.at)}</td>
                   <td>
-                    <span className="mut">{r.raw_merchant}</span>
-                    {" → "}<b>{r.to_canonical}</b>
-                    {r.from_canonical && (
+                    {/* the change in the server's words; the bank line
+                        only when it is neither name */}
+                    <b>{r.label}</b>
+                    {r.line && (
                       <span className="mut" style={{ fontSize: 12 }}>
-                        {" "}(was {r.from_canonical})</span>
+                        {" "}· {r.line}</span>
                     )}
                   </td>
                   <td style={{ width: "1%" }}>
@@ -282,13 +296,15 @@ export default function Merchants({ embedded = false }:
 
       <div className="card">
         {list.isPending && <p className="mut">loading…</p>}
-        {list.isError && (
-          <div className="note bad">Couldn't load: {String(list.error)}</div>
+        <StaleLine query={list} />
+        {list.data === undefined && list.isError && (
+          <FailedLine q={list} what="merchants" />)}
+        {/* "no match" only from a list that answered */}
+        {rows.length === 0 && list.data !== undefined && (
+          <p className="sub">{q || flt !== "all" ? EMPTY_LINES.filtered
+                                                 : EMPTY_LINES.merchants}</p>
         )}
-        {rows.length === 0 && !list.isPending && (
-          <p className="sub">No merchants match that.</p>
-        )}
-        {rows.map((m) => (
+        {(q ? rows : more.shown).map((m) => (
           <div key={m.display} role="button" tabIndex={0}
                className={"mrow" + (open === m.display ? " on" : "")}
                onClick={() => setOpen(open === m.display ? null : m.display)}
@@ -309,7 +325,8 @@ export default function Merchants({ embedded = false }:
                 )}
               </div>
               <div className="sb">
-                {m.rows} row{m.rows === 1 ? "" : "s"} · {money(m.total)} ·{" "}
+                {/* the total with its direction, in the server's words */}
+                {m.rows.toLocaleString()} row{m.rows === 1 ? "" : "s"} · {m.total_label} ·{" "}
                 {mmdd(m.first)} – {mmdd(m.last)}
                 {variantCount(m) > 1 && ` · ${variantCount(m)} source names`}
                 {(m.business_rows ?? 0) > 0 &&
@@ -319,10 +336,11 @@ export default function Merchants({ embedded = false }:
             <span className="mut" aria-hidden="true">›</span>
           </div>
         ))}
+        {!q && <ShowAllButton {...more} noun="merchants" />}
         {/* capped is judged on what the server sent, before the filter:
             a filter over a capped window can come back short or empty
             while the merchants it wants sit past the cap */}
-        {(list.data?.merchants.length ?? 0) >= limit && !q && (
+        {(list.data?.merchants.length ?? 0) >= limit && !q && more.all && (
           <p className="sub" style={{ marginTop: ".6rem" }}>
             Showing the {limit} most frequent — search to find any merchant.
           </p>
@@ -350,8 +368,12 @@ function NeedsALook({ merges, mayEdit, demo, busy, onDecide, onMergeAll, onOpen 
 }) {
   const [why, setWhy] = useState<string | null>(null);
   const n = merges.length;
+  // "Merge all" covers only the offers where one name is the other cut
+  // short (the server's `bulk`); two names that merely share a word are
+  // merged one at a time
+  const nBulk = merges.filter((p) => p.bulk).length;
   return (
-    <details className="card fold" open>
+    <details className="card disclosure" open>
       <summary>
         <b style={{ fontSize: 13 }}>Needs a look</b>
         <span className="mut" style={{ fontSize: 12, marginLeft: 8 }}>
@@ -362,8 +384,10 @@ function NeedsALook({ merges, mayEdit, demo, busy, onDecide, onMergeAll, onOpen 
         <span style={{ flex: 1 }}>
           Merge joins them (undo under Recent changes); Not the same keeps
           them apart for good. Nothing is merged unless you say so.</span>
-        {mayEdit && n > 1 && (
-          <button disabled={demo || busy} onClick={onMergeAll}>Merge all {n}</button>
+        {mayEdit && nBulk > 1 && (
+          <button disabled={demo || busy} onClick={onMergeAll}
+                  title="the offers where one name is the other cut short">
+            Merge all {nBulk} cut-off names</button>
         )}
       </div>
       {merges.map((p) => (
@@ -379,6 +403,8 @@ function NeedsALook({ merges, mayEdit, demo, busy, onDecide, onMergeAll, onOpen 
               <span className="mut" style={{ fontSize: 12 }}> · {p.into_facts?.rows ?? p.into_rows ?? "?"}</span>
             </div>
             <div className="sb">
+              {p.caution && (
+                <span style={{ color: "var(--amber)" }}>{p.caution} · </span>)}
               {p.signals[0]}
               {" "}<button type="button" className="linkish"
                            onClick={() => setWhy(why === p.id ? null : p.id)}>
@@ -438,7 +464,7 @@ function OfferSide({ tag, tone, name, facts, samples, onOpen }: {
       {facts ? (
         <>
           <div className="sb">
-            {facts.rows} row{facts.rows === 1 ? "" : "s"} · {money(facts.total)} ·{" "}
+            {facts.rows.toLocaleString()} row{facts.rows === 1 ? "" : "s"} · {money(facts.total)} ·{" "}
             {facts.first === facts.last
               ? mmdd(facts.first) : `${mmdd(facts.first)} – ${mmdd(facts.last)}`}
           </div>
@@ -472,26 +498,26 @@ function OfferSide({ tag, tone, name, facts, samples, onOpen }: {
 }
 
 /** What approving makes: one merchant under the surviving name, holding
- *  both sides' rows. The sums are the two boxes beside it, added. */
+ *  both sides' rows. The figures are the server's (`merged`): it adds the
+ *  two boxes beside it and signs the change, so nothing is summed here
+ *  (the phone prints the same). */
 function OfferMerged({ p }: { p: MergeProposal }) {
-  const f = p.from_facts, i = p.into_facts;
-  const dates = [f?.first, f?.last, i?.first, i?.last].filter(Boolean).sort() as string[];
+  const m = p.merged, i = p.into_facts;
   return (
     <div className="offer-box merged">
       <div className="offer-tag">After merge</div>
       <div className="nm">
         <MerchantAvatar name={p.into} logo={p.into_logo} size={18} /> {p.into}
       </div>
-      {f && i && (
+      {m && (
         <>
           <div className="sb">
-            {f.rows + i.rows} rows <span className="delta">+{f.rows}</span> ·{" "}
-            {money(f.total + i.total)} <span className="delta">
-              {f.total >= 0 ? "+" : ""}{money(f.total)}</span>
+            {m.rows.toLocaleString()} rows <span className="delta">{m.rows_delta}</span> ·{" "}
+            {money(m.total)} <span className="delta">{m.total_delta}</span>
           </div>
           <div className="sb">
-            {mmdd(dates[0])} – {mmdd(dates[dates.length - 1])}
-            {i.category && ` · ${catLabel(i.category)}`}
+            {m.first && m.last && `${mmdd(m.first)} – ${mmdd(m.last)}`}
+            {i?.category && ` · ${catLabel(i.category)}`}
           </div>
         </>
       )}
@@ -516,11 +542,11 @@ function MerchantPanel({ display, row, mayEdit, demo, busy, onClose, onRename }:
   const [draft, setDraft] = useState(display);
   const [pick, setPick] = useState("");
   useEffect(() => { setMode("view"); setDraft(display); setPick(""); }, [display]);
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  // Focus moves into the panel and stays there until Escape or × closes
+  // it, then returns to the merchant that opened it. Not modal: the list
+  // beside it still takes a click, which opens another merchant here.
+  const panel = useRef<HTMLElement | null>(null);
+  useDialog(panel, { onClose });
   const d = useQuery({ queryKey: ["merchant-detail", display],
                        queryFn: () => api.merchantDetail(display) });
   // the merge picker searches the catalog itself, so the target is always
@@ -551,11 +577,12 @@ function MerchantPanel({ display, row, mayEdit, demo, busy, onClose, onRename }:
       .filter(Boolean).join(" · ");
   const txnHref = "/transactions?" + new URLSearchParams({ q: display });
   const rows = m?.rows ?? row?.rows;
-  const total = m?.total ?? row?.total;
+  const totalLabel = m?.total_label ?? row?.total_label;
   const first = m?.first ?? row?.first;
   const last = m?.last ?? row?.last;
   return (
-    <aside className="side-panel" aria-label={`${display} details`}>
+    <aside className="side-panel" role="dialog" aria-label={`${display} details`}
+           ref={panel} tabIndex={-1}>
       <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
         <MerchantAvatar name={display} logo={m?.logo ?? row?.logo} size={40} />
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -563,7 +590,7 @@ function MerchantPanel({ display, row, mayEdit, demo, busy, onClose, onRename }:
           <div className="mut" style={{ fontSize: 12 }}>
             {m?.parent && <>outlet of {m.parent} · </>}
             {m?.kind && m.kind !== "merchant" && <>{catLabel(m.kind)} · </>}
-            {rows != null && <>{rows} row{rows === 1 ? "" : "s"} · {money(total)}</>}
+            {rows != null && <>{rows.toLocaleString()} row{rows === 1 ? "" : "s"} · {totalLabel}</>}
             {first && last && <> · {mmdd(first)} – {mmdd(last)}</>}
           </div>
         </div>
@@ -617,7 +644,10 @@ function MerchantPanel({ display, row, mayEdit, demo, busy, onClose, onRename }:
                     <span className="mut" style={{ fontSize: 11 }}> · {o.rows}</span>
                   </button>
                 ))}
-                {pickQ && !cands.isPending && options.length === 0 && (
+                {/* "no match" only from a search that answered */}
+                {pickQ && cands.isError && (
+                  <FailedLine q={cands} what="the merchants" />)}
+                {pickQ && cands.isSuccess && options.length === 0 && (
                   <span className="sub">No merchant matches that.</span>
                 )}
               </div>
@@ -627,8 +657,7 @@ function MerchantPanel({ display, row, mayEdit, demo, busy, onClose, onRename }:
       )}
 
       {d.isPending && <div className="sub" style={{ marginTop: "1rem" }}>loading…</div>}
-      {d.isError && <div className="note bad" style={{ marginTop: "1rem" }}>
-        Couldn't load: {String(d.error)}</div>}
+      {d.isError && <FailedLine q={d} what="this merchant" />}
       {m && (
         <div className="txn-detail" style={{ marginTop: "1rem" }}>
           <div className="mut" style={{ fontSize: 11, textTransform: "uppercase" }}>About</div>
@@ -640,9 +669,9 @@ function MerchantPanel({ display, row, mayEdit, demo, busy, onClose, onRename }:
             {m.mcc && <><dt>merchant code</dt><dd>MCC {m.mcc}</dd></>}
             <dt>category</dt><dd>
               {m.category ? catLabel(m.category) : <span className="mut">—</span>}
-              {m.rule && <span className="mut" style={{ fontSize: 12 }}>
-                {" "}· {m.rule.source === "user" ? "your rule" : `${m.rule.source} rule`}
-                {" "}→ {catLabel(m.rule.category_primary)}</span>}
+              {/* what the rule does, in the server's words */}
+              {m.rule?.label && <span className="mut" style={{ fontSize: 12 }}>
+                {" "}· {m.rule.label}</span>}
             </dd>
             <dt>source names</dt><dd className="mut" style={{ fontSize: 12 }}>
               {m.variants.join(" · ")}</dd>

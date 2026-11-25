@@ -6,20 +6,11 @@ import { api, errText, mmdd, money, toast, type PendingReimb, type ReimbPair,
          type ReimbPairsPage } from "../api/client";
 import { patchList, patchQueries, removeFromList } from "../api/cache";
 import { canEdit } from "../role";
-import { pairGapHint, parseMoneyDraft, reimbCandidateWhy, reimbLeft, reimbNeed,
-         reimbOwed } from "../moneymath";
+import { EMPTY_LINES, failLine, parseMoneyDraft, reimbCandidateWhy } from "../moneymath";
+import EmptyState from "../components/EmptyState";
+import { FailedLine } from "../components/Loaded";
+import Note from "../components/Note";
 
-// How long this charge has been out of pocket. Stating it, rather than
-// leaving it to be worked out from the date column, turns a list into a
-// to-do.
-function waited(iso: string): number {
-  const d = new Date(iso + "T00:00:00");
-  return Math.max(0, Math.round((Date.now() - d.getTime()) / 86400000));
-}
-function waitedLabel(iso: string): string {
-  const n = waited(iso);
-  return n === 0 ? "today" : n === 1 ? "waiting 1 day" : `waiting ${n} days`;
-}
 
 export default function Reimburse() {
   const q = useQuery({ queryKey: ["reimb"], queryFn: api.reimbPending });
@@ -37,16 +28,17 @@ export default function Reimburse() {
   // a failed REFETCH keeps the data it had — only a first load that
   // failed has nothing to show
   if (q.isLoadingError)
-    return <div className="card">Couldn't load: {String(q.error)}</div>;
+    // the page keeps its title when its read fails, as every page does
+    return <><h1>Reimbursements</h1>
+      <div className="card"><FailedLine q={q} what="reimbursements" /></div></>;
 
   const pending = q.data.pending;
 
   // The page's own number. "How much am I owed?" is the reason this list
-  // exists, so the page states it rather than leaving it to be added up.
-  // Each charge counts what is still owed against its expected amount
-  // (reimbOwed), the same figure the Today strip and the email state.
-  const owed = reimbOwed(pending);
-  const oldest = pending.reduce((a, t) => Math.max(a, waited(t.date)), 0);
+  // exists, so the page states it rather than leaving it to be added up:
+  // the server's (alerts.reimb_owed), the same figure the Today strip and
+  // the email state.
+  const owed = q.data.owed;
 
   return (
     <>
@@ -57,9 +49,9 @@ export default function Reimburse() {
           <span style={{ fontSize: "1.7rem", fontWeight: 700 }}>{money(owed)}</span>
           <span className="sub">owed back across {pending.length} charge
             {pending.length === 1 ? "" : "s"}</span>
-          {oldest > 0 && <span className="sub">· oldest {waitedLabel(
-            pending.reduce((a, t) => waited(t.date) > waited(a.date) ? t : a,
-                           pending[0]).date)}</span>}
+          {/* how long the oldest has waited, in the household's days —
+              the server's words (no browser clock) */}
+          {q.data.oldest_label && <span className="sub">oldest {q.data.oldest_label}</span>}
           <Link className="btn" to="/transactions"
                 style={{ marginLeft: "auto" }}>‹ transactions</Link>
         </div>
@@ -70,9 +62,8 @@ export default function Reimburse() {
 
       {pending.length === 0 ? (
         <div className="card">
-          <p className="sub" style={{ margin: 0 }}>Nothing waiting — flag a
-            charge from the ⋯ menu on the Transactions page
-            (⚑ reimbursement expected later).</p>
+          <EmptyState title={EMPTY_LINES.reimburse}
+            to="/transactions" action={EMPTY_LINES.reimburseAction} />
         </div>
       ) : (
         <div className="card">
@@ -82,7 +73,7 @@ export default function Reimburse() {
                   <th className="num" style={{ width: "1%" }}>Amount</th>
                   <th>Merchant</th>
                   <th className="hide-m">Account</th>
-                  <th style={{ width: "1%" }}></th></tr>
+                  <th style={{ width: "1%" }}><span className="sr-only">Actions</span></th></tr>
             </thead>
             <tbody>
               {pending.map((t) => (
@@ -148,7 +139,10 @@ function MatchedPairs({ mayEdit, onNotice }: {
   });
   // nothing ever matched: no card. A search with no hits keeps the card
   // (and its search box) so the search can be changed.
-  if (!q.data || (pairs.length === 0 && !search && !typed)) return null;
+  // A failed read keeps the card, its search box and the failed line: gone,
+  // it read as nothing ever matched.
+  if (q.data === undefined && !q.isError) return null;
+  if (q.data && pairs.length === 0 && !search && !typed) return null;
   return (
     <div className="card">
       <div style={{ display: "flex", gap: ".5rem", alignItems: "center",
@@ -159,16 +153,20 @@ function MatchedPairs({ mayEdit, onNotice }: {
                style={{ marginLeft: "auto" }}
                onChange={(e) => setTyped(e.target.value)} />
       </div>
-      <div className="sub" style={{ marginTop: "-.4rem" }}>Each pair nets a
+      <div className="sub" style={{ marginTop: ".3rem" }}>Each pair nets a
         charge against the deposit that paid it back. Undo a wrong match and
         both sides count as real spending and income again.</div>
-      <table style={{ marginTop: ".5rem" }}>
+      {q.data === undefined && (
+        <FailedLine q={q} what="the matched pairs" />)}
+      {/* .pairs-table + c-*: one pair a two-line row at phone width */}
+      {q.data !== undefined && (
+      <table className="pairs-table" style={{ marginTop: ".5rem" }}>
         <thead>
           <tr><th style={{ width: "1%", whiteSpace: "nowrap" }}>Date</th>
               <th>Charge</th>
               <th>Paid back by</th>
               <th className="num hide-m">Amount</th>
-              <th style={{ width: "1%" }}></th></tr>
+              <th style={{ width: "1%" }}><span className="sr-only">Actions</span></th></tr>
         </thead>
         <tbody>
           {pairs.length === 0 && (
@@ -176,26 +174,29 @@ function MatchedPairs({ mayEdit, onNotice }: {
               “{search}”.</td></tr>)}
           {pairs.map((p) => (
             <tr key={p.expense_id + p.reimburse_id}>
-              <td className="mut" style={{ whiteSpace: "nowrap" }}>
+              <td className="mut c-date" style={{ whiteSpace: "nowrap" }}>
                 {mmdd(p.expense_date)}</td>
-              <td>{p.expense_payee}
+              <td className="c-chg">{p.expense_payee}
                 {!!p.partial && <span className="pill m"
-                  style={{ marginLeft: ".4rem" }}
-                  title={`partial — ${money(p.received ?? 0)} of this charge is netted`}>
-                  partial</span>}</td>
-              <td>{p.deposit_payee}
-                <span className="mut"> · {mmdd(p.deposit_date)}</span></td>
-              <td className="num hide-m">{money(Math.abs(
-                p.partial ? (p.received ?? 0) : p.expense_amount))}</td>
-              <td>{mayEdit && (
+                  style={{ marginLeft: ".4rem" }}>partial</span>}</td>
+              {/* the server says when a deposit came well before its
+                  charge ("9 days before the charge") */}
+              <td className="c-dep">{p.deposit_payee}
+                <span className="mut"> · {mmdd(p.deposit_date)}
+                  {p.deposit_note ? ` · ${p.deposit_note}` : ""}</span></td>
+              {/* the server's words for what the pair nets — a partial
+                  names the charge it came back of */}
+              <td className="num hide-m c-amt">{p.amount_label}</td>
+              <td className="c-act">{mayEdit && (
                 <button disabled={unlink.isPending}
                         title="unlink this pair — the charge returns to real spending, the deposit to real income"
-                        onClick={() => unlink.mutate(p)}>undo match</button>
+                        style={{ whiteSpace: "nowrap" }}
+                        onClick={() => unlink.mutate(p)}>Undo match</button>
               )}</td>
             </tr>
           ))}
         </tbody>
-      </table>
+      </table>)}
       {q.hasNextPage && (
         <button style={{ marginTop: ".5rem" }}
                 disabled={q.isFetchingNextPage}
@@ -203,8 +204,8 @@ function MatchedPairs({ mayEdit, onNotice }: {
           {q.isFetchingNextPage ? "loading…" : "show more"}</button>
       )}
       {q.isFetchNextPageError && (
-        <span className="note bad" style={{ marginLeft: ".5rem" }}>
-          Couldn't load more: {errText(q.error)}</span>
+        <Note as="span" tone="bad" style={{ marginLeft: ".5rem" }}>
+          {failLine(q.error, "more", "web").text}</Note>
       )}
     </div>
   );
@@ -233,6 +234,8 @@ function PendingRow({ t, mayEdit, open, onToggle, onDone }: {
                                             (x) => x.id === t.id);
       qc.invalidateQueries({ queryKey: ["txns"] });
       qc.invalidateQueries({ queryKey: ["today"] });
+      // the owed-back headline is the server's figure: fetch it again
+      qc.invalidateQueries({ queryKey: ["reimb"] });
       onDone(`Unflagged ${t.payee}.`);
     },
     // the button simply re-enabling would read as "nothing happened"
@@ -262,24 +265,28 @@ function PendingRow({ t, mayEdit, open, onToggle, onDone }: {
       setEditExp(false);
       // the Transactions page shows the partial marking on its rows
       qc.invalidateQueries({ queryKey: ["txns"] });
+      // the percent received and the owed-back headline are the server's
+      // figures, worked out from the amount just saved: fetch them again
+      qc.invalidateQueries({ queryKey: ["reimb"] });
     },
   });
 
   const got = t.received ?? 0;
   const expect = t.expected ?? Math.abs(t.amount);
-  const pct = expect > 0 ? Math.min(100, Math.round((got / expect) * 100)) : 0;
+  // how much has come back, the server's (alerts.reimb_received_pct)
+  const pct = t.received_pct;
 
   return (
     <>
       <tr>
         <td className="mut" style={{ whiteSpace: "nowrap" }}>{mmdd(t.date)}</td>
-        <td className="num" style={{ whiteSpace: "nowrap" }}>{money(-t.amount)}</td>
+        <td className="num" style={{ whiteSpace: "nowrap" }}>{money(-t.amount, true)}</td>
         <td>{t.payee}
           {t.pending ? <span className="pill m" style={{ marginLeft: 6 }}>pend</span> : null}
           {!!t.partial && (
             <span className="pill m" style={{ marginLeft: 6 }}>partial</span>)}
           {!t.partial && (
-            <span className="sub"> · {waitedLabel(t.date)}</span>)}
+            <span className="sub"> · {t.waited_label}</span>)}
           {!!t.partial && (
             <div className="sub" style={{ display: "flex", gap: ".5rem",
                 marginTop: ".2rem", alignItems: "center", flexWrap: "wrap" }}>
@@ -287,10 +294,11 @@ function PendingRow({ t, mayEdit, open, onToggle, onDone }: {
               <span className="minibar" style={{ width: "7rem" }}>
                 <i style={{ width: `${pct}%` }} /></span>
               {mayEdit && !editExp && (
-                <a href="#" onClick={(e) => { e.preventDefault(); setEditExp(true); }}
-                >edit expected</a>)}
+                <button type="button" className="as-link"
+                        onClick={(e) => { e.preventDefault(); setEditExp(true); }}
+                >edit expected</button>)}
               {mayEdit && editExp && (
-                <input inputMode="decimal" autoFocus size={7}
+                <input aria-label="Expected reimbursement" inputMode="decimal" autoFocus size={7}
                   defaultValue={t.expected ?? ""} placeholder="expect $"
                   style={{ fontSize: 12, padding: "0 .3rem", minHeight: 0 }}
                   onKeyDown={(e) => e.key === "Enter" &&
@@ -299,7 +307,7 @@ function PendingRow({ t, mayEdit, open, onToggle, onDone }: {
                     const v = parseMoneyDraft(e.target.value) ?? 0;
                     setPartial.mutate({ partial: true, expected: v > 0 ? v : null });
                   }} />)}
-              <span>· {waitedLabel(t.date)}</span>
+              <span>· {t.waited_label}</span>
             </div>)}
         </td>
         <td className="mut hide-m" style={{ whiteSpace: "nowrap", maxWidth: "15rem",
@@ -351,12 +359,10 @@ function Matcher({ anchor, onDone }: {
     queryKey: ["reimb-cand", anchor.id, search],
     queryFn: () => api.reimbCandidates(anchor.id, search),
   });
-  // Ticked deposits by id, with their amounts. A filter change swaps the
-  // visible list but not the selection, so the running total and the
-  // count come from here — summing only the visible rows left a ticked
-  // deposit the filter now hides out of "selected $X", while the button
-  // still linked it.
-  const [picked, setPicked] = useState<Map<string, number>>(new Map());
+  // Ticked deposits by id. A filter change swaps the visible list but not
+  // the selection, so the count and the server's line are of every ticked
+  // row — a ticked deposit the filter now hides is still linked by Pair.
+  const [picked, setPicked] = useState<Set<string>>(new Set());
   // a partial match nets only the received amount off the charge;
   // the remainder stays real spend. Defaults from the flag's own marking.
   const [partial, setPartial] = useState(!!anchor.partial);
@@ -397,23 +403,35 @@ function Matcher({ anchor, onDone }: {
     onError: (e) => setLinkErr(errText(e)),
   });
 
-  // each ticked row counts what it has LEFT to give (reimbLeft), the
-  // figure the server links by
-  const toggle = (c: { id: string; amount: number;
-                       left_amount?: number | null }) => {
-    const n = new Map(picked);
-    if (n.has(c.id)) n.delete(c.id); else n.set(c.id, reimbLeft(c));
+  const toggle = (c: { id: string }) => {
+    const n = new Set(picked);
+    if (n.has(c.id)) n.delete(c.id); else n.add(c.id);
     setPicked(n);
   };
+  // "selected $X of $Y — …" is the server's: the link rule run on the
+  // ticked rows and undone, so it says what Pair will really do. Asked
+  // once the ticking pauses: each ask runs the link under the household's
+  // pairing lock, so a burst of ticks is one request, not one per tick.
+  const [settled, setPickedSettled] = useState<Set<string>>(picked);
+  useEffect(() => {
+    const id = setTimeout(() => setPickedSettled(picked), 300);
+    return () => clearTimeout(id);
+  }, [picked]);
+  const pickedIds = [...settled].sort();
+  const selection = useQuery({
+    queryKey: ["reimb-selection", anchor.id, pickedIds, partial],
+    queryFn: () => api.reimbSelection(anchor.id, pickedIds, partial),
+    enabled: settled.size > 0,
+    placeholderData: keepPreviousData,
+  });
   const target = Math.abs(anchor.amount);
   // What the charge still needs and what already came back, from the
-  // candidates door (the pending row's own `received` until it answers):
-  // a charge partly repaid is matched against the rest, not its face.
+  // candidates door — until it answers, the pending row's own figures,
+  // which the server states the same way (data.reimb_left): a charge
+  // partly repaid is matched against the rest, not its face.
   const live = { ...anchor, left_amount: cand.data?.anchor?.left_amount
-                   ?? Math.abs(anchor.amount) - (anchor.received ?? 0),
+                   ?? anchor.left_amount,
                  received: cand.data?.anchor?.received ?? anchor.received };
-  const need = reimbNeed(live);
-  const sum = [...picked.values()].reduce((s, a) => s + a, 0);
   const shown = new Set((cand.data?.candidates ?? []).map((c) => c.id));
   const hiddenPicked = cand.data
     ? [...picked.keys()].filter((id) => !shown.has(id)).length : 0;
@@ -425,7 +443,8 @@ function Matcher({ anchor, onDone }: {
             so the heading states the window rather than a start date */}
         <b>Deposits within 180 days of this {money(target)} charge — exact
           amounts first, then the closest dates</b>
-        <input placeholder="filter by merchant…" size={18} value={search}
+        <input aria-label="Filter by merchant"
+               placeholder="filter by merchant…" size={18} value={search}
                style={{ marginLeft: "auto" }}
                onChange={(e) => setSearch(e.target.value)} />
       </div>
@@ -436,7 +455,7 @@ function Matcher({ anchor, onDone }: {
       <div style={{ marginTop: ".7rem", display: "flex", gap: ".8rem",
                     alignItems: "center", flexWrap: "wrap" }}>
         <button className="pri" disabled={picked.size === 0 || link.isPending}
-                onClick={() => link.mutate({ ids: [...picked.keys()], partial })}>
+                onClick={() => link.mutate({ ids: [...picked], partial })}>
           {picked.size > 1 ? `match ${picked.size} selected` : "match selected"}
         </button>
         <label className="sub" style={{ cursor: "pointer" }}
@@ -446,26 +465,23 @@ function Matcher({ anchor, onDone }: {
                  onChange={(e) => setPartial(e.target.checked)} />
           {" "}partial reimbursement
         </label>
-        {picked.size > 0 && (
-          <span className="sub">selected {money(sum, true)} of{" "}
-            {money(need, true)}{(live.received ?? 0) > 0.005 && anchor.amount > 0
-              ? " still owed" : ""}
-            {pairGapHint([...picked.values()], live, partial)}
+        {picked.size > 0 && selection.data && (
+          <span className="sub">{selection.data.line}
             {hiddenPicked > 0 && ` (${hiddenPicked} ticked but hidden by the filter)`}</span>
+        )}
+        {picked.size > 0 && selection.isError && !selection.data && (
+          <FailedLine q={selection} what="the selected total" />
         )}
       </div>
       {linkErr && (
-        <div className="note bad" style={{ marginTop: ".5rem" }}
-             onClick={() => setLinkErr(null)}>{linkErr}</div>
+        <Note tone="bad" style={{ marginTop: ".5rem" }}
+             onDismiss={() => setLinkErr(null)}>{linkErr}</Note>
       )}
       {cand.isPending && <p className="mut">finding deposits…</p>}
       {/* a failed search must say so — otherwise neither the list nor the
           "nothing found" line renders and the matcher is just blank */}
       {cand.isError && !cand.data && (
-        <p className="note bad">Couldn't search for deposits:{" "}
-          {errText(cand.error)}{" "}
-          <button className="linklike" onClick={() => cand.refetch()}>
-            retry</button></p>
+        <FailedLine q={cand} what="the deposits" />
       )}
       {cand.data && cand.data.candidates.length === 0 && (
         <p className="mut">No opposite-direction transactions found near this
@@ -474,7 +490,7 @@ function Matcher({ anchor, onDone }: {
       {cand.data && cand.data.candidates.length > 0 && (
         <table style={{ marginTop: ".5rem" }}>
           <thead>
-            <tr><th style={{ width: "1%" }}></th>
+            <tr><th style={{ width: "1%" }}><span className="sr-only">Select</span></th>
                 <th style={{ width: "1%", whiteSpace: "nowrap" }}>Date</th>
                 <th className="num" style={{ width: "1%" }}>Amount</th>
                 <th>Merchant</th>
@@ -484,13 +500,14 @@ function Matcher({ anchor, onDone }: {
             {cand.data.candidates.map((c) => (
               <tr key={c.id} style={{ cursor: "pointer" }} onClick={() => toggle(c)}>
                 <td style={{ whiteSpace: "nowrap" }}>
-                  <input type="checkbox" checked={picked.has(c.id)}
+                  <input aria-label={`${mmdd(c.date)} ${c.payee} ${money(-c.amount, true)}`}
+                         type="checkbox" checked={picked.has(c.id)}
                          onClick={(e) => e.stopPropagation()}
                          onChange={() => toggle(c)} />
                 </td>
                 <td className="mut" style={{ whiteSpace: "nowrap" }}>{mmdd(c.date)}</td>
                 <td className={`num ${c.amount < 0 ? "pos" : ""}`}
-                    style={{ whiteSpace: "nowrap" }}>{money(-c.amount)}</td>
+                    style={{ whiteSpace: "nowrap" }}>{money(-c.amount, true)}</td>
                 {/* the list spans every checking and savings account plus
                     the charge's own card, so each row names where the
                     money landed, and a pending deposit says so */}

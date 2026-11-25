@@ -34,6 +34,7 @@ import os
 import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from starlette.concurrency import run_in_threadpool
 
 from ..notify import delivery
 from .security import limit
@@ -111,7 +112,8 @@ async def email_webhook(request: Request, token: str = ""):
         raise HTTPException(400, "malformed payload")
     if not isinstance(payload, dict):
         raise HTTPException(400, "malformed payload")
-    return _handle(payload)
+    # a bounce record is a control-plane write: off the event loop
+    return await run_in_threadpool(_handle, payload)
 
 
 # Every field we read is a string in Postmark's schema. A number, list or

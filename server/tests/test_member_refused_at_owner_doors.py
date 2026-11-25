@@ -106,16 +106,17 @@ class MemberOwnerDoorsTests(unittest.TestCase):
         # API module (routes under a permissions.OWNER_ONLY prefix are
         # pinned elsewhere)
         import re
-        from pathlib import Path
-        src = Path(__file__).resolve().parents[1].joinpath(
-            "oikonome", "web", "api.py").read_text()
+        from .util import api_source_files
         routes = set()
         # a handler's body up to the next decorator — the window must not
-        # run into the following route's own guard
-        for m in re.finditer(
-                r'@router\.(?:post|get|delete|put|patch)\("([^"]+)"[^\n]*\n'
-                r'(?:(?!@router\.).*\n){0,30}?[^\n]*_owner_only\(user\)', src):
-            routes.add(m.group(1))
+        # run into the following route's own guard, nor into the next
+        # API module, so each module is read on its own
+        for _, src in api_source_files():
+            for m in re.finditer(
+                    r'@router\.(?:post|get|delete|put|patch)\("([^"]+)"[^\n]*\n'
+                    r'(?:(?!@router\.).*\n){0,30}?[^\n]*_owner_only\(user\)',
+                    src):
+                routes.add(m.group(1))
         listed = {t for _, t, _, _ in DOORS}
         self.assertTrue(routes, "no owner doors found — regex drifted?")
         self.assertEqual(routes - listed, set(),

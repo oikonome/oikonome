@@ -177,6 +177,7 @@ class ThreadContextTests(unittest.TestCase):
                 got.append(removal(c, root))
                 done.set()
             finally:
+                c.execute("RESET lock_timeout")   # pooled: a session SET would ride back to the pool
                 c.close()
 
         remover = threading.Thread(target=remove, daemon=True)
@@ -247,6 +248,7 @@ class ThreadContextTests(unittest.TestCase):
                 gone.append(assistant.forget_thread(c, root))
                 done.set()
             finally:
+                c.execute("RESET lock_timeout")   # pooled: a session SET would ride back to the pool
                 c.close()
 
         remover = threading.Thread(target=remove, daemon=True)
@@ -359,6 +361,7 @@ class ThreadContextTests(unittest.TestCase):
                 except BaseException as e:               # noqa: BLE001
                     errs.append(e)
                 finally:
+                    c.execute("RESET lock_timeout")   # pooled: a session SET would ride back to the pool
                     c.close()
 
             trimmer = threading.Thread(target=ask_again, daemon=True)

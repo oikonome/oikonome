@@ -64,6 +64,46 @@ class CompanionMatchingTests(unittest.TestCase):
         self.assertEqual(occ["companions"], [])
         self.assertEqual(len(matched), 1)
 
+    def test_the_fee_search_reads_each_row_once_however_many_payments(self):
+        """A year of matched payments, each with a fee to look for: the
+        search looks only at the rows inside each payment's window, so the
+        ledger is not walked again for every payment, and every fee still
+        lands on its own payment."""
+        from unittest import mock
+        add_bill(self.conn, "Zenith Water", 90.00, frequency="MONTHLY",
+                 next_due=dt.date(2026, 1, 5), last_seen=dt.date(2025, 12, 5),
+                 companions=[{"tokens": "servicing surcharge", "amount": 1.0,
+                              "window_days": 3}])
+        for m in range(1, 13):
+            d = dt.date(2026, m, 5)
+            add_txn(self.conn, d, 90.00, "ZENITH WATER 0123",
+                    primary="RENT_AND_UTILITIES")
+            add_txn(self.conn, d + dt.timedelta(days=m % 3), 1.00,
+                    "SERVICING SURCHARGE", primary="GENERAL_SERVICES")
+            for k in range(8):
+                add_txn(self.conn, dt.date(2026, m, 10 + k), 20.0 + k + m,
+                        "CORNER GOODS")
+        bl = budget._recurring_bills(self.conn)
+        rows = budget._spend_rows(self.conn, dt.date(2026, 1, 1),
+                                  dt.date(2027, 1, 1))
+        occs = []
+        for m in range(1, 13):
+            occs += budget.month_occurrences(bl, 2026, m)
+        calls = [0]
+        real = budget.store_part
+
+        def counted(r):
+            calls[0] += 1
+            return real(r)
+
+        with mock.patch.object(budget, "store_part", counted):
+            matched, occs = budget.match_occurrences(rows, occs)
+        self.assertEqual(len(matched), 24)
+        for o in occs:
+            self.assertEqual([(r["amount"], r["date"]) for r in o["companions"]],
+                             [(1.0, o["due"] + dt.timedelta(days=o["due"].month % 3))])
+        self.assertLessEqual(calls[0], 3 * len(rows), (calls[0], len(rows)))
+
     def test_paid_amount_counts_both_legs(self):
         from oikonome.web import api as web_api
         _bill_with_fee(self.conn)
@@ -206,6 +246,17 @@ class CompanionDoorTests(unittest.TestCase):
             "next_due": TODAY.isoformat(),
             "companions": [{"tokens": "payportal", "amount": 120}]})
         self.assertEqual(r.status_code, 400, r.text)
+
+    def test_a_too_long_fee_description_is_refused_with_its_limit(self):
+        """A pasted descriptor past the cap reads as too long, never as if
+        the fee had no description, and the person is told the limit."""
+        r = self.client.post("/api/bills/save", json={
+            "payee": "Zenith Storage", "amount": 500, "cadence": "MONTHLY:1",
+            "next_due": TODAY.isoformat(),
+            "companions": [{"tokens": "payportal ref " + "7" * 80,
+                            "amount": 2.49}]})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("80 characters", r.json()["detail"])
 
 
 if __name__ == "__main__":

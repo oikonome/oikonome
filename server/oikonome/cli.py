@@ -1,8 +1,68 @@
 """oikonome CLI: migrate + serve (dev) + reset-password (self-hosted)."""
 
 import argparse
+import logging
 import os
 import sys
+
+
+# The access log writes each request line on the event loop, for any path,
+# before authentication, so its redaction must cost a bounded, linear amount
+# of time whatever the URL holds. Each argument is cut to this many
+# characters first (a token past the cut is dropped with the rest), and only
+# the link-token rules run: each is anchored on a literal `?`/`&` + parameter
+# name or `/segment/` prefix, and consumes a single character class, so no
+# start position rescans the string.
+_ACCESS_ARG_MAX = 2048
+_LINK_TOKEN_RULES = None
+
+
+def _redact_link_tokens(s: str) -> str:
+    global _LINK_TOKEN_RULES
+    if _LINK_TOKEN_RULES is None:
+        import re
+
+        from .web.feedback import TOKEN_PATH_SEGMENTS, TOKEN_QUERY_PARAMS
+        _LINK_TOKEN_RULES = (
+            re.compile(r"([?&](?:%s)=)[^&#\s\"]+"
+                       % "|".join(map(re.escape, TOKEN_QUERY_PARAMS))),
+            re.compile(r"(/(?:%s)/)[^/?#\s\"]{8,}"
+                       % "|".join(map(re.escape, TOKEN_PATH_SEGMENTS))),
+        )
+    for rule in _LINK_TOKEN_RULES:
+        s = rule.sub(r"\1<redacted>", s)
+    return s
+
+
+class _AccessLinkTokenFilter(logging.Filter):
+    """Rewrites an access-log record's request path with the app's link-token
+    rules before any handler formats it. uvicorn's access logger writes the
+    full path and query to stdout through a handler of its own, past the
+    app's log ring, so a clicked reset / unlock / invite / verify link would
+    otherwise sit in the container log while its token is still usable."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _redact_link_tokens(
+                    a if len(a) <= _ACCESS_ARG_MAX
+                    else a[:_ACCESS_ARG_MAX] + "...[truncated]")
+                if isinstance(a, str) else a for a in record.args)
+        return True
+
+
+def serve_log_config() -> dict:
+    """uvicorn's own logging configuration with the link-token filter on
+    the access handler — the one place `serve` hands uvicorn its logging."""
+    import copy
+
+    from uvicorn.config import LOGGING_CONFIG
+    config = copy.deepcopy(LOGGING_CONFIG)
+    config.setdefault("filters", {})["link_tokens"] = {
+        "()": _AccessLinkTokenFilter}
+    config["handlers"]["access"].setdefault("filters", []).append(
+        "link_tokens")
+    return config
 
 
 
@@ -136,6 +196,16 @@ def main() -> None:
     rs.add_argument("--tenant", default=None, help="one tenant id only")
     rs.add_argument("--dry-run", action="store_true",
                     help="count what would move, write nothing")
+    rp = sub.add_parser("repair-pairs",
+                        help="hold reimbursement links to what counts: a "
+                             "full pair on a deposit the bank feed withdrew, "
+                             "a charge repaid past its cost; prints counts "
+                             "per household (the nightly does this too)")
+    rp.add_argument("--tenant", default=None, help="one tenant id only")
+    rp.add_argument("--dry-run", action="store_true",
+                    help="run the repair in a transaction that is rolled "
+                         "back and print what it would change: counts and "
+                         "In/Out sums per month, no ids or descriptions")
     dt_ = sub.add_parser("dedupe-twins",
                          help="retire the second lineage of transactions that "
                               "reached an account twice under two ids (a "
@@ -154,6 +224,8 @@ def main() -> None:
     if args.cmd == "dedupe-twins":
         raise SystemExit(dedupe_twins(args.tenant, args.account, args.apply))
 
+    if args.cmd == "repair-pairs":
+        raise SystemExit(repair_pairs_cmd(args.tenant, dry_run=args.dry_run))
     if args.cmd == "reanchor-stranded":
         raise SystemExit(reanchor_stranded_cmd(args.tenant, dry_run=args.dry_run))
     if args.cmd == "merchants-resolve":
@@ -169,7 +241,7 @@ def main() -> None:
     elif args.cmd == "serve":
         import uvicorn
         uvicorn.run("oikonome.web.app:app", host=args.host, port=args.port,
-                    reload=args.reload)
+                    reload=args.reload, log_config=serve_log_config())
     elif args.cmd == "reset-password":
         reset_password(args.email)
     elif args.cmd == "clear-2fa":
@@ -218,6 +290,50 @@ def main() -> None:
         print(json.dumps({k: v for k, v in r.items() if k != "password"}))
 
 
+def repair_pairs_cmd(tenant: str | None = None, *,
+                     dry_run: bool = False) -> int:
+    """web.data.repair_pairs for every household (or one), one JSON line
+    each, numbered in the order read and never named: --dry-run prints
+    what the repair would change (web.data.repair_pairs_preview, always
+    rolled back); without it the repair is applied and its counts
+    printed. A last line totals the households."""
+    import json
+
+    from .db import tenancy
+    from .web.data import repair_pairs, repair_pairs_preview
+    admin = tenancy.admin_connect()
+    try:
+        rows = admin.execute("SELECT id FROM tenants" +
+                             (" WHERE id=%s" if tenant else "") +
+                             " ORDER BY created_at, id",
+                             ((tenant,) if tenant else ())).fetchall()
+    finally:
+        admin.close()
+    total = {"households": 0, "affected": 0, "links_settled": 0,
+             "pins_restored": 0, "in": 0.0, "out": 0.0}
+    for n, r in enumerate(rows, 1):
+        conn = tenancy.tenant_connect(str(r["id"]))
+        try:
+            if dry_run:
+                st = repair_pairs_preview(conn)
+                total["links_settled"] += st["links_settled"]
+                total["pins_restored"] += st["pins_restored"]
+                total["in"] += sum(m["in"] or 0 for m in st["months"])
+                total["out"] += sum(m["out"] or 0 for m in st["months"])
+                hit = bool(st["links_settled"] or st["pins_restored"])
+            else:
+                st = repair_pairs(conn)
+                hit = bool(st["stamps_released"] or st["rows_rechecked"])
+            total["households"] += 1
+            total["affected"] += hit
+            print(json.dumps({"household": n, "dry_run": dry_run, **st}))
+        finally:
+            conn.close()
+    total["in"], total["out"] = round(total["in"], 2), round(total["out"], 2)
+    print(json.dumps({"total": total, "dry_run": dry_run}))
+    return 0
+
+
 def reanchor_stranded_cmd(tenant: str | None = None, *, dry_run: bool = False) -> int:
     """Re-anchor stranded children for every tenant (or one) and print the
     counts as JSON, one line per tenant. --dry-run counts the stranded rows
@@ -245,6 +361,8 @@ def reanchor_stranded_cmd(tenant: str | None = None, *, dry_run: bool = False) -
                 from .sync import adopt
                 st = reanchor.reanchor_stranded(
                     conn, release_after_days=adopt.RECONCILE_DAYS)
+                from .web.data import repair_pairs
+                st["pairs_repaired"] = repair_pairs(conn)
             print(json.dumps({"tenant": str(r["id"]), **st}))
         finally:
             conn.close()
@@ -631,6 +749,18 @@ def rotate_master_key() -> bool:
         return False
     finally:
         admin.close()
+    if not rewrapped and not skipped:
+        # Nothing wrapped under either key: this database holds no secret
+        # at all. On a live instance that means the command reached the
+        # wrong database (a compose invocation that dropped the
+        # external-database overlay starts an empty bundled one), and a
+        # "rotated" here would tell the operator the old key can go.
+        print("NOTHING ROTATED: this database holds no wrapped key and no "
+              "encrypted secret. If this instance has households, the "
+              "command reached the wrong database — run it from docker/ "
+              "with plain `docker compose` so .env's COMPOSE_FILE applies "
+              "(docs/master-key.md). Keep the old key.", file=sys.stderr)
+        return False
     print(f"rotated: {rewrapped} secret(s) re-encrypted"
           + (f", {skipped} already current" if skipped else ""))
     print("keep the old key until a keycheck against your latest BACKUP "

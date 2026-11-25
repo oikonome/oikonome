@@ -75,6 +75,15 @@ class TransactionRowsTests(unittest.TestCase):
         return {r["id"]: r for r in self.conn.execute(
             "SELECT * FROM transactions").fetchall()}
 
+    def test_an_inflow_labelled_income_in_another_case_is_income(self):
+        got = self._restore([
+            ["in-1", "chk", "2026-03-01", "-100", "PAYROLL", None, "Income",
+             None, None, 0, 0, {}],
+            ["out-1", "chk", "2026-03-02", "100", "SHOP", None, "Income",
+             None, None, 0, 0, {}]])
+        self.assertEqual(got["in-1"]["category_primary"], "INCOME")
+        self.assertEqual(got["out-1"]["category_primary"], "Income")
+
     def test_plaids_category_and_facts_come_out_of_the_raw_record(self):
         raw = {"personal_finance_category": {
                    "primary": "FOOD_AND_DRINK",
@@ -459,6 +468,33 @@ class CategoryRulesTests(unittest.TestCase):
 
 def _admin():
     return tenancy.admin_connect(_admin_dsn(TEST_DB))
+
+
+class BillOffersFromBeforeTheRenameTests(unittest.TestCase):
+    """040: an install before it filed bill offers in
+    recurring_proposals, so its archive carries them as
+    recurring_proposals.csv. A rejected offer is the household's answer,
+    and the only thing keeping the detector from asking again."""
+
+    def test_an_offer_answered_before_the_rename_keeps_its_answer(self):
+        conn = make_db()
+        self.addCleanup(conn.close)
+        header = ["id", "kind", "bill_type", "payee", "amount", "frequency",
+                  "interval", "next_due", "evidence", "llm_tag", "status",
+                  "created_at", "decided_at"]
+        restore.restore_zip(conn, _zip({
+            "manifest.json": _manifest("039_receipt_kind.sql"),
+            "recurring_proposals.csv": _csv(header, [
+                ["offer-no", "bill", "occurrence", "Example Stream", "12.99",
+                 "MONTHLY", 1, "2026-04-01", {}, None, "rejected",
+                 "2026-01-01 00:00:00+00", "2026-01-05 00:00:00+00"],
+                ["offer-yes", "bill", "occurrence", "Sample Water", "40.00",
+                 "MONTHLY", 1, "2026-04-03", {}, None, "approved",
+                 "2026-01-01 00:00:00+00", "2026-01-06 00:00:00+00"]])}))
+        got = {r["id"]: r["status"] for r in conn.execute(
+            "SELECT id, status FROM bill_proposals").fetchall()}
+        self.assertEqual(got, {"offer-no": "rejected",
+                               "offer-yes": "approved"})
 
 
 class RecipientsFromBeforeInvitesTests(unittest.TestCase):

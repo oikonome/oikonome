@@ -173,6 +173,39 @@ class RollupTests(unittest.TestCase):
         self.assertAlmostEqual(st["buckets"]["food"]["actual"], 110.0)
         self.assertAlmostEqual(st["buckets"]["other"]["actual"], 60.0)
 
+    def test_the_parts_of_a_netted_split_add_up_to_its_net_to_the_cent(self):
+        """Each part's share rounded on its own adds up to more (or less)
+        than the charge's net: three equal parts of a $9.00 charge with
+        $4.00 paid back are 1.67 each, $5.01 against the $5.00 the spend
+        totals count. The rounding remainder goes to the largest part."""
+        odd = add_txn(self.conn, self.mid, 9.0, "THREE WAY", account="card",
+                      primary=OTHER)
+        splits.set_split(self.conn, odd, [
+            {"category": FOOD, "amount": 3}, {"category": OTHER, "amount": 3},
+            {"category": HOME, "amount": 3}])
+        dep = add_txn(self.conn, self.mid, -4.0, "PAID BACK", account="chk",
+                      primary="TRANSFER_IN")
+        self.conn.execute(
+            "INSERT INTO reimbursements (expense_id, reimburse_id, amount,"
+            " partial) VALUES (%s, %s, 4, 1)", (odd, dep))
+        for net in (budget.NET_AMOUNT, None):
+            if net is None:
+                expr, join = (reporting.PART_NET_JOINED,
+                              reporting.REIMB_PARTIAL_JOIN)
+            else:
+                from oikonome.engine import categories
+                expr, join = categories.part_net(net), ""
+            got = [float(r["a"]) for r in self.conn.execute(
+                f"SELECT {expr} AS a FROM transactions t {join} "
+                f"{reporting.SPLIT_JOIN} WHERE t.id = %s ORDER BY sp.line",
+                (odd,)).fetchall()]
+            self.assertEqual(round(sum(got), 2), 5.0, got)
+            self.assertEqual(sorted(got), [1.66, 1.67, 1.67])
+        rows = [r for r in budget._spend_rows(
+            self.conn, self.mid, TODAY + dt.timedelta(days=1))
+            if r["txn_id"] == odd]
+        self.assertEqual(round(sum(r["amount"] for r in rows), 2), 5.0)
+
     def test_a_split_charge_is_one_transaction_in_its_year(self):
         """Spend by year counts purchases: a three-way split is one charge,
         not three."""
@@ -186,6 +219,22 @@ class RollupTests(unittest.TestCase):
         self.assertEqual(after, before)
         self.assertEqual(after[str(TODAY.year)], 3)
 
+    def test_a_split_charge_is_one_transaction_in_each_category_it_reaches(self):
+        """A store matcher's parts can repeat a category (two books on one
+        order), and two stored keys can read as one category: the charge
+        is still one purchase under each category it lands in."""
+        for line, cat, amt in ((1, "Amazon Books", 30), (2, "Amazon_Books", 30),
+                               (3, "Amazon Home", 60)):
+            self.conn.execute(
+                "INSERT INTO transaction_splits (txn_id, line, category, "
+                "amount, source) VALUES (%s, %s, %s, %s, 'amazon')",
+                (self.big, line, cat, amt))
+        sp = reporting.compute_spending(self.conn, TODAY)
+        self.assertEqual(sorted(sp["amazon"]),
+                         [["Amazon Books", 60.0, 1], ["Amazon Home", 60.0, 1]])
+        self.assertEqual({y[0]: y[2] for y in sp["by_year"]},
+                         {str(TODAY.year): 3})
+
     def test_the_spending_reports_count_each_part_under_its_category(self):
         self._split()
         sp = reporting.compute_spending(self.conn, TODAY)
@@ -197,8 +246,8 @@ class RollupTests(unittest.TestCase):
         self.assertAlmostEqual(sum(m[1] for m in sp["by_month"]), 200.0)
         win = reporting.spending_window(self.conn, TODAY, "cur")
         cats = {c[0]: c[1] for c in win["categories"]}
-        self.assertAlmostEqual(cats["FOOD AND DRINK"], 130.0)
-        self.assertAlmostEqual(cats["GENERAL MERCHANDISE"], 70.0)
+        self.assertAlmostEqual(cats["FOOD_AND_DRINK"], 130.0)
+        self.assertAlmostEqual(cats["GENERAL_MERCHANDISE"], 70.0)
         self.assertAlmostEqual(win["total"], 200.0)
 
     def test_the_year_lens_counts_the_parts_and_opens_the_row_under_each(self):

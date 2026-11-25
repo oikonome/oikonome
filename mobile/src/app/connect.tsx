@@ -10,6 +10,8 @@ import { normalizeServerUrl, PINNED_SERVER_URL, probeServer,
 import { serverUrlVerdict } from "../lib/pure";
 import { C } from "../lib/theme";
 import { LogoSpinner } from "../components/logo-spinner";
+import { Note } from "../components/ui";
+import { fieldA11y } from "../components/field";
 
 export default function Connect() {
   // a pinned build has nothing to ask — this screen is only reachable
@@ -58,7 +60,7 @@ export default function Connect() {
         Enter the address of your Oikonome instance — the URL you use in
         the browser.
       </Text>
-      <TextInput
+      <TextInput {...fieldA11y("Instance address")}
         style={s.input}
         placeholder="https://oikonome.example.com"
         placeholderTextColor={C.mut}
@@ -76,8 +78,8 @@ export default function Connect() {
           readable. Prefer https:// once the server has a certificate.
         </Text>
       )}
-      {err && <Text style={s.err}>{err}</Text>}
-      <Pressable style={[s.btn, (!url.trim() || busy) && s.btnOff]}
+      {err && <Note bad style={s.err}>{err}</Note>}
+      <Pressable accessibilityRole="button" style={[s.btn, (!url.trim() || busy) && s.btnOff]}
                  disabled={!url.trim() || busy} onPress={next}>
         {busy ? <LogoSpinner color={C.text} />
               : <Text style={s.btnText}>Continue</Text>}
@@ -91,11 +93,11 @@ const s = StyleSheet.create({
           justifyContent: "center" },
   h1: { color: C.text, fontSize: 28, fontWeight: "700" },
   mut: { color: C.mut, fontSize: 15, lineHeight: 21 },
-  input: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.card, borderColor: C.field, borderWidth: 1,
            borderRadius: 10, color: C.text, fontSize: 16, padding: 14 },
   err: { color: C.bad, fontSize: 14 },
   warn: { color: C.warn, fontSize: 14, lineHeight: 20 },
-  btn: { backgroundColor: C.accent, borderRadius: 10, padding: 14,
+  btn: { backgroundColor: C.btn, borderRadius: 10, padding: 14,
          alignItems: "center" },
   btnOff: { opacity: 0.5 },
   btnText: { color: C.text, fontSize: 16, fontWeight: "600" },

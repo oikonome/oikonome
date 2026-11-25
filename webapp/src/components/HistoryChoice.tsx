@@ -5,6 +5,7 @@ import { api, errText, type Connection, type HistoryMonths }
   from "../api/client";
 import { saveSettings, SETTINGS_SAVES } from "../api/cache";
 import { isOwner } from "../role";
+import { FailedLine } from "./Loaded";
 
 /** The five reaches, in the words the wizard, the Import page and the
  *  phone all use. null = everything the source offers. */
@@ -124,13 +125,16 @@ export default function HistoryChoice({ title = true, footnote = true }: {
     return (
       <div className="hist-choice">
         {title && <b>How much history comes in</b>}
-        <p className="mut" style={{ margin: ".2rem 0 0", fontSize: 13 }}>
+        {/* a failed read ends in the failed line, not "Loading…" for good */}
+        {s.data === undefined && s.isError
+          ? <FailedLine q={s} what="the history setting" />
+          : <p className="mut" style={{ margin: ".2rem 0 0", fontSize: 13 }}>
           {s.data
             ? <><b style={{ color: "var(--ink)" }}>
                 {hit ? hit[1] : "Everything available"}</b> for every bank
                 linked and every file imported — the household owner sets
                 this.</>
-            : "Loading…"}</p>
+            : "Loading…"}</p>}
       </div>
     );
   }

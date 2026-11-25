@@ -55,11 +55,20 @@ podman run -d --name oikonome-dev-postgres -p 127.0.0.1:5433:5432 \
 #  which podman's journald driver files at priority err - thousands of SQL
 #  lines a day in `journalctl -p err`. `podman logs` still works.)
 
-# server deps
-cd server && python -m venv .venv && .venv/bin/pip install -e .
+# server deps: the committed resolution (server/requirements.txt), which is
+# also exactly what the image installs. The suite refuses to run on other
+# versions; `make sync` brings a venv back to it, `make lock` (needs uv)
+# re-resolves to the newest versions pyproject.toml allows. The suite's
+# test-only tools are pinned the same way in server/requirements-test.txt
+# (from server/requirements-test.in), which `make sync` also installs and
+# the image never does.
+cd server && python -m venv .venv && cd .. && make sync
+# the lint gate's ruff is a dev tool outside the lock: --no-deps so it can
+# never move a pinned package
+server/.venv/bin/pip install --no-deps 'ruff>=0.16'
 
 # apply the schema
-.venv/bin/python -m oikonome.db.migrate
+server/.venv/bin/python -m oikonome.db.migrate
 ```
 
 ## Everyday commands (see `Makefile`)
@@ -67,11 +76,14 @@ cd server && python -m venv .venv && .venv/bin/pip install -e .
 | Task | Command |
 |---|---|
 | Full test suite | `make test` |
+| Property, fuzz, restore and concurrency tests in long mode (tens of minutes; never part of `make test`) | `make test-long` |
 | Security + correctness lint only | `make lint` |
 | Dev server (inner loop) | `make dev` |
 | Build the SPA | `make spa` |
 | Container smoke test | `make container-check` |
 | Fresh-install test | `make install-test` |
+| Bring the venv to the committed dependency file (after a pull that moved it) | `make sync` |
+| Re-resolve dependencies to the newest `pyproject.toml` allows (needs `uv`; commit the file with a green suite) | `make lock` |
 
 The dev server runs with `OIKONOME_DEV=1` (relaxed cookie flags for
 `http://localhost`). Point a browser at the port it prints; the SPA is at
@@ -110,7 +122,7 @@ ruleset catches is invisible on the page — stdlib XML parsers expand entities
 unbounded, which is why `tests/test_inventory_xml_safety.py` exists alongside
 it.
 
-Install it with `server/.venv/bin/pip install -e 'server[dev]'`. If it is
+Install it with `server/.venv/bin/pip install --no-deps 'ruff>=0.16'` (`--no-deps` so it never moves a pinned package). If it is
 missing the target warns and continues, so a fresh checkout still gets a
 working `make test`.
 
@@ -139,6 +151,78 @@ sensitive shape must be guarded or explicitly triaged). When one fails,
 the fix is usually to add the guard — not to add the route to the
 exemption list. Exemptions require a written reason and the tests check
 that the reason is non-empty and that the route still exists.
+
+### Property tests
+
+Some tests state a rule once and let a generator look for the case that
+breaks it, instead of checking examples someone thought of. The design and
+the full list of rules is `specs/invariants-and-fuzzing.md`; the pieces are
+in `server/tests/`:
+
+| Piece | What it generates |
+|---|---|
+| `props.py` | the Hypothesis profiles, the seeded-household switch, the long-mode seed |
+| `roundtrip_builders.py` | a synthetic household per seed, for the money and restore properties |
+| `body_fuzz.py`, `fuzz_checks.py` | hostile request bodies at every documented door, and the checks on each reply |
+| `restore_invariants.py`, `archive_eras.py` | hostile archive cells, and archives shaped as an older install wrote them |
+| `concurrency.py` | writers run at once on one household, paused at lock seams in chosen orders |
+
+**The default run** (inside `make test`) is deterministic, so a failure is
+the same failure on every machine: Hypothesis is derandomized with 40
+examples per pure property, the seeded properties use a fixed few
+households, the fuzz sends every value class once per door (at a field
+picked by a hash of the door) and every text class at every text field,
+the hostile archive cells take a fixed sample, an older-archive check runs
+two schema eras, and each concurrency scenario runs its fixed schedules.
+
+**Long mode** runs the same modules with `OIKONOME_PROPERTY=long`:
+
+```bash
+make test-long                 # every such module, one process
+make test-long JOBS=6          # dealt over six test databases of their own
+make test-long ONLY=restore    # only modules whose file name matches
+```
+
+It turns on 2,000 random examples per Hypothesis property, 12 seeded
+households (`OIKONOME_PROPERTY_SEEDS`) and 24 round-trip seeds
+(`OIKONOME_RT_SEEDS`), every column of every archive member, every schema
+era an archive's shape changed in, random fuzz fields, and seeded random
+interleavings in every concurrency scenario. Expect an hour or more in one
+process; `JOBS` divides that by about the number of jobs, down to the
+slowest module.
+
+**Reproducing a failure.** Every failure says how:
+
+- a Hypothesis property prints `@reproduce_failure(...)`; paste it above the
+  test, run the module, remove it once fixed;
+- a seeded household names its seed (`seed 7`) — `OIKONOME_PROPERTY_SEEDS=7`
+  runs seeds 1 to 7, `OIKONOME_RT_SEEDS=7,` adds just seed 7 to the round
+  trip's fixed ones;
+- an older archive names its seed and schema era (long mode, with the seeds
+  as above);
+- a random schedule or fuzz field names `OIKONOME_PROPERTY_SEED=<n>`, which
+  the run also prints first and last — `make test-long SEED=<n> ONLY=<module>`
+  replays the same choices.
+
+**The runtime budget.** The suite is sharded by file size, not by time, so
+a small slow module can land on a heavy shard. No property, fuzz, restore
+or concurrency module may take more than about 25 seconds on its own in the
+default run; split it (by router, by role, pure versus database-backed)
+before it grows past that. Anything heavier belongs behind
+`props.LONG`.
+
+**The cash forecast benchmark** (`specs/forecast-benchmark.md`) scores
+`forecast.build` against simulated households with known truth, fed through
+the production Plaid sync. Two default modules hold six sentinel personas to
+`server/tests/forecast_bench/baseline.json`; long mode runs all eighteen.
+Before and after an estimator change, run the scoreboard and include its
+table in the commit message or pull request description:
+
+```bash
+make forecast-scoreboard BASE=main            # six sentinels, four days
+make forecast-scoreboard BASE=main MODE=long SEEDS=3 JOBS=6   # everyone
+make forecast-baseline                        # ratchet (WHY="..." if worse)
+```
 
 ### Never run two suites against one test database
 
@@ -338,6 +422,13 @@ tracked stub renders nothing. An operator drops their own copy of that
 directory in `extras/webapp-ext/` and the image build puts it in the slot
 before the client is built (`docker/Dockerfile`); the shape must match the
 stub's, since nothing else in the product imports from it.
+
+An add-on package in `extras/` is installed after the product under the
+product's pins: with an `extras/requirements.txt` of its own, that file
+is installed hash-checked (`--require-hashes`) and the add-on with
+`--no-deps`; without one, its dependencies resolve constrained to the
+versions in `server/requirements.txt`, so it can add packages but never
+move one the product was tested on.
 
 The mobile app has the same slot at `mobile/src/ext/index.tsx` (build
 flavour flags, extra screens, the Settings account section, lockouts, the

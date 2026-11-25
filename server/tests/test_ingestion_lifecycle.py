@@ -113,9 +113,10 @@ class SettlementCarryTests(unittest.TestCase):
             self.conn.execute(
                 "INSERT INTO transaction_notes (txn_id, note) VALUES (%s,%s)",
                 (old, f"note {i}"))
+            # each charge its own photo: the same bytes would be one slip
             self.conn.execute(
                 "INSERT INTO receipts (txn_id, image, mime) "
-                "VALUES (%s, %s, 'image/png')", (old, b"\x89PNG"))
+                "VALUES (%s, %s, 'image/png')", (old, b"\x89PNG" + old.encode()))
         sync_base.upsert_transactions(self.conn, [
             Transaction(id=new, account_id="chk", date=TODAY,
                         amount=10.0 + i, name="POSTED", pending=False,
@@ -161,7 +162,10 @@ class SettlementCarryTests(unittest.TestCase):
             real = self.conn.execute
 
             def spy(sql, *a, **kw):
-                if any(m in sql for m in marks):
+                # the merchant resolver's cleaned-line read shares a marker
+                # with the carry and runs once per pass only while a line is
+                # still unanswered — never per row, and not the carry's
+                if any(m in sql for m in marks) and "LIKE ANY" not in sql:
                     seen.append(sql)
                 return real(sql, *a, **kw)
 

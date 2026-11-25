@@ -9,7 +9,7 @@ from oikonome.engine import budget
 from oikonome.jobs import worker
 from oikonome.web import lens_email
 
-from .util import TODAY, add_txn, make_db, write_config
+from .util import TODAY, add_txn, make_db, write_config, freeze_month
 
 
 def _set_sched(conn, **cads):
@@ -221,6 +221,8 @@ class LensEmailTests(unittest.TestCase):
         self.conn.close()
 
     def test_monthly_builds(self):
+        last = TODAY.replace(day=1) - dt.timedelta(days=1)
+        freeze_month(self.conn, last.year, last.month)
         subject, plain, html = lens_email.build_monthly(self.conn, TODAY)
         self.assertIn("report card", subject)
         self.assertNotIn("budget budget", subject.lower())

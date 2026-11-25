@@ -86,7 +86,7 @@ export const ws = StyleSheet.create({
   input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14, minHeight: TAP,
            paddingHorizontal: 10, paddingVertical: 8 },
-  btn: { backgroundColor: C.accent, borderRadius: 8, minHeight: TAP,
+  btn: { backgroundColor: C.btn, borderRadius: 8, minHeight: TAP,
          paddingHorizontal: 14, justifyContent: "center",
          alignItems: "center" },
   quiet: { backgroundColor: C.hover, borderWidth: 1,

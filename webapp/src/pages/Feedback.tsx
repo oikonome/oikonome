@@ -1,7 +1,11 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useState } from "react";
-import { api, type TestingState } from "../api/client";
-import { patchQuery, SETTINGS_SAVES, saveSettings } from "../api/cache";
+import { Link } from "react-router";
+import { api } from "../api/client";
+import { FailedLine } from "../components/Loaded";
+import { failLine } from "../moneymath";
+import SegmentedControl from "../components/SegmentedControl";
+import Note from "../components/Note";
 
 /** The feedback pipeline: message + optional screenshot, emailed
  *  to the maintainer (or handed back as a zip when SMTP isn't set up).
@@ -46,7 +50,7 @@ function FeedbackCard({ canEmail, feedbackTo }:
     <div className="card" style={{ marginBottom: "1rem",
                                    borderColor: "rgba(230,177,89,.45)" }}>
       {send.isSuccess && (
-        <div className="note" style={{ marginBottom: ".8rem",
+        <Note style={{ marginBottom: ".8rem",
               background: "rgba(92,181,107,.10)",
               borderColor: "rgba(92,181,107,.4)" }}>
           {send.data.delivery === "emailed"
@@ -54,41 +58,32 @@ function FeedbackCard({ canEmail, feedbackTo }:
                 number is <b>{send.data.number}</b>; quote it in any follow-up.</>
             : <>Packaged as <b>{send.data.number}</b> — the zip just downloaded.
                 Email it to <b>{feedbackTo}</b>.</>}
-        </div>
+        </Note>
       )}
       {send.isError && (
-        <div className="note" style={{ marginBottom: ".8rem",
+        <Note style={{ marginBottom: ".8rem",
               background: "rgba(224,105,93,.10)",
               borderColor: "rgba(224,105,93,.4)", color: "var(--red)" }}>
-          {String(send.error)}</div>
+          {failLine(send.error, "your report", "web", "send").text}</Note>
       )}
-      <h2 style={{ marginTop: 0 }}>Feedback &amp; bug reports</h2>
-      <div className="seg" role="radiogroup" aria-label="Kind of report"
-           style={{ display: "inline-flex", gap: ".3rem", margin: ".2rem 0 .6rem" }}>
-        {(["feedback", "bug"] as FeedbackKind[]).map((k) => (
-          <button key={k} type="button" role="radio"
-                  aria-checked={kind === k}
-                  className={kind === k ? "pri" : undefined}
-                  onClick={() => setKind(k)}>
-            {k === "bug" ? "Report a bug" : "Feedback"}
-          </button>
-        ))}
-      </div>
+      <SegmentedControl label="Kind of report" value={kind} onChange={setKind}
+        style={{ margin: ".2rem 0 .6rem" }}
+        options={[{ value: "feedback", label: "Feedback" },
+                  { value: "bug", label: "Report a bug" }]} />
+      {/* One line: what to write, and where it goes. The package is the
+          system-health bundle plus recent log lines — never transaction
+          contents, tokens, hostnames or bank names — and the line says the
+          part a person weighs before pressing Send. */}
       <p className="mut" style={{ margin: ".4rem 0 .7rem" }}>
         {kind === "bug"
-          ? <>Something broke? Say what happened, what you expected, and
-              where — a screenshot helps a lot.</>
-          : <>Something confusing, missing, or worth changing? Tell us.</>}{" "}
-        Your report is packaged with the system-health diagnostic bundle (no
-        hostnames, bank names or collector labels) and the app's recent log
-        lines (no transaction contents, no tokens) and gets a
-        report number.{" "}
+          ? "Say what happened, what you expected, and where"
+          : "Something confusing, missing, or worth changing?"}
+        {" — "}
         {canEmail
-          ? (feedbackTo
-              ? <>It goes straight to <b>{feedbackTo}</b>.</>
-              : <>It goes straight to the maintainer.</>)
-          : <>This instance has no email configured, so the package downloads
-              as a .zip — <b>attach it to an email to {feedbackTo}</b>.</>}
+          ? <>it goes to {feedbackTo ? <b>{feedbackTo}</b> : "the maintainer"}
+              {" "}with a diagnostic bundle (no bank names or transactions).</>
+          : <>this instance has no email, so it downloads as a .zip to send
+              to {feedbackTo ? <b>{feedbackTo}</b> : "the maintainer"}.</>}
       </p>
       {kind === "bug" ? (
         <>
@@ -115,41 +110,17 @@ function FeedbackCard({ canEmail, feedbackTo }:
       )}
       <div style={{ display: "flex", gap: ".7rem", alignItems: "center",
                     marginTop: ".5rem", flexWrap: "wrap" }}>
-        <input type="file" accept=".png,.jpg,.jpeg,.gif,.webp"
+        <input aria-label="Attach a screenshot" type="file" accept=".png,.jpg,.jpeg,.gif,.webp"
           onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
         <button className="pri" style={{ marginLeft: "auto" }}
           disabled={send.isPending || !text.trim()}
           onClick={() => send.mutate()}>
           {send.isPending ? "packaging…"
-            : canEmail ? `Send to ${feedbackTo}` : "Build my report .zip"}
+            : canEmail ? (feedbackTo ? `Send to ${feedbackTo}` : "Send")
+              : "Build my report .zip"}
         </button>
       </div>
     </div>
-  );
-}
-
-// instance-wide feedback on/off (owner; viewers see the state only)
-function FeedbackToggle({ enabled }: { enabled: boolean }) {
-  const qc = useQueryClient();
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
-  const flip = useMutation({
-    scope: SETTINGS_SAVES,
-    mutationFn: () => saveSettings(qc, { feedback_enabled: !enabled }),
-    onSuccess: () => {
-      // the page flips on ["testing"] — write the one bit it changed now,
-      // and let the refetch confirm the rest of that view
-      patchQuery<TestingState>(qc, ["testing"], { enabled: !enabled });
-      qc.invalidateQueries({ queryKey: ["testing"] });
-    },
-  });
-  if (me.data?.role !== "owner") return null;
-  return (
-    <p style={{ marginBottom: 0 }}>
-      <button disabled={flip.isPending} onClick={() => flip.mutate()}>
-        {enabled ? "Turn feedback off for this instance"
-          : "Turn feedback back on"}
-      </button>
-    </p>
   );
 }
 
@@ -158,7 +129,7 @@ export default function Feedback() {
   if (q.isPending)
     return <div className="centered"><span className="mut">loading…</span></div>;
   if (q.isLoadingError)
-    return <div className="card">Couldn't load: {String(q.error)}</div>;
+    return <div className="card"><FailedLine q={q} what="the feedback page" /></div>;
   const d = q.data;
   if (!d.enabled)
     return (
@@ -166,16 +137,14 @@ export default function Feedback() {
         <h1>Feedback &amp; bug reports</h1>
         <div className="card">
           <p style={{ margin: 0 }}>Feedback and bug reports are <b>turned
-            off</b> on this instance. The owner can re-enable them here or
-            on the Settings page.</p>
-          <FeedbackToggle enabled={false} />
+            off</b> on this instance. The owner can turn them back on under{" "}
+            <Link to="/settings/data">Settings › Data</Link>.</p>
         </div>
       </>
     );
   return (
     <>
       <h1>Feedback &amp; bug reports</h1>
-      <FeedbackToggle enabled />
       <FeedbackCard canEmail={d.can_email} feedbackTo={d.feedback_to} />
     </>
   );

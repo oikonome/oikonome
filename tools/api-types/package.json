@@ -1,0 +1,10 @@
+{
+  "name": "oikonome-api-types-tool",
+  "private": true,
+  "description": "The pinned generator that writes the clients' API types from specs/openapi.json (scripts/gen-api-types.py).",
+  "license": "AGPL-3.0-or-later",
+  "devDependencies": {
+    "openapi-typescript": "7.13.0",
+    "typescript": "5.9.3"
+  }
+}

@@ -12,7 +12,7 @@ export function DownloadButton({ path, filename, label }: {
   const { client } = useSession();
   const [busy, setBusy] = useState(false);
   return (
-    <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
+    <Pressable accessibilityRole="button" style={[s.btn, busy && { opacity: 0.5 }]}
                disabled={busy}
                onPress={async () => {
                  setBusy(true);
@@ -28,7 +28,7 @@ export function DownloadButton({ path, filename, label }: {
 }
 
 const s = StyleSheet.create({
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8,
          alignSelf: "flex-start", marginTop: 6 },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

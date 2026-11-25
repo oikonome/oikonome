@@ -1,9 +1,11 @@
 import { useState } from "react";
-import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, errText } from "../api/client";
 import { smsPauseNote } from "../api/cache";
 import { signOut } from "../push";
+import { AccountExit } from "./AccountExits";
 import { RecoverySheetButtons } from "./RecoverySheetButtons";
+import Note from "./Note";
 
 /** a blocking enrollment gate. Hosted accounts must set up a
  *  second factor (authenticator app OR passkey) before the app is usable
@@ -43,6 +45,9 @@ const inputStyle = {
 
 export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
   const qc = useQueryClient();
+  // the shell only renders this gate once /api/me has answered, so the
+  // role is read from the same cached query, not asked for again
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me, retry: false });
   const [mode, setMode] = useState<"choose" | "totp" | "codes" | "note">(
     "choose");
   const [enroll, setEnroll] = useState<{ secret: string; qr: string } | null>(null);
@@ -114,12 +119,13 @@ export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
 
   return (
     <div className="centered" style={{ minHeight: "100vh" }}>
-      <div className="card" style={{ maxWidth: "30rem", width: "100%" }}>
+      <div style={{ maxWidth: "30rem", width: "100%" }}>
+      <div className="card">
         <h1 style={{ marginTop: 0 }}>Secure your account</h1>
-        {err && <div className="note bad" style={{ marginBottom: ".7rem" }}>{err}</div>}
+        {err && <Note tone="bad" style={{ marginBottom: ".7rem" }}>{err}</Note>}
 
         {note && (mode === "codes" || mode === "note") && (
-          <div className="note" style={{ marginBottom: ".7rem" }}>{note}</div>
+          <Note style={{ marginBottom: ".7rem" }}>{note}</Note>
         )}
         {mode === "note" ? (
           <button className="pri" onClick={finish}>Continue</button>
@@ -152,7 +158,8 @@ export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
                             borderRadius: 8, margin: "0 0 .6rem" }} />
             )}
             <p>Secret: <code style={{ userSelect: "all" }}>{enroll?.secret}</code></p>
-            <input inputMode="numeric" autoComplete="one-time-code" autoFocus
+            <input aria-label="6-digit code"
+                   inputMode="numeric" autoComplete="one-time-code" autoFocus
                    placeholder="6-digit code" style={inputStyle}
                    value={code} onChange={(e) => setCode(e.target.value)} />
             <button className="pri" style={{ marginTop: ".7rem" }}
@@ -184,11 +191,22 @@ export default function TwoFactorGate({ onDone }: { onDone: () => void }) {
         {mode !== "codes" && mode !== "note" && (
           <p className="mut" style={{ fontSize: 13, marginTop: "1rem",
                                       marginBottom: 0 }}>
-            <a href="#" onClick={(e) => { e.preventDefault();
+            <button type="button" className="as-link" onClick={(e) => { e.preventDefault();
               signOut().finally(() => { window.location.href = "/login"; });
-            }}>Sign out</a>
+            }}>Sign out</button>
           </p>
         )}
+      </div>
+      {/* Nor is it a toll: the server lets a factorless session erase the
+          household (owner) or leave it (anyone else), so the gate offers
+          that door too — hidden once a factor is in, when the app opens
+          and Settings holds it. No export from here: the export door
+          wants the factor first. */}
+      {mode !== "codes" && mode !== "note" && (
+        <AccountExit role={me.data?.role}
+          exportHint={"Want a copy first? Secure the account above, then "
+                      + "export it under Settings → Data."} />
+      )}
       </div>
     </div>
   );

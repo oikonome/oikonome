@@ -61,7 +61,7 @@ class ExportHoldsNothingWhileSendingTests(unittest.TestCase):
         message the client is sent, whether the connection the door
         opened is back in the pool and the household's slot is free.
         `on_body(n)` runs at the n-th body message, mid-send."""
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         from oikonome.web.app import app
         opened, seen, bodies = [], [], []
         real_conn = api._conn
@@ -128,7 +128,7 @@ class ExportHoldsNothingWhileSendingTests(unittest.TestCase):
                 "/api/transactions/export?q=corner%20grocer&format=csv")
 
     def test_files_still_being_sent_are_bounded(self):
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         for knob, status in (("_EXPORT_HELD_MAX", 503),
                              ("_EXPORT_HELD_PER_HOUSEHOLD", 429)):
             with self.subTest(bound=knob):
@@ -151,7 +151,7 @@ class ExportHoldsNothingWhileSendingTests(unittest.TestCase):
                 self.assertEqual(api._EXPORT_HELD, {})
 
     def test_a_client_that_leaves_mid_send_closes_and_removes_the_file(self):
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         made, links = [], []
         real = tempfile.SpooledTemporaryFile
 

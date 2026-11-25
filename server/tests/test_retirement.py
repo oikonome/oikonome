@@ -308,9 +308,13 @@ class TestBuckets(unittest.TestCase):
             self.assertIsNone(
                 R.project(conn, age=40, end_age=60, **kw)["grow_to_67"])
             at67 = R.project(conn, age=67, end_age=95, **kw)
-            self.assertEqual(at67["grow_to_67"], at67["growth_path"][0][1])
+            self.assertEqual(at67["grow_to_67"], at67["buckets"]["total"])
+            # seven years of the steady real return on the brokerage,
+            # nothing added; the fixture's $4,750 of cash keeps pace
             younger = R.project(conn, age=60, end_age=95, **kw)
-            self.assertEqual(younger["grow_to_67"], younger["growth_path"][7][1])
+            rr = R.real_return(0.07, 0.03)
+            self.assertAlmostEqual(younger["grow_to_67"],
+                                   100_000 * (1 + rr) ** 7 + 4750, places=1)
         finally:
             conn.close()
 

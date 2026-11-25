@@ -13,7 +13,7 @@ Four provenance groups, each labeled on its rows:
   or set a category from a merchant's history page, and that choice is
   saved as a rule of yours. A correction applied to **Just this one**
   changes only that row and never appears here.
-- **Model-learned** — the local model's classifications. When an LLM is
+- **From an AI pass** — the AI endpoint's classifications. When an LLM is
   configured (Settings), merchants the data source left in vague
   buckets (general merchandise / services / other) are classified once
   by the model and cached. This group only ever holds **untouched**
@@ -24,15 +24,25 @@ Four provenance groups, each labeled on its rows:
   from the server, an endpoint that has gone away — this group simply
   stops growing, so the nightly run's failure is announced instead: an
   alert on Today and in the daily email, and a **last run** row under
-  Smart categorization on the Doctor page (see the Alerts guide).
-- **Learned** — a small classifier trained on your own corrections. Once
+  Smart categorization on the System health page (Doctor in the app's
+  More list; see the Alerts guide).
+- **Your trained model** — a small classifier trained on your household's
+  own corrections. Once
   it has seen enough of them, it fills vague buckets for merchants that
   resemble ones you already sorted, and stays quiet when unsure. Like
-  Model-learned, it holds only untouched inferences, hides when empty, and
+  an AI pass, it holds only untouched inferences, hides when empty, and
   a correction makes the rule yours.
 - **Built-in** — deterministic seed patterns for well-known chains and
   payment-processor prefixes. These match on your first import and need
   no LLM at all.
+
+The page's heading counts the rules in the same words — *2,340 yours ·
+340 from an AI pass · 45 from your household's trained model · 120
+built-in* — and adds **(none set up now)** after the AI pass when no AI
+endpoint answers categorization any more: those rules stay, but no new
+ones are being made. System health counts the same four sources under
+Smart categorization → merchant map, as brand rules, an AI pass, your
+trained model and your corrections.
 
 The machine sources take turns in a fixed order over the merchants still
 uncategorized: built-in patterns first, then the learned classifier, and
@@ -40,7 +50,7 @@ only what neither could place goes to the LLM.
 
 "Your rules" is expanded by default; the other groups collapse to a
 count. The search box spans all groups (merchant and category), and
-each group pages through its rules about 50 at a time — nothing renders
+each group pages through its rules 25 at a time — nothing renders
 thousands of rows at once.
 
 ## One rule per merchant
@@ -92,29 +102,31 @@ leaves alone any row whose category has been changed again since.
 ## Editing, disabling, deleting
 
 Each row (the owner or a member — a view-only login sees the list
-read-only) offers:
+read-only) lets you:
 
-- **edit** — change the rule's category. The picker offers spending
-  categories and your own; a rule cannot file a merchant as a transfer,
-  income or a loan payment. Editing also re-enables a disabled rule.
-- **disable** — the rule is kept but stops applying. Rows it already
-  categorized keep their category; re-enabling re-applies the rule to
-  past rows.
-- **delete** — the rule is gone, after a confirmation. No promotion, no
-  undo; transactions it already categorized keep their category.
+- **change the category** — pick a new one from the category chip on
+  the row. The picker offers spending categories and your own; a rule
+  cannot file a merchant as a transfer, income or a loan payment.
+  Choosing one also turns a turned-off rule back on.
+- **Turn off** (in the row's ⋯ menu) — the rule is kept but stops
+  applying. Rows it already categorized keep their category; **Turn
+  back on** re-applies the rule to past rows.
+- **Delete this rule** (same menu) — the rule is gone, after a
+  confirmation. No promotion, no undo; transactions it already
+  categorized keep their category.
 
-**Editing or disabling a model or built-in rule promotes it to your
-rules** — the system made a guess, you made a call, so the rule moves
-to "Your rules" and gains your-rule semantics. Re-enabling a promoted
-rule keeps it yours. There is no group-level kill switch; disable is
-per-rule only.
+**Changing the category of, or turning off, an AI-pass, trained-model or
+built-in rule promotes it to your rules** — the system made a guess, you made a call, so the rule moves
+to "Your rules" and gains your-rule semantics. Turning a promoted
+rule back on keeps it yours. There is no group-level kill switch;
+turning off is per-rule only.
 
 ## Gotchas
 
 - Deleting a model rule for a merchant the source still reports vaguely
   just puts that merchant back in the classification queue — the model
-  may learn it again. **Disable** (or edit) is how you say "stop";
-  delete is how you say "forget".
+  may learn it again. **Turn off** (or change its category) is how you
+  say "stop"; **Delete this rule** is how you say "forget".
 - Disabling a rule doesn't revert anything — rows it already
   categorized keep their category until something recategorizes them.
 - When several rules resolve to the same canonical merchant, they apply

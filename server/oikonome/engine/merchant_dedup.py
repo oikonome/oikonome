@@ -60,6 +60,30 @@ _TAIL = re.compile(
 # survives while the 'Tran:' marker is cut)
 _NOISE = re.compile(
     r"~.*$|\b(?:des|id|ppd|ref|conf|tran|indn|co)\b\s*:.*$|\bweb\s*id\b.*$", re.I)
+# What a bank's statement export glues IN FRONT of the payee: its own word
+# for the kind of entry, the transaction-type column written into the
+# description ("ACH Withdrawal FABRIKAM TUTORING", "Direct Deposit — CONTOSO
+# PAYROLL"). It is how the money moved, not who was paid, and the live feed
+# sends the same payment without it — left in, the statement's row cleans
+# to "Withdrawal Fabrikam Tutoring" beside the feed's "Fabrikam Tutoring", two
+# merchants for one payee. Only the entry kinds that are followed by a
+# payee: an ATM withdrawal, a transfer between the household's own accounts
+# or a deposit "from" a place name the terminal or the other account, and
+# cutting those would mint a merchant per location.
+_LEAD_IN = re.compile(
+    r"^\s*(?:ach\s+(?:withdrawal|deposit|debit|credit)|direct\s+deposit)\b"
+    r"\s*(?:[-\u2013\u2014]+\s*)?", re.I)
+
+
+def strip_lead_in(line: str) -> str:
+    """`line` without a statement export's entry-kind lead-in (_LEAD_IN).
+    Left whole when nothing name-like would remain: "ACH Withdrawal" alone
+    is the bank's constant, and a constant is not turned into an empty
+    name."""
+    cut = _LEAD_IN.sub("", line or "", count=1)
+    return cut if cut != line and re.search(r"[A-Za-z]{3}", cut) else (line or "")
+
+
 # Street address / locality tail. Aggregators sometimes send NO merchant
 # name at all, and the raw descriptor then carries the store's full address:
 #   'ACME AUTO SPA 100 MAIN ST SPRINGFIELD, IL, USA'
@@ -392,6 +416,43 @@ def _short_tokens_kept(toks: list[tuple[str, bool]]) -> list[str]:
     return out
 
 
+# A brand whose sign uses digits, as banks also spell it in words or glued
+# ("SEVEN ELEVEN", "7ELEVEN"): read at the front of a line only, and written
+# the way the digit form cleans, so every spelling lands on one merchant.
+_SPELLED_BRANDS = ((re.compile(r"^\s*(?:seven|7)\s*-?\s*eleven\b", re.I),
+                    "7-ELEVEN"),)
+# A short number at the very front, then a word: the shape of a numbered
+# brand ("7 ELEVEN", "99 RANCH MARKET") — or of a street address when the
+# word is followed by a street suffix ("12 MAIN ST").
+_LEADING_NUMBER = re.compile(
+    r"\s*([1-9]\d?)(?:\s+|-)([A-Za-z]{3,})(?=[\s#]|$)\s*([A-Za-z]+)?")
+_STREET_SUFFIX = {"st", "street", "rd", "road", "dr", "ln", "ave", "av",
+                  "blvd", "hwy", "way", "pkwy", "ct", "pl", "cir"}
+
+
+def _bind_leading_number(s: str) -> str:
+    """Join a short leading number to the brand word after it, so the space
+    and hyphen spellings of one brand clean to one name.
+
+    Before a distinctive word the number IS the brand ("7 ELEVEN" is not
+    "Eleven"), so it binds with a hyphen — the form "7-ELEVEN" already
+    cleans to. Before a generic word it binds with a space, the form the
+    lone-word edge rule keeps ("76 FUEL" -> "76 Fuel") and leaves out of a
+    longer run of generic words ("12 GAS STATION" is a station, numbered).
+    Two digits at most, none leading with zero: a longer run is a store or
+    house number, and a short one before a street suffix is an address."""
+    for pat, brand in _SPELLED_BRANDS:
+        s = pat.sub(brand, s, count=1)
+    m = _LEADING_NUMBER.match(s)
+    if not m:
+        return s
+    num, word, nxt = m.group(1), m.group(2), (m.group(3) or "").lower()
+    if word.lower() in _STOP or nxt in _STREET_SUFFIX:
+        return s
+    glue = " " if word.lower() in _GENERIC_ALONE else "-"
+    return f"{num}{glue}{word}{s[m.end(2):]}"
+
+
 def cut_card_numbers(text):
     """`text` as a machine may write it into a merchant's name: a card number
     or a long run of digits cut to its last four, the cut a file row's own
@@ -430,7 +491,7 @@ def canonical_merchant(name: str, cities=()) -> str:
     # regexes whose cost grows faster than linearly on long runs of one
     # character, so the label is cut first — nothing a real merchant name
     # carries lives past this point.
-    s = ascii_fold((name or "")[:_MAX_LABEL])
+    s = ascii_fold(strip_lead_in((name or "")[:_MAX_LABEL]))
     s = _NOISE.sub("", s)
     s = _PROC.sub("", s)
     s = _TAIL.sub("", s)
@@ -444,6 +505,7 @@ def canonical_merchant(name: str, cities=()) -> str:
         stripped = _ADDR.sub("", geo)
         # never let the cut empty the name — under-merge, don't destroy
         s = stripped if stripped.strip(" ,.-") else geo
+    s = _bind_leading_number(s)
     # A hyphen BETWEEN letters or digits is part of the word when it binds a
     # SHORT piece — "Q-Pack", "K-O-A", "A-1 Auto", "9-Lantern", "1-800-Blooms"
     # are one token each. Cutting on it and then dropping digits and
@@ -1382,6 +1444,13 @@ def undo(conn, change_id: int) -> dict:
             "restored": row["from_canonical"]}
 
 
+# One place however the feed spells it: a town written with and without
+# its apostrophe or space is one town, so a place is keyed on its letters
+# and digits, case folded, and shown in its most common spelling.
+_PLACE_KEY = ("lower(regexp_replace(COALESCE({c}, ''), '[^[:alnum:]]', '',"
+              " 'g'))")
+
+
 def detail(conn, display: str) -> dict | None:
     """One merchant, all of it — for the expandable row on the merchants
     screen. The catalog row carries counts and variants; this adds what a
@@ -1401,6 +1470,7 @@ def detail(conn, display: str) -> dict | None:
     # merchant's count, total, category and places do too. Identity stays
     # unscoped: the name still lists, the variants still show.
     from . import links
+    from .categories import EFFECTIVE_SQL as _EFFECTIVE_SQL
     shadows = links.shadow_ids(conn)
     personal = (f"COALESCE(true {budget.PERSONAL_ONLY_SQL}, false) "
                 "AND NOT (t.account_id = ANY(%(shadows)s::text[]))")
@@ -1409,6 +1479,20 @@ def detail(conn, display: str) -> dict | None:
                    count(*) FILTER (WHERE {personal}) AS rows,
                    round(COALESCE(sum(t.amount)
                          FILTER (WHERE {personal}), 0)::numeric, 2) AS total,
+                   -- the personal rows that move money between accounts:
+                   -- the total's words are the list's (listing_words)
+                   count(*) FILTER (WHERE {personal} AND COALESCE(
+                       {_EFFECTIVE_SQL} IN {_MOVE_SQL}, false)) AS moved_rows,
+                   count(*) FILTER (WHERE {personal} AND COALESCE(
+                       {INTEREST_ROW_SQL}, false)) AS interest_rows,
+                   COALESCE(sum(abs(t.amount)) FILTER (WHERE {personal}), 0)
+                       AS gross_dollars,
+                   COALESCE(sum(abs(t.amount)) FILTER (WHERE {personal}
+                       AND COALESCE({_EFFECTIVE_SQL} IN {_MOVE_SQL}, false)),
+                       0) AS moved_dollars,
+                   COALESCE(sum(abs(t.amount)) FILTER (WHERE {personal}
+                       AND COALESCE({INTEREST_ROW_SQL}, false)), 0)
+                       AS interest_dollars,
                    min(t.date) AS first, max(t.date) AS last,
                    array_agg(DISTINCT {merchant_sql.RAW_KEY}) AS variants,
                    -- the keys a rule reaches these rows by (see the rule
@@ -1446,8 +1530,12 @@ def detail(conn, display: str) -> dict | None:
     out["locations"] = [dict(r) for r in conn.execute(
         f"""SELECT l.city, l.region, l.address, l.postal, l.lat, l.lon,
                    l.n, l.last
-              FROM (SELECT t.location_city AS city, t.location_region AS region,
-                           t.location_address AS address,
+              FROM (SELECT mode() WITHIN GROUP (ORDER BY t.location_city)
+                               AS city,
+                           mode() WITHIN GROUP (ORDER BY t.location_region)
+                               AS region,
+                           mode() WITHIN GROUP (ORDER BY t.location_address)
+                               AS address,
                            (array_agg(t.location_postal ORDER BY t.date DESC)
                               FILTER (WHERE t.location_postal IS NOT NULL))[1]
                                AS postal,
@@ -1465,7 +1553,9 @@ def detail(conn, display: str) -> dict | None:
                             OR t.location_lat IS NOT NULL)
                        AND NOT (t.account_id = ANY(%s::text[]))
                        {budget.PERSONAL_ONLY_SQL}
-                     GROUP BY 1, 2, 3) l
+                     GROUP BY {_PLACE_KEY.format(c="t.location_city")},
+                              {_PLACE_KEY.format(c="t.location_region")},
+                              {_PLACE_KEY.format(c="t.location_address")}) l
              ORDER BY l.n DESC, l.last DESC LIMIT 5""",
         (display, shadows)).fetchall()]
     # The user's own rule for it, if any (what new rows will get) — found
@@ -1501,7 +1591,113 @@ def detail(conn, display: str) -> dict | None:
              ORDER BY (m.source = 'user') DESC, m.classified_at DESC LIMIT 1""",
         (canons, canons, mids, mids)).fetchone()
     out["rule"] = dict(rule) if rule else None
+    if out["rule"]:
+        out["rule"]["label"] = rule_label(out["rule"])
+    # the list's words for the same total, by the one rule
+    out["total_label"] = listing_words(out)["total_label"]
+    for k in _LINE_DOLLARS:
+        out.pop(k, None)
     return out
+
+
+def rename_words(r: dict) -> dict:
+    """A Recent changes row in words: the name the bank line read as, then
+    the one it reads as now, and the bank line itself only when it is
+    neither — "Acme Fuel Co → Acme Fuel Co (was Acme Fuel)" said nothing
+    changed."""
+    raw = r.get("raw_merchant") or ""
+    was = r.get("from_canonical")
+    to = r.get("to_canonical") or ""
+    label = f"{was or raw} → {to}"
+    same = {(was or "").casefold(), to.casefold()}
+    line = (None if not was or raw.casefold() in same
+            else f"bank line “{raw}”")
+    return {"label": label, "line": line}
+
+
+def total_label(total, *, moved: bool = False) -> str:
+    """A merchant's net total, said with its direction: the ledger stores
+    spending as positive and money received as negative, and a bare
+    "-$1,200" on a list of positive totals says neither what it is nor
+    which way it went. `moved`: every counted row is a transfer or a card
+    or loan payment (MOVE_CATEGORIES) — money moved between the
+    household's own accounts, neither spent at a merchant nor received
+    from one."""
+    v = float(total or 0)
+    if moved:
+        return f"${abs(v):,.0f} in transfers and payments"
+    word = "received" if v < 0 else "spent"
+    return f"${abs(v):,.0f} {word}"
+
+
+# the categories that move money between the household's own accounts:
+# a line whose counted rows are all in them is no merchant's spending
+# (income is money received, and keeps its word)
+MOVE_CATEGORIES = ("TRANSFER_IN", "TRANSFER_OUT", "LOAN_PAYMENTS")
+
+
+# A row that is a bank's interest line, not a merchant's: an interest
+# category from the feed, or a line whose name has the word interest in
+# it anywhere ("Interest …", "Credit Interest" — the feed leaves many of
+# them uncategorized). `t` is the transactions row.
+INTEREST_ROW_SQL = ("(COALESCE(t.category_detailed, '') ILIKE '%%INTEREST%%'"
+                    " OR t.name ~* '\\minterest\\M')")
+
+
+def line_words(total, rows: int | None, moved_rows: int | None,
+               interest_rows: int | None = 0, *,
+               dollars: tuple | None = None) -> str:
+    """A Merchants line's total in words, by the one rule the list and the
+    panel share: a line whose counted rows are all transfers and card or
+    loan payments (MOVE_CATEGORIES — a card issuer's line, "Transfer from
+    Checking") is money moved, not spent at a merchant nor received from
+    one, and one most of whose DOLLARS are is "mostly" that; a line of
+    interest rows is interest, the same way; any other line is spent or
+    received (total_label). `dollars`: (every counted row's, the moved
+    rows', the interest rows') sums of the amounts' sizes; without them
+    "mostly" is decided by the row counts."""
+    n = int(rows or 0)
+    v = abs(float(total or 0))
+    gross, moved_d, interest_d = (float(x or 0) for x in (dollars or (0, 0, 0)))
+    for k, d, what in ((int(interest_rows or 0), interest_d, "interest"),
+                       (int(moved_rows or 0), moved_d,
+                        "transfers and payments")):
+        if n and k == n:
+            return f"${v:,.0f} in {what}"
+        if n and k and (d * 2 > gross if dollars else k * 2 > n):
+            return f"${v:,.0f}, mostly {what}"
+    return total_label(total)
+
+
+# the dollar sums line_words decides "mostly" by; read, never sent
+_LINE_DOLLARS = ("gross_dollars", "moved_dollars", "interest_dollars")
+
+
+def listing_words(r: dict) -> dict:
+    """A Merchants list row as the clients print it: the row, its total
+    in words (line_words)."""
+    out = {k: v for k, v in r.items() if k not in _LINE_DOLLARS}
+    return {**out, "total_label": line_words(
+        r["total"], r.get("rows"), r.get("moved_rows"),
+        r.get("interest_rows"),
+        dollars=(tuple(r.get(k) for k in _LINE_DOLLARS)
+                 if r.get("gross_dollars") is not None else None))}
+
+
+# who wrote a category rule, in the words the merchant panel prints
+_RULE_WHO = {"user": "your rule", "manual": "your rule",
+             "seed": "a built-in rule", "llm": "the AI's rule",
+             "model": "the AI's rule"}
+
+
+def rule_label(rule: dict) -> str:
+    """What the merchant's category rule does, in one sentence: the rule
+    decides where NEW charges go, which is why it can name a different
+    category from the one most of its past rows carry."""
+    from .categories import display_label
+    who = _RULE_WHO.get(rule.get("source") or "", "an automatic rule")
+    return (f"new charges go to {display_label(rule.get('category_primary'))}"
+            f" ({who})")
 
 
 # The catalog's sorts and filters. A filter or sort cut on the client from
@@ -1509,22 +1705,32 @@ def detail(conn, display: str) -> dict | None:
 # here, before the LIMIT.
 LISTING_SORTS = ("count", "alpha", "spend", "recent")
 LISTING_FILTERS = ("all", "oneoff", "unnamed", "month")
-# a name the aggregator never resolved: a run of three digits, a terminal's
-# * or #, or an all-caps string of four letters or more that no one would
-# write as a name — the same test the merchant screens apply
-_UNNAMED_SQL = (f"({DISPLAY_MERCHANT} ~ '[0-9]{{3,}}|[*#]' OR "
-                f"({DISPLAY_MERCHANT} ~ '[A-Z]{{4,}}' AND "
-                f"{DISPLAY_MERCHANT} = upper({DISPLAY_MERCHANT})))")
+# a name the aggregator never resolved: a long number (five digits or
+# more, a terminal or store id) or a terminal's * or #; a shorter number in
+# a line with no lower case ("POS 482 KIOSK"); several words all in
+# capitals ("TERMINAL ORCHARD"). Never a name a person gave the merchant,
+# however it is written, and never one capitalised word — many a business
+# writes its own name as one ("ZEFO") — nor a number in a written name
+# ("412 Kitchenette", "88 Elm Lane").
+_D = DISPLAY_MERCHANT
+_UNNAMED_SQL = (f"(COALESCE(mm.name_source, mc.method, '') <> 'manual' AND ("
+                f"{_D} ~ '[0-9]{{5,}}|[*#]' OR "
+                f"({_D} ~ '[0-9]{{3,}}' AND {_D} !~ '[a-z]') OR "
+                f"({_D} ~ '[A-Z]{{4,}}' AND {_D} ~ ' ' AND {_D} = upper({_D}))))")
+# a → z as people read it: capitals do not order names ("Abbey" before
+# "AZ"); the name as written then breaks a tie between two spellings
+_BY_NAME = f"lower({_D}) ASC, 1 ASC"
 _LISTING_ORDER = {
     # ordinals: 1 = display, 2 = the personal row count, 3 = the personal
     # total, 6 = last seen; the name breaks every tie so paging with an
     # offset never repeats or skips a merchant
-    "count": "2 DESC, 1 ASC",
-    "alpha": "1 ASC",
-    "spend": "3 DESC, 1 ASC",
-    "recent": "6 DESC NULLS LAST, 1 ASC",
+    "count": f"2 DESC, {_BY_NAME}",
+    "alpha": _BY_NAME,
+    "spend": f"3 DESC, {_BY_NAME}",
+    "recent": f"6 DESC NULLS LAST, {_BY_NAME}",
 }
 _MAX_OFFSET = 10_000_000
+_MOVE_SQL = "(" + ", ".join(f"'{c}'" for c in MOVE_CATEGORIES) + ")"
 
 
 def listing(conn, q: str = "", limit: int = 200,
@@ -1579,6 +1785,7 @@ def listing(conn, q: str = "", limit: int = 200,
     # doubled figures. The row still feeds the identity columns (variants,
     # seen-range), so a name only a shadow carries still lists.
     from . import links
+    from .categories import EFFECTIVE_SQL as _EFFECTIVE_SQL
     args: list = [links.shadow_ids(conn)]
     conds: list[str] = []
     having = ""
@@ -1641,10 +1848,23 @@ def listing(conn, q: str = "", limit: int = 200,
                            AS amt_personal,
                        count(*) FILTER (WHERE NOT r.personal AND r.counted)
                            AS n_business,
+                       count(*) FILTER (WHERE r.personal AND r.counted
+                                        AND r.moved) AS n_moved,
+                       count(*) FILTER (WHERE r.personal AND r.counted
+                                        AND r.interest) AS n_interest,
+                       sum(abs(r.amount)) FILTER (WHERE r.personal
+                                                  AND r.counted) AS d_personal,
+                       sum(abs(r.amount)) FILTER (WHERE r.personal AND r.counted
+                                                  AND r.moved) AS d_moved,
+                       sum(abs(r.amount)) FILTER (WHERE r.personal AND r.counted
+                                                  AND r.interest) AS d_interest,
                        min(r.date) AS first_seen, max(r.date) AS last_seen
                   FROM (SELECT t.merchant_id, t.merchant_outlet, t.merchant_name,
                                t.name, t.amount, t.date, {personal} AS personal,
-                               NOT (t.account_id = ANY(%s::text[])) AS counted
+                               NOT (t.account_id = ANY(%s::text[])) AS counted,
+                               COALESCE({_EFFECTIVE_SQL} IN {_MOVE_SQL}, false)
+                                   AS moved,
+                               COALESCE({INTEREST_ROW_SQL}, false) AS interest
                           FROM transactions t
                          WHERE t.removed = 0 OFFSET 0) r
                  GROUP BY 1, 2, 3, 4)
@@ -1661,7 +1881,15 @@ def listing(conn, q: str = "", limit: int = 200,
                    max(mm.kind) AS kind,
                    (max(mm.plaid_entity_id) IS NOT NULL) AS plaid,
                    -- an outlet's brand ("Costco Gas" → Costco)
-                   max(pm.name) AS parent
+                   max(pm.name) AS parent,
+                   -- personal rows that move money between accounts
+                   -- (listing_words)
+                   sum(t.n_moved)::bigint AS moved_rows,
+                   sum(t.n_interest)::bigint AS interest_rows,
+                   -- the dollars "mostly" is decided by (listing_words)
+                   COALESCE(sum(t.d_personal), 0) AS gross_dollars,
+                   COALESCE(sum(t.d_moved), 0) AS moved_dollars,
+                   COALESCE(sum(t.d_interest), 0) AS interest_dollars
               FROM t {MC_JOIN}
               LEFT JOIN merchants pm ON pm.id = mm.parent_id
              {where}

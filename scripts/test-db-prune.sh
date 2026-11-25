@@ -12,7 +12,7 @@
 # with a live connection.
 set -uo pipefail
 
-KEEP="${OIKONOME_TEST_DB:-oikonome_test}"
+KEEP="${OIKONOME_TEST_DB:-oikonome_test}"; KEEP="${KEEP,,}"
 ADMIN="${OIKONOME_TEST_ADMIN_DSN:-postgresql://postgres:devpass@127.0.0.1:5433}"
 PY=server/.venv/bin/python
 [ -x "$PY" ] || PY=python3

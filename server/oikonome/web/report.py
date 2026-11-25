@@ -21,7 +21,8 @@ from email.message import EmailMessage
 
 from .. import envnum
 from ..envnum import env_flag
-from ..engine import alerts, anomalies, bills, budget, forecast, savings
+from ..engine import alerts, anomalies, bills, budget, forecast, merchant_sql, savings
+from ..engine.categories import display_label
 from ..engine.compat import as_date, as_dict
 from .data import _as_array
 
@@ -90,10 +91,10 @@ def _money(v: float) -> str:
 
 
 def _still_due_this_month(conn, cfg: dict, day: dt.date, *,
-                          income: bool = False,
                           memo: dict | None = None) -> list[dict]:
-    """The walk's occurrences that are still this month's money — one month
-    boundary for both sides of the "after cards, bills & paychecks" tile.
+    """The walk's bill occurrences that are still this month's money — the
+    bills side of the "after cards & bills" tile (the paychecks side is the
+    month plan's own still-due half, budget._month_income_parts).
     The walk re-dates an unpaid occurrence due today (a bill also when
     overdue) to at least tomorrow, so on the month's last day a horizon of
     month end would lose them all and the tile would read $0 with rent
@@ -104,7 +105,7 @@ def _still_due_this_month(conn, cfg: dict, day: dt.date, *,
     month_end = day.replace(day=calendar.monthrange(day.year, day.month)[1])
     occs = budget.upcoming_bill_occurrences(
         conn, cfg, day, max(month_end, day + dt.timedelta(days=1)),
-        income=income, memo=memo)
+        memo=memo)
     return [o for o in occs
             if o["due"] <= month_end or o["occ"]["due"] <= day]
 
@@ -127,23 +128,87 @@ def bills_remaining_month(conn, cfg: dict, day: dt.date,
     `day`; callers holding a status pass it, otherwise it is computed here.
     `memo` is the request-scoped cache gather() threads through every engine
     pass."""
-    nxt = (dt.date(day.year + 1, 1, 1) if day.month == 12
-           else dt.date(day.year, day.month + 1, 1))
-    total = sum(o["planned"] for o in _still_due_this_month(
-        conn, cfg, day, memo=memo))
+    return month_end_parts(conn, cfg, day, env_states,
+                           memo=memo)["total"]
+
+
+def month_end_parts(conn, cfg: dict, day: dt.date,
+                    env_states: list[dict] | None = None, *,
+                    memo: dict | None = None) -> dict:
+    """What the month still owes through its end, read from the walk ONCE
+    (_still_due_this_month and envelope_reserves) and split for printing
+    (specs/today-figures.md, "Envelopes are their own row"):
+
+    - `total`: bills_remaining_month, the figure the cash tiles subtract,
+      summed exactly as it always was (the occurrences, then each
+      envelope's reserve in turn), to the cent;
+    - `bills_cents` / `envelopes_cents`: its two halves in dollars to the
+      cent — the bill occurrences (this month's and any late one the
+      walk carries) and the envelopes' reserves;
+    - `bills` / `envelopes`: those two in whole dollars, apportioned ONCE
+      to `whole_dollars(total)`, so "bills $X + envelopes $Y" adds up to
+      the total as printed — the Bills row's still-due figure and the
+      Envelopes row's "still expected this month" print these two;
+    - `occs`: the walk's occurrences (server-only: the Bills row's
+      breakdown reads them rather than walking again) and `reserves`,
+      each envelope's, in `env_states` order.
+
+    `env_states` is month_status's envelope accounting for `day`; without
+    it the month is read here."""
+    occs = _still_due_this_month(conn, cfg, day, memo=memo)
     if env_states is None:
         env_states = budget.month_status(
             conn, day, memo=memo)["buckets"]["fixed"]["envelopes"]
+    reserves = envelope_reserves(env_states, day)
+    return dict(split_month_end([o["planned"] for o in occs], reserves),
+                occs=occs, reserves=reserves)
+
+
+def month_end_text(parts: dict) -> str | None:
+    """The line beneath "left at month end" on Today (web and phone) and
+    in the daily email: what the month still owes, in its two parts —
+    "bills $X + envelopes $Y" — only when both are above $0."""
+    if parts["bills"] > 0 and parts["envelopes"] > 0:
+        return (f"bills {_money(parts['bills'])} + envelopes "
+                f"{_money(parts['envelopes'])}")
+    return None
+
+
+def split_month_end(planned: list[float], reserves: list[float]) -> dict:
+    """month_end_parts' arithmetic: the total summed as
+    bills_remaining_month always summed it (the occurrences, then each
+    reserve in turn, rounded to the cent once) and its two halves, in
+    cents and in whole dollars apportioned once to the total's."""
+    from ..engine.reporting import shown_dollars
+    bills = sum(planned)
+    total = bills
+    for r in reserves:
+        total += r
+    total = round(total, 2)
+    b_c, e_c = round(bills, 2), round(sum(reserves), 2)
+    b_d, e_d = shown_dollars([b_c, e_c], total)
+    return {"total": total, "bills_cents": b_c, "envelopes_cents": e_c,
+            "bills": b_d, "envelopes": e_d}
+
+
+def envelope_reserves(env_states: list[dict], day: dt.date) -> list[float]:
+    """What the walk's drip would charge each envelope tomorrow→EOM, in
+    `env_states` order: a monthly pool's max(0, pool − used) in full, an
+    annual pool's rest-of-month share of its remaining YEAR pool."""
+    nxt = (dt.date(day.year + 1, 1, 1) if day.month == 12
+           else dt.date(day.year, day.month + 1, 1))
     days_left_month = (nxt - dt.timedelta(days=1) - day).days  # tomorrow..EOM
     days_left_year = (dt.date(day.year, 12, 31) - day).days
-    if days_left_month:
-        for e in env_states:
-            if e["period_months"] >= 12:            # annual pool
-                total += (e["period_left"] * days_left_month / days_left_year
-                          if days_left_year else 0.0)
-            else:
-                total += max(0.0, e["pool"] - e["used"])
-    return round(total, 2)
+    out = []
+    for e in env_states:
+        if not days_left_month:
+            out.append(0.0)
+        elif e["period_months"] >= 12:              # annual pool
+            out.append(e["period_left"] * days_left_month / days_left_year
+                       if days_left_year else 0.0)
+        else:
+            out.append(max(0.0, e["pool"] - e["used"]))
+    return out
 
 
 def gather(conn, today: dt.date, *, live: bool = True,
@@ -195,6 +260,12 @@ def gather(conn, today: dt.date, *, live: bool = True,
     status = budget.month_status(conn, today, historical=historical,
                                  cfg=cfg, memo=memo)
     status["today"] = today
+    # what the planner offers to save a month on the saved plan: an
+    # ordinary month's, not this one's (forecast.plan_savings_suggestion).
+    # A now-fact, so none on a past day.
+    status["savings_suggested"] = (
+        forecast.plan_savings_suggestion(conn, status, today, memo=memo,
+                                         cfg=cfg) if live else None)
     # which hero face the PAGE shows (today_view setting; absent =
     # simple). The daily email's face is the separate
     # email_schedule.daily.summary setting — the email sweep passes its
@@ -217,7 +288,7 @@ def gather(conn, today: dt.date, *, live: bool = True,
     # name (merchant row / rename) — the raw `payee` the verdict matched on
     # stays on status["rows"] for the matching that needs it
     status["yesterday_rows"] = [
-        {**dict(r), "payee": r.get("display_payee") or r["payee"]}
+        {**dict(r), "payee": merchant_sql.shown_payee(r)}
         for r in status["rows"] if as_date(r["date"]) in span]
     # What each Amazon order in the recent window actually contained, keyed
     # by txn id to match the recent rows — the template and the plain-text
@@ -272,6 +343,28 @@ def gather(conn, today: dt.date, *, live: bool = True,
                               if live else None)
     except Exception:
         status["forecast"] = None
+    # how close the forecast has landed (forecast_score; failure-tolerant)
+    try:
+        from ..engine import forecast_score
+        if live and status["forecast"]:
+            # the day's night, kept here when the hourly step has not run
+            # yet and the household's clock has passed the hour
+            forecast_score.record_if_due(conn, today)
+            status["forecast_score"] = forecast_score.current(conn, today)
+        else:
+            status["forecast_score"] = None
+    except Exception:
+        status["forecast_score"] = None
+    # the walked checking account's own-account transfers lately, which
+    # the forecast does not walk (todayview.transfers_note words them)
+    try:
+        acct = (forecast.checking_pick(conn, cfg)[0]
+                if live and status["forecast"] else None)
+        status["own_transfers"] = (
+            dict(forecast_score.kept_own_transfers(conn, cfg, acct, today))
+            if acct else None)
+    except Exception:
+        status["own_transfers"] = None
     # anomaly watch (a now-signal — quiet on a past-day view)
     try:
         status["anomalies"] = anomalies.detect(conn, today) if live else []
@@ -279,7 +372,7 @@ def gather(conn, today: dt.date, *, live: bool = True,
         status["anomalies"] = []
     # recurring detection: pending-proposal count + auto-applied drifts
     try:
-        status["recurring_pending"] = len(bills.pending_proposals(conn))
+        status["recurring_pending"] = len(bills.pending_proposals(conn, today))
         status["recurring_drifts"] = [
             {"payee": r["payee"], **as_dict(r["evidence"])}
             for r in bills.recent_auto_changes(conn, days=1)]
@@ -315,7 +408,13 @@ def gather(conn, today: dt.date, *, live: bool = True,
                WHERE a.type = 'credit' {forecast.CARD_SCOPE_SQL}
                ORDER BY a.balance_current DESC""",
             (budget.excluded_account_ids(cfg),)).fetchall()
-        card_debt = sum(max(0.0, c["bal"] or 0.0) for c in cards)
+        # the card debt the cash card prints: posted balances and pending
+        # charges, decided once (forecast.card_debt_total) — the forecast
+        # built above already holds it; read again only without one
+        card_debt = (status["forecast"]["card_debt"]
+                     if status.get("forecast") else
+                     forecast.card_debt_total(
+                         conn, budget.excluded_account_ids(cfg)))
         horizon = paycheck or (today + dt.timedelta(days=14))
         # The same rule the forecast uses — occurrence-matched against MTD
         # spend (a bill paid early is already out of checking; reserving it again
@@ -412,25 +511,55 @@ def gather(conn, today: dt.date, *, live: bool = True,
                     memo=memo))
     except Exception:
         status["savings_goals"] = []
+    # The running month's bills in parts that add up to its plan
+    # (bills_breakdown.running): one walk, one try, so the still-due
+    # figure the cash tiles subtract and the parts the Bills row prints
+    # cannot come from two reads — a failure leaves both None, never one
+    # of them. A past day has neither (still due is a now-fact).
+    # The month-end figure the cash tiles subtract and its two printed
+    # halves (month_end_parts): the walk read once, a now-fact (None on a
+    # past day, or when it cannot be read — then the tiles say nothing)
     try:
-        status["bills_remaining_month"] = (
-            bills_remaining_month(
-                conn, cfg, today,
-                env_states=status["buckets"]["fixed"]["envelopes"],
-                memo=memo)
+        parts = (month_end_parts(
+            conn, cfg, today,
+            env_states=status["buckets"]["fixed"]["envelopes"], memo=memo)
             if live else None)
     except Exception:
-        status["bills_remaining_month"] = None
+        parts = None
+    status["bills_remaining_month"] = (parts["total"] if parts is not None
+                                       else None)
+    status["month_end_parts"] = (
+        dict({k: parts[k] for k in ("total", "bills", "envelopes")},
+             text=month_end_text(parts))
+        if parts is not None else None)
+    try:
+        from . import bills_breakdown
+        status["bills_breakdown"] = (
+            bills_breakdown.running(conn, cfg, status, today, memo=memo,
+                                    parts=parts)
+            if parts is not None else None)
+    except Exception:
+        logging.getLogger("oikonome.report").exception(
+            "bills breakdown failed")
+        status["bills_breakdown"] = None
+    # ...and the month's pools, the Envelopes row (envelope_breakdown):
+    # what is set aside to month end is the envelopes half of the same
+    # walk, so the row and the cash tile's "envelopes $Y" are one figure
+    try:
+        from . import envelope_breakdown
+        status["envelopes_breakdown"] = envelope_breakdown.month(
+            status["buckets"]["fixed"], kind="running", y=today.year,
+            m=today.month,
+            reserve=parts["envelopes"] if parts is not None else 0)
+    except Exception:
+        logging.getLogger("oikonome.report").exception(
+            "envelopes breakdown failed")
+        status["envelopes_breakdown"] = None
     # The paychecks still due this month — their dates and their sum —
-    # from the ONE walk the cash forecast and the runway reserve with
-    # (budget.upcoming_bill_occurrences, income=True), each occurrence
-    # sized at the series' latest deposit like the month's expected
-    # income is. Not `income_expected` itself: that half is matched
-    # against posted AND pending deposits, while checking starts from the
-    # current balance when the bank reports no available one — so on
-    # payday a pending check would be "received" there and absent from
-    # the balance here, and the tile would read +$0 against a cash figure
-    # that never saw the money. The walk re-dates that case to tomorrow.
+    # are the month plan's own "still due" half
+    # (budget._month_income_parts → expected): one figure for Budget's
+    # "still due", Today's "paychecks still due" and the email. A check
+    # posted pending counts as landed there, so it is not still due here.
     # None when the household tracks no income series: the tile then says
     # that no paycheck is set up — the month-end figure counts bills and
     # no income, and a reader who sees only the bills side thinks the
@@ -449,43 +578,38 @@ def gather(conn, today: dt.date, *, live: bool = True,
     status["income_due_note"] = None
     try:
         if live:
-            off = {(p or "").lower() for p in (cfg.get("disabled_bills") or [])}
-            scheduled = [b for b in budget._recurring_bills(
-                             conn, caps=cfg.get("occurrence_caps"),
-                             income=True, memo=memo)
-                         if (b["recurrence"] or {}).get("frequency")]
-            series = [b for b in scheduled if b["payee"].lower() not in off]
-            if not series:
+            parts = budget._month_income_parts(conn, cfg, today,
+                                               closed=False, memo=memo)
+            if parts is None:
+                scheduled = [b for b in budget._recurring_bills(
+                                 conn, caps=cfg.get("occurrence_caps"),
+                                 income=True, memo=memo)
+                             if (b["recurrence"] or {}).get("frequency")]
                 status["income_due_note"] = (
                     "off" if scheduled
                     else "budgeted" if budget.active_monthly_income(cfg)
                     else "none")
-            if series:
-                # the same month boundary the bills side uses: a month-end
-                # payday not yet posted (the commonest semi-monthly
-                # schedule) is re-dated into next month and still counts
-                occs = _still_due_this_month(
-                    conn, cfg, today, income=True, memo=memo)
-                total = 0.0
-                if occs:
-                    claims = budget._income_claims(
-                        conn, today, [o["occ"]["bill"] for o in occs], memo=memo,
-                        excluded=budget.excluded_account_ids(cfg))
-                    latest: dict = {}
-                    for o in occs:
-                        b = o["occ"]["bill"]
-                        if b["payee"] not in latest:
-                            latest[b["payee"]] = budget.latest_deposit_amount(
-                                conn, today, b, claims=claims)
-                        amt = latest[b["payee"]]
-                        total += amt if amt is not None else o["planned"]
-                status["income_due_dates"] = [o["due"].isoformat()
-                                              for o in occs]
-                status["income_due_total"] = round(total, 2)
+            else:
+                status["income_due_dates"] = parts["expected_dates"]
+                status["income_due_total"] = parts["expected"]
     except Exception:
         status["income_due_dates"] = None
         status["income_due_total"] = None
         status["income_due_note"] = None
+    # The Cash timeline's month-end tiles, one figure each: checking less
+    # card debt less the bills still due this month, and the same plus the
+    # paychecks still due. A now-fact (None on a past day, or with no
+    # checking balance to start from).
+    status["after_cards_bills"] = None
+    status["after_cards_bills_paychecks"] = None
+    rw_ = status.get("runway") or {}
+    if (rw_.get("checking") is not None
+            and status.get("bills_remaining_month") is not None):
+        after = rw_["checking"] - rw_["card_debt"] - status["bills_remaining_month"]
+        status["after_cards_bills"] = round(after, 2)
+        if status["income_due_total"] is not None:
+            status["after_cards_bills_paychecks"] = round(
+                after + status["income_due_total"], 2)
     # charges flagged "reimbursement expected" — surfaced as an alert.
     # The engine helper nets partial receipts off each charge, so the
     # total is what's still OWED, not the charges' face value.
@@ -548,15 +672,15 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     # the recent list shows VARIABLE spend only — the subject $ matches it
     fixed_ids = {r["txn_id"] for r in d["buckets"]["fixed"]["rows"]}
     y_rest = [r for r in d["yesterday_rows"] if r["txn_id"] not in fixed_ids]
-    spent_yday = sum(r["amount"] for r in y_rest)
+    spent_yday = round(sum(r["amount"] for r in y_rest), 2)
     yday_label = "Recent transactions"
 
     if verdict == "ON BUDGET":
         v_detail = "variable spending on pace"
     elif verdict == "UNDER BUDGET":
-        v_detail = f"{_money(-variance)} ahead on variable spending"
+        v_detail = f"{_money(-variance)} less than planned on variable spending"
     else:
-        v_detail = f"{_money(variance)} over on variable spending"
+        v_detail = f"{_money(variance)} more than planned on variable spending"
 
     # on plan is green in the subject too — it is the same signal as the
     # verdict pill, and amber there reads as a warning
@@ -570,52 +694,30 @@ def build(d: dict, *, summary: bool = False) -> tuple:
 
     var_budget_total = (d["buckets"]["food"]["month_budget"]
                         + d["buckets"]["other"]["month_budget"])
-    # the hero's "$X of $Y left": the month's paced share and what is left
-    # of it (month_status), the remainder the tiles hand out a day at a time
-    hero_budget = d.get("variable_budget_paced", var_budget_total)
+    # the hero's "$X of the month's $Y left": what is left of the month's
+    # paced share (month_status); the words after it are hero_face's
     remaining = d.get("month_remaining_paced",
                       var_budget_total - d["variable_actual"])
 
-    # cash: quiet until it matters — plain-text mirror of the
-    # HTML block's three states. autopay-statement is the
-    # realistic with-cards trajectory.
+    # HTML = the shared Today template, email mode. The context is built
+    # ONCE and shared with the plain-text mirror below — it aggregates
+    # the whole hero (allowances, bill cards, why chips, MTD rollups),
+    # which is too much work to redo for a second surface of the same
+    # send.
+    from .todayview import (_moneyc, build_context,
+                            render_email)
+    ctx = build_context(d, email=True)
+    html = render_email(d, summary=summary, ctx=ctx)
+
+    # cash: quiet until it matters — the plain-text words for the notice
+    # todayview decided (cash_notice); no threshold is judged here
     rw = d.get("runway") or {}
-    spare = None
     fc = d.get("forecast")
-    # When the balance is known to be stale, todayview drops the whole
-    # forecast — SPA card, email card, cash notice — rather than present a
-    # number seeded from a lie. The plain-text mirror cannot show a caveat,
-    # so it suppresses the same way; the set-your-balance
-    # nudge in the verdict still tells them why it is quiet.
     if rw.get("balance_unreliable") or rw.get("no_checking"):
         fc = None
-    pc = fc["pace_stmt"] if fc else None
-    if rw.get("checking") is not None and not rw.get("balance_unreliable"):
-        spare = rw["checking"] - rw["required"]
-    income = d.get("income")
-    paycheckish = (income / 2) if income else 1000
-    neg_in = None
-    if pc and pc.get("negative_date"):
-        neg_in = (dt.date.fromisoformat(pc["negative_date"])
-                  - d["today"]).days
-    cash_critical = ((spare is not None and spare < 0)
-                     or (neg_in is not None and neg_in <= 14))
-    cash_tight = not cash_critical and (
-        (spare is not None and spare < paycheckish)
-        or bool(pc and (pc["min"] < 0 or neg_in is not None)))
-    # the shortfall quoted beside negative_date is the balance ON that day
-    # (`first_neg_amount`), never the possibly-deeper later `min` — same
-    # pairing as todayview.build_context, which the HTML renders
-    first_neg = pc.get("first_neg_amount") if pc else None
-    slow_to = None
-    if first_neg is not None and first_neg < 0 and neg_in and neg_in > 0:
-        slow_to = max(0.0, (pc.get("rate") or 0) + first_neg / neg_in)
-    slow_txt = (f", or slow spending to {_money(slow_to)}/day"
-                if slow_to is not None else "")
+    pc = fc["pace_usual"] if fc else None
+    note = ctx["cash_notice"]
     cash_line = None
-    # the payday the headroom stops at, named so the notice reads as timing
-    np_ = d.get("next_paycheck")
-    np_txt = f" ({_d(np_)})" if np_ else ""
     # the two "we can't see your cash yet" nudges — the same sentences the
     # HTML card carries in place of a cash alarm
     if rw.get("balance_unreliable"):
@@ -624,47 +726,16 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     elif rw.get("no_checking"):
         cash_line = ("No checking account linked — link your checking "
                      "account on the Accounts page to see cash ahead.")
-    elif cash_critical:
-        if spare is not None and spare < 0:
-            cash_line = (f"!! CASH: short {_money(-spare)} today — checking "
-                         f"doesn't cover cards & bills before the next "
-                         f"paycheck{np_txt}. Cover it from savings{slow_txt}.")
-        else:
-            by = _d(pc["negative_date"]) if pc.get("negative_date") else "now"
-            short = first_neg if first_neg is not None else pc["min"]
-            cash_line = (f"!! CASH: short {_money(-short)} by {by} — "
-                         f"cover it from savings{slow_txt}.")
-    elif cash_tight:
-        if pc and (pc["min"] < 0 or neg_in is not None):
-            cash_line = (f"Cash gets tight around {_d(pc['min_date'])} "
-                         f"(low {_money(pc['min'])}).")
-        else:
-            cash_line = (f"Cash is tight — {_money(spare)} left after cards "
-                         f"& bills before the next paycheck{np_txt}.")
-
-    # the plan chain and the heavy/light judgement read the month's bill
-    # SCHEDULE, the figure the variable scale subtracted — the cash-basis
-    # fixed total moves with an early autopay of next month's bill, and the
-    # chain in -> bills due -> to spend would stop adding up. The fixed
-    # line below keeps the cash basis and says so.
-    month_bills = d.get("scheduled_month",
-                        d["buckets"]["fixed"]["month_budget"])
-    weight = month_bills - d["avg_bills"]
-    weight_txt = (f"heavy month, +{_money(weight)} vs average" if weight > 100
-                  else f"light month, −{_money(-weight)} vs average" if weight < -100
-                  else "typical month")
+    elif note["text"]:
+        # the notice in the words every surface prints
+        # (todayview.cash_sentence); a critical one keeps its alarm mark
+        cash_line = (("!! CASH: " if note["state"] == "critical"
+                      and not note["ask"] else "") + note["text"])
+    elif ctx.get("cash_band"):
+        # the quiet heavier-month line (todayview.cash_band)
+        cash_line = ctx["cash_band"]["text"]
 
     summaries = d.get("amazon_summaries") or {}
-
-    # HTML = the shared Today template, email mode. The context is built
-    # ONCE and shared with the plain-text mirror below — it aggregates
-    # the whole hero (allowances, bill cards, why chips, MTD rollups),
-    # which is too much work to redo for a second surface of the same
-    # send.
-    from .todayview import (_moneyc, build_context, no_paycheck_note,
-                            render_email)
-    ctx = build_context(d, email=True)
-    html = render_email(d, summary=summary, ctx=ctx)
 
     # plain-text mirror — same section order as the html / Today page.
     # Brand line mirrors the HTML header's link; only for a MAILABLE base
@@ -696,20 +767,17 @@ def build(d: dict, *, summary: bool = False) -> tuple:
         tile_line = " · ".join(
             (f"{label} $0 (over by {_money(-a['left_today'])})"
              if a["left_today"] < -0.5
-             else f"{label} {_money(max(0.0, a['left_today']))} "
-                  f"of {_money(a['today_allowance'])}")
+             # the folded row's words (MIRRORS today_body.html)
+             else f"{label} $0 today" if a.get("zero_day")
+             else f"{label} ${a['left_dollars']:,} "
+                  f"of ${a['today_allowance_dollars']:,}")
             + (f" ({a['daily_note']}"
                + (f"; {a['recover_note']}" if a.get("recover_note") else "")
                + ")" if a.get("daily_note") else "")
             for label, a in day_ctx["allow_tiles"])
     plain += [f"{state} — {day_ctx['pace_line']} · "
-              f"{_money(abs(remaining))} "
-              f"{'over the' if remaining < 0 else 'of'} "
-              f"{_money(hero_budget)}"
-              f"{'' if remaining < 0 else ' left'} · "
-              f"{day_ctx['days_left']} "
-              f"day{'' if day_ctx['days_left'] == 1 else 's'}",
-              f">> LEFT TO SPEND TODAY: {tile_line} <<"]
+              f"{_money(abs(remaining))} {day_ctx['month_words']}",
+              f">> {day_ctx['left_label'].upper()}: {tile_line} <<"]
     # pinned bills (bill setting "pin to Today") — the same server-composed
     # card sentences the page and the HTML render
     if day_ctx["bill_cards"]:
@@ -718,7 +786,12 @@ def build(d: dict, *, summary: bool = False) -> tuple:
             f"{'left' if c['kind'] == 'envelope' else 'to go'} "
             f"({c['sub']}{'; ' + c['status'] if c['status'] else ''})"
             for c in day_ctx["bill_cards"])
-        plain += [f"Pinned bills: {card_line}"]
+        plain += [f"Pinned: {card_line}"]
+    # the HTML's auto-scale sentence, where the HTML puts it
+    if d.get("variable_scale"):
+        plain += ["Variable budgets auto-scaled from "
+                  f"{_money(d['variable_scale']['static_total'])} to fit "
+                  "this month's bills."]
     if cash_line:
         plain += [cash_line]
     # the WHY, over-budget only — a good day is quiet: merchant chips as
@@ -728,7 +801,7 @@ def build(d: dict, *, summary: bool = False) -> tuple:
     if day_ctx["why_chips"]:
         chip_txt = ", ".join(
             f"{c['payee'][:26]} {_money(c['amount'])}"
-            + (f" ({c['count']}x)" if c["count"] > 1 else "")
+            + (f" ({c['count']}×)" if c["count"] > 1 else "")
             for c in day_ctx["why_chips"])
         plain += [f"Driving it: {chip_txt}"]
         for e in w.get("entries") or []:
@@ -747,61 +820,40 @@ def build(d: dict, *, summary: bool = False) -> tuple:
             # re-casing it here is exactly the drift the shared string
             # exists to prevent
             plain += ["", day_ctx["sweep_line"]]
-    plan_flow = (f"Plan: "
-                 f"{_money(d['income']) if d.get('income') is not None else '·'} in -> "
-                 f"{_money(month_bills)} bills due "
-                 f"(avg {_money(d['avg_bills'])}; {weight_txt}) -> "
-                 f"{_money(var_budget_total)} to spend")
-    # the surplus subtracts the savings plan, so without this leg the chain
-    # lands on a number the terms shown do not produce
-    if (d.get("savings_plan") or 0) > 0.005:
-        plan_flow += f" -> {_money(d['savings_plan'])} saved"
-    if d.get("plan_surplus") is not None:
-        plan_flow += f" -> {_money(d['plan_surplus'])} excess"
-    # the sweep goals' line — the SAME server-composed sentence the page
-    # and the HTML render, beside the chain (a sweep takes from the
-    # excess only when the month provides it, so it is not a chain link)
-    if day_ctx.get("sweep_line"):
-        plan_flow += f" · {day_ctx['sweep_line']}"
-    if view == "detail":
+    # the terms print in the whole dollars budget.plan_line rounded to the
+    # printed excess, so the chain adds up as printed; without an excess
+    # (no income) there is nothing to add up to and each prints its own
+    # the plan line in the terms budget.plan_line rounded to the printed
+    # excess, as the HTML prints it — and, like the HTML, only when there
+    # is a plan line (no income yet: no line)
+    pl = d.get("plan_line")
+    if pl and view == "detail":
+        # this month's schedule against the average, in the words the
+        # page and the HTML print beside the bills (todayview.bills_weight)
+        weight_txt = (f" ({day_ctx['bills_weight']})"
+                      if day_ctx.get("bills_weight") else "")
+        plan_flow = (f"Plan: {_money(pl['income'])} in -> "
+                     f"{_money(pl['bills'])} "
+                     f"{day_ctx.get('plan_bills_label') or 'bills'}"
+                     f"{weight_txt} -> "
+                     f"{_money(pl['to_spend'])} to spend")
+        if pl["saved"] is not None:
+            plan_flow += f" -> {_money(pl['saved'])} saved"
+        # the excess in the Budget summary's words (plan_excess_words)
+        ex_words = (day_ctx.get("plan_excess_words") or {}).get("text")
+        plan_flow += f" -> {_money(pl['excess'])} {ex_words or 'excess'}"
+        # the sweep goals' line — the SAME server-composed sentence the
+        # page and the HTML render, beside the chain (a sweep takes from
+        # the excess only when the month provides it, so it is not a link)
+        if day_ctx.get("sweep_line"):
+            plan_flow += f" · {day_ctx['sweep_line']}"
         plain += ["", plan_flow]
-    if d.get("variable_scale"):
-        sc = d["variable_scale"]
-        plain += [f"  Heavy bill month: variable budgets scaled to {_money(sc['available'])} "
-                  f"(from {_money(sc['static_total'])})"]
     # the summary email ends with the verdict pane — everything the HTML's
     # hero card carries is now said; the map/timeline/goals sections below
     # belong to the extensive version only
     if summary:
         plain += ["", "(summary email — open Oikonome for the full report)"]
         return subject, "\n".join(plain), html
-    if d.get("irregular_bills"):
-        plain += ["  Non-monthly bills this month: " + ", ".join(
-            f"{i['payee']} {_money(i['amount'])} ({i['label']})"
-            for i in d["irregular_bills"][:4])]
-    # cash timeline header — cash's one home (checking, cards, after
-    # everything, and the forecast low), one line
-    if rw.get("checking") is not None:
-        after_cards = rw["checking"] - rw["card_debt"]
-        cash_now = (f"Cash timeline: checking {_money(rw['checking'])} · "
-                    f"card debt {_money(rw['card_debt'])}")
-        if d.get("bills_remaining_month") is not None:
-            inc = d.get("income_due_total")
-            if inc is not None:
-                dates = d.get("income_due_dates") or []
-                when = (" (" + ", ".join(_d(x) for x in dates[:3]) + ")"
-                        if dates else "")
-                cash_now += (f" · paychecks still due +{_money(inc)}{when}"
-                             " · after cards, bills & paychecks "
-                             + _money(after_cards - d["bills_remaining_month"]
-                                      + inc))
-            else:
-                cash_now += (" · after cards & bills "
-                             + _money(after_cards - d["bills_remaining_month"])
-                             + f" ({no_paycheck_note(d)})")
-        if pc:
-            cash_now += (f" · low {_money(pc['min'])} {_d(pc['min_date'])}")
-        plain += ["", cash_now]
     # savings goals — trackable ones, and the ones that need an account to
     # become trackable (their line is the prompt to pick it; any other
     # plan-only row has nothing to report), and the advanced face only: the
@@ -817,12 +869,16 @@ def build(d: dict, *, summary: bool = False) -> tuple:
                 plain += [f"  {g['name']}: match words need an account — "
                           "pick one on the Budget page"]
                 continue
-            # open-ended goal (no target): "$X saved" + the measured rate —
-            # never "of $0" (mirrors Today.tsx)
+            # withdrawals outweighing deposits is not the same news as
+            # nothing arriving (mirrors Today.tsx)
+            nothing = ("no net saving in the last 3 months"
+                       if g.get("contributed_90d")
+                       else "no contributions in 3 months")
+            # open-ended goal (no target): "$X saved" + what the last 3
+            # months saved — never "of $0" (mirrors Today.tsx)
             if not g.get("target"):
-                pace = (f"saving {_money(g['rate_90d'])}/mo"
-                        if (g.get("rate_90d") or 0) > 0
-                        else "no contributions in 90 days")
+                pace = (f"{_money(g['saved_90d'])} in the last 3 months"
+                        if (g.get("saved_90d") or 0) > 0 else nothing)
                 plain += [f"  {g['name']}: {_money(g.get('saved') or 0)} "
                           f"saved — {pace}"]
                 continue
@@ -830,53 +886,106 @@ def build(d: dict, *, summary: bool = False) -> tuple:
                     else "off pace" if g.get("on_pace") is False
                     else "on pace" if g.get("on_pace")
                     else (f"~{_d(g['eta'])} at the current rate"
-                          if g.get("eta") else "no contributions in 90 days"))
+                          if g.get("eta") else nothing))
             plain += [f"  {g['name']}: {_money(g.get('saved') or 0)} of "
                       f"{_money(g.get('target') or 0)}"
                       + (f" ({g['pct']}%)" if g.get("pct") is not None else "")
                       + f" — {pace}"]
-    plain += [""]
-    vsign = "+" if d["variance"] > 0 else "-"
-    plain.append(f"{'Variable spending':<22} spent {_money(d['variable_actual']):>11}  "
-                 f"expected {_money(d['variable_expected']):>11}  "
-                 f"({vsign}{_money(abs(d['variance']))})")
-    for key in ("food", "other"):
-        b = d["buckets"][key]
-        kids = b.get("children") or []
-        # with custom buckets the parent line shows the remainder
-        # after the carve-outs; each child gets its own indented line
-        actual = b["display_actual"] if kids else b["actual"]
-        expected = b["display_expected"] if kids else b["expected"]
-        sign = "+" if actual - expected > 0 else "-"
-        plain.append(f"  {BUCKET_LABELS[key]:<20} spent {_money(actual):>11}  "
-                     f"expected {_money(expected):>11}  "
-                     f"({sign}{_money(abs(actual - expected))})")
-        for c in kids:
-            csign = "+" if c["variance"] > 0 else "-"
-            plain.append(f"    {c['name'][:18]:<18} spent {_money(c['actual']):>11}  "
-                         f"expected {_money(c['expected']):>11}  "
-                         f"({csign}{_money(abs(c['variance']))})")
-    fx = d["buckets"]["fixed"]
-    plain.append(f"{'Fixed bills (info)':<20} posted {_money(fx['actual']):>10}  "
-                 f"awaiting {_money(fx.get('unpaid_due', 0)):>10}  "
-                 f"month cash {_money(fx['month_budget'])}")
+    # the money map — the HTML's Monthly budget card, row for row: the
+    # same rows (todayview.money_map), the same words beside each
+    # (row_status, on Today's pace basis), the same captions and footer
+    # lines, so the plain text says what the page and the HTML say
+    mp = ctx["map"]
+    plain += ["", "Monthly budget:"]
+    for r in mp["rows"]:
+        pad = "    " if r["indent"] else "  "
+        figs = (f"{r.get('actual_label') or _money(r['actual'])} / "
+                f"{'—' if r['unbudgeted'] else _money(r['budget'])}")
+        plain.append(f"{pad}{r['label']} {figs}"
+                     + (f" — {r['delta']['text']}" if r["delta"] else ""))
+        if r["unbudgeted"]:
+            plain.append(f"{pad}  no budget set — set one on the Budget "
+                         "page so this counts toward the verdict")
+        elif r.get("caption"):
+            plain.append(f"{pad}  {r['caption']}")
+    if mp["folded"]:
+        plain += ["  Also this month: " + " · ".join(mp["folded"])]
+    if d.get("irregular_bills"):
+        plain += ["  Non-monthly bills this month: " + " · ".join(
+            f"{i['payee']} {_money(i['amount'])} ({i['label']})"
+            for i in d["irregular_bills"][:4])]
     # a charge the bank feed withdrew is not a bill that never posted —
     # it gets its own line, as on the Today page
     late = [o for o in budget.overdue_entries(d) if not o[3]]
     gone = [o for o in budget.overdue_entries(d) if o[3]]
     if late:
-        plain += ["Scheduled but not yet posted: "
-                  + ", ".join(f"{p} {_money(a)}" for p, a, *_ in late[:4])]
+        plain += ["  Scheduled but not yet posted: "
+                  + ", ".join(f"{p} {_money(a)} (due {_d(due)})"
+                              for p, a, due, _ in late[:4])]
     if gone:
-        plain += ["withdrawn by the bank feed: "
+        plain += ["  withdrawn by the bank feed: "
                   + ", ".join(f"{p} {_money(a)} ({_d(on)})"
                               for p, a, _, on in gone[:4])]
-    plain += ["", f"{yday_label} ({_money(spent_yday)} variable):"]
-    if y_rest:
+    # cash timeline header — cash's one home (checking, cards, after
+    # everything, and the forecast low), one line
+    if rw.get("checking") is not None:
+        # the card debt the HTML's tile prints: the forecast's (pending
+        # charges included), the runway's posted figure only without one
+        debt = fc["card_debt"] if fc else rw["card_debt"]
+        cash_now = (f"Cash timeline: checking {_money(rw['checking'])} · "
+                    f"card debt {_money(debt)}")
+        if d.get("income_due_total") is not None:
+            dates = d.get("income_due_dates") or []
+            when = (" (" + ", ".join(_d(x) for x in dates[:3]) + ")"
+                    if dates else "")
+            cash_now += (f" · paychecks still due "
+                         f"+{_money(d['income_due_total'])}{when}")
+        # the balance the timeline ends the month on, and why
+        # (todayview.month_end_left), as the HTML's tile says it
+        if ctx["month_end"]:
+            cash_now += (f" · {ctx['month_end_label']} "
+                         f"{_money(ctx['month_end']['balance'])} "
+                         f"({ctx['month_end_note']})")
+            # what the cards still hold then, as the HTML
+            if ctx["month_end_cards_note"]:
+                cash_now += f" · {ctx['month_end_cards_note']}"
+        # each card scenario's low point, in the HTML's words
+        if pc and ctx["fc_lows"]:
+            cash_now += " · low: " + "; ".join(
+                f"{lo['label'].lower()} "
+                # a low that ends its own sentence gives up its period to
+                # the cards' clause
+                + (f"{lo['words'].rstrip('.')}, {lo['cards_note']}"
+                   if lo.get("cards_note") else lo["words"])
+                for lo in ctx["fc_lows"])
+        plain += ["", cash_now]
+        if fc and ctx["pace_note"]:
+            plain += [f"  {ctx['pace_note']}"]
+        # the forecast's track record, as the HTML prints it
+        sc = ctx.get("forecast_score") or {}
+        for line in (sc.get("text"), sc.get("bias_text")):
+            if fc and line:
+                plain += [f"  {line}"]
+        if fc and ctx["card_timing_note"]:
+            plain += [f"  {ctx['card_timing_note']}"]
+        # a paycheck left out because it stopped arriving, as the HTML
+        if fc and ctx.get("stopped_paychecks_note"):
+            plain += [f"  {ctx['stopped_paychecks_note']}"]
+        # own-account transfers the forecast leaves out, as the HTML
+        if fc and ctx.get("transfers_note"):
+            plain += [f"  {ctx['transfers_note']}"]
+        if fc and ctx["scenarios"] and ctx["scenarios"][0]["cards_note"]:
+            plain += [f"  {ctx['scenarios'][0]['cards_note']}"]
+    # the recent rows in the page's order (build_context sorts them)
+    recent = day_ctx["recent_var"]
+    plain += ["", f"{yday_label} ({_money(day_ctx['recent_var_total'])} "
+                  "variable):"]
+    if recent:
         # cents on transaction rows, like the site's tables
         plain += [f"    {_moneyc(r['amount']):>10}  "
                   f"{r['payee'] + ' — ' + summaries[r['txn_id']] if r['txn_id'] in summaries else r['payee']}"
-                  f"  [{r['category']}]" for r in y_rest]
+                  + (" (pend)" if r.get("pending") else "")
+                  + f"  [{display_label(r['category'])}]" for r in recent]
     else:
         plain += ["  (none)"]
     return subject, "\n".join(plain), html
@@ -895,6 +1004,41 @@ def _flag_on_unless_disabled(name: str) -> bool:
             if (os.environ.get(name) or "").strip() else True)
 
 
+def relay_user(conn, cfg: dict) -> str:
+    """The relay login as stored settings hold it, decrypted. It is stored
+    encrypted like the password beside it: Postmark takes the server API
+    token as the login. An untagged value (an older build's, or a box
+    without a master key) passes through; one that will not decrypt (the
+    key it was sealed under is gone) reads as no login, so the relay
+    refuses the send where the mail health probe sees it, and no settings
+    save stops on it."""
+    from ..db import crypto
+    try:
+        return crypto.decrypt(conn, cfg.get("smtp_user") or None) or ""
+    except Exception:                                    # noqa: BLE001
+        import logging
+        logging.getLogger("oikonome.email").warning(
+            "the stored mail relay login does not decrypt; read as none")
+        return ""
+
+
+def seal_relay_user(conn, stored, posted) -> str:
+    """What to store for a posted relay login: blank stays blank, the
+    stored ciphertext when it already holds this login (a re-save of the
+    whole settings document is no change), otherwise the login encrypted
+    under the household's key."""
+    from ..db import crypto
+    posted = str(posted or "")
+    if not posted:
+        return ""
+    try:
+        if stored and crypto.decrypt(conn, stored) == posted:
+            return stored
+    except Exception:                                    # noqa: BLE001
+        pass                     # unreadable: replaced by what was posted
+    return crypto.encrypt(conn, posted)
+
+
 def _user_as_sender(user) -> str | None:
     from .mailguard import valid_address
     return user if valid_address(user) else None
@@ -903,7 +1047,11 @@ def _user_as_sender(user) -> str | None:
 def _env_smtp() -> dict:
     host = os.environ.get("OIKONOME_SMTP_HOST", "")
     return {"host": host or "localhost",
-            "port": int(envnum.env_num("OIKONOME_SMTP_PORT", "587")),
+            # a hand-edited port that is not a number ("587/tcp") would
+            # raise on every mail path, the mail-health probe included;
+            # env_int names it in the log and keeps the default
+            "port": envnum.env_int("OIKONOME_SMTP_PORT", 587,
+                                   lo=1, hi=65535),
             "user": os.environ.get("OIKONOME_SMTP_USER"),
             "password": os.environ.get("OIKONOME_SMTP_PASSWORD"),
             "sender": os.environ.get("OIKONOME_SMTP_FROM",
@@ -1026,13 +1174,13 @@ def resolve_smtp(conn) -> dict:
             return _env_smtp()
         return {"host": cfg["smtp_host"],
                 "port": _stored_port(cfg.get("smtp_port")),
-                "user": cfg.get("smtp_user") or None,
+                "user": relay_user(conn, cfg) or None,
                 "password": crypto.decrypt(conn, cfg.get("smtp_password"))
                             if cfg.get("smtp_password") else None,
                 # a relay saved before the settings door filled an empty
                 # From still sends as its own account, as the door now saves
                 "sender": cfg.get("smtp_from") or _user_as_sender(
-                    cfg.get("smtp_user")) or "oikonome@localhost",
+                    relay_user(conn, cfg)) or "oikonome@localhost",
                 "starttls": bool(cfg.get("smtp_starttls", True)),
                 # self-host: the operator's env escape hatch reaches a
                 # relay saved here only when it is on their own network

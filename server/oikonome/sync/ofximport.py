@@ -32,7 +32,7 @@ from ofxtools.Parser import OFXTree
 
 from ..engine.compat import as_date
 from . import feed_dates, flowmap
-from .base import (FileImportIds, Transaction, _descriptor,
+from .base import (FileRowCount, FileImportIds, Transaction, _descriptor,
                    check_split_accounts, ensure_split_account,
                    mask_account_name,
                    drop_before_history, upsert_transactions)
@@ -167,6 +167,10 @@ def parse_ofx(data: bytes, tenant: str | None = None) -> list[dict]:
 def _parse_tree(data: bytes) -> list[dict]:
     tree = OFXTree()
     tree.parse(io.BytesIO(data))
+    # the UTC day an earlier build dated each zoned line by, read before
+    # the stamps lose their clock time: the matcher recognises a row that
+    # build stored by it
+    utc_days = feed_dates.ofx_utc_days(tree.getroot())
     # the day each stamp prints in the file's own zone, not its UTC day
     feed_dates.pin_ofx_days(tree.getroot())
     ofx = tree.convert()
@@ -176,10 +180,21 @@ def _parse_tree(data: bytes) -> list[dict]:
         acct_hint = getattr(acct, "acctid", None)
         window = _statement_window(stmt)
         for t in (stmt.transactions or []):
+            fitid = getattr(t, "fitid", None)
+            date = _posted_date(t)
+            amount = (float(t.trnamt) if getattr(t, "trnamt", None)
+                      is not None else None)
+            utc_day = None
+            if date is not None and amount is not None:
+                key = (str(fitid).strip() if fitid else None, date,
+                       round(amount * 100))
+                queue = utc_days.get(key)
+                if queue:
+                    utc_day = queue.pop(0)
             out.append({
-                "fitid": getattr(t, "fitid", None),
-                "date": _posted_date(t),
-                "amount": float(t.trnamt) if getattr(t, "trnamt", None) is not None else None,
+                "fitid": fitid,
+                "date": date,
+                "amount": amount,
                 "name": (getattr(t, "name", None) or getattr(t, "memo", None) or "?"),
                 "memo": getattr(t, "memo", None),
                 "type": getattr(t, "trntype", None),
@@ -192,6 +207,7 @@ def _parse_tree(data: bytes) -> list[dict]:
                 # the days this statement speaks for (DTSTART..DTEND):
                 # a re-import may only restate a stored charge it covers
                 "window": window,
+                "utc_day": utc_day,
             })
     return out
 
@@ -271,6 +287,7 @@ sys.exit(_child_main(src, dst))
 def _to_wire(r: dict) -> dict:
     out = dict(r)
     out["date"] = r["date"].isoformat() if r["date"] else None
+    out["utc_day"] = r["utc_day"].isoformat() if r["utc_day"] else None
     out["window"] = ([d.isoformat() for d in r["window"]]
                      if r["window"] else None)
     for k in ("fitid", "name", "memo", "type", "acct", "accttype"):
@@ -307,6 +324,8 @@ def _from_wire(r) -> dict:
             "cc": bool(r.get("cc")),
             "window": ((dt.date.fromisoformat(w[0]),
                         dt.date.fromisoformat(w[1])) if w else None),
+            "utc_day": (dt.date.fromisoformat(r["utc_day"])
+                        if r.get("utc_day") else None),
         }
     except (TypeError, ValueError, IndexError, KeyError):
         raise ValueError(_FAILED_MSG) from None
@@ -481,20 +500,26 @@ def import_ofx(conn, account_id: str, data: bytes,
     # the sync package carries no load-time dependency on the web layer.
     from ..web.bulk_import import hold_ledger_write_locks
     hold_ledger_write_locks(conn)
+    # rows a build that dated by the printed day wrote without the note
+    # (the released app keeps serving while the one-shot backfill runs)
+    # are noted before the matcher reads which rows are printed
+    since = _dating_began(conn)
+    if since is not None:
+        mark_printed_day_rows(conn, since)
     by_acct: dict = {}
     for r in rows:
         by_acct.setdefault(r["acct"], []).append(r)
     if len([k for k in by_acct if k]) <= 1:
         return _import_into(conn, account_id, rows, batch_id=batch_id)
     check_split_accounts(k for k in by_acct if k)
-    total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
+    total = {"imported": 0, "matched": 0, "rows": 0, "skipped_duplicates": 0,
              "split_accounts": {}}
     for acct in sorted(by_acct, key=str):
         grp = by_acct[acct]
         # rows with no ACCTID at all (rare) stay on the user's pick
         target = _stmt_target(conn, grp) if acct else account_id
         out = _import_into(conn, target, grp, batch_id=batch_id)
-        for k in ("imported", "rows", "skipped_duplicates"):
+        for k in ("imported", "matched", "rows", "skipped_duplicates"):
             total[k] += out[k]
         name = conn.execute("SELECT name FROM accounts WHERE id=%s",
                             (target,)).fetchone()
@@ -522,6 +547,11 @@ class _FitidIds:
     Minting that suffixed id is only right for a charge the account does
     not already hold, so before it, in order:
 
+    - the FITID's stored row is the one an earlier build wrote for this
+      very line, which dated a zoned stamp by its UTC day: stored on
+      exactly that line's UTC day, same amount and name, and without the
+      printed-day note every row this build writes carries — moved onto
+      the printed day;
     - a FITID whose stored row is a DIFFERENT charge has shown itself to be
       reused, so a row already stored with this line's exact date, amount
       and name (under whatever FITID it came in with) is this line — the
@@ -564,6 +594,9 @@ class _FitidIds:
         # (date, name) -> (cents, id) of the same; a restated amount keeps
         # the day
         self._by_day: dict[tuple, list[tuple]] = {}
+        # FITIDs' rows this build dated (the printed-day note in raw): never
+        # the earlier build's UTC-day artifact, whatever their date
+        self._printed: set[str] = set()
         self._windows = self._covered_spans(rows)
         if not bases:
             return
@@ -573,11 +606,14 @@ class _FitidIds:
         reach = dt.timedelta(days=self.RESTATE_DAYS)
         dates = [r["date"] for r in rows if r["fitid"]]
         for x in conn.execute(
-                "SELECT id, date, amount, name FROM transactions "
+                "SELECT id, date, amount, name, "
+                "jsonb_typeof(raw) = 'object' AND raw ->> %s = %s AS printed "
+                "FROM transactions "
                 "WHERE account_id = %s AND left(id, 4) = 'ofx:' "
                 "AND (id = ANY(%s) OR date BETWEEN %s AND %s) "
                 "ORDER BY id",
-                (account_id, list(bases), min(dates) - reach,
+                (feed_dates.PRINTED_DAY_KEY, feed_dates.PRINTED_DAY_VALUE,
+                 account_id, list(bases), min(dates) - reach,
                  max(dates) + reach)).fetchall():
             key = (as_date(x["date"]), round(float(x["amount"]) * 100),
                    self._name_key(x["name"]))
@@ -586,6 +622,8 @@ class _FitidIds:
                 (key[1], x["id"]))
             if x["id"] in bases:
                 self._owner[x["id"]] = key
+                if x["printed"]:
+                    self._printed.add(x["id"])
 
     @staticmethod
     def _covered_spans(rows: list[dict]) -> list[tuple]:
@@ -646,13 +684,16 @@ class _FitidIds:
         return None
 
     def assign(self, rows: list[tuple]) -> list[str | None]:
-        """The id of each (fitid, date, amount, name) row, in order; None
-        for a row without a FITID."""
+        """The id of each (fitid, date, amount, name[, utc_day]) row, in
+        order; None for a row without a FITID. utc_day is the day an
+        earlier build stored the line on (`feed_dates.ofx_utc_day`)."""
         out: list[str | None] = [None] * len(rows)
         claimed: set[str] = set()
         occ: dict[tuple, int] = {}
         seen: list[tuple] = []
-        for fitid, date, amount, name in rows:
+        utc: list = []
+        for fitid, date, amount, name, *rest in rows:
+            utc.append(rest[0] if rest else None)
             if not fitid:
                 seen.append(())
                 continue
@@ -664,6 +705,23 @@ class _FitidIds:
         for i, s in enumerate(seen):
             if s and s[0] in self._owner and s[2] == 1 \
                     and self._owner[s[0]][:2] == s[1]:
+                out[i] = s[0]
+                claimed.add(s[0])
+        # 1b. the row an earlier build stored for this very line on its
+        # stamp's UTC day: the stored date is that line's own UTC day (not
+        # merely a day off — a reused FITID a day off is another charge),
+        # with the same amount and name, on a row this build never dated (a
+        # row it did is a neighbouring charge whose stamps cross midnight
+        # UTC, not the artifact). Repeated same-amount charges
+        # never pair uniquely in step 4, so without this each one would
+        # mint a second row beside its first.
+        for i, s in enumerate(seen):
+            if not s or out[i] or not utc[i] or s[0] in claimed \
+                    or s[0] not in self._owner or s[0] in self._printed \
+                    or s[2] != 1:
+                continue
+            od, oc, on = self._owner[s[0]]
+            if od == utc[i] != s[1][0] and oc == s[1][1] and on == s[3][2]:
                 out[i] = s[0]
                 claimed.add(s[0])
         # 2. the same line stored under another FITID or account id
@@ -778,7 +836,8 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
         kept.append((r, amount, name))
     # FITID ids are decided for the whole file at once: which stored row a
     # line is depends on which rows the other lines already are
-    by_fitid = fitids.assign([(r["fitid"], r["date"], amount, name)
+    by_fitid = fitids.assign([(r["fitid"], r["date"], amount, name,
+                               r.get("utc_day"))
                               for r, amount, name in kept])
     for (r, amount, name), tid in zip(kept, by_fitid):
         if tid is None:
@@ -799,9 +858,12 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
         # that rides /export and the data-portability archive, so only the
         # last 4 may land there (all _stmt_target ever needed anyway).
         raw = {k: (v.isoformat() if isinstance(v, dt.date) else v)
-               for k, v in r.items() if k != "window"}
+               for k, v in r.items() if k not in ("window", "utc_day")}
         if raw.get("acct"):
             raw["acct"] = str(raw["acct"])[-4:]
+        # every write dates the row by its printed day, a re-dated row
+        # included, so step 1b of the id matcher never moves it again
+        raw[feed_dates.PRINTED_DAY_KEY] = feed_dates.PRINTED_DAY_VALUE
         # NAME/MEMO can carry the same number in free text ("ONLINE
         # TRANSFER TO CHK 1234567890123"); the stored name is masked, and
         # raw must not keep the copy the name lost
@@ -817,7 +879,68 @@ def _import_into(conn, account_id: str, rows: list[dict], *,
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
-    added = upsert_transactions(conn, txns)
-    return {"imported": added, "rows": len(txns),
+    count = FileRowCount(conn, txns)
+    upsert_transactions(conn, txns)
+    added, matched = count.after()
+    return {"imported": added, "matched": matched, "rows": len(txns),
             "skipped_duplicates": skipped_dupes,
             "skipped_older": skipped_older}
+
+
+# The instant never changes once recorded, so one process reads it once.
+_began: list = []
+
+
+def _dating_began(conn):
+    if not _began:
+        t = feed_dates.printed_day_dating_began(conn)
+        if t is None:
+            return None
+        _began.append(t)
+    return _began[0]
+
+
+def mark_printed_day_rows(conn, since, only_ids=None) -> int:
+    """Give the printed-day note to every OFX row whose latest import batch
+    began at or after `since`, the moment this install first dated OFX
+    lines by their printed day; returns the rows written.
+
+    The builds between that change and the note wrote printed-day rows
+    without it, and step 1b of the id matcher would take such a row for an
+    earlier build's UTC-day artifact and move it onto a neighbouring
+    charge. An import rewrites a row's raw whole, `_batch` included, so a
+    row whose latest batch is that recent was last dated by the printed
+    day. A row with an older batch, or none, keeps no note and stays a
+    candidate for the move, as it was.
+
+    Run by migration 220 over every household, and by each OFX import over
+    its own (the connection's RLS scopes both reads), so a row written
+    after the migration's pass is noted before any import matches it.
+    One pass over transactions with no join: the recent batches are read
+    first (a small table) and matched as one array, so the cost does not
+    rest on what the planner guesses about a database it has no
+    statistics for yet (a restore, a fresh upgrade). Only a row with no
+    note at all is written: one noted "printed" needs nothing, and one a
+    restore noted "utc" (an archive from before printed-day dating) is a
+    positive fact about the row that a batch time — the source's, or the
+    restore's — cannot overrule.
+
+    `only_ids` holds the pass to those rows: a restore passes the rows it
+    landed, because `since` is then a fact about the archive's source and
+    says nothing of the rows the household already had."""
+    keys = [r["k"] for r in conn.execute(
+        "SELECT tenant_id::text || ':' || id AS k FROM import_batches "
+        "WHERE created_at >= %s", (since,)).fetchall()]
+    if not keys or (only_ids is not None and not only_ids):
+        return 0
+    sql = ("UPDATE transactions "
+           "SET raw = raw || jsonb_build_object(%s::text, %s::text) "
+           "WHERE left(id, 4) = 'ofx:' AND jsonb_typeof(raw) = 'object' "
+           "AND tenant_id::text || ':' || (raw ->> '_batch') "
+           "= ANY(%s::text[]) AND NOT raw ? %s")
+    params = [feed_dates.PRINTED_DAY_KEY, feed_dates.PRINTED_DAY_VALUE, keys,
+              feed_dates.PRINTED_DAY_KEY]
+    if only_ids is not None:
+        sql += " AND id = ANY(%s::text[])"
+        params.append(list(only_ids))
+    return conn.execute(sql, params).rowcount

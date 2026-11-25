@@ -17,7 +17,7 @@ from oikonome.engine import forecast
 from oikonome.sync import base
 from oikonome.web import report, todayview
 
-from .util import add_txn, make_db, write_config
+from .util import add_bill, add_txn, make_db, write_config
 
 TODAY = dt.date.today()
 
@@ -57,6 +57,13 @@ class ImportedCheckingWithoutBalanceTests(unittest.TestCase):
                          type_="depository", subtype="checking")
         self._assert_asks_for_the_balance()
 
+    def _paycheck(self):
+        # a scheduled paycheck: without one the cash notice is the ask
+        # for it, and these tests are about the alarm
+        add_bill(self.conn, "Northwind Payroll", 900.0, income=True,
+                 frequency="WEEKLY", interval=2,
+                 next_due=TODAY + dt.timedelta(days=9))
+
     def test_an_empty_imported_row_does_not_hide_a_real_overdraft(self):
         self.conn.execute("UPDATE accounts SET balance_current=-80, "
                           "balance_available=-80 WHERE id='chk'")
@@ -64,6 +71,7 @@ class ImportedCheckingWithoutBalanceTests(unittest.TestCase):
                           "WHERE id='card'")
         base.ensure_split_account(self.conn, "mint", "Old Checking")
         add_txn(self.conn, TODAY, 40.0, "KROGER")
+        self._paycheck()
         self.assertEqual(forecast._checking_start(self.conn, {}),
                          (-80, True, False))
         st = report.gather(self.conn, TODAY)
@@ -117,6 +125,7 @@ class ImportedCheckingWithoutBalanceTests(unittest.TestCase):
         self.conn.execute("UPDATE accounts SET balance_current=1250 "
                           "WHERE id='card'")
         add_txn(self.conn, TODAY, 40.0, "KROGER")
+        self._paycheck()
         self.assertEqual(forecast._checking_start(self.conn, {}),
                          (0, True, False))
         st = report.gather(self.conn, TODAY)

@@ -23,6 +23,7 @@ import unittest
 from unittest import mock
 
 from oikonome.web import api, data
+from oikonome.web.fields import Fields
 
 from .util import add_txn, make_db, write_config
 
@@ -82,7 +83,7 @@ class DoorsFollowSettledHold(unittest.TestCase):
 
     def test_flag_with_the_hold_id_flags_the_posted_row(self):
         self._settle()
-        out = api.reimburse_flag("hold-1", user=self.user, body={})
+        out = api.reimburse_flag("hold-1", user=self.user, body=Fields({}))
         self.assertEqual(out["id"], "post-1")
         self.assertTrue(self._flagged("post-1"))
         self.assertFalse(self._flagged("hold-1"))
@@ -93,8 +94,8 @@ class DoorsFollowSettledHold(unittest.TestCase):
         self.conn.execute("INSERT INTO reimbursements (expense_id, "
                           "reimburse_id, partial) VALUES ('hold-1','dep-1',0)")
         self._settle()
-        out = api.reimburse_unlink(user=self.user, body={
-            "expense_id": "hold-1", "reimburse_id": "dep-1"})
+        out = api.reimburse_unlink(user=self.user, body=Fields({
+            "expense_id": "hold-1", "reimburse_id": "dep-1"}))
         self.assertTrue(out["removed"])
         self.assertEqual(out["expense_id"], "post-1")
         self.assertIsNone(self.conn.execute(
@@ -122,7 +123,7 @@ class DoorsFollowSettledHold(unittest.TestCase):
         rid = receipts.add(self.conn, None, _png(), "image/png")
         self._settle()
         out = api.receipt_match_by_hand(rid, user=self.user,
-                                        body={"txn_id": "hold-1"})
+                                        body=Fields({"txn_id": "hold-1"}))
         self.assertEqual(out["txn_id"], "post-1")
         self.assertEqual(self.conn.execute(
             "SELECT txn_id FROM receipts WHERE id=%s::uuid",
@@ -133,8 +134,8 @@ class DoorsFollowSettledHold(unittest.TestCase):
         add_txn(self.conn, DAY, -45.60, "VENMO FROM SAM", account="chk",
                 txn_id="dep-1")
         self._settle()
-        out = api.reimburse_link(user=self.user, body={
-            "txn_id": "hold-1", "other_ids": ["dep-1"]})
+        out = api.reimburse_link(user=self.user, body=Fields({
+            "txn_id": "hold-1", "other_ids": ["dep-1"]}))
         self.assertEqual((out["linked"], out["errors"]), (1, []))
         self.assertEqual(out["txn_id"], "post-1")
         self.assertEqual(self.conn.execute(
@@ -145,8 +146,8 @@ class DoorsFollowSettledHold(unittest.TestCase):
         add_txn(self.conn, DAY, -45.60, "VENMO FROM SAM", account="chk",
                 txn_id="dep-1")
         self._settle()
-        out = api.reimburse_link(user=self.user, body={
-            "txn_id": "dep-1", "other_ids": ["hold-1"]})
+        out = api.reimburse_link(user=self.user, body=Fields({
+            "txn_id": "dep-1", "other_ids": ["hold-1"]}))
         self.assertEqual((out["linked"], out["errors"]), (1, []))
         self.assertEqual(self.conn.execute(
             "SELECT expense_id FROM reimbursements WHERE reimburse_id='dep-1'"

@@ -17,14 +17,12 @@ measured against figures on its own footing.
 
 import datetime as dt
 import os
-import pathlib
 import threading
 import time
 import unittest
 
 import psycopg
 
-import oikonome
 from oikonome.db import tenancy
 from oikonome.engine import entities, equity, selfemploy
 from oikonome.sync import export, restore
@@ -189,6 +187,36 @@ class HouseholdMarkSurvivesARestoreTests(unittest.TestCase):
         self.assertIn("Member A", [m["member_name"] for m in
                                    entities.list_members(self.src, self.eid)])
 
+    def test_an_archive_marking_two_members_restores_its_first(self):
+        """A hand-edited or pre-rule archive can mark two members of one
+        business. The restore keeps the first mark and completes: the
+        second member lands unmarked, never a unique-index error that rolls
+        back the whole archive."""
+        import csv
+        import io
+        import zipfile
+        src = zipfile.ZipFile(io.BytesIO(export.build_zip(self.src)))
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            for name in src.namelist():
+                data = src.read(name)
+                if name.endswith("entity_membership.csv"):
+                    rows = list(csv.DictReader(io.StringIO(data.decode())))
+                    rows.sort(key=lambda r: r["member_name"])
+                    for r in rows:
+                        r["is_household"] = "True"
+                    out = io.StringIO()
+                    w = csv.DictWriter(out, fieldnames=list(rows[0]))
+                    w.writeheader()
+                    w.writerows(rows)
+                    data = out.getvalue().encode()
+                z.writestr(name, data)
+        restore.restore_zip(self.dest, buf.getvalue())
+        self.assertEqual(_marked(self.dest, self.eid), ["Member A"])
+        self.assertEqual(sorted(m["member_name"] for m in
+                                entities.list_members(self.dest, self.eid)),
+                         ["Member A", "Member B"])
+
     def test_every_member_column_is_read_back(self):
         """A column added to entity_membership and not to restore vanishes
         on every recovery; this names the ones deliberately left out."""
@@ -196,12 +224,13 @@ class HouseholdMarkSurvivesARestoreTests(unittest.TestCase):
             "SELECT column_name FROM information_schema.columns "
             "WHERE table_name = 'entity_membership'").fetchall()}
         not_restored = {"tenant_id", "created_at"}
-        src = (pathlib.Path(oikonome.__file__).parent
-               / "sync/restore.py").read_text()
-        i = src.index("INSERT INTO entity_membership")
-        stmt = src[i:src.index("VALUES", i)]
-        self.assertEqual(
-            sorted(c for c in cols - not_restored if c not in stmt), [])
+        restore.restore_zip(self.dest, export.build_zip(self.src))
+        read = ", ".join(f"{c}::text" for c in sorted(cols - not_restored))
+
+        def rows(conn):
+            return sorted(tuple(r.values()) for r in conn.execute(
+                f"SELECT {read} FROM entity_membership").fetchall())
+        self.assertEqual(rows(self.dest), rows(self.src))
 
 
 class HouseholdShareFootingTests(unittest.TestCase):

@@ -1,9 +1,12 @@
 {% extends "base.html" %}
 {% block body %}
 <div class="card" style="max-width:26rem">
+  {# the page's heading for a screen reader: the wordmark above the card
+     already says where you are, so it is not drawn #}
+  <h1 class="sr-only">Sign in</h1>
   <div id="demo-note" class="note" style="display:none;margin-bottom:.8rem;background:rgba(230,177,89,.10);border-color:rgba(230,177,89,.4)"></div>
-  {% if notice %}<div class="note" style="margin-bottom:.8rem;background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.4);color:var(--green)">{{ notice }}</div>{% endif %}
-  <div id="login-err" class="note" style="{% if not error %}display:none;{% endif %}margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{% if error %}{{ error }}{% endif %}</div>
+  {% if notice %}<div class="note" role="status" style="margin-bottom:.8rem;background:rgba(92,181,107,.10);border-color:rgba(92,181,107,.4);color:var(--green)">{{ notice }}</div>{% endif %}
+  <div id="login-err" class="note" role="alert" style="{% if not error %}display:none;{% endif %}margin-bottom:.8rem;background:rgba(224,105,93,.10);border-color:rgba(224,105,93,.4);color:var(--red)">{% if error %}{{ error }}{% endif %}</div>
   {# Two-step sign-in (pages.js → /api/login): step 1 email+password, step 2
      code only (password kept in JS memory, never re-typed). Server-rendered
      need_totp / passkey_only is the no-JS fallback and must re-ask password. #}
@@ -14,9 +17,11 @@
     <div id="login-step-cred">
       <p><label>Email<br><input type="email" name="email" required
           value="{{ email or '' }}" autocomplete="username"
+          aria-describedby="login-err"{% if error %} aria-invalid="true"{% endif %}
           style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
       <p><label>Password<br><input type="password" name="password" required
           autocomplete="current-password"
+          aria-describedby="login-err"{% if error %} aria-invalid="true"{% endif %}
           style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
     </div>
     <div id="login-step-2fa" style="display:none">
@@ -27,6 +32,7 @@
       </p>
       <p><label id="login-2fa-label">Authenticator or recovery code<br>
         <input name="totp_code" id="login-totp" autocomplete="one-time-code"
+          aria-describedby="login-2fa-hint login-err"
           placeholder="6-digit code or recovery code"
           style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink);font-family:ui-monospace,monospace"></label></p>
     </div>
@@ -48,10 +54,12 @@
       <p><label id="login-2fa-label">{% if passkey_only %}Recovery code{% else %}Authenticator or recovery code{% endif %}<br>
         <input name="totp_code" id="login-totp" required
           autocomplete="{% if passkey_only %}off{% else %}one-time-code{% endif %}"
+          aria-describedby="login-2fa-hint login-err"{% if error %} aria-invalid="true"{% endif %}
           placeholder="{% if passkey_only %}xxxx-xxxx-xxxx-xxxx-xxxx{% else %}6-digit code or recovery code{% endif %}"
           style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink);font-family:ui-monospace,monospace"></label></p>
       <p><label>Password<br><input type="password" name="password" required
           autocomplete="current-password"
+          aria-describedby="login-err"{% if error %} aria-invalid="true"{% endif %}
           style="width:100%;padding:.5rem;background:var(--hover);border:1px solid var(--line);border-radius:var(--rs);color:var(--ink)"></label></p>
       <input type="hidden" name="email" value="{{ email or '' }}">
     </div>

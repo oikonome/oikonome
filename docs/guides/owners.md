@@ -33,10 +33,12 @@ ownership one (see the concepts guide).
 
 ## Filtering transactions
 
-Once at least one owner label exists, the Transactions page grows an
-**owner** dropdown listing every label in use — account defaults and
-per-transaction overrides both, alphabetically. Pick one and the month
-view shows only that owner's transactions.
+Once at least one owner label exists, the Transactions page's **more ▾**
+filters gain an **owner** dropdown (first choice **all owners**) listing
+every label in use — account defaults and per-transaction overrides
+both, alphabetically. Pick one and the month view shows only that
+owner's transactions; the **more** button then shows a count so the
+filter is never hidden silently.
 
 The lens applies to the **month view only** — a search runs across all
 owners regardless of the dropdown.
@@ -71,7 +73,7 @@ it takes the owner or a member.
 - Labels are exact-match text: "Alex" and "alex" are two different
   owners. Pick a spelling and stick to it.
 - The owner dropdown is invisible until the first label exists — label
-  an account on the Accounts page and it appears.
+  an account on the Accounts page and it appears, under **more ▾**.
 - Unattributed transactions vanish from every individual owner's view.
   If someone's total looks light, look for unlabeled accounts in the
   all-owners view.

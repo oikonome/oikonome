@@ -88,6 +88,11 @@ class PushSendsHoldNoConnection(unittest.TestCase):
         self.tid = self.client.get("/api/me").json()["tenant_id"]
         admin = tenancy.admin_connect()
         try:
+            # the instance signing key is a singleton in the shared test
+            # database; an earlier suite can leave it sealed under a master
+            # key this process no longer has, and every web send would then
+            # be skipped. Start from none, so the next send mints one.
+            admin.execute("DELETE FROM push_vapid")
             self.uid = admin.execute(
                 "SELECT id FROM users WHERE email=%s",
                 (self.email,)).fetchone()["id"]

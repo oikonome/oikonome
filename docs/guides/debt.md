@@ -17,13 +17,44 @@ cents, except accounts the Accounts page marks **excl** (those stay out
 of every report, and this one). A business entity's own accounts and a
 manually-entered shadow of a linked account are not debts here either.
 
+Two more kinds of debt are handled on their own:
+
+- **A card you pay in full every month** is not on the schedule. It
+  never charges interest, so planning its balance as debt would quote a
+  debt-free date and interest that never happen. A card counts as paid in
+  full when the bank's last statement was paid off (a $0 minimum on that
+  statement means nothing is due) and no interest was charged in the
+  last 90 days — or, when the bank sends no statement, when your own
+  payments over the last three months cover its balance with no interest
+  charged. A new statement that is not yet due does not put the card
+  back on the plan: until its due date, the card is judged by the cycle
+  before it. Such cards are listed under the plan as **Paid in full
+  monthly — no interest, so not in the plan**, each saying why (*last
+  statement $X paid in full*, or *your payments clear it each month*).
+- **A mortgage or loan you typed in on Net Worth** (kind *mortgage*, or
+  any item with a negative value) joins the schedule, marked **entered on
+  Net Worth**. Its payment is read from your ledger — the payment that
+  carries the loan's name (its lender's word, like "Northwind" in
+  "Northwind Mortgage") in at least two of the last three months — and
+  shows **from your payments**. Its rate is asked once: type it on the
+  row and save. A linked mortgage account replaces a typed-in mortgage,
+  as on Net Worth — only one Net Worth counts, so a business account,
+  the backup copy of a linked pair or a mortgage with no balance
+  replaces nothing.
+
 Each debt needs two numbers beyond its balance, and the page says where
 each came from:
 
 - **APR %** — the bank's, where the connection reports liabilities (a
   card's purchase APR, a mortgage's rate, a student loan's rate): marked
-  **issuer**. What you typed: **yours**. Neither: **unknown — 0%**, which
-  understates the interest until you fill it in.
+  **issuer**. What you typed: **yours**. Neither: **est. — add yours**
+  (the rate shows greyed in the box) — a typical rate for that kind of debt (22% for a card, 7.5% for a car loan, 6.5%
+  for a student loan or a mortgage, 10% for any other loan), lowered
+  where a known payment would not retire the debt at it. The page marks
+  the debt-free date and the interest as **estimated** ("Interest to pay
+  (estimated)", and how many debts are walked at a typical rate or an
+  estimated minimum) until every debt has a rate and a minimum from the
+  bank or from you; type them on the row and save.
 - **Min $/mo** — the bank's minimum payment (**issuer**), what you typed
   (**yours**), or an **estimate**: a month's interest plus 1% of a card's balance, never under 2% of it (at least $25),
   a five-year payment for another loan, a thirty-year payment for a
@@ -38,6 +69,14 @@ each came from:
   the servicer's whole payment, which overstates the principal and
   interest by the escrow. If your statement shows the principal and
   interest, type that figure in.
+- A loan whose servicer sends a **maturity or payoff date** is planned to
+  end that month: that date is the last payment. Whether this month's
+  payment is still owed is read from the servicer's own dates — a next
+  due date later this month (or today) means it is still owed, whatever
+  was paid earlier in the month; a next due date in a later month means
+  it is paid; with no usable due date, a payment reported this month
+  means it is paid. Without either date, the payment counts as owed through its payment
+  day (the maturity date's day of the month), that day included.
 
 Type over either number in the table and **Save plan**. Clearing the box
 goes back to the bank's number (or the estimate). **Skip** leaves a debt

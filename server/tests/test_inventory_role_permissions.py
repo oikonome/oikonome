@@ -56,6 +56,8 @@ MEMBER_OK = {
     "PUT /api/transactions/{txn_id:path}/split",
     "DELETE /api/transactions/{txn_id:path}/split",
     "POST /api/transactions/{txn_id:path}/note",
+    # whom a check paid: written as its note, the same bookkeeping
+    "POST /api/transactions/{txn_id:path}/check-payee",
     "POST /api/transactions/{txn_id:path}/owner",
     "POST /api/transactions/{txn_id:path}/entity",
     "POST /api/transactions/{txn_id:path}/receipt",
@@ -75,6 +77,7 @@ MEMBER_OK = {
     "POST /api/bills/delete",
     "POST /api/bills/restore",
     "POST /api/bills/toggle",
+    "POST /api/income/payer",
     "POST /api/bills/detect",
     "POST /api/bills/hint",
     "POST /api/bills/proposal",
@@ -85,6 +88,8 @@ MEMBER_OK = {
     "POST /bills/detect",
     "POST /bills/proposal",
     "POST /api/reimburse/link",
+    # the matcher's line: the link tried and rolled back, nothing kept
+    "POST /api/reimburse/selection",
     "POST /api/reimburse/unlink",
     "POST /api/reimburse/{txn_id:path}/flag",
     "POST /api/reimburse/{txn_id:path}/unflag",
@@ -97,6 +102,10 @@ MEMBER_OK = {
     "POST /api/receipts/{rid}/match",
     "POST /api/receipts/{rid}/unmatch",
     "POST /api/receipts/{rid}/details",
+    # saying two receipts are one slip or two purchases: bookkeeping on
+    # the household's own receipts, like pairing one by hand
+    "POST /api/receipts/{rid}/same-slip",
+    "POST /api/receipts/{rid}/two-purchases",
     "POST /api/budget/snapshots/backfill",
     # the debt payoff plan (method, extra payment, rate overrides) is a
     # budget the household keeps, not the account
@@ -121,6 +130,7 @@ MEMBER_OK = {
     "POST /api/business/entities/{entity_id}/status",
     "POST /api/business/entities/{entity_id}/vendors",
     "POST /api/business/entities/{entity_id}/equity",
+    "POST /api/business/entities/{entity_id}/owner-transfer",
     "DELETE /api/business/entities/{entity_id}/equity/{movement_id}",
     "POST /api/business/entities/{entity_id}/mileage",
     "DELETE /api/business/entities/{entity_id}/mileage/{trip_id}",
@@ -165,6 +175,13 @@ MEMBER_OK = {
     "POST /api/import/bulk/jobs/{job_id}/cancel",
     "POST /api/import/taxdoc/analyze",
     "POST /api/import/taxdoc/commit",
+    "DELETE /api/import/taxdoc/w2s/{doc_id}",
+    "POST /api/import/taxdoc/w2s/{doc_id}/owner",
+    # anyone who may import may take a stored document back out (put back
+    # for 30 days; an earnings record or a multi-year one steps up)
+    "DELETE /api/import/taxdoc/stored/{upload_id}",
+    "POST /api/import/taxdoc/stored/{upload_id}/restore",
+    "POST /api/import/taxdoc/stored/{upload_id}/payer",
     "POST /api/import/plan-activity",
     "POST /api/import/coinbase",
     "POST /api/import/amazon",

@@ -2,8 +2,9 @@
 notification). VAPID keypair is per-instance, generated lazily on first
 use and stored in the control-plane push_vapid row with the private key
 encrypted under OIKONOME_MASTER_KEY. Subscriptions live in
-push_subscriptions (one per browser); delivery failures with 404/410
-mark the subscription dead instead of retrying forever."""
+push_subscriptions (one per browser); a 404/410 from the push service,
+or keys that cannot be used to encrypt at all, mark the subscription dead
+instead of retrying forever."""
 
 from __future__ import annotations
 
@@ -124,6 +125,46 @@ def vapid_subject() -> str:
     return _FALLBACK_SUBJECT
 
 
+# Browsers one person may have subscribed at once. Every household push
+# reads and POSTs to each of them in the shared web process or worker, so
+# the subscribe door keeps at most this many per person (the oldest goes)
+# and one send pass never reads more, whatever a table from before the
+# bound holds. A person uses a handful of browsers; this is generous.
+MAX_PER_USER = 10
+
+_B64U = re.compile(r"[A-Za-z0-9_-]+={0,2}")
+
+
+def _b64u_decode(value) -> bytes | None:
+    """base64url as a browser writes it (padding optional), or None."""
+    if not isinstance(value, str) or not _B64U.fullmatch(value):
+        return None
+    bare = value.rstrip("=")
+    try:
+        return base64.urlsafe_b64decode(bare + "=" * (-len(bare) % 4))
+    except ValueError:
+        return None
+
+
+def keys_usable(p256dh, auth) -> bool:
+    """Can a push be encrypted to these keys? What PushSubscription.toJSON()
+    sends: p256dh a base64url uncompressed P-256 point (65 bytes, 0x04,
+    on the curve) and auth a 16-byte secret. Anything else fails inside
+    the sender before a push service is ever asked, on every send."""
+    point = _b64u_decode(p256dh)
+    secret = _b64u_decode(auth)
+    if point is None or secret is None or len(secret) != 16:
+        return False
+    if len(point) != 65 or point[0] != 0x04:
+        return False
+    from cryptography.hazmat.primitives.asymmetric import ec
+    try:
+        ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), point)
+    except ValueError:
+        return False
+    return True
+
+
 def _b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode().rstrip("=")
 
@@ -201,16 +242,21 @@ def live_subscriptions(c, tenant_id: str, user_id=None) -> list:
     push off for themselves (users.push_muted) — or, with `user_id`, that
     one user's browsers whatever their switch says, because a notice about
     a person's own account is theirs to receive."""
+    # At most MAX_PER_USER per person, newest first: a pass never reads
+    # an unbounded set, whatever the table holds.
     if user_id is None:
-        return c.execute(
-            "SELECT id, endpoint, p256dh, auth FROM push_subscriptions "
-            f"WHERE tenant_id=%s AND {LIVE} AND NOT EXISTS ("
-            "SELECT 1 FROM users mu WHERE mu.id = push_subscriptions.user_id"
-            " AND mu.push_muted)", (tenant_id,)).fetchall()
+        who, args = ("AND NOT EXISTS (SELECT 1 FROM users mu WHERE "
+                     "mu.id = push_subscriptions.user_id AND mu.push_muted)",
+                     (tenant_id, MAX_PER_USER))
+    else:
+        who, args = "AND user_id=%s", (tenant_id, user_id, MAX_PER_USER)
     return c.execute(
-        "SELECT id, endpoint, p256dh, auth FROM push_subscriptions "
-        f"WHERE tenant_id=%s AND user_id=%s AND {LIVE}",
-        (tenant_id, user_id)).fetchall()
+        "SELECT id, endpoint, p256dh, auth FROM ("
+        " SELECT id, endpoint, p256dh, auth, created_at, row_number() OVER"
+        " (PARTITION BY user_id ORDER BY created_at DESC, id) AS nth"
+        " FROM push_subscriptions"
+        f" WHERE tenant_id=%s AND {LIVE} {who}) s"
+        " WHERE nth <= %s ORDER BY created_at DESC, id", args).fetchall()
 
 
 def send_tenant(conn, tenant_id: str, title: str, body: str,
@@ -230,6 +276,7 @@ def send_tenant(conn, tenant_id: str, title: str, body: str,
         raise TypeError("send_tenant needs a connection or `connect`")
     if not available():
         return 0
+    import requests
     from py_vapid import Vapid
     from pywebpush import WebPushException, webpush
     with db_handle(conn, connect) as c:
@@ -288,13 +335,30 @@ def send_tenant(conn, tenant_id: str, title: str, body: str,
                 ttl=6 * 3600)
             sent += 1
         except WebPushException as e:
-            code = getattr(getattr(e, "response", None), "status_code", None)
+            response = getattr(e, "response", None)
+            code = getattr(response, "status_code", None)
             if code in (404, 410):     # endpoint gone — browser unsubscribed
                 gone.append(s["id"])
+            elif response is None and not keys_usable(s["p256dh"],
+                                                      s["auth"]):
+                # refused before any POST: keys no send can ever use
+                gone.append(s["id"])
             else:
+                # a 5xx or a 429 is the push service's passing trouble;
+                # the subscription is tried again next time
                 log.warning("push delivery failed (%s): %s", code, e)
-        except Exception as e:                   # noqa: BLE001
+        except requests.RequestException as e:
+            # the network or the push service, not the subscription
             log.warning("push delivery failed: %s", e)
+        except Exception as e:                   # noqa: BLE001
+            # A failure inside this process — decoding the keys, the
+            # encryption — retires the row when its keys are unusable: it
+            # would fail the same way on every send. Keys that pass are
+            # not to blame, so the row stays.
+            if not keys_usable(s["p256dh"], s["auth"]):
+                gone.append(s["id"])
+            else:
+                log.warning("push delivery failed: %s", e)
     if gone:
         try:
             with db_handle(conn, connect) as c:

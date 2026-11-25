@@ -74,17 +74,20 @@ class ReimburseLinkBoundsTests(unittest.TestCase):
                                    "other_ids": {"a": 1}})
         self.assertEqual(r.status_code, 400, r.text)
 
-    def test_junk_elements_fail_per_item_not_the_request(self):
+    def test_junk_elements_are_refused_before_any_link(self):
         """A nested list/dict/number element must never reach the SQL adapter
-        as a raw parameter (a 500) — it just fails to match a transaction."""
+        as a raw parameter (a 500): the list is a list of ids, so one that
+        is not a string makes the request malformed, and nothing links."""
         r = self.client.post("/api/reimburse/link",
                              json={"txn_id": self.dep,
                                    "other_ids": [["nested"], {"d": 1}, 7,
                                                  self.exp]})
-        self.assertEqual(r.status_code, 200, r.text)
-        out = r.json()
-        self.assertEqual(out["linked"], 1)
-        self.assertEqual(len(out["errors"]), 3)
+        self.assertEqual(r.status_code, 400, r.text)
+        self.assertIn("other_ids", r.json()["detail"])
+        r = self.client.post("/api/reimburse/link",
+                             json={"txn_id": self.dep,
+                                   "other_ids": [self.exp]})
+        self.assertEqual(r.json()["linked"], 1, r.text)
 
     def test_route_declares_a_rate_limit(self):
         """Structural, like the step-up doors: the route carries the limiter

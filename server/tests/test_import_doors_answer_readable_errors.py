@@ -37,7 +37,7 @@ class _Client(unittest.TestCase):
 
 class TaxdocBackendFailures(_Client):
     def _analyze_raising(self, exc):
-        with mock.patch("oikonome.engine.taxdocs.analyze", side_effect=exc):
+        with mock.patch("oikonome.engine.taxdocs.parse", side_effect=exc):
             return self.client.post(
                 "/api/import/taxdoc/analyze",
                 files={"file": ("w2.png", b"\x89PNG....", "image/png")})

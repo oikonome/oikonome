@@ -134,7 +134,9 @@ class ReCleanedMerchantTests(unittest.TestCase):
         merchant_dedup.apply(self.conn)
         self.assertIsNone(self._rule(WAS))
         self.assertEqual(merchant_dedup.detail(self.conn, NOW)["rule"],
-                         {"category_primary": "FOOD_AND_DRINK", "source": "user"})
+                         {"category_primary": "FOOD_AND_DRINK", "source": "user",
+                          "label": "new charges go to Food and Drink "
+                                   "(your rule)"})
 
     def test_a_persons_rule_outranks_the_machines_under_the_new_name(self):
         self.conn.execute(

@@ -84,7 +84,10 @@ class EveryMigrationIsAccountedForTests(unittest.TestCase):
         # functions on the pooled session
         self.assertNotIn("replay", up.HOWS)
         self.assertFalse(hasattr(up, "replay"))
-        src = (up.MIGRATIONS.parent.parent / "sync" / "restore.py").read_text()
+        sync = up.MIGRATIONS.parent.parent / "sync"
+        # the restore and the landers it drives
+        src = "".join((sync / f).read_text()
+                      for f in ("restore.py", "landers.py"))
         self.assertNotIn("pg_temp", src)
         self.assertNotIn("MIGRATIONS", src)
 

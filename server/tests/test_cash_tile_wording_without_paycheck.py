@@ -1,5 +1,5 @@
 """Without a paycheck figure, the Cash timeline's month-end tile says WHY,
-and its figure stays the cash one (checking − card debt − bills still due).
+and its figure is still the balance the month ends on.
 
 A household whose income is a budgeted figure (an income scenario or the
 monthly amount) has no paycheck schedule to forecast from, and one that
@@ -59,13 +59,14 @@ class CashTileWordingTests(unittest.TestCase):
         return d, plain, html
 
     def _assert_cash_figure(self, d, plain, html):
-        rw = d["runway"]
-        after = rw["checking"] - rw["card_debt"] - d["bills_remaining_month"]
+        from oikonome.web import todayview
+        # the figure is the balance the month ends on (month_end_left)
+        after = todayview.build_context(d)["month_end"]["balance"]
         self.assertIsNone(d["income_due_total"])
-        self.assertIn("after cards & bills " + report._money(after), plain)
-        self.assertIn("after cards &amp; bills", html)
+        self.assertIn("checking at month end " + report._money(after), plain)
+        self.assertIn("checking at month end</span>", html)
         self.assertNotIn("paychecks still due", plain)
-        self.assertNotIn("after cards, bills &amp; paychecks", html)
+        self.assertNotIn("paychecks still due", html)
 
     def test_no_income_at_all_asks_for_it(self):
         d, plain, html = self._render("none")

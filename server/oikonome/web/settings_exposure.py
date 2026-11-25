@@ -25,6 +25,9 @@ key the save takes that the read never echoes, is classified here:
     scrub (``sync.restore.scrub_config``) already drops credential-NAMED
     keys; ``export=False`` here covers credentials the name rule cannot
     see.
+  * ``sealed`` — the value is stored encrypted under the household's key
+    and read decrypted by the roles ``read`` names (``readable``, on the
+    stored document before the view is built).
   * ``door`` — the key points somewhere the household's mail or data goes
     (relay, recipients, AI endpoint, the consent to send a tax form to a
     remote model). These are the keys a demo instance must never take,
@@ -45,6 +48,7 @@ class Exposure(NamedTuple):
     url: bool = False         # endpoint URL(s): credentials masked for all
     export: bool = True       # rides the export ZIP (after the deep scrub)
     door: bool = False        # where mail/data is sent: demo never writes it
+    sealed: bool = False      # stored encrypted, read decrypted
 
 
 _ALL = Exposure()
@@ -60,21 +64,42 @@ TABLE: dict[str, Exposure] = {
         "retirement_saving", "income_biweekly_saving",
         "income_biweekly_not_saving", "excluded_accounts",
         "occurrence_caps", "disabled_bills", "dismissed_hints",
-        "manual_assets", "theme", "home_web", "home_mobile", "timezone",
+        "paycheck_payers", "manual_assets", "theme", "home_web", "home_mobile", "timezone",
         "today_view", "feedback_enabled", "merchant_logos",
-        "plaid_recurring", "plaid_enrich_cap", "email_schedule",
-        "email_send_hour_utc", "advisory_fees", "advisory_fee_exempt_masks",
+        "advisory_fees", "advisory_fee_exempt_masks",
         "investment_basis_override", "history_months", "setup_mode",
         "bill_detection_auto", "biz_wizard_steps", "ret_wizard_steps",
         "income_scenarios", "active_scenario", "savings_goals",
-        "categorizer_active", "outbound_paused", "demo_read_only")},
+        "outbound_paused", "demo_read_only",
+        "ret_wizard_answers")},
+    # ---- the household's setup, the owner's to read as well as to write
+    # where its mail goes and when, which AI endpoint
+    # reads its transactions, which bank-connection keys and billed
+    # cross-checks it runs on. Both clients show these to the owner only,
+    # and a member or a viewer is told what they need through their own
+    # keys (email_list_configured, email_on_list, the *_set booleans).
+    # `timezone` stays readable by everyone: every screen dates by it.
+    "email_schedule": Exposure(read="owner"),
+    # who each cadence reaches (notify/reach), derived on every read
+    "email_reach": Exposure(read="owner", export=False),
+    "email_send_hour_utc": Exposure(read="owner"),
+    "plaid_recurring": Exposure(read="owner"),
+    "plaid_enrich_cap": Exposure(read="owner"),
+    # the version of each whole-list setting as read, for the save's
+    # compare-and-swap; derived from the stored lists, never stored itself
+    "list_versions": Exposure(export=False),
     # ---- who gets the mail. The recipient list is the household's own
     # roster of addresses; the mute list and per-address status are cut to
     # the caller's own row for anyone but the owner by the settings door's
     # people filter (api._hide_people), which owns that rule.
-    "email_recipients": Exposure(door=True),
-    "email_muted": _ALL,
+    "email_recipients": Exposure(read="owner", door=True),
+    "email_muted": Exposure(read="owner"),
     "email_recipient_status": Exposure(export=False),
+    # what a non-owner is told instead of the roster: whether a list is
+    # configured, and whether it names their own mailbox (derived per
+    # caller by api._hide_people, never stored)
+    "email_list_configured": Exposure(export=False),
+    "email_on_list": Exposure(export=False),
     "email_recipients_added": Exposure(read="never", door=True,
                                        export=False),
     "email_recipients_removed": Exposure(read="never", door=True,
@@ -83,41 +108,46 @@ TABLE: dict[str, Exposure] = {
     # Postmark takes the server API token as both the username and the
     # password (notify/delivery reads it as the token). Owner only, the
     # others learn that one is set; and it never rides the export, like the
-    # password beside it.
-    "smtp_host": Exposure(door=True),
-    "smtp_port": Exposure(door=True),
+    # password beside it, and is stored encrypted like it.
+    "smtp_host": Exposure(read="owner", door=True),
+    "smtp_port": Exposure(read="owner", door=True),
     "smtp_user": Exposure(read="owner", below="set", door=True,
-                          export=False),
-    "smtp_from": Exposure(door=True),
-    "smtp_starttls": Exposure(door=True),
+                          export=False, sealed=True),
+    "smtp_from": Exposure(read="owner", door=True),
+    "smtp_starttls": Exposure(read="owner", door=True),
     "smtp_password": Exposure(read="never", door=True, export=False),
     "smtp_password_set": _ALL,
     "smtp_user_set": _ALL,           # what a non-owner gets for smtp_user
     # ---- the AI endpoint. URLs are masked for every role (a password in
     # the userinfo is a credential like the api key); the key and the extra
     # body are write-only and leave as presence flags.
-    "llm_url": Exposure(url=True, door=True),
-    "llm_model": Exposure(door=True),
-    "llm_vision_model": Exposure(door=True),
-    "llm_backends": Exposure(url=True, door=True),
-    "llm_roles": Exposure(door=True),
-    "llm_bundled": Exposure(url=True, export=False),
-    "llm_effective": Exposure(url=True, export=False),
+    "llm_url": Exposure(read="owner", url=True, door=True),
+    "llm_model": Exposure(read="owner", door=True),
+    "llm_vision_model": Exposure(read="owner", door=True),
+    "llm_backends": Exposure(read="owner", url=True, door=True),
+    "llm_roles": Exposure(read="owner", door=True),
+    # which endpoint and model actually answer each task, the operator's
+    # bundled one included: the same setup, read through the resolver
+    "llm_bundled": Exposure(read="owner", url=True, export=False),
+    "llm_effective": Exposure(read="owner", url=True, export=False),
     "llm_api_key": Exposure(read="never", door=True, export=False),
     "llm_api_key_set": _ALL,
     # echoed as "" with a presence flag beside it (the declared shape)
-    "llm_extra_body": Exposure(door=True, export=False),
+    "llm_extra_body": Exposure(read="owner", door=True, export=False),
     "llm_extra_body_set": _ALL,
-    "taxdocs_allow_remote_llm": Exposure(door=True),
+    "taxdocs_allow_remote_llm": Exposure(read="owner", door=True),
+    # whether the trained classifier categorizes before the AI endpoint:
+    # read only by the owner's AI card
+    "categorizer_active": Exposure(read="owner"),
     # ---- the household's own aggregator keys. A client id is an
     # identifier, not a secret, and the Connections card shows which keys
     # are set; the secrets are write-only.
-    "plaid_client_id": _ALL,
-    "plaid_env": _ALL,
+    "plaid_client_id": Exposure(read="owner"),
+    "plaid_env": Exposure(read="owner"),
     "plaid_secret": Exposure(read="never", export=False),
     "plaid_secret_set": _ALL,
-    "mx_client_id": _ALL,
-    "mx_env": _ALL,
+    "mx_client_id": Exposure(read="owner"),
+    "mx_env": Exposure(read="owner"),
     "mx_api_key": Exposure(read="never", export=False),
     "mx_api_key_set": _ALL,
 }
@@ -129,6 +159,27 @@ DEMO_DOOR_KEYS = frozenset(k for k, e in TABLE.items() if e.door)
 # Stored keys that must not leave in an export although no credential-name
 # rule would catch them.
 NOT_EXPORTED = frozenset(k for k, e in TABLE.items() if not e.export)
+
+# Stored encrypted, shown decrypted to the roles that may read them.
+SEALED = frozenset(k for k, e in TABLE.items()
+                   if e.sealed and e.read != "never")
+
+
+def readable(conn, cfg: dict) -> dict:
+    """A copy of the stored settings document with every SEALED key
+    decrypted (`conn` is the household's), for building the settings view.
+    A value that will not decrypt (the key it was sealed under is gone) is
+    left out rather than failing the whole read; a client posting the
+    document back then leaves the stored value as it is."""
+    from ..db import crypto
+    out = dict(cfg)
+    for k in SEALED:
+        if out.get(k):
+            try:
+                out[k] = crypto.decrypt(conn, out[k])
+            except Exception:                            # noqa: BLE001
+                out.pop(k)
+    return out
 
 
 def _rank(role) -> int:

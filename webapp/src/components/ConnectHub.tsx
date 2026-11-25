@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { ago, api, AuthError, errText, releasedHoldDays, req, toast,
-         type Connection, type Settings } from "../api/client";
+         type Connection, type PlaidLinkBank, type Settings } from "../api/client";
 import { ext } from "../ext";
 import { patchQuery, removeFromList } from "../api/cache";
 import { sharedLock } from "../sharedlogin";
@@ -10,8 +10,8 @@ import { bankAwaitsConfirm, CONFIRM_TO_CONNECT, VerifyEmailCard }
 import { HISTORY_SAVING, historyRowNote, useHistorySaving, windowNarrower }
   from "./HistoryChoice";
 import { cancelPending, finishPending, isCancelled, isPending, markPending,
-         pendingLine, pollWait, sleepOrWake, usePlaidLinks,
-         type PendingLinkKind } from "./plaidlinks";
+         pendingLine, pollWait, setPendingProgress, sleepOrWake,
+         usePlaidLinks, type PendingLinkKind } from "./plaidlinks";
 // The file importer is a page of its own and opens only behind the
 // "Import files" button, so its code arrives on that click rather than
 // riding in with every screen that shows this hub.
@@ -61,7 +61,23 @@ export function bankLinkHoldNote(s: Settings | undefined,
 export type PlaidLinkResult = { kind?: string; institution?: string; error?: string;
                                 /** "pending": the bank is saved and its
                                  *  first pull is queued on the worker */
-                                first_sync?: "pending" | "ok" };
+                                first_sync?: "pending" | "ok";
+                                /** several banks in one session: each one,
+                                 *  and the server's sentence for them all */
+                                results?: PlaidLinkBank[]; summary?: string;
+                                progress?: string; quiet?: boolean };
+
+/** Under every add-a-bank button: the server's line — how many more banks
+ *  the household may connect, and whether several can be connected in one
+ *  sign-in (said only when the next link really asks for several).
+ *  Mobile: BankLinkLine in components/pending-links.tsx. */
+export function BankLinkLine() {
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  const line = me.data?.features?.bank_link_line;
+  if (!line) return null;
+  return <p className="mut" style={{ fontSize: 13, margin: ".4rem 0 0" }}>
+    {line}</p>;
+}
 
 /** What a bank saved but not yet pulled says on its connection row and in
  *  the link's own result line. Mobile: FIRST_SYNC_RUNNING in
@@ -114,11 +130,15 @@ export function plaidLinkOutcome(s: PlaidLinkResult,
         ? "No bank was linked — the sign-in window was closed."
         : "No change — the window was closed." };
     case "add_failed":
+      // several banks, none kept: the server says which and why
+      if (s.summary) return { ok: false, text: s.summary };
       return { ok: false, text: `The bank link didn't complete${detail}.` };
     case "update_failed":
       return { ok: false, text: (mode === "fix" ? "Reconnect" : "That")
         + ` didn't complete — the connection still reports an error${detail}.` };
     default:
+      // several banks in one session: every one, and any not kept
+      if (mode === "add" && s.summary) return { ok: true, text: s.summary };
       return { ok: true, text: mode === "add"
         ? `Linked ${s.institution || "bank"}`
           + (s.first_sync === "pending" ? ` — ${FIRST_SYNC_RUNNING}.` : ".")
@@ -295,24 +315,45 @@ export async function pollPlaidLink(linkToken: string,
     // tab regaining focus, the completion page calling over); a failed
     // request backs off from there
     let backoff = 0;
+    // the banks a several-bank session has connected so far, while the
+    // person may still add another
+    let sofar: PlaidLinkResult | null = null;
     while (Date.now() < deadline) {
       await sleepOrWake(backoff || pollWait());
-      if (cancelled?.()) return { kind: "cancelled" };
+      if (cancelled?.()) {
+        // the window closed after some banks were in: those are the
+        // answer (the server keeps finishing the session either way)
+        if (sofar) {
+          void setPlaidLinkAside(linkToken);
+          return sofar;
+        }
+        return { kind: "cancelled" };
+      }
       try {
         // a resumed session is watched for its answer only: the server
         // does not keep it counted under the institution cap for us
         const s = resume
           ? await req<PlaidLinkResult & { done: boolean }>(
               `/accounts/plaid/link/${encodeURIComponent(linkToken)}`
-              + "/status?resume=1")
+              + "/status?resume=1&v=2")
           : await api.plaidLinkStatus(linkToken);
         backoff = 0;
         if (s.done) return s;
+        // the banks connected so far, on the session's row
+        if (s.progress) setPendingProgress(linkToken, s.progress);
+        if (s.summary && s.results?.some((r) => r.connected))
+          sofar = { kind: "add", summary: s.summary, results: s.results,
+                    first_sync: "pending",
+                    institution: s.results.filter((r) => r.connected)
+                      .map((r) => r.institution ?? "").filter(Boolean)
+                      .join(", ") };
       } catch (e) {
         if (!pollMayRetry(e)) throw e;
         backoff = Math.min((backoff || 2500) * 2, 30_000);
       }
     }
+    // a bank is in: that is the answer, never a timeout
+    if (sofar) return sofar;
     throw new Error("Timed out waiting for the bank connection");
   } finally {
     watching.delete(linkToken);
@@ -394,7 +435,7 @@ const ROWS: { key: ProviderKey; name: string; cost: string; effort: string;
 
 const field = (v: string, set: (s: string) => void, ph: string,
                type = "text") => (
-  <input type={type} value={v} placeholder={ph}
+  <input aria-label={ph} type={type} value={v} placeholder={ph}
     onChange={(e) => set(e.target.value)}
     style={{ width: "100%", padding: ".5rem", background: "var(--hover)",
              border: "1px solid var(--line)", borderRadius: "var(--rs)",
@@ -412,7 +453,9 @@ const field = (v: string, set: (s: string) => void, ph: string,
 // on a tenant that already has data on those pages. Prefix invalidates
 // are free while the pages are unmounted.
 function afterFirstPull(qc: ReturnType<typeof useQueryClient>) {
-  for (const k of ["connections", "accounts", "settings", "today",
+  // a new bank spends one of the plan's institutions, and that figure
+  // (used of cap) rides /api/me
+  for (const k of ["connections", "accounts", "settings", "today", "me",
                    "onboarding", "txns", "lens-month", "lens-year", "report",
                    "bills", "merchants", "reimb", "biz", "budget-snapshots"])
     qc.invalidateQueries({ queryKey: [k] });
@@ -556,6 +599,7 @@ function PlaidConnectButton({ label, hint, full = false, closed }: {
       {saving && !starting && <p className="mut" style={{ fontSize: 13 }}>
         {HISTORY_SAVING}</p>}
       <p className="mut" style={{ marginTop: ".5rem", fontSize: 13 }}>{hint}</p>
+      <BankLinkLine />
       <PendingLinkRows />
       {err && <p style={{ fontSize: 13, color: "var(--red)" }}>{err}</p>}
     </div>
@@ -781,7 +825,8 @@ export function SimplefinFlow({ onDone }: { onDone: () => void }) {
         <>Paste it here — it's claimed and your first sync runs
           immediately:</>,
       ]} />
-      <textarea rows={3} value={token} onChange={(e) => setToken(e.target.value)}
+      <textarea aria-label="SimpleFIN setup token"
+                rows={3} value={token} onChange={(e) => setToken(e.target.value)}
         placeholder="paste the SimpleFIN setup token"
         style={{ width: "100%", padding: ".5rem", background: "var(--hover)",
                  border: "1px solid var(--line)", borderRadius: "var(--rs)",
@@ -797,8 +842,17 @@ export function SimplefinFlow({ onDone }: { onDone: () => void }) {
   );
 }
 
-export default function ConnectHub({ onDone }: { onDone?: () => void }) {
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+export default function ConnectHub({ onDone, inWizard }: {
+  onDone?: () => void;
+  // inside the setup wizard's connect step: the step already carries the
+  // heading, and a first-run household is not sent off to the scripts docs
+  inWizard?: boolean;
+}) {
+  // while the bank door waits on the emailed link, ask again: the link is
+  // usually opened somewhere else (another tab, the phone), and a door
+  // that stays shut after "Email confirmed" reads as broken
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me,
+    refetchInterval: (q) => bankAwaitsConfirm(q.state.data) ? 5000 : false });
   // the grid shows LIVE connected state per provider, so a linked
   // SimpleFIN does not look like an untouched one
   // poll while the grid is on screen: Plaid Link finishes in ANOTHER tab,
@@ -878,6 +932,8 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
   if (hosted) {
     const all = conns.data?.connections ?? [];
     const linked = all.filter((c) => c.aggregator !== "simplefin");
+    // a removed link linked again since is listed, but is not a bank
+    const live = linked.filter((c) => !c.replaced);
     // What the cap allows: the add door refuses past it, so the screen
     // shows the same limit. Both figures come from the server: the cap has
     // a per-tenant override an operator can raise, so a number written
@@ -895,7 +951,7 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                                                     : null;
     return (
       <div className="card" style={{ marginBottom: "1rem" }}>
-        <h2>Connect your accounts</h2>
+        {!inWizard && <h2>Connect your accounts</h2>}
         {me.data?.bank_link ? (
           <>
             <p className="mut">Pick your bank and sign in — that's it.
@@ -929,7 +985,7 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
             <div className="linked-hdr">
               <b>Connected</b>
               <span className="pill g">
-                {linked.length} {linked.length === 1 ? "bank" : "banks"}
+                {live.length} {live.length === 1 ? "bank" : "banks"}
                 {linked.some((c) => typeof c.accounts === "number") && (
                   <> · {linked.reduce((t, c) => t + (c.accounts ?? 0), 0)} accounts</>)}
               </span>
@@ -939,8 +995,9 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                 household has five or six banks */}
             <div className="linked-rows">
               {linked.map((c) => {
-                const bad = (c.status || "").startsWith("error")
-                  || c.status === "reaped";
+                // the server's test; a removed link linked again since
+                // (replaced) says so in its own words and is only forgotten
+                const bad = c.needs_attention;
                 return (
                   <div key={c.id} className="linked-row">
                     <span className={"linked-dot" + (bad ? " bad" : "")} />
@@ -949,7 +1006,9 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                       <small>
                         {typeof c.accounts === "number" && (
                           <>{c.accounts} {c.accounts === 1 ? "account" : "accounts"}</>)}
-                        {bad
+                        {c.replaced
+                          ? <> · {c.removed_text}</>
+                          : bad
                           ? <> · <span style={{ color: "var(--red)" }}>needs attention</span></>
                           : c.last_ok
                             ? <> · synced {ago(c.last_ok)}</>
@@ -958,7 +1017,7 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                             the bank refreshes that copy on its own
                             schedule, so this is the number that explains a
                             sync which found nothing. */}
-                        {!bad && c.bank_updated_at && (
+                        {!bad && !c.replaced && c.bank_updated_at && (
                           <> · bank sent data {ago(c.bank_updated_at)}</>)}
                         {/* the window this bank was linked with, when it
                             is less than everything: a choice widened
@@ -971,13 +1030,19 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                     {!bad && windowNarrower(c.history_months,
                                             hubSettings.data?.history_months) && (
                       <HubMoreHistory c={c} />)}
+                    {c.replaced ? (
+                    <button className="linked-x"
+                      title="stop listing this removed link — its history stays"
+                      disabled={disc.isPending}
+                      onClick={() => disc.mutate(c.id)}>forget</button>
+                    ) : (
                     <button className="linked-x"
                       title="disconnect — stops syncing, keeps history"
                       disabled={disc.isPending}
                       onClick={() => window.confirm(
                         `Disconnect ${c.institution_name || c.id}? It stops `
                         + "syncing (history is kept).") && disc.mutate(c.id)}>
-                      Disconnect</button>
+                      Disconnect</button>)}
                   </div>
                 );
               })}
@@ -987,12 +1052,13 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
         <p className="mut">For history no aggregator carries, exports from
           another tool, or accounts you'd rather feed yourself.</p>
         <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap" }}>
-          <button className={open === "files" ? "" : "pri"}
+          <button
             onClick={() => setOpen(open === "files" ? null : "files")}>
             {open === "files" ? "close file imports" : "Import files"}
           </button>
-          <a className="btn" href="https://github.com/oikonome/oikonome"
-             target="_blank" rel="noreferrer">API scripts docs ↗</a>
+          {!inWizard && (
+            <a className="btn" href="https://github.com/oikonome/oikonome"
+               target="_blank" rel="noreferrer">API scripts docs ↗</a>)}
         </div>
         {open === "files" && <div style={{ marginTop: "1rem" }}><FileImport /></div>}
       </div>
@@ -1010,13 +1076,17 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
         provide.</p>
       <div style={{ overflowX: "auto" }}>
         <table style={{ fontSize: 14 }}>
-          <thead><tr><th></th><th>Cost</th><th>Setup</th>
-            <th>Data detail</th><th></th></tr></thead>
+          <thead><tr><th><span className="sr-only">Source</span></th><th>Cost</th><th>Setup</th>
+            <th>Data detail</th><th><span className="sr-only">Actions</span></th></tr></thead>
           <tbody>
             {ROWS.map((r) => {
-              const linked = connsFor(r.key);
-              const broken = linked.filter(
-                (c) => (c.status || "").startsWith("error")).length;
+              const listed = connsFor(r.key);
+              // the server's status: a link the bank feed removed and the
+              // household linked again since (replaced) is history, not a
+              // connection — it gets no ✓ and is only forgotten
+              const linked = listed.filter((c) => !c.replaced);
+              const gone = listed.filter((c) => c.replaced);
+              const broken = linked.filter((c) => c.needs_attention).length;
               return (
               <tr key={r.key}
                   style={open === r.key ? { background: "var(--hover)" } : undefined}>
@@ -1038,6 +1108,7 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                                          + "history"
                                          + (r.key === "plaid"
                                             ? "; frees the Plaid slot" : "")}
+                            aria-label={`Disconnect ${c.institution_name || c.id}`}
                             style={{ background: "none", border: "none",
                                      cursor: "pointer", padding: "0 .15rem",
                                      color: "var(--mut, #888)", fontSize: 12 }}
@@ -1057,8 +1128,20 @@ export default function ConnectHub({ onDone }: { onDone?: () => void }) {
                       ))}
                       {broken > 0 && (
                         <span style={{ color: "var(--red)" }}>
-                          {" "}({broken} needs attention)</span>)}
+                          {" "}({broken} need{broken === 1 ? "s" : ""} attention)</span>)}
                     </div>)}
+                  {gone.map((c) => (
+                    <div key={c.id} className="mut" style={{ fontSize: 12 }}>
+                      {c.institution_name || c.id} · {c.removed_text}
+                      {" "}<button type="button" className="linklike mut"
+                        title="stop listing this removed link — its history stays"
+                        aria-label={`Forget the removed link ${c.institution_name || c.id}`}
+                        style={{ background: "none", border: "none",
+                                 cursor: "pointer", padding: "0 .15rem",
+                                 fontSize: 12 }}
+                        disabled={disc.isPending}
+                        onClick={() => disc.mutate(c.id)}>forget</button>
+                    </div>))}
                 </td>
                 <td>{hosted && r.hostedCost ? r.hostedCost : r.cost}</td>
                 <td>{hosted && r.hostedEffort ? r.hostedEffort : r.effort}</td>

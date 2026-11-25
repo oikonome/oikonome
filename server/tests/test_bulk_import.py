@@ -55,19 +55,19 @@ class AnalyzeTests(unittest.TestCase):
 
     def test_an_initials_account_name_can_still_be_matched(self):
         """An initialism account name still matches its statements. An
-        account named an initialism plus filler ('ING Savings') has no word
+        account named an initialism plus filler ('ZZQ Savings') has no word
         past the four-letter floor, so the short word is used; otherwise each
         statement for it would create a second account. The short word is
         used only because nothing longer survives — a name with a real word
         still never matches on a short one."""
-        self.conn.execute("UPDATE accounts SET name='ING Savings' "
+        self.conn.execute("UPDATE accounts SET name='ZZQ Savings' "
                           "WHERE id='chk'")
         plan = bulk_import.analyze(self.conn, [
-            ("ing_2021_statement.csv", BANK_CSV),
+            ("zzq_2021_statement.csv", BANK_CSV),
             ("acme_2021_statement.csv", BANK_CSV),
         ])
         f = {p["name"]: p for p in plan["files"]}
-        self.assertEqual(f["ing_2021_statement.csv"]["account_id"], "chk")
+        self.assertEqual(f["zzq_2021_statement.csv"]["account_id"], "chk")
         # an unrelated bank still creates its own account
         self.assertIsNone(f["acme_2021_statement.csv"]["account_id"])
 

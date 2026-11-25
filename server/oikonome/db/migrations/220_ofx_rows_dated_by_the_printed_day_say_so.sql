@@ -1,0 +1,26 @@
+-- An OFX row written by this build carries a note in raw ("dated":
+-- "printed") saying its date is the day its line printed. A re-import reads
+-- it: a stored row WITHOUT the note, dated exactly the UTC day of a line's
+-- zoned stamp, is taken for a row an earlier build stored on that UTC day,
+-- and is moved onto the printed day instead of doubled.
+--
+-- The builds between the printed-day dating change (migrations 210 and 211
+-- shipped with it) and the note wrote printed-day rows without it. Daily
+-- same-amount charges whose stamps cross midnight UTC, numbered per
+-- download, then look exactly like that artifact one FITID over, and the
+-- move would carry one charge's note, category and receipt onto the next.
+--
+-- The step, db/migrate.py's PYTHON_STEPS entry for this file
+-- (ofximport.mark_printed_day_rows), runs in this file's transaction: it
+-- gives the note to every ofx: row whose latest import batch began at or
+-- after the earliest applied_at of 210 and 211. An import rewrites raw
+-- whole, `_batch` included, so such a row was last dated by the printed
+-- day. A fresh install records 210 and 211 before its first row, so every
+-- batched row it holds is noted. A row with an older batch or none keeps
+-- no note and stays movable, as before. One pass over transactions with
+-- the recent batch ids as one array (no join for the planner to misjudge
+-- on a database without statistics); a noted row is not written again.
+-- So this file changes no schema and no row; it is the record that the
+-- step ran.
+
+SELECT 1;

@@ -70,7 +70,10 @@ class WhyRateMatchesTheTileTests(unittest.TestCase):
         self.assertIsNotNone(rec)
         days = min(tiles["Food"]["rate_days"],
                    tiles["Everything else"]["rate_days"])
-        self.assertIn(f"over the last {days} days", rec)
+        # the days still to come, said so: "the last 14 days" read as the
+        # fortnight just past
+        self.assertIn(f"To get back on track over the {days} days left:", rec)
+        self.assertNotIn("the last", rec)
         cap = int(tiles["Food"]["rate"])
         self.assertIn(f"${cap:,d}/day on Food", rec)
         self._assert_parity(st, tiles)

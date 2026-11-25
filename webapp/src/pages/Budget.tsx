@@ -12,13 +12,13 @@ import BudgetFineTune from "../components/BudgetFineTune";
 import BudgetHistoryCard from "../components/BudgetHistoryCard";
 import BudgetPlanner from "../components/BudgetPlanner";
 import IncomeScenarioCard from "../components/IncomeScenarioCard";
-import PlanBars, { planRows } from "../components/PlanBars";
+import PlanBars, { sentPlanRows } from "../components/PlanBars";
 import BillTweaksCard from "../components/BillTweaksCard";
 import SavingsGoalsCard from "../components/SavingsGoalsCard";
 import ViewerLock from "../components/ViewerLock";
-import { api, money } from "../api/client";
+import { FailedLine, StaleLine } from "../components/Loaded";
+import { api, mmdd, money } from "../api/client";
 import { canEdit } from "../role";
-import { isPlanSavingsGoal, monthSavings } from "../moneymath";
 
 const toast = (m: string) =>
   window.dispatchEvent(new CustomEvent("oiko-toast", { detail: m }));
@@ -69,7 +69,6 @@ export default function Budget() {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const ob = useQuery({ queryKey: ["onboarding"], queryFn: api.onboarding });
   const d = q.data;
-  const goal = (d?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   // the plan's controls are editor chrome (writes are 403'd
   // server-side too); a viewer still reads the plan and this month.
   const mayEdit = canEdit(me);
@@ -115,6 +114,11 @@ export default function Budget() {
   return (
     <>
       <h1>Budget</h1>
+      {/* the plan and this month are one read: a failed one says so in
+          their place, a kept copy carries the stale line */}
+      <StaleLine query={q} />
+      {d === undefined && q.isError && (
+        <FailedLine q={q} what="this month's plan" />)}
       {/* HERO: the plan as ONE flow line — the same sentence Today
           and the daily email speak, so the plan reads identically wherever it
           appears. It leads, and the planner FORM sits beneath it, because
@@ -124,30 +128,37 @@ export default function Budget() {
         <div className="card" style={{ marginTop: 0 }}>
           <div style={{ display: "flex", gap: ".55rem", flexWrap: "wrap",
                         alignItems: "baseline" }}>
-            {d.income !== null && (<>
-              <span><b style={{ fontSize: "1.25rem" }}>{money(d.income)}</b>
+            {/* the plan's legs in the whole dollars every surface prints
+                (budget.plan_legs): with an income they add up to the
+                printed excess, as on Today; a plan with no income prints
+                bills → to spend → saved, and no excess */}
+            {d.plan_legs.income !== null && (<>
+              <span><b style={{ fontSize: "1.25rem" }}>{money(d.plan_legs.income)}</b>
                 <span className="sub"> in</span></span>
-              <span style={{ color: "var(--line)" }}>→</span>
+              <span className="mut" aria-hidden="true">→</span>
             </>)}
             <span><b style={{ fontSize: "1.25rem" }}>
-              {/* scheduled bills, not the fixed bar's cash basis, so the
-                  chain balances (same figure and words as Today) */}
-              {money(d.scheduled_month ?? d.buckets.fixed.month_budget)}</b>
-              <span className="sub"> bills due</span></span>
-            <span style={{ color: "var(--line)" }}>→</span>
-            <span><b style={{ fontSize: "1.25rem" }}>{money(d.variable_budget)}</b>
+              {money(d.plan_legs.bills)}</b>
+              {/* "bills & envelopes" when the plan has a pool; an older
+                  server sends no words (older-server path: "bills") */}
+              <span className="sub"> {d.plan_bills_label ?? "bills"}</span></span>
+            <span className="mut" aria-hidden="true">→</span>
+            <span><b style={{ fontSize: "1.25rem" }}>{money(d.plan_legs.to_spend)}</b>
               <span className="sub"> to spend</span></span>
-            {(d.savings_plan ?? 0) > 0.005 && (<>
-              <span style={{ color: "var(--line)" }}>→</span>
-              <span><b style={{ fontSize: "1.25rem" }}>{money(d.savings_plan!)}</b>
+            {d.plan_legs.saved !== null && (<>
+              <span className="mut" aria-hidden="true">→</span>
+              <span><b style={{ fontSize: "1.25rem" }}>{money(d.plan_legs.saved)}</b>
                 <span className="sub"> saved</span></span>
             </>)}
-            {d.plan_surplus !== null && (<>
-              <span style={{ color: "var(--line)" }}>→</span>
+            {/* the excess's words and tone are the server's: a plan
+                figure, and none of it this month once spending is past
+                the month's budget (todayview.plan_excess_words) */}
+            {d.plan_legs.excess !== null && d.plan_excess_words && (<>
+              <span className="mut" aria-hidden="true">→</span>
               <span><b style={{ fontSize: "1.25rem" }}
-                       className={d.plan_surplus >= 0 ? "pos" : "neg"}>
-                {money(d.plan_surplus)}</b>
-                <span className="sub"> excess</span></span>
+                       className={d.plan_excess_words.tone}>
+                {money(d.plan_legs.excess)}</b>
+                <span className="sub"> {d.plan_excess_words.text}</span></span>
             </>)}
           </div>
           {/* "variable spending $0 of $0" is arithmetic, not news, and it
@@ -160,7 +171,13 @@ export default function Budget() {
             {!(ob.data && !ob.data.budgets_set) && (
               <span>day {d.day_of_month} of {d.days_in_month} · variable spending{" "}
                 <b style={{ color: "var(--ink)" }}>{money(d.variable_actual)}</b>{" "}
-                of {money(d.variable_budget)}</span>)}
+                of {money(d.variable_budget_paced ?? d.variable_budget)}
+                {/* the progress reads the month's spendable share; when
+                    that is not the plan's figure the line says why */}
+                {d.variable_scale
+                  ? <> (scaled to {money(d.variable_budget_paced)} this month)</>
+                  : d.paced_from
+                    ? <> (paced from {mmdd(d.paced_from)})</> : null}</span>)}
             {/* this month's income is what landed plus what is still due,
                 so a three-paycheck month and a changed check both show —
                 the two halves say which is which */}
@@ -171,6 +188,11 @@ export default function Budget() {
               </span>)}
             <Link to="/bills" style={{ marginLeft: "auto" }}>manage bills ›</Link>
           </div>
+          {d.variable_scale && (
+            <div className="sub" style={{ marginTop: ".4rem", color: "var(--amber)" }}>
+              Variable budgets auto-scaled from {money(d.variable_scale.static_total)} to
+              fit this month's bills.</div>
+          )}
         </div>
       )}
 
@@ -182,23 +204,10 @@ export default function Budget() {
           <h2 style={{ marginTop: 0 }}>This month
             <span className="sub" style={{ fontWeight: 400 }}>
               {" "}— the plan below, tracked</span></h2>
-          <PlanBars
-            total={{ label: "Variable spending", actual: d.variable_actual,
-                     expected: d.buckets.food.expected
-                               + d.buckets.other.expected,
-                     budget: d.variable_budget }}
-            rows={planRows(d.buckets, {
-              // the Budget page shows the same month Today does, so its
-              // rows open the same doors
-              period: { y: Number(d.date.slice(0, 4)), m: Number(d.date.slice(5, 7)) },
-              fixedActual: d.buckets.fixed.actual,
-              fixedBudget: d.buckets.fixed.month_budget,
-              fixedPending: d.fixed_unpaid_due,
-              // this month's posted contribution, or the 90-day average
-              // (labelled as one) from a server that doesn't send it
-              savings: goal ? monthSavings(goal, goal.saved_this_month) : null,
-              excess: d.plan_surplus,
-            })} />
+          {/* the server's rows and the bar over them (each figure the
+              sum of its rows), the same rows Today's map draws */}
+          <PlanBars total={d.plan_total}
+            rows={sentPlanRows(d.plan_rows ?? [])} />
           {/* the excess-cash caption that stood here is gone: the hero's
               last term already says it, once */}
         </div>
@@ -219,6 +228,10 @@ export default function Budget() {
         </ViewerLock>
       </div>
 
+      {/* the fine-tune, scenario, goals and bill cards edit settings: a
+          failed read says so in their place */}
+      {mayEdit && s.data === undefined && s.isError && (
+        <FailedLine q={s} what="the budget settings" />)}
       {mayEdit && s.data && (
         <>
           <BudgetFineTune key={tuneKey} data={s.data}

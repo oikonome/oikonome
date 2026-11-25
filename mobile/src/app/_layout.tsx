@@ -18,6 +18,7 @@ import { persistOptions, queryClient } from "../lib/query";
 import { SessionProvider, useSession } from "../lib/session";
 import { C, isDarkTheme } from "../lib/theme";
 import Unlock from "./unlock";
+import { ConnectionWatch } from "../components/offline";
 
 /** Warm the tabs someone taps next while they read Today — a first tap
  *  on Bills/Accounts then paints from cache instead of a spinner. Once per
@@ -194,7 +195,7 @@ export default function RootLayout() {
         // screen that cancels it; the profile is refetched too, so a
         // recovery the cache has not seen yet shows on Alerts' banner
         const cachedMe = queryClient.getQueryData<Me>(["me"]);
-        if (event === "alert")
+        if (event === "alert" || event === "security")
           queryClient.invalidateQueries({ queryKey: ["me"] });
         const route = pushTapRoute(pushRoute(event, data,
           pushSentAt(resp.notification.date), cachedMe?.timezone), cachedMe);
@@ -219,6 +220,7 @@ export default function RootLayout() {
                                 persistOptions={persistOptions}>
       <SessionProvider>
         <Prefetcher />
+        <ConnectionWatch />
         <LogosProvider>
         <Gate>
           {/* Android draws edge-to-edge, so the window no longer shrinks
@@ -254,7 +256,7 @@ export default function RootLayout() {
             <Stack.Screen name="alerts" options={{ title: "Alerts" }} />
             <Stack.Screen name="activity" options={{ title: "Activity" }} />
             <Stack.Screen name="items" options={{ title: "Receipts" }} />
-            <Stack.Screen name="doctor" options={{ title: "Doctor" }} />
+            <Stack.Screen name="doctor" options={{ title: "System health" }} />
             <Stack.Screen name="retire" options={{ title: "Retire" }} />
             <Stack.Screen name="debt" options={{ title: "Debt" }} />
             <Stack.Screen name="reimburse" options={{ title: "Reimburse" }} />

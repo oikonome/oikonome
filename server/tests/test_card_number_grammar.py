@@ -67,7 +67,7 @@ class RandomText(unittest.TestCase):
     def test_idempotent_and_selected(self):
         import re
         sel = re.compile(card_number.sql_selector())
-        rnd = random.Random(20261106)
+        rnd = random.Random(73529)
         alphabet = "0123456789" * 4 + " ./-…a"
         for _ in range(20000):
             s = "".join(rnd.choice(alphabet)

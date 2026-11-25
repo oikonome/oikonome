@@ -11,13 +11,18 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router";
 import Onboarding from "./Onboarding";
 import { checklistOpen } from "../checklist";
-import { api, errText, mmdd, money, type AlertRow, type TodayFull, type Txn, catLabel } from "../api/client";
-import { patchList, patchQueries, removeFromList, saveSettings } from "../api/cache";
+import { api, dueLabel, errText, mmdd, money, type TodayFull, type Txn, catLabel } from "../api/client";
+import { patchQueries, saveSettings } from "../api/cache";
 import AreaChart from "../components/AreaChart";
 import MoneyMap, { Track } from "../components/MoneyMap";
-import { planRows } from "../components/PlanBars";
+import { sentPlanRows, sentPlanTotal } from "../components/PlanBars";
+import { FailedLine } from "../components/Loaded";
 import { canEdit } from "../role";
-import { isPlanSavingsGoal, localDayOf, monthSavings, rowSpend } from "../moneymath";
+import { localDayOf } from "../moneymath";
+import PageSkeleton from "../components/PageSkeleton";
+import SegmentedControl from "../components/SegmentedControl";
+import Note from "../components/Note";
+import ForecastRecord from "../components/ForecastRecord";
 
 /** Card autopays as chart marks: the series is one point per day starting
  *  today, so a due date is found by its own index. A date the window does
@@ -40,6 +45,25 @@ export function autopayMarks(series: [string, number][],
   }));
 }
 
+/** the server's card due-date marks (todayview.due_marks) as chart events:
+ *  one line per card per due date, its caption and the hovered day's line
+ *  in the server's words */
+export function dueMarks(series: [string, number][],
+                         marks: { date: string; label: string; words: string }[]) {
+  return marks.flatMap((m) => {
+    const i = series.findIndex(([d]) => d === m.date);
+    return i < 0 ? [] : [{ i, label: m.label, note: m.words }];
+  });
+}
+
+// one row of the cash timeline after today, as the table prints it
+type TimelineRow = {
+  date: string; amount: number; label: string; bal_now: number | null;
+  bal_stmt: number | null; kind: "event" | "month_end"; card?: string | null;
+  // cash after card balances that day (the server's after_cards)
+  after_cards?: number | null;
+};
+
 // shared with the Month/Year lenses
 export const VERDICT = {
   "OVER BUDGET": { cls: "r", label: "OVER BUDGET" },
@@ -53,14 +77,12 @@ export const VERDICT = {
 // the account (see the toggle below)
 const FACE_KEY = "oiko-today-face";
 
-// The cash tile's line when it has no paycheck figure, keyed by the
-// payload's `income_due_note` (the server decides why; never re-derived
-// here). Same strings as the email render and the mobile Today screen.
-const NO_PAYCHECK_NOTE: Record<string, string> = {
-  none: "no paycheck set up — add your income under Bills & Income and this counts it",
-  budgeted: "your income is budgeted, not scheduled — this counts no paycheck",
-  off: "your income is switched off under Bills & Income — this counts no paycheck",
-};
+// the most serious alert leads the needs-you line; its edge carries the
+// severity the way the Alerts page's rows do
+const SEV_RANK: Record<string, number> = { bad: 3, warn: 2, info: 1, good: 0 };
+const sevRank = (sev: string) => SEV_RANK[sev] ?? 2;
+const sevClass = (sev: string) =>
+  sev === "bad" || sev === "info" || sev === "good" ? sev : "";
 
 // date = a past day (YYYY-MM-DD) the user stepped back to; null = live
 // today. The cache key must carry the date — every day is its own payload.
@@ -72,6 +94,9 @@ export default function Today({ date = null }: { date?: string | null }) {
   // dismissing an alert is a tenant-wide write — editor chrome only
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const [allEvents, setAllEvents] = useState(false);
+  // the card scenario the cash chart and timeline show; "Your usual" is
+  // the server's headline and the default
+  const [scenKey, setScenKey] = useState<string>("usual");
   // hero face override while the settings write lands — the server's
   // today_view is the durable value (mobile follows it; the daily
   // email's face is the separate email_schedule.daily.summary setting)
@@ -100,8 +125,8 @@ export default function Today({ date = null }: { date?: string | null }) {
       return null;                      // storage blocked — session-only
     }
   });
-  if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
-  if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
+  if (q.isPending) return <PageSkeleton />;
+  if (q.isLoadingError) return <FailedLine q={q} what="Today" />;
   const d: TodayFull = q.data;
   // the stored face is the OWNER's own per-device choice, so it is read
   // back only for them: a viewer on a demo still sees the household's
@@ -131,56 +156,39 @@ export default function Today({ date = null }: { date?: string | null }) {
       });
   };
   const v = VERDICT[d.verdict as keyof typeof VERDICT] ?? VERDICT["ON BUDGET"];
-  // the hero's month figure: the spendable share and what is left of it,
-  // composed once on the server (the tiles hand it out a day at a time);
-  // an older payload falls back to the whole month
-  const heroBudget = d.variable_budget_paced ?? d.variable_budget;
-  const remaining = d.month_remaining_paced
-    ?? d.variable_budget - d.variable_actual;
+  // the hero's month figure: what is left of the month's spendable share,
+  // and the words after it, composed once on the server (hero_face)
+  const remaining = d.month_remaining_paced;
   const rw = d.runway;
   // no checking account (card-only or savings-only): cash ahead is
   // unknown, not $0 — the forecast's walk starts from nothing, so it is
-  // not shown and no alarm is drawn from it. The server says so outright;
-  // an older payload by its null checking balance. (mobile: noCheckingLinked)
-  const noChecking = !!d.forecast?.no_checking || !!rw?.no_checking
-    || (!!rw && rw.checking == null);
+  // not shown and no alarm is drawn from it. The runway says so outright;
+  // an older payload by its null checking balance. (The server sends no
+  // forecast at all for such a household.) (mobile: noCheckingLinked)
+  const noChecking = !!rw?.no_checking || (!!rw && rw.checking == null);
   const fc = noChecking ? null : d.forecast;
 
   // setup is the owner's work — every step behind the checklist and
   // the wizard is a 403 for a viewer, so the card could only dead-end them
   const showChecklist = mayEdit && ob.data && checklistOpen(ob.data);
 
-  // ---- cash: quiet until it matters — three states ----
-  // autopay-statement is the realistic with-cards trajectory.
-  // OK = silence. Tight = one calm line (headroom under ~a paycheck, or
-  // the forecast dips under $0 beyond 14 days). Critical = red, with an
-  // action (short today, or under $0 within 14 days).
+  // ---- cash: quiet until it matters — the notice the server decided
+  // (todayview: state, the dollar it quotes, the date it runs to). The
+  // forecast low still dates the timeline's cut below. ----
   const p0 = fc?.pace_stmt ?? null;
-  const daysTo = (iso: string) => Math.round(
-    (new Date(iso).getTime() - new Date(d.date).getTime()) / 86400000);
-  const negIn = p0?.negative_date ? daysTo(p0.negative_date) : null;
-  const paycheckish = d.income ? d.income / 2 : 1000;
-  const cashCritical = !noChecking && ((d.headroom !== null && d.headroom < 0) ||
-    (negIn !== null && negIn <= 14));
-  const cashTight = !noChecking && !cashCritical &&
-    ((d.headroom !== null && d.headroom < paycheckish) ||
-     (negIn !== null || !!(p0 && p0.min < 0)));
-  // the shortfall quoted beside negative_date is the balance ON that day
-  // (first_neg_amount) — `min` can be a far deeper trough weeks later, and
-  // pairing min with negative_date welded the wrong dollar to the wrong day
-  const firstNeg = p0?.negative_date
-    ? ((p0 as { min: number; first_neg_amount?: number | null })
-        .first_neg_amount ?? p0.min)
-    : null;
-  // "slow spending to $X/day": the daily burn that clears the shown dip
-  const slowTo = firstNeg !== null && firstNeg < 0 && negIn && negIn > 0
-    ? Math.max(0, (p0!.rate ?? 0) + firstNeg / negIn) : null;
-
+  // the three card scenarios as the server sent them (your usual, pay all
+  // cards now, pay on the due date), each with its walk, low point in
+  // words, chart lines and timeline rows — printed, never worked out here
+  const scens = fc?.scenarios !== undefined ? (fc?.scenarios ?? []) : null;
+  const scen = scens?.find((x) => x.key === scenKey) ?? scens?.[0] ?? null;
+  const note = noChecking ? null : (d.cash_notice ?? null);
   // per-category tiles: X / Y — what's left TODAY of the daily rate that
   // finishes the month on budget — one framing, combined
   const tiles = ([["Food", d.allow.food], ["Everything else", d.allow.other],
     ...d.allow_kids.map((k) => [k.name, k] as const)] as const)
-    .filter(([, a]) => a);
+    // a parent whose whole budget went to its carve-outs would read
+    // "$0 of $0"; it carries nothing, so the day's totals do not move
+    .filter(([, a]) => a && !(a as { empty?: boolean }).empty);
   // the month on view, for the links a label opens
   // asOf: the day on view — a past day's tiles are that day's figures, so
   // the rows a label opens stop on that day too
@@ -198,24 +206,11 @@ export default function Today({ date = null }: { date?: string | null }) {
       : label === "Everything else" ? "other" : label)}${ym}`;
 
   // top-pane bars are DAY-scoped: today's spend against today's
-  // allowance. The month gauges live in the Monthly budget card —
-  // repeating them up here would say the same thing twice. Rendered with the
+  // allowance (todayview.simple_day_meter, the same bar as the email).
+  // The month gauges live in the Monthly budget card. Rendered with the
   // map's Track so overspend keeps the divider + stripes idiom.
-  // Mirrors the server's simple_day_meter (todayview.py) so this bar,
-  // the headline and the email always agree: spend counts against the
-  // bar only up to each bucket's own allowance — an over bucket's excess
-  // can't be absorbed by a neighbour's unused room — and once every
-  // bucket is exhausted the true overshoot returns so the bar reads over
-  // exactly when the day as a whole is.
-  // left_today is the server's own rounded per-bucket remainder — summing
-  // it (not re-deriving allowance − spent) keeps this bar equal to the
-  // headline to the cent.
-  const dayAllow = tiles.reduce((s, [, a]) => s + a!.today_allowance, 0);
-  const dayLeft = tiles.reduce((s, [, a]) =>
-    s + Math.max(0, a!.left_today), 0);
-  const daySpent = dayAllow - dayLeft + (dayLeft < 0.005
-    ? tiles.reduce((s, [, a]) => s + Math.max(0, -a!.left_today), 0)
-    : 0);
+  const daySpent = d.day_meter?.spent ?? 0;
+  const dayAllow = d.day_meter?.allow ?? 0;
   const dayRow = (spent: number, allow: number) => ({
     // an exhausted allowance with spend on it must read OVER (red past the
     // divider), not "unbudgeted" amber — floor the budget off zero
@@ -225,10 +220,9 @@ export default function Today({ date = null }: { date?: string | null }) {
 
   // start of the recent window: yesterday, or today itself on the 1st
   const yesterday = d.yesterday ?? d.date;
-  // the verdict's per-row figure (net of a partial reimbursement), the same
-  // amounts the email's recent-spending total adds — the gross `amount`
-  // would print a different number than the email for the same window
-  const recentSum = d.recent.reduce((s, r) => s + rowSpend(r), 0);
+  // the recent window's variable spending: the server's sum, the figure
+  // the email prints
+  const recentSum = d.recent_variable_spending ?? null;
   // the footnote's two kinds of missed bill: never posted, and posted then
   // withdrawn by the bank feed (the fourth slot; an older server omits it)
   const lateBills = d.overdue_unpaid.filter((o) => !o[3]);
@@ -240,9 +234,18 @@ export default function Today({ date = null }: { date?: string | null }) {
   // scheduled events, shown through the forecast low point by default.
   const paidRows = d.forecast_rows.filter(
     (r) => r.bal_now === null && r.bal_stmt === null && r.date <= d.date);
-  const futureRows = d.forecast_rows.filter((r) => !paidRows.includes(r));
-  const lowDate = p0?.min_date ?? null;
-  const preLow = lowDate ? futureRows.filter((r) => r.date <= lowDate) : futureRows;
+  // the selected scenario's rows after today; an older server's
+  // forecast_rows otherwise (older-server path: stands in for `scenarios`)
+  const futureRows: TimelineRow[] = scen
+    ? scen.rows.map((r) => ({ date: r.date, amount: r.amount ?? 0, label: r.label,
+                              bal_now: r.balance, bal_stmt: r.balance, kind: r.kind,
+                              card: r.card ?? null, after_cards: r.after_cards }))
+    : d.forecast_rows.filter((r) => !paidRows.includes(r));
+  const lowDate = (scen ?? p0)?.min_date ?? null;
+  // the month-end row always shows: the tile above quotes its balance
+  const preLow = lowDate
+    ? futureRows.filter((r) => r.kind === "month_end" || r.date <= lowDate)
+    : futureRows;
   const shownFuture = allEvents || preLow.length === 0 ? futureRows : preLow;
   const hiddenCount = futureRows.length - shownFuture.length;
   // The card scenarios differ only in payment TIMING — converged lows mean
@@ -251,9 +254,23 @@ export default function Today({ date = null }: { date?: string | null }) {
     { label: "pay all cards now", short: "cards now", s: fc.pace_now },
     { label: "autopay statement", short: "autopay", s: fc.pace_stmt },
   ] : [];
-  const converged = lows.length > 0 &&
+  const converged = scen !== null || (lows.length > 0 &&
     lows.every((l) => l.s.min === lows[0].s.min
-                      && l.s.min_date === lows[0].s.min_date);
+                      && l.s.min_date === lows[0].s.min_date));
+  // balance columns: none without a forecast (every cell would be a dot —
+  // the set-your-balance prompt in the hero already says why), one when
+  // the card scenarios agree, two when they differ
+  // cash after card balances beside the selected scenario's balance,
+  // headed in the server's words; absent from an older server's rows
+  const afterLabel = scen && fc?.after_cards_label
+    && scen.rows.some((r) => r.after_cards != null) ? fc.after_cards_label : null;
+  const balCols = !fc ? 0 : converged ? (afterLabel ? 2 : 1) : 2;
+  const pastBal = balCols === 1
+    ? <td className="num mut c-bal c-none">·</td>
+    : balCols === 2
+      ? <><td className="num mut hide-m">·</td>
+          <td className="num mut c-bal c-none">·</td></>
+      : null;
 
   const txnLabel = (r: Txn) =>
     r.item_summary ? <>{r.payee} — <i>{r.item_summary}</i></> : r.payee;
@@ -263,14 +280,14 @@ export default function Today({ date = null }: { date?: string | null }) {
       {/* a two-factor recovery pending on this account — the notice
           can still be undone, and only Settings > Security cancels it */}
       {me.data?.factor_reset_pending && (
-        <div className="note bad" style={{ margin: "1rem 0 0" }}>
+        <Note tone="bad" style={{ margin: "1rem 0 0" }}>
           <span style={{ flex: 1 }}>
             Someone asked for a recovery that removes this account's
             two-factor methods. It lands {mmdd(localDayOf(me.data.factor_reset_pending))}.
             {" "}Not you?{" "}
             <Link to="/settings/security">Cancel it in Security</Link>
           </span>
-        </div>
+        </Note>
       )}
       {/* ---- past-day view (back-nav): the banner is THE way home. The
            forward-looking panes — cash forecast card/chart, alert strips,
@@ -291,6 +308,10 @@ export default function Today({ date = null }: { date?: string | null }) {
           path — a parallel checklist whose links bypass it just competes.
           The checklist takes over once the wizard is done or dismissed.
           (Setup state is a now-fact too — not shown on a past day.) */}
+      {/* an unread setup state is not "setup finished": the failed line
+          sits where the setup card would */}
+      {d.is_today && mayEdit && ob.data === undefined && ob.isError && (
+        <FailedLine q={ob} what="the setup progress" />)}
       {d.is_today && showChecklist && (ob.data!.wizard_done
         ? <Onboarding data={ob.data!} hosted={!!me.data?.hosted} />
         : (
@@ -303,60 +324,24 @@ export default function Today({ date = null }: { date?: string | null }) {
               Resume setup →</button></Link>
           </div>
         ))}
-      {d.alerts.map((a, i) => {
-        // BOTH keys, like the Alerts page already does: the strip reads
-        // ["today"], but the header bell's count reads ["alertsHistory"]
-        // with a 60s staleTime, so clearing only the first removes the
-        // alert and leaves the badge still showing 1.
-        // Both are patched in place, up front: a dismissal has one
-        // outcome, and waiting on a refetch of the full Today payload to
-        // prove it left the note sitting there — and a second click on it
-        // posting again. The strip goes back only if the server refuses.
-        const dismiss = async () => {
-          const todayKey = ["today", date ?? "now"];
-          // a focus/poll refetch already in flight would land after the
-          // patch and put the alert back with nothing left to reconcile it
-          await qc.cancelQueries({ queryKey: todayKey });
-          const prev = qc.getQueryData<TodayFull>(todayKey);
-          const same = (x: { kind: string; message: string }) =>
-            x.kind === a.kind && x.message === a.message;
-          removeFromList<TodayFull, TodayFull["alerts"][number]>(
-            qc, todayKey, "alerts", same);
-          patchList<{ alerts: AlertRow[] }, AlertRow>(
-            qc, ["alertsHistory"], "alerts", same, { dismissed: 1 });
-          return api.alertDismiss(a.kind, a.message)
-            .catch((e) => {
-              if (prev) qc.setQueryData(todayKey, prev);
-              qc.invalidateQueries({ queryKey: ["alertsHistory"] });
-              window.dispatchEvent(new CustomEvent("oiko-toast",
-                { detail: `Dismiss failed: ${errText(e)}` }));
-            });
-        };
+      {/* what needs you, as ONE line: how many alerts are waiting and
+          the most serious one, opening the Alerts page — where each is
+          fixed or dismissed with the same verbs. A bar per alert, each
+          with its own buttons, pushed the day's number off a phone's
+          first screen and said every alert twice in two vocabularies. */}
+      {d.alerts.length > 0 && (() => {
+        const worst = [...d.alerts].sort((x, y) =>
+          sevRank(y.severity) - sevRank(x.severity))[0];
+        const n = d.alerts.length;
         return (
-        <div key={i} className={`note ${a.severity === "bad" ? "bad" : a.severity === "info" ? "info" : a.severity === "good" ? "good" : ""}`}
-             style={{ margin: "1rem 0 0" }}>
-          <span style={{ flex: 1 }}>
-            {a.severity === "good" ? "✓" : a.severity === "info" ? "•" : "⚠"}{" "}
-            {/* An alert that names something you'd want to change links to
-                the page that changes it (drift → that bill's history), and
-                FOLLOWING that link counts as acting on it: the strip is for
-                things still needing attention, so an alert you have gone and
-                dealt with must not still be sitting there when you come
-                back. It lands in the alert history like any dismissal,
-                restorable from there. Viewers can't dismiss, so
-                for them it stays a plain link. */}
-            {a.link ? (
-              <Link to={a.link} onClick={() => { if (mayEdit) dismiss(); }}>
-                {a.message}</Link>
-            ) : a.message}
-          </span>
-          {mayEdit && (
-          <button className="dismiss" title="dismiss"
-                  onClick={dismiss}>✕</button>
-          )}
-        </div>
+          <Link to="/alerts" className={`needsrow ${sevClass(worst.severity)}`}>
+            <b style={{ flexShrink: 0 }}>
+              {n === 1 ? "1 thing needs you" : `${n} things need you`}</b>
+            <span className="needsrow-msg">{worst.message}</span>
+            <span className="needsrow-go" aria-hidden="true">›</span>
+          </Link>
         );
-      })}
+      })()}
 
       {/* the face toggle sits OUTSIDE the cards and scopes the WHOLE
           page: summary = the verdict card IS the page,
@@ -371,22 +356,14 @@ export default function Today({ date = null }: { date?: string | null }) {
           other write controls that hide rather than dead-end. */}
       {mayEdit && (
       <div style={{ display: "flex", justifyContent: "flex-end",
-                    marginTop: "1rem" }}>
-        <span style={{ display: "inline-flex", borderRadius: 999,
-                       border: "1px solid var(--line)", overflow: "hidden",
-                       fontSize: 12.5 }}>
-          {(["summary", "detail"] as const).map((f) => {
-            const on = (adv ? "detail" : "summary") === f;
-            return (
-              <button key={f} onClick={() => setFace(f)}
-                style={{ background: on ? "var(--hover)" : "none",
-                         border: "none", cursor: "pointer", font: "inherit",
-                         fontSize: 12.5, padding: ".28rem .85rem",
-                         color: on ? "var(--ink)" : "var(--mut)",
-                         fontWeight: on ? 600 : 400 }}>{f}</button>
-            );
-          })}
-        </span>
+                    alignItems: "center", gap: ".5rem", marginTop: "1rem" }}>
+        {/* a bare pair of words reads as a caption; the label and the
+            capitals make it a control */}
+        <span className="sub" id="today-view-label">View</span>
+        <SegmentedControl labelledBy="today-view-label" size="sm"
+          value={adv ? "detail" : "summary"} onChange={setFace}
+          options={[{ value: "summary", label: "Summary" },
+                    { value: "detail", label: "Detail" }]} />
       </div>
       )}
 
@@ -417,19 +394,21 @@ export default function Today({ date = null }: { date?: string | null }) {
             <span className={`hv-delta ${v.cls === "r" ? "neg" : "pos"}`}>
               {d.pace_line}</span>
           )}
-          <span className="hv-month sub">
+          {/* the month's one figure on Today; its bars and the plan
+              live on Budget, so the figure opens it */}
+          <Link to="/budget" className="hv-month sub"
+                style={{ color: "var(--mut)", textDecoration: "none" }}
+                title="the month's budget, bar by bar">
             <b className={remaining < 0 ? "neg" : ""}>
               {money(Math.abs(remaining))}</b>
-            {remaining < 0 ? " over the " : " of "}{money(heroBudget)}
-            {remaining < 0 ? "" : " left"} · {d.days_left}{" "}
-            day{d.days_left === 1 ? "" : "s"}
-          </span>
+            {" "}{d.month_words} ›
+          </Link>
         </div>
 
         {/* LEFT TO SPEND TODAY — the star. It's the only number that
             changes what you do today, so it gets the big type; the meter
             is today's allowance, not the month's. */}
-        <div className="sub hero-todaylbl">Left to spend today</div>
+        <div className="sub hero-todaylbl">{d.left_label}</div>
         {!adv && (<>
           {/* SIMPLE face (today_view, the default): the one number —
               still-spendable today across every variable bucket — a
@@ -458,32 +437,45 @@ export default function Today({ date = null }: { date?: string | null }) {
         <div>
           {tiles.map(([label, a]) => {
             const overT = a!.left_today < -0.5;
+            // nothing to hand out and nothing spent (server-decided): ONE
+            // line, not a big $0 over an empty bar and a caption saying it
+            // again. Same words in the email and the app.
+            if (a!.zero_day && !overT) return (
+              <div key={label} style={{ marginTop: ".7rem", fontSize: 13 }}>
+                <Link className="catlink" to={tileTo(label)}><b>{label}</b></Link>
+                <span className="sub"> $0 today</span>
+                {a!.daily_note && (<>
+                  <span className="sub"> · </span>
+                  <span className={`sub ${a!.rate < a!.plan ? "neg" : "pos"}`}>
+                    {a!.daily_note}</span>
+                </>)}
+                {a!.recover_note && (
+                  <span className="sub"> · {a!.recover_note}</span>)}
+              </div>
+            );
             // meter is DAY-scoped, not month-scoped: fill = today's spend
             // of today's allowance. The month gauges already live in the
             // Monthly budget card, so a month meter up here would say the
             // same thing twice. Numbers stack under the label — the whole pane keeps
             // one left-aligned anatomy, matching the simple face.
             return (
-              <div key={label} style={{ marginTop: ".7rem" }}>
+              <div key={label} className="drow" style={{ marginTop: ".7rem" }}>
                 {/* the label opens the rows behind the number: the
                     category's ledger for the month on view */}
-                <div><Link className="catlink" to={tileTo(label)}><b>{label}</b></Link></div>
+                <div className="drow-l"><Link className="catlink" to={tileTo(label)}><b>{label}</b></Link></div>
                 {/* the number keeps the tiles' 26px weight — the row
                     layout is free to change, the number's prominence is
                     not */}
-                <div className={`htile-big ${overT ? "neg" : ""}`}>
-                  {money(Math.max(0, a!.left_today))}</div>
-                <div className="sub" style={{ fontSize: 12 }}>
-                  {overT
-                    ? <>over today by <b className="neg">
-                        {money(-a!.left_today)}</b> · spent{" "}
-                        {money(a!.spent_today)} of {money(a!.today_allowance)}</>
-                    : a!.spent_today > 0.005
-                      ? <>of {money(a!.today_allowance)} today · spent{" "}
-                          {money(a!.spent_today)}</>
-                      : <>of {money(a!.today_allowance)} today · nothing
-                          spent yet</>}
-                </div>
+                {/* an over-budget row says so in the figure's place at
+                    every width, as the app does; the lines under it are
+                    the same at every width */}
+                <div className={`htile-big drow-n ${overT ? "neg" : ""}`}>
+                  {overT ? <>over by {money(-a!.left_today)}</>
+                    : money(a!.left_dollars)}</div>
+                {/* the line under the figure — the server's words, shown at
+                    every width, as the app and the email show them */}
+                <div className={`sub drow-s ${overT ? "neg" : ""}`}
+                     style={{ fontSize: 12 }}>{a!.day_line}</div>
                 <span style={{ display: "block", marginTop: 3 }}
                       title={`spent ${money(a!.spent_today)} of ${
                         money(a!.today_allowance)} today`}>
@@ -519,7 +511,7 @@ export default function Today({ date = null }: { date?: string | null }) {
         {(d.bill_cards ?? []).length > 0 && (
           <>
             <div className="sub hero-todaylbl" style={{ marginTop: ".8rem" }}>
-              Pinned bills</div>
+              Pinned</div>
             <div>
               {d.bill_cards.map((c) => (
                 <div key={c.label} style={{ marginTop: ".7rem" }}>
@@ -580,36 +572,21 @@ export default function Today({ date = null }: { date?: string | null }) {
             <Link to="/accounts">Link your checking account on
             Accounts</Link> to see cash ahead.
           </div>
-        ) : cashCritical ? (
-          <div className="hero-watch bad"><span className="wdot" />
-            <span>
-            {d.headroom !== null && d.headroom < 0 ? (
-              <>Short <b>{money(-d.headroom)}</b> today — checking doesn't
-                cover cards &amp; bills before the next paycheck{d.next_paycheck
-                  ? ` (${mmdd(d.next_paycheck)})` : ""}. Cover it from
-                savings{slowTo !== null
-                  ? <>, or slow spending to <b>{money(slowTo)}/day</b></>
-                  : ""}.</>
-            ) : (
-              <>Short <b>{money(-(firstNeg ?? p0!.min))}</b> by{" "}
-                <b>{p0!.negative_date ? mmdd(p0!.negative_date) : "now"}</b> —
-                cover it from savings{slowTo !== null
-                  ? <>, or slow spending to <b>{money(slowTo)}/day</b></>
-                  : ""}.</>
-            )}
-            </span>
-          </div>
-        ) : cashTight ? (
+        ) : note?.state && note.ask ? (
           <div className="hero-watch"><span className="wdot" />
-            <span>
-            {p0 && (p0.min < 0 || negIn !== null)
-              ? <><b>Cash gets tight</b> around {mmdd(p0.min_date)}{" "}
-                  (low {money(p0.min)}).</>
-              : <><b>Cash is tight</b> — {money(d.headroom)} left after
-                  cards &amp; bills before the next paycheck{d.next_paycheck
-                    ? ` (${mmdd(d.next_paycheck)})` : ""}.</>}
-            </span>
+            <span><Link to="/bills">{note.ask}</Link></span>
           </div>
+        ) : note?.state && note.text ? (
+          // the sentence is the server's (todayview.cash_sentence): the
+          // app and both emails print the same words
+          <div className={`hero-watch ${note.state === "critical" ? "bad" : ""}`}>
+            <span className="wdot" /><span>{note.text}</span>
+          </div>
+        ) : !noChecking && d.cash_band ? (
+          // the quiet heavier-month line (todayview.cash_band): the usual
+          // walk stays above $0, a heavier month would not
+          <div className="hero-watch"><span className="wdot" />
+            <span>{d.cash_band.text}</span></div>
         ) : null}
         {/* the WHY, over-budget only — a good day is QUIET, so this does
             not render on every verdict: one scannable row of merchant
@@ -654,27 +631,39 @@ export default function Today({ date = null }: { date?: string | null }) {
         )}
         {/* "This month's plan" as ONE flow line — monthly facts,
             not daily news; Budget owns the detail */}
-        {adv && d.plan_surplus !== null && (
+        {adv && d.plan_line && (() => {
+          // the terms in the whole dollars the server rounded to the
+          // printed excess (plan_line), so the line adds up as printed;
+          // no plan line (no income yet) prints nothing in its place
+          const pl = d.plan_line;
+          return (
           <div className="planflow"
                style={{ marginTop: ".9rem", paddingTop: ".7rem",
                         borderTop: "1px solid var(--line)", fontSize: 13,
                         display: "flex", gap: ".55rem", flexWrap: "wrap",
                         alignItems: "baseline" }}>
             <span className="sub">Plan:</span>
-            <span className="sub"><b style={{ color: "var(--ink)" }}>{money(d.income)}</b> in</span>
-            <span style={{ color: "var(--line)" }}>→</span>
-            {/* scheduled bills, not the fixed bar's cash basis, so the
-                chain balances (same figure and words as the email) */}
-            <span className="sub"><b style={{ color: "var(--ink)" }}>{money(d.scheduled_month ?? d.buckets.fixed.month_budget)}</b> bills due</span>
-            <span style={{ color: "var(--line)" }}>→</span>
-            <span className="sub"><b style={{ color: "var(--ink)" }}>{money(d.variable_budget)}</b> to spend</span>
-            <span style={{ color: "var(--line)" }}>→</span>
-            {(d.savings_plan ?? 0) > 0.005 && (<>
-              <span className="sub"><b style={{ color: "var(--ink)" }}>{money(d.savings_plan!)}</b> saved</span>
-              <span style={{ color: "var(--line)" }}>→</span>
+            <span className="sub"><b style={{ color: "var(--ink)" }}>{money(pl.income)}</b> in</span>
+            <span className="mut" aria-hidden="true">→</span>
+            {/* the plan's own figures — bills evened over the year, the
+                budgets as set — the basis the excess is computed from,
+                so the chain adds up (same figures and words as the email) */}
+            <span className="sub"><b style={{ color: "var(--ink)" }}>{money(pl.bills)}</b> {d.plan_bills_label ?? "bills"}
+              {/* this month against the average — the server's words */}
+              {d.bills_weight && <> ({d.bills_weight})</>}</span>
+            <span className="mut" aria-hidden="true">→</span>
+            <span className="sub"><b style={{ color: "var(--ink)" }}>{money(pl.to_spend)}</b> to spend</span>
+            <span className="mut" aria-hidden="true">→</span>
+            {pl.saved !== null && (<>
+              <span className="sub"><b style={{ color: "var(--ink)" }}>{money(pl.saved)}</b> saved</span>
+              <span className="mut" aria-hidden="true">→</span>
             </>)}
-            <span className="sub"><b className={d.plan_surplus >= 0 ? "pos" : "neg"}>
-              {money(d.plan_surplus)}</b> excess</span>
+            {/* the excess in the Budget summary's words and tone — "planned
+                excess", "· none this month" once the overrun has used it
+                up (todayview.plan_excess_words) */}
+            <span className="sub"><b className={d.plan_excess_words
+                ? d.plan_excess_words.tone : pl.excess >= 0 ? "pos" : "neg"}>
+              {money(pl.excess)}</b> {d.plan_excess_words?.text ?? "excess"}</span>
             {/* sweep goals sit beside the chain, not inside it — the
                 sentence is server-composed so no surface can drift */}
             {d.sweep_line && (
@@ -684,7 +673,8 @@ export default function Today({ date = null }: { date?: string | null }) {
               title="rework income, budgets, carve-outs and the savings plan">
               balance the budget →</Link>
           </div>
-        )}
+          );
+        })()}
       </div>
       )}
 
@@ -718,8 +708,8 @@ export default function Today({ date = null }: { date?: string | null }) {
                   </>
                 ) : (
                   <>
-                    {/* open-ended goal (no target): "$X saved" + the
-                        measured rate — never "of $0" */}
+                    {/* open-ended goal (no target): "$X saved" + what
+                        the last 3 months saved — never "of $0" */}
                     <span className="mut" style={{ fontSize: 13 }}>
                       {money(g.saved ?? 0)}{g.target ? <> of {money(g.target)}
                       </> : " saved"}
@@ -727,15 +717,21 @@ export default function Today({ date = null }: { date?: string | null }) {
                     <span className="mut" style={{ fontSize: 13,
                           marginLeft: "auto" }}>
                       {!g.target
-                        ? ((g.rate_90d ?? 0) > 0
-                            ? `saving ${money(g.rate_90d!)}/mo`
-                            : "no contributions in 90 days")
+                        ? ((g.saved_90d ?? 0) > 0
+                            ? `${money(g.saved_90d!)} in the last 3 months`
+                            // withdrawals outweighing deposits is not
+                            // the same news as nothing arriving
+                            : g.contributed_90d
+                              ? "no net saving in the last 3 months"
+                              : "no contributions in 3 months")
                         : g.pct != null && g.pct >= 100 ? "funded ✓"
                         : g.on_pace === false
                           ? <b className="neg">off pace for {mmdd(g.target_date!)}</b>
                         : g.on_pace ? `on pace for ${mmdd(g.target_date!)}`
                         : g.eta ? `~${mmdd(g.eta)} at the current rate`
-                        : "no contributions in 90 days"}</span>
+                        : g.contributed_90d
+                          ? "no net saving in the last 3 months"
+                        : "no contributions in 3 months"}</span>
                   </>
                 )}
               </div>
@@ -761,18 +757,8 @@ export default function Today({ date = null }: { date?: string | null }) {
       <div className="card">
         <h2>Monthly budget</h2>
         <MoneyMap
-          rows={planRows(d.buckets, { period,
-            fixedActual: d.buckets.fixed.actual,
-            fixedBudget: d.buckets.fixed.month_budget,
-            fixedPending: d.fixed_unpaid_due,
-            savings: (() => {
-              const g = (d.savings_goals ?? []).find((x) => isPlanSavingsGoal(x.name));
-              // this month's posted contribution when the payload has it;
-              // otherwise the trailing 90-day average, labelled as one
-              return g ? monthSavings(g, g.saved_this_month) : null;
-            })(),
-            excess: d.plan_surplus,
-          })}
+          rows={sentPlanRows(d.plan_rows ?? [])}
+          total={sentPlanTotal(d.plan_total)}
           footnote={(d.overdue_unpaid.length > 0 || d.irregular_bills.length > 0) && (
             <div className="sub" style={{ fontSize: 12, marginTop: ".2rem" }}>
               {d.irregular_bills.length > 0 && (
@@ -825,43 +811,46 @@ export default function Today({ date = null }: { date?: string | null }) {
                 <div className={`kpi sm ${fc.checking < 0 ? "neg" : ""}`}>{money(fc.checking)}</div></div>
               <div><span className="sub">card debt</span>
                 <div className="kpi sm">{money(fc.card_debt)}</div></div>
-              {/* typeof guard: a mixed-deploy payload without
-                  the field must not render $NaN */}
-              {/* the month-end figure counts the paychecks still due as
-                  well as the bills still due — bills alone reads as if the
-                  product forgot the household's pay. Without an income
-                  series the tile says why (`income_due_note`); the figure
-                  stays cash. */}
-              {rw && rw.checking !== null && typeof d.bills_remaining_month === "number" && (
-                typeof d.income_due_total === "number" ? (<>
-                  <div><span className="sub" title="paychecks still due this month">
-                      paychecks still due</span>
-                    <div className="kpi sm pos">+{money(d.income_due_total)}</div>
-                    {(d.income_due_dates ?? []).length > 0 && (
-                      <div className="sub" style={{ fontSize: 11 }}>
-                        {(d.income_due_dates ?? []).slice(0, 3).map(mmdd).join(", ")}</div>)}
-                  </div>
-                  <div><span className="sub"
-                      title="checking − card debt − bills still due this month + paychecks still due this month">
-                      after cards, bills &amp; paychecks</span>
-                    <div className={`kpi sm ${rw.checking - rw.card_debt
-                          - d.bills_remaining_month + d.income_due_total >= 0 ? "pos" : "neg"}`}>
-                      {money(rw.checking - rw.card_debt
-                             - d.bills_remaining_month + d.income_due_total)}</div></div>
-                </>) : (
-                  <div><span className="sub"
-                      title="checking − card debt − bills still due this month">
-                      after cards &amp; bills</span>
-                    <div className={`kpi sm ${rw.checking - rw.card_debt
-                          - d.bills_remaining_month >= 0 ? "pos" : "neg"}`}>
-                      {money(rw.checking - rw.card_debt
-                             - d.bills_remaining_month)}</div>
+              {/* paychecks still due, then the balance the month ends on —
+                  the same day the timeline's month-end row shows
+                  (todayview.month_end_left), with the server's note under
+                  it: what it is after, or why no paycheck is counted */}
+              {typeof d.income_due_total === "number" && (
+                <div><span className="sub" title="paychecks still due this month">
+                    paychecks still due</span>
+                  <div className="kpi sm pos">+{money(d.income_due_total)}</div>
+                  {(d.income_due_dates ?? []).length > 0 && (
                     <div className="sub" style={{ fontSize: 11 }}>
-                      {NO_PAYCHECK_NOTE[d.income_due_note ?? "none"]
-                        ?? NO_PAYCHECK_NOTE.none}</div></div>
-                )
+                      {(d.income_due_dates ?? []).slice(0, 3).map(mmdd).join(", ")}</div>)}
+                </div>
               )}
-              {converged ? (() => {
+              {typeof d.month_end_left === "number" && (
+                <div><span className="sub">{d.month_end_label ?? "left at month end"}</span>
+                  <div className={`kpi sm ${d.month_end_left >= 0 ? "pos" : "neg"}`}>
+                    {money(d.month_end_left)}</div>
+                  {d.month_end_note && (
+                    <div className="sub" style={{ fontSize: 11, maxWidth: "16rem" }}>
+                      {d.month_end_note}</div>)}
+                  {/* what the cards still hold then, and the next card
+                      payment after the month (todayview.month_end_left) */}
+                  {d.month_end_cards_note && (
+                    <div className="sub" style={{ fontSize: 11, maxWidth: "16rem" }}>
+                      {d.month_end_cards_note}</div>)}
+                </div>
+              )}
+              {/* each card scenario's low point, side by side in the
+                  server's words (todayview.low_words) */}
+              {scens ? scens.map((x) => (
+                <div key={x.key}><span className="sub">low — {x.label.toLowerCase()}</span>
+                  <div className={`kpi sm ${x.min < 0 ? "neg" : ""}`}
+                       style={{ fontSize: 14 }}>{x.low_words}</div>
+                  {/* what that walk still holds on the cards on its low
+                      day (todayview.low_cards_note) */}
+                  {x.low_cards_note && (
+                    <div className="sub" style={{ fontSize: 11, maxWidth: "16rem" }}>
+                      {x.low_cards_note}</div>)}
+                </div>
+              )) : converged ? (() => {
                 const s = lows[0].s;
                 const negs = lows.filter((l) => l.s.negative_date);
                 return (
@@ -896,18 +885,95 @@ export default function Today({ date = null }: { date?: string | null }) {
           {/* fc_chart as a static line: h=220, zero_line, fill,
               critical-date marker (todayview.build_context):
               autopay statement is the primary series */}
-          {fc && (
+          {/* one selector for the chart and the timeline below it */}
+          {fc && scens && scens.length > 1 && (
+            <SegmentedControl label="Card payments" size="sm"
+              value={scen?.key ?? null} onChange={setScenKey}
+              style={{ margin: ".4rem 0 .2rem" }}
+              options={scens.map((x) => ({ value: x.key, label: x.label }))} />
+          )}
+          {fc && scen && (
             <AreaChart variant="static" height={220}
+              subject={`Cash timeline for the next ${fc.days} days, ${scen.label.toLowerCase()}`}
+              points={scen.series}
+              zeroLine
+              markX={(() => { const i = scen.series.findIndex(([, v]) => v < 0);
+                              return i === -1 ? null : i; })()}
+              markLabel={scen.runs_out_label}
+              // each card's due dates in every scenario; the dated payments
+              // (older-server path: stands in for `due_marks`)
+              events={scen.due_marks !== undefined
+                ? dueMarks(scen.series, scen.due_marks ?? [])
+                : autopayMarks(scen.series, scen.marks)}
+              // the range the forecast's own past misses suggest,
+              // shaded, once the server sends it; the same walk in a
+              // heavier month, dashed beside it, until then
+              band={scen.band ?? undefined}
+              second={scen.band ? undefined : scen.heavy ?? undefined}
+              labels={[scen.label, scen.band ? scen.band_label ?? ""
+                                             : scen.heavy_label ?? ""]}
+              // the hovered day lists the other scenarios' balances too
+              tipExtra={(scens ?? []).filter((x) => x.key !== scen.key)
+                .map((x) => ({ name: x.label, points: x.series }))} />
+          )}
+          {/* older-server path: stands in for `scenarios` */}
+          {fc && !scens && (
+            <AreaChart variant="static" height={220}
+              subject={`Cash timeline for the next ${fc.days} days, autopay statement balance`}
               points={fc.pace_stmt.series}
               second={fc.pace_now.series}
               zeroLine
               markX={(() => { const i = fc.pace_stmt.series.findIndex(([, v]) => v < 0);
                               return i === -1 ? null : i; })()}
-              markLabel={fc.pace_stmt.negative_date
-                ? "runs out " + mmdd(fc.pace_stmt.negative_date).replace(/^0/, "").replace(/\/0/, "/")
-                : ""}
+              // the server's mark, in the page's MM/DD/YY
+              markLabel={fc.runs_out_label}
               events={autopayMarks(fc.pace_stmt.series, fc.card_autopay)}
               labels={["autopay statement balance", "pay all cards now"]} />
+          )}
+          {/* the one-offs the daily pace leaves out — the server's
+              sentence, the app's and the email's */}
+          {fc?.pace_note && (
+            <div className="sub" style={{ fontSize: 12, marginTop: ".3rem" }}>
+              {fc.pace_note}</div>
+          )}
+          {/* the band's sentence while it is drawn — the server's */}
+          {scen?.band_text && (
+            <div className="sub" style={{ fontSize: 12, marginTop: ".3rem" }}>
+              {scen.band_text}</div>
+          )}
+          {/* how close the forecast has landed (todayview.score_sentences):
+              the line opens the record; the lean and the first weeks'
+              note print as sent */}
+          {fc?.score?.text && <ForecastRecord text={fc.score.text} />}
+          {fc?.score?.bias_text && (
+            <div className="sub" style={{ fontSize: 12, marginTop: ".3rem" }}>
+              {fc.score.bias_text}</div>
+          )}
+          {fc?.score?.note && (
+            <div className="sub" style={{ fontSize: 12, marginTop: ".3rem" }}>
+              {fc.score.note}</div>
+          )}
+          {/* card spending the selected walk still owes when it ends */}
+          {scen?.cards_note && (
+            <div className="sub" style={{ fontSize: 12, marginTop: ".3rem" }}>
+              {scen.cards_note}</div>
+          )}
+          {/* when card spending reaches checking — the server's words */}
+          {fc?.card_timing_note && (
+            <div className="sub" style={{ fontSize: 12, marginTop: ".3rem" }}>
+              {fc.card_timing_note}</div>
+          )}
+          {/* a paycheck the forecast leaves out because it stopped
+              arriving — the server's words */}
+          {fc?.stopped_paychecks_note && (
+            <div className="sub" style={{ fontSize: 12, marginTop: ".3rem" }}>
+              {fc.stopped_paychecks_note}</div>
+          )}
+          {/* own-account transfers the forecast leaves out — the
+              server's words (todayview.transfers_note) */}
+          {fc?.transfers_note && (
+            <div className="sub" style={{ fontSize: 12, marginTop: ".3rem" }}>
+              {fc.transfers_note}</div>
           )}
           {/* .cash-tl + per-td c-* classes: index.css restacks each row
               into a two-line card at phone widths (the TxnTable pattern) —
@@ -915,10 +981,11 @@ export default function Today({ date = null }: { date?: string | null }) {
               to nothing on a phone. Desktop rendering is untouched. */}
           <table className="cash-tl" style={{ marginTop: ".6rem" }}>
             <thead><tr><th>Date</th><th>Event</th><th className="num">Amount</th>
-              {converged || !fc
-                ? <th className="num">Balance</th>
-                : <><th className="num hide-m">Pay cards now</th>
-                    <th className="num">Autopay stmt</th></>}
+              {afterLabel ? <><th className="num hide-m">{afterLabel}</th>
+                    <th className="num">Balance</th></>
+                : balCols === 1 ? <th className="num">Balance</th>
+                : balCols === 2 ? <><th className="num hide-m">Pay cards now</th>
+                    <th className="num">Autopay stmt</th></> : null}
             </tr></thead>
             <tbody>
               {paidRows.map((r, i) => (
@@ -926,10 +993,7 @@ export default function Today({ date = null }: { date?: string | null }) {
                   <td className="mut c-date" style={{ whiteSpace: "nowrap", width: "1%" }}>{mmdd(r.date)}</td>
                   <td className="mut c-label" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.label}</td>
                   <td className="num mut c-amt" style={{ whiteSpace: "nowrap" }}>{money(r.amount)}</td>
-                  {converged || !fc
-                    ? <td className="num mut c-bal">·</td>
-                    : <><td className="num mut hide-m">·</td>
-                        <td className="num mut c-bal">·</td></>}
+                  {pastBal}
                 </tr>
               ))}
               {d.recent.map((r) => (
@@ -938,19 +1002,18 @@ export default function Today({ date = null }: { date?: string | null }) {
                   <td className="c-label" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                     <Link to="/transactions">{txnLabel(r)}</Link>
                     {r.pending ? <span className="pill m" style={{ marginLeft: 6 }}>pend</span> : null}
-                    <span className="sub"> · {catLabel(r.category)}</span>
+                    {/* its own line on a phone (.tl-cat), where a dot
+                        would otherwise end the line above it */}
+                    <span className="sub tl-cat"><span className="tl-dot"> · </span>{catLabel(r.category)}</span>
                   </td>
                   <td className={`num c-amt ${r.amount < 0 ? "pos" : ""}`}
                       style={{ whiteSpace: "nowrap" }}>{money(-r.amount, true)}</td>
-                  {converged || !fc
-                    ? <td className="num mut c-bal">·</td>
-                    : <><td className="num mut hide-m">·</td>
-                        <td className="num mut c-bal">·</td></>}
+                  {pastBal}
                 </tr>
               ))}
               {fc && (
                 <tr className="tr-today">
-                  <td colSpan={converged ? 4 : 5}
+                  <td colSpan={3 + balCols}
                       style={{ borderBottom: "1px solid var(--blue)",
                                padding: ".3rem .55rem" }}>
                     <b style={{ fontSize: 12, color: "var(--blue)" }}>TODAY</b>
@@ -961,16 +1024,25 @@ export default function Today({ date = null }: { date?: string | null }) {
               )}
               {shownFuture.map((r, i) => (
                 <tr key={`f${i}`}>
-                  <td className="mut c-date" style={{ whiteSpace: "nowrap", width: "1%" }}>{mmdd(r.date)}</td>
-                  <td className={`c-label ${r.bal_now === null ? "mut" : ""}`}
+                  <td className="mut c-date" style={{ whiteSpace: "nowrap", width: "1%" }}>{dueLabel(r.date, d.date)}</td>
+                  {/* a bill on a card is listed on its day and moves no
+                      checking balance: greyed like a paid row */}
+                  <td className={`c-label ${r.bal_now === null || r.card ? "mut" : ""}`}
                       style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.label}</td>
-                  <td className={`num c-amt ${r.bal_now === null ? "mut" : r.amount > 0 ? "pos" : ""}`}
-                      style={{ whiteSpace: "nowrap" }}>{money(r.amount)}</td>
+                  {/* the month-end row is a balance with no amount */}
+                  <td className={`num c-amt ${r.bal_now === null || r.card || r.kind === "month_end" ? "mut" : r.amount > 0 ? "pos" : ""}`}
+                      style={{ whiteSpace: "nowrap" }}>{r.kind === "month_end" ? "" : money(r.amount)}</td>
                   {/* without checking the walk's balances start from
                       nothing — the events stand, their balances do not */}
                   {converged ? (
-                    <td className={`num c-bal ${r.bal_stmt !== null && r.bal_stmt < 0 ? "neg" : "mut"}`}
-                        style={{ whiteSpace: "nowrap" }}>{r.bal_stmt !== null ? money(r.bal_stmt) : "·"}</td>
+                    <>
+                      {afterLabel && (
+                        <td className={`num hide-m ${!noChecking && r.after_cards != null && r.after_cards < 0 ? "neg" : "mut"}`}
+                            style={{ whiteSpace: "nowrap" }}>{!noChecking && r.after_cards != null ? money(r.after_cards) : "·"}</td>
+                      )}
+                      <td className={`num c-bal ${r.bal_stmt !== null && r.bal_stmt < 0 ? "neg" : "mut"}`}
+                          style={{ whiteSpace: "nowrap" }}>{r.bal_stmt !== null ? money(r.bal_stmt) : "·"}</td>
+                    </>
                   ) : (
                     <>
                       <td className={`num hide-m ${!noChecking && r.bal_now !== null && r.bal_now < 0 ? "neg" : "mut"}`}

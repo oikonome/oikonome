@@ -41,8 +41,8 @@ class RecipientCapTests(unittest.TestCase):
         self.assertEqual(got, ["a@example.dev", "b@example.dev"])
 
     def test_the_settings_door_refuses_instead_of_truncating(self):
-        api = (pathlib.Path(oikonome.__file__).parent / "web"
-               / "api.py").read_text()
+        from .util import api_sources
+        api = api_sources()
         self.assertIn("cap=None", api)
         self.assertIn("the \"\n                             f\"limit is", api)
         self.assertIn("Remove ", api)
@@ -60,7 +60,7 @@ class RecipientEditorFeedbackTests(unittest.TestCase):
         self.assertIn("export function errText", _src("api/client.ts"))
 
     def test_a_failure_and_a_success_do_not_look_the_same(self):
-        self.assertIn('"note" + (notice.bad ? " bad" : " good")', self.src)
+        self.assertIn('<Note tone={notice.bad ? "bad" : "good"}', self.src)
 
     def test_resend_reports_both_outcomes(self):
         self.assertIn("onError: (e) => setResendMsg(", self.src)

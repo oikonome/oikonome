@@ -573,26 +573,39 @@ def claim_netloc(claim: str) -> str | None:
         return None
 
 
+# The one write door that runs the Origin check itself (web/mcp.py): it
+# must answer 404 for every request while it is switched off, and its
+# refusal must be a JSON-RPC error, so the middleware leaves it to the
+# route, which applies `cross_origin_write` first thing once switched on.
+ORIGIN_CHECKED_IN_ROUTE = frozenset({"/api/integrations/mcp"})
+
+
+def cross_origin_write(request) -> bool:
+    """A write whose Origin (or Referer) claims another host."""
+    if request.method not in _WRITE:
+        return False
+    origin = request.headers.get("origin") or ""
+    referer = request.headers.get("referer") or ""
+    claim = origin or referer
+    if not claim:
+        return False
+    # A present-but-opaque Origin (the literal "null" a browser sends for
+    # sandboxed iframes / data: / file: / some cross-origin redirects) has
+    # no netloc, and an attacker-controlled opaque context must not be
+    # able to POST. A claim that IS present but doesn't parse to THIS host
+    # is cross-origin, full stop; only a genuinely absent claim (non-browser
+    # client) stays allowed. One that does not parse at all (None) is not
+    # this host either.
+    return claim_netloc(claim) != request.headers.get("host", "")
+
+
 class OriginCheckMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        if request.method in _WRITE:
-            origin = request.headers.get("origin") or ""
-            referer = request.headers.get("referer") or ""
-            claim = origin or referer
-            if claim:
-                host = claim_netloc(claim)
-                # A present-but-opaque Origin (the literal "null" a
-                # browser sends for sandboxed iframes / data: / file: /
-                # some cross-origin redirects) has no netloc, and an
-                # attacker-controlled opaque context must not be able to
-                # POST. A claim that IS present but doesn't parse to THIS
-                # host is cross-origin, full stop; only a genuinely absent
-                # claim (non-browser client) stays allowed. One that does
-                # not parse at all (None) is not this host either.
-                if host != request.headers.get("host", ""):
-                    from starlette.responses import JSONResponse
-                    return JSONResponse({"detail": "cross-origin write blocked"},
-                                        status_code=403)
+        if (request.url.path not in ORIGIN_CHECKED_IN_ROUTE
+                and cross_origin_write(request)):
+            from starlette.responses import JSONResponse
+            return JSONResponse({"detail": "cross-origin write blocked"},
+                                status_code=403)
         return await call_next(request)
 
 
@@ -631,6 +644,10 @@ _PROTECTED_NS = frozenset({
                     # the 15-attempt cap that stops a distributed TOTP brute
     "stepup-fail",  # per-session step-up lockout: the same cap for the
                     # codes a signed-in session offers at posture doors
+    "lock-level",   # second-factor lock trip history: dropping it makes
+                    # every trip a first one, so the lock never escalates
+    "lock-day",     # second-factor misses over a day: dropping it hands a
+                    # paced guesser its daily budget back
     "strike",       # the auto-ban's evidence — clear it and no repeat
                     # offender ever reaches the ban threshold
     "banhist",      # ban-escalation history: without it every offence is a
@@ -1505,14 +1522,131 @@ class AutoBanMiddleware(BaseHTTPMiddleware):
 _ACCT_FAIL_MAX = 15          # failures per account before lockout
 _ACCT_FAIL_WINDOW = 900      # 15-minute sliding window / cooldown
 
+# The lock ESCALATES. Once the misses already kept fill the window, the next
+# attempt trips a hard lock on the bucket, and each trip in the last week doubles the
+# next one (15 min, 30 min, 1 h, ... capped at a day). The trip history is
+# NOT cleared by a successful sign-in — otherwise a daily-active owner
+# would hand whoever holds the password a fresh first offence every day —
+# and drains on its own a week after the last trip. Without escalation a
+# paced attacker takes the full window every quarter hour, about 1,440
+# codes a day, for as long as they like.
+_LOCK_MAX = 86400            # escalation cap: 24 hours
+_LOCK_HISTORY_WINDOW = 7 * 86400
+_LOCK_ALERT_EVERY = 86400    # at most one owner notice a day per account
+# The short window alone is not enough: one wrong code a minute keeps it at
+# fourteen forever. Misses are also counted over a day, and that budget
+# trips the same lock by itself. A slot handed back (the code was right)
+# is not a miss in either.
+_DAY_MISS_MAX = 30
+_DAY_WINDOW = 86400
+
+# The reset link's recovery-code step has its own plain budget, outside the
+# escalating lock: the notice tells the owner to reset, and a lock an
+# attacker tripped with the password must not stop the mailbox from doing
+# it. It is no way around the lock for password sign-in — the link is
+# minted only to the mailbox, and what it yields is a new password, not a
+# session — and recovery codes are too long to guess fifteen at a time.
+_RESET_FAIL_MAX = _ACCT_FAIL_MAX
+_RESET_FAIL_WINDOW = _ACCT_FAIL_WINDOW
+
+# Set by the web app: called with the account's email (from a daemon
+# thread's point of view: it must not raise or block) the first time in a
+# day that the second-factor lock trips after a verified password.
+on_second_factor_lockout = None
+# Set by the web app: called with the user id, at the same once-a-day rate,
+# the first time a credential's step-up lock trips (_tell_of_step_up_lock).
+on_step_up_lockout = None
+
 
 def _acct_key(email: str) -> tuple:
     return ("login-fail", account_key_part(email))
 
 
-def account_login_locked(email: str) -> bool:
+def _lock_keys(key: tuple) -> tuple[tuple, tuple]:
+    """The hard-lock marker and the trip history for one guess bucket."""
+    return ("lock",) + key, ("lock-level",) + key
+
+
+def _day_key(key: tuple) -> tuple:
+    return ("lock-day",) + key
+
+
+def _bucket_locked(key: tuple) -> bool:
+    return bool(_dual("blocked", _lock_keys(key)[0]))
+
+
+def _lock_remaining(key: tuple, window_s: float, limit: int) -> float:
+    """Seconds until this bucket takes a guess again (0 when it does now):
+    the lock's own TTL, else the window when the window is full."""
+    left = _dual("blocked", _lock_keys(key)[0]) or 0
+    if not left and (_dual("count", key, window_s) or 0) >= limit:
+        left = window_s
+    return float(left)
+
+
+def login_lock_remaining(email: str) -> float:
+    return _lock_remaining(_acct_key(email), _ACCT_FAIL_WINDOW,
+                           _ACCT_FAIL_MAX)
+
+
+def wait_words(seconds: float) -> str:
+    """'about 12 minutes' / 'about 3 hours' for a refusal message."""
+    import math
+    mins = max(1, math.ceil(seconds / 60))
+    if mins < 120:
+        return f"about {mins} minute{'s' if mins != 1 else ''}"
+    return f"about {math.ceil(mins / 60)} hours"
+
+
+def lift_login_lock(email: str) -> None:
+    """A completed password reset: the password the lock was holding off is
+    gone, so the lock, its windows and its history go with it."""
     key = _acct_key(email)
-    return _dual("count", key, _ACCT_FAIL_WINDOW) >= _ACCT_FAIL_MAX
+    lock, hist = _lock_keys(key)
+    _dual_clear("unblock", lock)
+    for k in (key, hist, _day_key(key), _trips_today_key(key)):
+        _dual_clear("clear", k)
+
+
+def _reset_key(email: str) -> tuple:
+    return ("login-fail", "reset", account_key_part(email))
+
+
+def reserve_reset_guess(email: str):
+    """One recovery-code guess on a reset link: the plain 15-per-window
+    budget of its own bucket, never the escalating sign-in lock, and no
+    owner notice (the reset mail already went to the mailbox)."""
+    return _reserve_guess(_reset_key(email), _RESET_FAIL_MAX,
+                          _RESET_FAIL_WINDOW)
+
+
+def reset_lock_remaining(email: str) -> float:
+    return _lock_remaining(_reset_key(email), _RESET_FAIL_WINDOW,
+                           _RESET_FAIL_MAX)
+
+
+def account_login_locked(email: str) -> bool:
+    """Checked at the start of every password door: the kept misses trip
+    the lock here as well as at the next guess, so the door refuses before
+    it verifies anything."""
+    locked, now = _evaluate_lock(_acct_key(email), _ACCT_FAIL_MAX,
+                                 _ACCT_FAIL_WINDOW)
+    if now:
+        _tell_owner_of_lockout(email)
+    return locked
+
+
+def _tell_owner_of_lockout(email: str) -> None:
+    """A trip that stands, after a verified password: at most one notice a
+    day per account."""
+    if on_second_factor_lockout is None:
+        return
+    alert = ("lock-alert", account_key_part(email))
+    if _dual("block_if_absent", alert, _LOCK_ALERT_EVERY):
+        try:
+            on_second_factor_lockout(email)
+        except Exception:                                # noqa: BLE001
+            _seclog.exception("second-factor lockout notice failed")
 
 
 def record_login_failure(email: str) -> None:
@@ -1521,6 +1655,8 @@ def record_login_failure(email: str) -> None:
 
 
 def clear_login_failures(email: str) -> None:
+    """A successful sign-in empties the short window. The trip history and
+    a lock already in force stay: see _LOCK_MAX."""
     key = _acct_key(email)
     _dual_clear("clear", key)
 
@@ -1533,14 +1669,87 @@ def reserve_login_guess(email: str):
     after the slow verify lets a concurrent burst of wrong codes all be
     verified. A right answer hands the slot back through
     `release_login_guess`; a wrong one keeps it, and that kept slot IS the
-    recorded failure."""
-    return _reserve_guess(_acct_key(email), _ACCT_FAIL_MAX,
-                          _ACCT_FAIL_WINDOW)
+    recorded failure. Once the kept misses fill the window or the day's
+    budget, the next guess trips the escalating lock instead and, at most
+    once a day, the owner is told."""
+    tripped = []
+    slot = _reserve_escalating(_acct_key(email), _ACCT_FAIL_MAX,
+                               _ACCT_FAIL_WINDOW, tripped)
+    if tripped:
+        _tell_owner_of_lockout(email)
+    return slot
 
 
 def release_login_guess(slot) -> None:
     """Give back a slot `reserve_login_guess` took."""
     release_step_up_guess(slot)
+
+
+def _trips_today_key(key: tuple) -> tuple:
+    # in the protected trip-history namespace, but its own key: counting
+    # the week's history over a day would prune the week's entries
+    return ("lock-level", "24h") + key
+
+
+def _trip_due(key: tuple, limit: int, window_s: float) -> bool:
+    """Do the misses ALREADY KEPT trip the lock? A full short window does;
+    so does the day's miss count reaching the next day threshold, which
+    grows with every trip standing in the last day (30, then 60, ...) — the
+    day's misses are never cleared, so a right code can never hand them
+    back to whoever is guessing."""
+    if (_dual("count", key, window_s) or 0) >= limit:
+        return True
+    trips = _dual("count", _trips_today_key(key), _DAY_WINDOW) or 0
+    return ((_dual("count", _day_key(key), _DAY_WINDOW) or 0)
+            >= _DAY_MISS_MAX * (trips + 1))
+
+
+def _evaluate_lock(key: tuple, limit: int, window_s: float
+                   ) -> tuple[bool, bool]:
+    """(locked, tripped_now). The trip is decided only from misses already
+    kept — every earlier slot that was not handed back — before the next
+    guess takes its own, so a trip always stands: no right answer handed
+    back later can be the guess that tripped it, and nothing has to be
+    undone. Only the caller that sets the lock records it and escalates."""
+    lock, hist = _lock_keys(key)
+    if _dual("blocked", lock):
+        return True, False
+    if not _trip_due(key, limit, window_s):
+        return False, False
+    # a second past the window, so the misses that tripped it have left the
+    # window when it lifts and do not trip it again on the spot
+    base = window_s + 1
+    if not _dual("block_if_absent", lock, base):
+        return True, False           # a concurrent caller tripped it
+    _dual("add", hist, _LOCK_HISTORY_WINDOW)
+    _dual("add", _trips_today_key(key), _DAY_WINDOW)
+    trips = _dual("count", hist, _LOCK_HISTORY_WINDOW) or 1
+    ttl = min(_LOCK_MAX, window_s * (2 ** (max(trips, 1) - 1))) + 1
+    if ttl > base:
+        # this caller owns the lock it just set
+        _dual("block", lock, ttl)
+    _sec_event("second_factor_lock", current_ip() or "-",
+               lock_seconds=int(ttl),
+               prior_locks=trips - 1, route=key[0])
+    return True, True
+
+
+def _reserve_escalating(key: tuple, limit: int, window_s: float,
+                        tripped: list | None = None):
+    """`_reserve_guess` under the escalating lock: None while the lock is in
+    force (appending True to `tripped` when this call set it); otherwise
+    one slot in the short window and one in the day's misses. Handing the
+    slot back (a right answer) returns exactly those two and nothing else."""
+    locked, now = _evaluate_lock(key, limit, window_s)
+    if now and tripped is not None:
+        tripped.append(True)
+    if locked:
+        return None
+    slot = _reserve_guess(key, limit, window_s)
+    if slot is None:
+        return None
+    day = _reserve_guess(_day_key(key), 1 << 30, _DAY_WINDOW)
+    return slot + ((day, None),)
 
 
 def _reserve_guess(key: tuple, limit: int, window_s: float):
@@ -1580,14 +1789,44 @@ _STEP_UP_FAIL_WINDOW = _ACCT_FAIL_WINDOW
 
 
 def _step_up_key(user_id) -> tuple:
-    return ("stepup-fail", str(user_id or ""), current_credential() or "-")
+    # a request that carried no credential fingerprint is keyed by its
+    # address: one shared "-" bucket would let any such caller lock every
+    # other one out, and spend a budget meant to be theirs alone
+    cred = current_credential() or f"ip:{current_ip() or '-'}"
+    return ("stepup-fail", str(user_id or ""), cred)
 
 
 def step_up_locked(user_id) -> bool:
     """True once the credential making this request has spent its step-up
-    guesses at this user's factors."""
-    return (_dual("count", _step_up_key(user_id), _STEP_UP_FAIL_WINDOW)
-            >= _STEP_UP_FAIL_MAX)
+    guesses at this user's factors, or while the escalating lock those
+    guesses tripped is in force."""
+    locked, now = _evaluate_lock(_step_up_key(user_id), _STEP_UP_FAIL_MAX,
+                                 _STEP_UP_FAIL_WINDOW)
+    if now:
+        _tell_of_step_up_lock(user_id)
+    return locked
+
+
+def _tell_of_step_up_lock(user_id) -> None:
+    """A step-up lock that stands: the account hears of it on the security
+    notice's channel, as a failed sign-in's lock is told
+    (_tell_owner_of_lockout) — once per lock, since only the caller that
+    sets a lock gets here, and at most once a day per USER, whichever
+    session tripped it, so a thief cannot fill the inbox by changing
+    cookies."""
+    if on_step_up_lockout is None:
+        return
+    alert = ("stepup-lock-alert", str(user_id or ""))
+    if _dual("block_if_absent", alert, _LOCK_ALERT_EVERY):
+        try:
+            on_step_up_lockout(str(user_id or ""))
+        except Exception:                                # noqa: BLE001
+            _seclog.exception("step-up lockout notice failed")
+
+
+def step_up_lock_remaining(user_id) -> float:
+    return _lock_remaining(_step_up_key(user_id), _STEP_UP_FAIL_WINDOW,
+                           _STEP_UP_FAIL_MAX)
 
 
 def record_step_up_failure(user_id) -> None:
@@ -1603,17 +1842,29 @@ def reserve_step_up_guess(user_id):
     of them adds to it, so every one of them is verified. Taking the slot
     first, with the same atomic sliding-window step `limit` uses, means at
     most the limit can be in flight or spent. A right answer hands its slot
-    back through `release_step_up_guess`; a wrong one simply keeps it."""
-    return _reserve_guess(_step_up_key(user_id), _STEP_UP_FAIL_MAX,
-                          _STEP_UP_FAIL_WINDOW)
+    back through `release_step_up_guess`; a wrong one simply keeps it.
+    The call that trips the lock tells the account (_tell_of_step_up_lock)."""
+    tripped = []
+    slot = _reserve_escalating(_step_up_key(user_id), _STEP_UP_FAIL_MAX,
+                               _STEP_UP_FAIL_WINDOW, tripped)
+    if tripped:
+        _tell_of_step_up_lock(user_id)
+    return slot
 
 
 def release_step_up_guess(slot) -> None:
     """Give back a slot `reserve_step_up_guess` took — the guess was right,
-    or it was no guess at all."""
-    if slot is not None:
-        store, key, token = slot
-        store.release(key, token)
+    or it was no guess at all. Only the guess's own slots go back: a lock
+    is only ever tripped by misses already kept, so there is none to lift."""
+    if slot is None:
+        return
+    store, key, token = slot[:3]
+    store.release(key, token)
+    if len(slot) > 3:
+        day = slot[3][0]
+        if day is not None:
+            dstore, dkey, dtoken = day
+            dstore.release(dkey, dtoken)
 
 
 # ---- risk signal for the human check (risk-based gating) -----------

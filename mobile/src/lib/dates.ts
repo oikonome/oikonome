@@ -67,3 +67,36 @@ export function monthGrid(y: number, m1: number):
   }
   return weeks;
 }
+
+// Above this text size a seventh of the screen cannot hold "+$1,250": the
+// month is listed as days in words instead of drawn as a grid
+// (specs/accessibility.md, decision 4). Below it the cells wrap.
+export const CALENDAR_LIST_SCALE = 1.3;
+
+/** One listed day in words — "Tue 12: +$1,250 in, $86 out" — from the
+ *  server's in and out for that day; an older server sends only the net,
+ *  which is then what the grid cell would have shown. */
+/** A calendar day's two figures as its grid cell prints them, each with
+ *  its sign and never netted: "+$2,400" in, "−$15" out (the web cell
+ *  prints the same). Empty for a server that sends no in and out. */
+export function calendarCellFigures(day: { came_in?: number; went_out?: number },
+                                    fmt: (v: number) => string):
+    { text: string; tone: "in" | "out" }[] {
+  const out: { text: string; tone: "in" | "out" }[] = [];
+  if ((day.came_in ?? 0) > 0) out.push({ text: `+${fmt(day.came_in!)}`, tone: "in" });
+  if ((day.went_out ?? 0) > 0) out.push({ text: `−${fmt(day.went_out!)}`, tone: "out" });
+  return out;
+}
+
+export function calendarDayLine(day: { date: string; total: number;
+                                       came_in?: number; went_out?: number },
+                                fmt: (v: number) => string): string {
+  const d = new Date(`${day.date}T12:00:00`);
+  const name = `${d.toLocaleDateString("en-US", { weekday: "short" })} ${Number(day.date.slice(8, 10))}`;
+  if (day.came_in === undefined || day.went_out === undefined)
+    return `${name}: ${day.total > 0 ? "+" : ""}${fmt(Math.abs(day.total))}`;
+  const parts = [];
+  if (day.came_in > 0) parts.push(`+${fmt(day.came_in)} in`);
+  if (day.went_out > 0) parts.push(`${fmt(day.went_out)} out`);
+  return `${name}: ${parts.join(", ") || fmt(0)}`;
+}

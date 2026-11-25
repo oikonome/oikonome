@@ -1,6 +1,6 @@
 import { focusManager, onlineManager, useMutation, useQuery, useQueryClient }
   from "@tanstack/react-query";
-import { Fragment, useEffect, useRef, useState,
+import { createContext, Fragment, useContext, useEffect, useId, useRef, useState,
          type ReactNode } from "react";
 import { Link, NavLink, useNavigate, useParams } from "react-router";
 import { MxFlow, PlaidFlow, SimplefinFlow } from "../components/ConnectHub";
@@ -19,6 +19,7 @@ import { patchQuery, removeFromList, saveSettings, SETTINGS_SAVES,
          smsPauseNote, invalidateAfterRotation, invalidateAiRoute }
   from "../api/cache";
 import ManageAccounts from "../components/ManageAccounts";
+import { ShowAllButton, useShowMore } from "../components/ShowMore";
 import Doctor from "./Doctor";
 import Rules from "./Rules";
 import Merchants from "./Merchants";
@@ -30,16 +31,21 @@ const AccountCard = ext.account?.Card;
 import { deviceZone } from "../devicezone";
 import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, prefOn, withPref,
          type EmailKind } from "../recipients";
-import { looksLikeMailbox, myDailyLine, NEED_BASE_URL, recipientDuplicate,
-         resendHeld }
+import { looksLikeMailbox, myDailyFrom, myEmailSubtitle, NEED_BASE_URL,
+         recipientDuplicate, resendHeld }
   from "../recipients";
 import { useNarrow } from "../narrow";
+import { FailedLine, StaleLine } from "../components/Loaded";
 import { INVEST_STALE_STATUS, investChanges, investFormOf, investSeenOf,
          type BasisRow, type FeeRow, type InvestForm,
          type InvestSeen } from "../investsettings";
-import { localDayOf, rebaseSchedule } from "../moneymath";
+import { droppedCredentialsNote, EMPTY_LINES, localDayOf, rebaseSchedule,
+         SettingsMovedError } from "../moneymath";
+import { DeleteAccountCard, LeaveHouseholdCard } from "../components/AccountExits";
 import { browserPushBlocked, disableBrowserPush, enableBrowserPush,
          ownPushEndpoint as ownPushEndpointShared } from "../push";
+import Field from "../components/Field";
+import Note from "../components/Note";
 
 // one section at a time, behind its own route — a section list on
 // the left, that section's cards on the right (spec:
@@ -62,8 +68,9 @@ const SECS = [
   // Push because it is the same subject — what leaves the box about the
   // money — for a machine instead of a person.
   { id: "integrations", label: "Integrations", title: "Integrations" },
-  // labelled Users; the id stays "household" for deep links
-  { id: "household", label: "Users", title: "Users" },
+  // the people who share the books: "Household" in the list, on the page
+  // and in the help docs alike; the id stays "household" for deep links
+  { id: "household", label: "Household", title: "Household" },
   // how the app presents itself to this household: which page each app
   // opens on. Not delivery, not data — its own small subject.
   { id: "prefs", label: "Preferences", title: "Preferences" },
@@ -130,7 +137,7 @@ function SettingsSide({ items, show, active, summary, top, filter, setFilter,
 }) {
   return (
     <aside className="setnav" style={{ top }}>
-      <input className="settings-filter" type="search"
+      <input aria-label="Search settings" className="settings-filter" type="search"
              placeholder="Search settings…" value={filter}
              onChange={(e) => setFilter(e.target.value)} />
       {items.map((s) => (
@@ -141,6 +148,9 @@ function SettingsSide({ items, show, active, summary, top, filter, setFilter,
           {summary[s.id] && (
             <span className={"setnav-s" + (summary[s.id]!.warn ? " warn" : "")}>
               {summary[s.id]!.warn && "⚠ "}{summary[s.id]!.text}</span>)}
+          {/* on a phone the list is an index of screens, and each row says
+              so the way every other drill-in row in the app does */}
+          <span className="setnav-chev" aria-hidden="true">›</span>
         </NavLink>
       ))}
     </aside>
@@ -153,15 +163,25 @@ function SettingsSide({ items, show, active, summary, top, filter, setFilter,
 // on entry would fire every card's query with it — thirty-odd requests for
 // sections nobody is looking at — so only the one in the URL (and, while
 // searching, the ones that match) costs anything.
+//
+// The section's name is printed ONCE. On a desktop the highlighted entry in
+// the list beside it already names it, so the heading is kept for screen
+// readers only; on a phone the list is a different screen and while
+// searching several sections stack, so there the heading shows. A card
+// whose own title would only repeat the section's name carries none.
+const SecHeadingShown = createContext(true);
+
 function Sec({ id, show, children }: {
   id: string; show: boolean; children: ReactNode;
 }) {
   const opened = useRef(show);
   if (show) opened.current = true;
+  const shown = useContext(SecHeadingShown);
   return (
     <section className="sgrp" data-sec={id} id={"sec-" + id}
              style={{ display: show ? undefined : "none" }}>
-      <h2 className="ssec">{SECS.find((s) => s.id === id)!.title}</h2>
+      <h2 className={"ssec" + (shown ? "" : " sr-only")}>
+        {SECS.find((s) => s.id === id)!.title}</h2>
       {opened.current && children}
     </section>
   );
@@ -307,8 +327,17 @@ export default function Settings() {
   const membersQ = useQuery({ queryKey: ["members"], queryFn: api.members });
   const invitesQ = useQuery({ queryKey: ["invites"], queryFn: api.invites,
                               enabled: isOwner(meQ) });
-  const passkeyQ = useQuery({ queryKey: ["passkeys"], queryFn: api.passkeys });
+  // passkeys are a hosted feature: a self-hosted server has no such door,
+  // so it is not asked (the read answered 404 on every Settings load)
+  const passkeyQ = useQuery({ queryKey: ["passkeys"], queryFn: api.passkeys,
+                              enabled: !!meQ.data?.hosted });
   const onbQ = useQuery({ queryKey: ["onboarding"], queryFn: api.onboarding });
+  // the Categorization subtitle: the first page of "Your rules" the
+  // section itself opens on (same key), whose counts cover every source.
+  // A viewer has no such section.
+  const rulesQ = useQuery({ queryKey: ["rules", "user", "", 1],
+                            queryFn: () => api.rules("user", "", 1),
+                            enabled: !!meQ.data && !isViewer(meQ) });
   // Doctor is self-host only, and it already computes the verdict the System
   // subtitle needs — the card below shares this exact cache entry. Must sit
   // with the other hooks: the early returns further down are conditional.
@@ -416,9 +445,13 @@ export default function Settings() {
     mutationFn: async (body: Record<string, unknown>) => {
       const base = schedBase.current.get(body);
       if (!base) return saveSettings(qc, body);
-      const live = schedOf((await api.settings()).email_schedule);
+      const cur = await api.settings();
+      const live = schedOf(cur.email_schedule);
+      // the basis carries the schedule the edit was laid over — filled in
+      // like the form, so a default the form shows is not read as a change
       return saveSettings(qc, { ...body, email_schedule:
-        rebaseSched(body.email_schedule as Sched, base, live) });
+        rebaseSched(body.email_schedule as Sched, base, live) },
+        { ...cur, email_schedule: live });
     },
     // one save at a time: each edit's read of the stored schedule must
     // see the edit before it
@@ -516,10 +549,12 @@ export default function Settings() {
     onError: (e) => setNotice({ text: errText(e), bad: true }),
   });
 
+  // a failed first read ends in the failed line, not in "loading…" forever
+  // (the form is seeded only from an answer, so it stays null after one)
+  if (q.data === undefined && q.isError)
+    return (<><h1>Settings</h1><FailedLine q={q} what="settings" /></>);
   if (q.isPending || form === null)
     return <div className="centered"><span className="mut">loading…</span></div>;
-  if (q.isLoadingError)
-    return <div className="card">Couldn't load settings: {String(q.error)}</div>;
 
   // card-level filter hits — title + hand-picked keywords per card,
   // section shows while any of its cards match
@@ -633,24 +668,36 @@ export default function Settings() {
   const active = secParam && ids.includes(secParam) ? secParam
                  : missingSec ? "" : narrow ? "" : ids[0];
   const secOn = (id: string) => searching ? !!secShow[id] : id === active;
+  // said on every branch of the page — an owner following an old link to
+  // /settings/billing on a self-hosted server got a blank body
+  const missingNote = missingSec && (
+    <div className="note" style={{ marginTop: 0 }}>
+      This instance has no <b>{secParam}</b> settings section —
+      it belongs to the {secParam === "system" ? "self-hosted"
+        : "hosted"} setup. Pick one from the list.
+    </div>
+  );
 
   // Left-list subtitles: current state, read off data already loaded — never
   // a second request, and never a guess. A section with nothing honest to
   // say gets no subtitle rather than a vague one.
-  const hourLabel = (n: number) =>
-    `${((n + 11) % 12) + 1}${n < 12 ? "am" : "pm"}`;
-  const nRecip = (q.data.email_recipients ?? []).length;
-  const nConn = connQ.data?.connections?.length ?? 0;
+  // a removed link the household has since linked again is history, not
+  // a connection (it is listed once, under Connections, to forget)
+  const nConn = (connQ.data?.connections ?? []).filter((c) => !c.replaced)
+    .length;
   // A connection that stopped working is the page's most actionable fact,
   // so it must not be reachable only by opening the section. It renders
   // amber here AND at the top of the section that owns it — findable from
   // anywhere without a floating banner that could appear over any section.
-  const nBad = (connQ.data?.connections ?? [])
-    .filter((c) => c.status && c.status !== "ok" && c.status !== "healthy")
-    .length;
+  // the server's count — the header chip and the phone read the same one
+  const nBad = connQ.data?.attention ?? 0;
+  // who the daily email reaches — the owner's to read, like the schedule
+  const dailyReach = q.data.email_reach?.daily;
   const nUsers = membersQ.data?.users?.length ?? 0;
   const nInv = (invitesQ.data?.invites ?? []).length;
-  const nKeys = (passkeyQ.data?.passkeys ?? []).length;
+  // null until the passkey list has answered: an unread list is not "no
+  // passkeys", and must not raise "no 2FA or passkey"
+  const nKeys = passkeyQ.data ? passkeyQ.data.passkeys.length : null;
   const twoFA = !!meQ.data?.totp_enabled;
   const nTxn = onbQ.data?.transactions ?? 0;
 
@@ -664,20 +711,36 @@ export default function Settings() {
       ? { text: meQ.data.email_delivery.state === "complained"
                 ? "reported as spam — paused" : "not arriving — paused",
           warn: true }
-      : { text: form.sched.daily.on
-      ? `daily ${hourLabel(form.sched.daily.hour)}`
-        + (nRecip ? ` · +${nRecip} recipient${nRecip > 1 ? "s" : ""}` : "")
-      : "daily email off" },
+      // the household's schedule and recipients are the owner's to read;
+      // anyone else is told about their own daily email, never a default
+      // who actually receives it is the server's answer (notify/reach):
+      // "daily 9am · nobody receiving it" when every address is muted and
+      // no device takes the push
+      : owner ? (dailyReach
+          ? { text: dailyReach.text, warn: dailyReach.warn } : undefined)
+      : (() => {
+          const mine = myEmailSubtitle(meQ.data, q.data);
+          return mine ? { text: mine } : undefined;
+        })(),
     connections: connQ.data
-      ? (nBad ? { text: `${nConn} linked · ${nBad} needs attention`, warn: true }
+      ? (nBad ? { text: `${nConn} linked · ${nBad} need${nBad === 1 ? "s" : ""} attention`, warn: true }
          : { text: nConn ? `${nConn} linked` : "nothing linked" })
       : undefined,
-    // ONLY the tenant's own model. An empty llm_model does not mean "none":
-    // llm_categorize falls back to an env-provided backend (how the bundled
-    // Ollama is wired), which this payload cannot see — so saying "no model
-    // set" here would be false on every standard install.
-    ai: q.data.llm_model ? { text: q.data.llm_model }
-      : { text: "no endpoint — built-in only" },
+    // What the server says answers (llm_effective — the resolver the
+    // calls themselves use): a named backend or the bundled model answers
+    // with no legacy llm_model set, so that field alone would say "no
+    // endpoint" on a working install. The endpoint is the owner's to
+    // read: anyone else is sent none of it, and its absence must not read
+    // as a fact about the household's AI, so they get no subtitle.
+    ai: owner ? (() => {
+          const effs = q.data.llm_effective ?? {};
+          const eff = effs.categorize
+            ?? LLM_TASKS.map(([r]) => effs[r]).find((e) => !!e);
+          // the model in words (the server's label), never its raw id
+          return eff ? { text: eff.label || eff.name || "endpoint set" }
+            : { text: "no endpoint — built-in only" };
+        })()
+      : undefined,
     billing: ext.account?.summary?.(meQ.data?.plan),
     integrations: hooksQ.data
       ? (() => {
@@ -708,19 +771,36 @@ export default function Settings() {
              })(), warn: true })
       : undefined,
     wizards: onbQ.data
-      ? { text: onbQ.data.wizard_done ? "setup complete" : "setup unfinished" }
+      ? { text: onbQ.data.setup_complete ? "setup complete" : "setup unfinished" }
       : undefined,
+    prefs: { text: "web opens on " + (WEB_HOMES.find(
+      ([r]) => r === (q.data.home_web || "/"))?.[1] ?? "Today") },
+    categorize: rulesQ.data?.counts
+      ? (() => {
+          const c = rulesQ.data.counts;
+          const n = c.user + c.llm + c.seed + (c.model ?? 0);
+          return { text: `${n.toLocaleString()} rule${n === 1 ? "" : "s"}`
+                         + (c.user ? ` · ${c.user.toLocaleString()} yours` : "") };
+        })()
+      : undefined,
+    merchants: { text: switches.on("merchant_logos", q.data.merchant_logos)
+                       ? "logos on" : "logos off" },
     // No second factor AT ALL is a problem worth saying out loud, in the
     // one place someone scanning their setup will see it. A passkey IS a
     // second factor — password + passkey is the model working as intended,
     // so it must not read as a warning: a fresh passkey signup seeing
     // "⚠ 2FA off · 1 passkey" would take it for an error.
-    security: meQ.data
+    // a self-hosted server has no passkeys, so 2FA is the whole answer
+    security: meQ.data && !meQ.data.hosted
+      ? (twoFA ? { text: "2FA on" } : { text: "2FA off", warn: true })
+      : meQ.data
       ? (twoFA
          ? { text: `2FA on${nKeys ? ` · ${nKeys} passkey${nKeys > 1 ? "s" : ""}` : ""}` }
          : nKeys
            ? { text: `${nKeys} passkey${nKeys > 1 ? "s" : ""}` }
-           : { text: "no 2FA or passkey", warn: true })
+           : nKeys === 0 ? { text: "no 2FA or passkey", warn: true }
+           // the passkey list did not answer: nothing is claimed
+           : undefined)
       : undefined,
   };
 
@@ -758,7 +838,7 @@ export default function Settings() {
 
   if (viewer)
     return (
-      <>
+      <SecHeadingShown.Provider value={narrow || searching}>
         <h1>Settings</h1>
         <p className="mut">You have view-only access — the budget and instance
           configuration are managed by the owner.</p>
@@ -767,13 +847,7 @@ export default function Settings() {
           {showBody && (
           <div className="setbody">
             {back}
-            {missingSec && (
-              <div className="note" style={{ marginTop: 0 }}>
-                This instance has no <b>{secParam}</b> settings section —
-                it belongs to the {secParam === "system" ? "self-hosted"
-                  : "hosted"} setup. Pick one from the list.
-              </div>
-            )}
+            {missingNote}
             {/* a member's own delivery: on/off for THEIR inbox; the
                 schedule is the owner's */}
             <Sec id="email" show={secOn("email")}>
@@ -784,7 +858,7 @@ export default function Settings() {
               <MyPushCard />
             </Sec>
             <Sec id="security" show={secOn("security")}>
-              <VerifyEmailCard me={meQ.data} />
+              {/* the confirm-your-email card lives on Email & Push alone */}
               <DemoLock on={false} shared={lockLogin}>
               <Show on={h.password}><PasswordCard /></Show>
               <Show on={h.totp}><TwoFactorCard /></Show>
@@ -800,7 +874,7 @@ export default function Settings() {
             {searching && !ids.some((id) => secShow[id]) && <NoHits />}
           </div>)}
         </div>
-      </>
+      </SecHeadingShown.Provider>
     );
 
   // The demo instance is READ-ONLY: its credentials are shared and printed
@@ -813,8 +887,10 @@ export default function Settings() {
   const demo = !!meQ.data?.demo;
 
   return (
-    <>
+    <SecHeadingShown.Provider value={narrow || searching}>
       <h1>Settings</h1>
+      {/* settings kept from before a refresh that failed */}
+      <StaleLine query={q} />
       {q.data?.outbound_paused && (
         <OutboundPausedBanner p={q.data.outbound_paused}
           canResume={owner && !lockGrant} lock={owner ? lockGrant : null}
@@ -831,8 +907,8 @@ export default function Settings() {
           visitor. Explore freely; the data is synthetic.
         </div>
       )}
-      {notice && <div className={"note" + (notice.bad ? " bad" : " good")}
-                      onClick={() => setNotice(null)}>{notice.text}</div>}
+      {notice && <Note tone={notice.bad ? "bad" : "good"}
+                      onDismiss={() => setNotice(null)}>{notice.text}</Note>}
       <fieldset disabled={demo} style={demo
           ? { border: 0, margin: 0, padding: 0, opacity: 0.55 }
           : { border: 0, margin: 0, padding: 0 }}>
@@ -841,6 +917,7 @@ export default function Settings() {
       {showBody && (
       <div className="setbody">
       {back}
+      {missingNote}
 
       {/* The guided walkthroughs, re-runnable. Savings goals live on
           /budget and property & vehicles on /networth; the read-only
@@ -887,7 +964,8 @@ export default function Settings() {
           number to hit today.{hosted
             ? <> We send it — there is nothing to configure.</>
             : <> Needs SMTP configured below or in <code>docker/.env</code> —
-                System health shows whether it is.</>}</p>
+                System health shows whether it is.</>}{" "}
+          <Link to="/help?topic=today">How this works</Link></p>
         <div className="field-grid">
           {/* not a comma-separated text box: such a list can only tell you
               what you typed — never that an address has never been
@@ -901,7 +979,7 @@ export default function Settings() {
             onChange={(recipients) => applyEmail({ ...form, recipients })}
             onMutedChange={(muted) => applyEmail({ ...form, muted })}
             addLock={lockGrant} />
-          <CadenceEditor sched={form.sched}
+          <CadenceEditor sched={form.sched} reach={q.data.email_reach}
             onChange={(sched) => applyEmail({ ...form, sched })}
             timezone={form.timezone}
             onTimezone={(timezone) => applyEmail({ ...form, timezone })} />
@@ -1005,8 +1083,7 @@ export default function Settings() {
       <Sec id="merchants" show={secOn("merchants")}>
       <Show on={h.merchants}>
       <div className="card" style={{ marginTop: "1rem" }}>
-        <b>Merchants</b>
-        <div className="sub" style={{ margin: ".2rem 0 .5rem" }}>
+        <div className="sub" style={{ margin: "0 0 .5rem" }}>
           Every name your ledger shows, and the source strings underneath it.
           Rename a merchant, or merge two that are the same shop under
           different names — every change is undoable. Open a merchant for
@@ -1138,9 +1215,9 @@ export default function Settings() {
       <div className="card" style={{ marginTop: "1rem" }}>
         <h2>Feedback &amp; bug reports</h2>
         <p className="mut" style={{ marginBottom: ".5rem" }}>The Feedback
-          &amp; bug reports tab (feedback and bug reports to the maintainer,
-          with the system-health bundle attached). Turn it off if you'd
-          rather not see it.</p>
+          &amp; bug reports tab sends feedback and bug reports to the
+          maintainer, with the system-health bundle attached. Turn it
+          off to hide the tab.</p>
         <label className="check">
           <input type="checkbox"
             checked={switches.on("feedback_enabled", q.data.feedback_enabled)}
@@ -1184,7 +1261,9 @@ export default function Settings() {
       )}
 
       <Sec id="security" show={secOn("security")}>
-      <VerifyEmailCard me={meQ.data} />
+      {/* the confirm-your-email card lives on Email & Push alone: the
+          mail it holds up is that section's subject, and one card in two
+          places read as two things to do */}
       <Show on={h.email}>
       <DemoLock on={meQ.data?.demo} shared={lockLogin}>
       <EmailCard current={meQ.data?.email}
@@ -1251,7 +1330,7 @@ export default function Settings() {
       </div>)}
       </div>
       </fieldset>
-    </>
+    </SecHeadingShown.Provider>
   );
 }
 
@@ -1500,11 +1579,11 @@ function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
     onSuccess: (r) => {
       setErr(null); setFresh({ name: r.name, token: r.token });
       setName("");
-      // the mint response IS the new row (minus the plaintext): append it
-      // so the table grows at once, then confirm the list
+      // the mint response IS the new row (minus the plaintext, and never
+      // used or revoked yet): append it so the table grows at once, then
+      // confirm the list
       const row: ApiToken = { id: r.id, name: r.name, created_at: r.created_at,
-        last_used_at: r.last_used_at, revoked_at: r.revoked_at,
-        scope: r.scope ?? scope };
+        last_used_at: null, revoked_at: null, scope: r.scope ?? scope };
       qc.setQueryData<{ tokens: ApiToken[] }>(["tokens"],
         (old) => old && { tokens: [...old.tokens, row] });
       qc.invalidateQueries({ queryKey: ["tokens"] });
@@ -1536,31 +1615,37 @@ function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
       <h2>{read ? "Integration tokens" : "Script tokens"}</h2>
       {read ? (
         <p className="mut">Read-only credentials for the programs that
-          watch your money: a Prometheus scrape of <code>/metrics</code>, a
-          Home Assistant sensor on the summary endpoint, the local MCP
-          server your assistant talks to. A read token can read the
+          watch your money. A read token can read the
           integrations endpoints — nothing else: it can't import a row,
-          change a setting or see a credential. Revoke it here any time.</p>
+          change a setting or see a credential.{" "}
+          <Link to="/help?topic=integrations">How this works</Link></p>
       ) : (
-        <p className="mut">Credentials for your own collector scripts
-          (community scripts). A token can push data through the import
+        <p className="mut">Credentials for your own collector scripts.
+          A token can push data through the import
           endpoints — nothing else: it can't read your ledger or change
-          settings. Put it in the script's config instead of your login
-          password; revoke it here any time.</p>
+          settings.{" "}
+          <Link to="/help?topic=community-scripts">How this works</Link></p>
       )}
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+      {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
       {fresh && (
         <div className="note good" style={{ display: "block" }}>
           <div><b>{fresh.name}</b> — copy this token now; it won't be shown
             again:</div>
-          <input readOnly value={fresh.token} style={{ width: "100%",
+          <input aria-label={`${fresh.name} token`}
+                 readOnly value={fresh.token} style={{ width: "100%",
               marginTop: ".4rem", fontFamily: "monospace", fontSize: 12 }}
             onFocus={(e) => e.target.select()} />
         </div>
       )}
+      {/* a failed read is not "no tokens": the failed line sits where the
+          table would */}
+      <StaleLine query={q} />
+      {q.data === undefined && q.isError && (
+        <FailedLine q={q} what="the tokens" />)}
       {rows.length > 0 && (
         <table style={{ marginTop: ".5rem" }}>
-          <thead><tr><th>Name</th><th>Created</th><th>Last used</th><th /></tr></thead>
+          <thead><tr><th>Name</th><th>Created</th><th>Last used</th>
+            <th><span className="sr-only">Actions</span></th></tr></thead>
           <tbody>
             {rows.map((t) => (
               <tr key={t.id}>
@@ -1579,7 +1664,8 @@ function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
       )}
       <div style={{ display: "flex", gap: ".5rem", marginTop: ".6rem",
                     flexWrap: "wrap" }}>
-        <input placeholder={read ? "what will use it (e.g. grafana)"
+        <input aria-label={read ? "What will use it" : "Script name"}
+               placeholder={read ? "what will use it (e.g. grafana)"
                                  : "script name (e.g. payroll-plan)"}
                value={name} onChange={(e) => setName(e.target.value)} />
         <button disabled={minted.isPending || !name.trim()}
@@ -1630,7 +1716,7 @@ function SecretOnce({ label, secret, onDone }: {
       <div><b>{label}</b> — copy the signing secret now; it won't be shown
         again. Your receiver checks <code>X-Oikonome-Signature</code> with
         it.</div>
-      <input readOnly value={secret} style={{ width: "100%",
+      <input aria-label={`${label} signing secret`} readOnly value={secret} style={{ width: "100%",
           marginTop: ".4rem", fontFamily: "monospace", fontSize: 12 }}
         onFocus={(e) => e.target.select()} />
       <button className="dismiss" onClick={onDone}
@@ -1644,6 +1730,7 @@ function DeliveryLog({ id }: { id: string }) {
                        queryFn: () => api.webhookDeliveries(id) });
   const rows: WebhookDelivery[] = q.data?.deliveries ?? [];
   if (q.isPending) return <div className="mut">loading…</div>;
+  if (q.data === undefined) return <FailedLine q={q} what="the delivery log" />;
   if (!rows.length) return <div className="mut">nothing sent yet</div>;
   return (
     <table style={{ marginTop: ".3rem", fontSize: 12 }}>
@@ -1750,13 +1837,13 @@ function WebhookRow({ hook, events }: { hook: Webhook; events: WebhookEvent[] })
           && <> · {hook.failures} failed in a row</>}
       </div>
       {hook.disabled_reason && (
-        <div className="note bad" style={{ marginTop: ".3rem" }}>
+        <Note tone="bad" style={{ marginTop: ".3rem" }}>
           {hook.disabled_reason} — fix the receiver, then tick the box to
-          turn it back on.</div>
+          turn it back on.</Note>
       )}
-      {msg && <div className={"note " + (msg.bad ? "bad" : "good")}
+      {msg && <Note tone={msg.bad ? "bad" : "good"}
                    style={{ marginTop: ".3rem" }}
-                   onClick={() => setMsg(null)}>{msg.text}</div>}
+                   onDismiss={() => setMsg(null)}>{msg.text}</Note>}
       {secret && <SecretOnce label="New secret" secret={secret}
                              onDone={() => setSecret(null)} />}
       <div style={{ display: "flex", gap: ".4rem", marginTop: ".4rem",
@@ -1773,9 +1860,9 @@ function WebhookRow({ hook, events }: { hook: Webhook; events: WebhookEvent[] })
       </div>
       {editing && (
         <div style={{ marginTop: ".5rem", display: "grid", gap: ".4rem" }}>
-          <input value={name} onChange={(e) => setName(e.target.value)}
+          <input aria-label="Webhook name" value={name} onChange={(e) => setName(e.target.value)}
                  placeholder="name" />
-          <input value={url} onChange={(e) => setUrl(e.target.value)}
+          <input aria-label="Webhook URL" value={url} onChange={(e) => setUrl(e.target.value)}
                  placeholder="https://…" style={{ fontFamily: "monospace" }} />
           <EventPicker events={events} value={evs} onChange={setEvs} />
           <div>
@@ -1825,24 +1912,23 @@ function WebhooksCard() {
       <h2>Webhooks</h2>
       <p className="mut">Tell another program when something happens: a
         sync that brought new charges, an alert, the daily verdict, a bill
-        someone edited. Each event is one signed HTTP POST to a URL you
-        choose — a Home Assistant webhook trigger, a bot, a script of your
-        own. Failed deliveries retry for a day; a receiver that stays down
-        gets switched off and says so here. Payloads and the signature
-        check are in the{" "}
-        <Link to="/help?topic=integrations">integrations guide</Link>.</p>
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+        someone edited.{" "}
+        <Link to="/help?topic=integrations">How this works</Link></p>
+      {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
       {fresh && <SecretOnce label={fresh.name} secret={fresh.secret}
                             onDone={() => setFresh(null)} />}
+      <StaleLine query={q} />
+      {q.data === undefined && q.isError && (
+        <FailedLine q={q} what="the webhooks" />)}
       {hooks.map((h) => <WebhookRow key={h.id} hook={h} events={events} />)}
-      {!hooks.length && !q.isPending && (
+      {!hooks.length && q.data !== undefined && (
         <div className="mut" style={{ marginTop: ".4rem" }}>No webhooks yet.</div>
       )}
       {adding ? (
         <div style={{ marginTop: ".6rem", display: "grid", gap: ".4rem" }}>
-          <input placeholder="name (e.g. home-assistant)" value={name}
+          <input aria-label="Webhook name" placeholder="name (e.g. home-assistant)" value={name}
                  onChange={(e) => setName(e.target.value)} />
-          <input placeholder="https://receiver.example/hook" value={url}
+          <input aria-label="Webhook URL" placeholder="https://receiver.example/hook" value={url}
                  onChange={(e) => setUrl(e.target.value)}
                  style={{ fontFamily: "monospace" }} />
           <EventPicker events={events} value={evs} onChange={setEvs} />
@@ -1898,8 +1984,8 @@ function EndpointsCard() {
   }
 }`;
   const Snip = ({ title, text }: { title: string; text: string }) => (
-    <details style={{ marginTop: ".5rem" }}>
-      <summary style={{ cursor: "pointer" }}>{title}</summary>
+    <details className="disclosure" style={{ marginTop: ".5rem" }}>
+      <summary>{title}</summary>
       <pre style={{ overflowX: "auto", fontSize: 12, marginTop: ".3rem" }}>
         <code>{text}</code></pre>
     </details>
@@ -1907,13 +1993,8 @@ function EndpointsCard() {
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Read endpoints</h2>
-      <p className="mut">Every one takes a read token as a bearer.
-        The summary is one JSON document — the verdict, dollars left today,
-        balances, bills due, alerts, connection freshness; <code>/metrics</code>
-        is the same numbers in the Prometheus text format; the query doors
-        behind the MCP server search the ledger, spending, bills and the
-        net-worth series. Full reference:{" "}
-        <Link to="/help?topic=integrations">integrations guide</Link>.</p>
+      <p className="mut">Every one takes a read token as a bearer.{" "}
+        <Link to="/help?topic=integrations">How this works</Link></p>
       <table style={{ fontSize: 12.5 }}>
         <tbody>
           <tr><td><code>GET {base}/api/integrations/summary</code></td>
@@ -1997,17 +2078,12 @@ function DataExportCard({ hosted }: { hosted: boolean }) {
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Your data</h2>
       <p className="mut">Everything is exportable, always: the full export
-        ZIP (every table as CSV, with a README that maps what each file is
-        — opens in any spreadsheet){hosted
-          ? <>. Instance health is managed by the host.</>
-          : <>, or the exact database dump (.sql.gz — the same format the
-        manager's backups use; restore one with{" "}
-        <code>./oikonome.sh restore &lt;file&gt;</code>). Instance
-        health lives under{" "}
-        <Link to="/settings/system">System health</Link>.</>}
+        ZIP{hosted
+          ? <>.</>
+          : <>, or the exact database dump — restore one with{" "}
+        <code>./oikonome.sh restore &lt;file&gt;</code>.</>}
         {" "}You'll confirm it's you before the download starts — it is
-        your whole household leaving the instance, so a signed-in tab alone
-        is not enough.
+        your whole household leaving the instance.
       </p>
       <div style={{ marginTop: ".8rem", display: "flex", gap: ".5rem",
                     flexWrap: "wrap" }}>
@@ -2022,10 +2098,10 @@ function DataExportCard({ hosted }: { hosted: boolean }) {
         )}
       </div>
       {warn.length > 0 && (
-        <div className="note" style={{ display: "block", marginTop: ".6rem" }}>
+        <Note style={{ display: "block", marginTop: ".6rem" }}>
           <div><b>Downloaded, but a restore would refuse this file:</b></div>
           {warn.map((w) => <div key={w}>{w}</div>)}
-        </div>
+        </Note>
       )}
       {err && <p style={{ color: "var(--red)", marginTop: ".6rem" }}>{err}</p>}
     </div>
@@ -2098,14 +2174,17 @@ function ContinuityCard() {
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Continuity packet</h2>
-      <p className="mut">If something happens to you, the person left
-        running the household needs a map: every account and where it is
-        held, the balances that day, the bills that come due and what pays
-        them, the income, the businesses — and, in your words, where the
-        rest is (the password manager, the will, the lawyer, who to call).
-        One PDF, printed from what Oikonome already knows. It holds no
-        passwords. Print it whenever the accounts change and keep it where
-        they will look.</p>
+      <p className="mut">One PDF, printed from what Oikonome already
+        knows, for the person left running the household if something
+        happens to you. It holds no passwords.{" "}
+        <Link to="/help?topic=continuity-packet">How this works</Link></p>
+      {/* the note says where the will and the passwords are: the server
+          sends its text to the owner alone, and anyone else is told only
+          that one is written — so they get no box to type over it in */}
+      {d?.note_readable === false ? (
+        <p className="mut" style={{ marginTop: ".8rem" }}>
+          Only the household owner can read this note.</p>
+      ) : (<>
       <label style={{ display: "block", marginTop: ".8rem" }}>
         <span className="mut">Prepared for (optional)</span>
         <input value={whoNow} placeholder="a name, e.g. Sam"
@@ -2124,11 +2203,14 @@ function ContinuityCard() {
           style={{ ...inputStyle, marginTop: ".3rem" }}
           onChange={(e) => setNote(e.target.value)} />
       </label>
+      </>)}
       <div style={{ marginTop: ".6rem", display: "flex", gap: ".5rem",
                     flexWrap: "wrap", alignItems: "center" }}>
+        {d?.note_readable !== false && (
         <button disabled={!dirty || busy} onClick={() => save.mutate()}>
           {save.isPending ? "saving…" : "Save"}
         </button>
+        )}
         <button className="pri" disabled={busy || !d}
           onClick={() => get.mutate()}>
           {get.isPending ? "preparing…" : "Download PDF"}
@@ -2144,13 +2226,15 @@ function ContinuityCard() {
           <div style={{ marginTop: ".3rem", display: "flex", gap: ".5rem",
                         flexWrap: "wrap", alignItems: "center" }}>
             {d.members_only ? (
-              <select value={to} onChange={(e) => setTo(e.target.value)}
+              <select aria-label="Member to hand over to"
+                      value={to} onChange={(e) => setTo(e.target.value)}
                 style={{ ...inputStyle, width: "auto", minWidth: "16rem" }}>
                 <option value="">choose a member…</option>
                 {d.members.map((m) => <option key={m} value={m}>{m}</option>)}
               </select>
             ) : (
-              <input type="email" value={to} list="continuity-members"
+              <input aria-label="Their email address"
+                     type="email" value={to} list="continuity-members"
                 placeholder="their email address"
                 style={{ ...inputStyle, width: "auto", minWidth: "16rem" }}
                 onChange={(e) => setTo(e.target.value)} />
@@ -2176,7 +2260,7 @@ function ContinuityCard() {
             <p className="mut" style={{ marginTop: ".4rem" }}>
               Hosted mails the household's finances only to an address with
               an account here. Invite them under{" "}
-              <Link to="/settings/household">Users</Link> first, or download
+              <Link to="/settings/household">Household</Link> first, or download
               the PDF and hand it over.</p>
           )}
         </div>
@@ -2227,7 +2311,10 @@ function ConnectionsBackupCard({ onImported }: { onImported: () => void }) {
     onSuccess: (r) => {
       setErr(null);
       const grp = r.config.length ? r.config.join(", ") : "none";
-      setOk(`Imported ${r.items} bank link(s); config restored: ${grp}.`);
+      // a key or password whose address the bundle moved was not kept
+      const dropped = droppedCredentialsNote(r.credentials_dropped);
+      setOk(`Imported ${r.items} bank link(s); config restored: ${grp}.`
+            + (dropped ? ` ${dropped}` : ""));
       setImportPass(""); setFile(null);
       onImported();
     },
@@ -2245,11 +2332,7 @@ function ConnectionsBackupCard({ onImported }: { onImported: () => void }) {
       <h2>Move to a fresh environment</h2>
       <p className="mut">A passphrase-sealed bundle of your instance
         credentials — Plaid/MX provider keys, the LLM endpoint + key, SMTP
-        mail settings, and every live bank link. Unlike the database dump it
-        survives a different install: banks stay linked and email/LLM stay
-        wired on the new box (or the hosted version), nothing to re-enter. It
-        carries credentials only; accounts, history, and budgets ride the
-        export ZIP above. One sync after import repopulates accounts.</p>
+        mail settings, and every live bank link.</p>
 
       {/* this is the whole credential set leaving (or entering) the
           instance — either door confirms it's you first (passkey, or
@@ -2301,7 +2384,10 @@ function ConnectionsBackupCard({ onImported }: { onImported: () => void }) {
 // get an explanation instead of a broken button.
 function PasskeysCard() {
   const qc = useQueryClient();
-  const q = useQuery({ queryKey: ["passkeys"], queryFn: api.passkeys });
+  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
+  // hosted only (the card renders nothing elsewhere), so only asked there
+  const q = useQuery({ queryKey: ["passkeys"], queryFn: api.passkeys,
+                       enabled: !!me.data?.hosted });
   const [err, setErr] = useState<string | null>(null);
   // adding or removing a factor is elevation-gated, so a stolen session
   // can't enroll its own key (or strip yours) and keep access — the sheet
@@ -2314,7 +2400,6 @@ function PasskeysCard() {
   // removing the key this session signed in with ends the session; when
   // that removal also minted a new sheet, sign-in waits until it is saved
   const [signedOut, setSignedOut] = useState(false);
-  const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const available = typeof window !== "undefined" && window.isSecureContext &&
     !!window.PublicKeyCredential;
   const add = useMutation({
@@ -2383,6 +2468,10 @@ function PasskeysCard() {
           // can load again anyway; dismissing the sheet reloads to /login.
           focusManager.setEventListener(() => () => undefined);
           onlineManager.setEventListener(() => () => undefined);
+          // and no fetch at all from here on: a whole-cache invalidate
+          // (a sync finishing, any other write's refetch) would otherwise
+          // still reach ["me"]. Offline, every query keeps what it holds.
+          onlineManager.setOnline(false);
           setRecovery(fresh);
           setSignedOut(true);
           // worded without refetching: this session is gone, and a
@@ -2421,26 +2510,31 @@ function PasskeysCard() {
         : errText(e));
     },
   });
-  if (q.isPending || q.isLoadingError) return null;
   // passkeys are offered in hosted mode — absent on self-hosted
   // installs
-  if (!me.data?.hosted) return null;
+  if (!me.data?.hosted || q.isPending) return null;
+  // a failed read keeps the card, saying so: gone, it read as "no passkeys"
+  if (q.data === undefined)
+    return (
+      <div className="card" style={{ marginTop: "1rem" }}>
+        <h2>Passkeys</h2>
+        <FailedLine q={q} what="the passkeys" />
+      </div>);
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Passkeys</h2>
-      <p className="mut">Add a fingerprint, face, or security key. You can
-        keep an authenticator app <b>and</b> passkeys — at sign-in, use
-        either <b>password + app code</b> or <b>passkey alone</b> (your choice).
-        Each device can have its own key.</p>
+      <p className="mut">Add a fingerprint, face, or security key — at
+        sign-in, use either <b>password + app code</b> or{" "}
+        <b>passkey alone</b>.{" "}
+        <Link to="/help?topic=security">How this works</Link></p>
       {!available && (
         <p className="mut">Passkeys need a <b>secure context</b> — serve
-          this instance over https (or open it as <code>localhost</code>)
-          and this card comes alive. Password sign-in is unaffected.</p>
+          this instance over https (or open it as <code>localhost</code>).</p>
       )}
-      {err && <div className="note bad" style={{ marginBottom: ".6rem" }}
-                   onClick={() => setErr(null)}>{err}</div>}
-      {note && <div className="note good" style={{ marginBottom: ".6rem" }}
-                    onClick={() => setNote(null)}>{note}</div>}
+      {err && <Note tone="bad" style={{ marginBottom: ".6rem" }}
+                   onDismiss={() => setErr(null)}>{err}</Note>}
+      {note && <Note tone="good" style={{ marginBottom: ".6rem" }}
+                    onDismiss={() => setNote(null)}>{note}</Note>}
       {recovery && (
         <div className="note good" style={{ display: "block" }}>
           <b>Recovery codes</b> — save these somewhere safe. Each works once
@@ -2455,6 +2549,7 @@ function PasskeysCard() {
                             if (signedOut) window.location.href = "/login"; }} />
         </div>
       )}
+      <StaleLine query={q} />
       {q.data.passkeys.length > 0 ? (
         <table>
           <tbody>
@@ -2757,9 +2852,9 @@ function NotifyChannels({ status }: { status?: NotifyStatus }) {
           )}
         </div>
       )}
-      {msg && <p className={"note " + (msg.bad ? "bad" : "good")}
+      {msg && <Note as="p" tone={msg.bad ? "bad" : "good"}
                  style={{ margin: ".4rem 0 0" }}
-                 onClick={() => setMsg(null)}>{msg.text}</p>}
+                 onDismiss={() => setMsg(null)}>{msg.text}</Note>}
     </div>
   );
 }
@@ -2930,7 +3025,9 @@ function OutboundPausedBanner({ p, canResume, lock, onResumed, onError }: {
   );
 }
 
-function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
+function CadenceEditor({ sched, reach, onChange, timezone, onTimezone }: {
+  /** who each saved cadence reaches — the server's (notify/reach) */
+  reach?: SettingsData["email_reach"];
   sched: { daily: { on: boolean; hour: number; sms: boolean; push: boolean;
                     summary: boolean };
            monthly: { on: boolean; hour: number; sms: boolean; push: boolean };
@@ -2963,16 +3060,20 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
   const pushOk = !pushLock && (!!notify.data?.push_available
                                 || !!notify.data?.native_push_available
                                 || (notify.data?.native_push_devices ?? 0) > 0);
+  // why SMS is off, only from a read that answered: an unread setup is not
+  // "isn't configured" (the failed line sits under the schedule)
   const smsWhy = pushLock ? pushLock
-    : !notify.data?.sms_available
+    : notify.data === undefined ? ""
+    : !notify.data.sms_available
     ? "SMS isn't configured on this instance"
     : notify.data?.phone && !notify.data.phone_verified
       ? "texts are paused until you confirm the number below"
     : !notify.data?.phone_verified
       ? "verify a phone number below first" : "";
   const [openCad, setOpenCad] = useState<string | null>(null);
-  const hourSel = (value: number, set: (h: number) => void) => (
-    <select value={value} onChange={(e) => set(Number(e.target.value))}>
+  const hourSel = (value: number, set: (h: number) => void, label: string) => (
+    <select aria-label={label} value={value}
+            onChange={(e) => set(Number(e.target.value))}>
       {HOURS12.map((o) => <option key={o.h} value={o.h}>{o.label}</option>)}
     </select>
   );
@@ -2986,15 +3087,18 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
     { cad: "daily", label: "Daily verdict",
       when: `every day at ${hourLabel(sched.daily.hour)}`,
       edit: <>at {hourSel(sched.daily.hour, (hour) =>
-        onChange({ ...sched, daily: { ...sched.daily, hour } }))}</> },
+        onChange({ ...sched, daily: { ...sched.daily, hour } }),
+        "Daily verdict hour")}</> },
     { cad: "monthly", label: "Monthly report card",
       when: `on the 1st at ${hourLabel(sched.monthly.hour)}`,
       edit: <>on the 1st at {hourSel(sched.monthly.hour, (hour) =>
-        onChange({ ...sched, monthly: { ...sched.monthly, hour } }))}</> },
+        onChange({ ...sched, monthly: { ...sched.monthly, hour } }),
+        "Monthly report card hour")}</> },
     { cad: "yearly", label: "Year in review",
       when: `on Jan 1 at ${hourLabel(sched.yearly.hour)}`,
       edit: <>on Jan 1 at {hourSel(sched.yearly.hour, (hour) =>
-        onChange({ ...sched, yearly: { ...sched.yearly, hour } }))}</> },
+        onChange({ ...sched, yearly: { ...sched.yearly, hour } }),
+        "Year in review hour")}</> },
   ];
 
   // what a row says at rest: the channels it actually reaches you on
@@ -3034,7 +3138,7 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
       <div style={{ marginTop: ".35rem", display: "flex", gap: ".5rem",
                     alignItems: "center", flexWrap: "wrap" }}>
         <span className="mut" style={{ fontSize: 13 }}>Time zone</span>
-        <select value={timezone}
+        <select aria-label="Time zone" value={timezone}
                 onChange={(e) => onTimezone(e.target.value)}>
           <option value="">
             {instanceZone ? `instance default — ${zoneLabel(instanceZone)}`
@@ -3056,7 +3160,10 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
             <div key={cad} className="setrow">
               <span className="lab">{label}</span>
               <span className="val">{chans
-                ? `${when} · ${chans}` : "off"}</span>
+                ? `${when} · ${chans}` : "off"}
+                {reach?.[cad].warn && (
+                  <span style={{ color: "var(--amber)" }}>
+                    {" "}· nobody receiving it</span>)}</span>
               <span className="act">
                 <button style={{ fontSize: 13 }}
                         aria-expanded={open}
@@ -3090,15 +3197,18 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
                   )}
                   {chanBox(cad, "sms", "SMS", smsOk, smsWhy)}
                   {chanBox(cad, "push", "push", pushOk,
-                           pushLock ?? ("push needs a supported browser "
-                                        + "over HTTPS, or the mobile app"))}
+                           pushLock ?? (notify.data === undefined ? ""
+                             : "push needs a supported browser "
+                               + "over HTTPS, or the mobile app"))}
                 </div>
               )}
             </div>
           );
         })}
       </div>
-      <NotifyChannels status={notify.data} />
+      {notify.data === undefined && notify.isError
+        ? <FailedLine q={notify} what="the text and push setup" />
+        : <NotifyChannels status={notify.data} />}
     </div>
   );
 }
@@ -3108,8 +3218,11 @@ function CadenceEditor({ sched, onChange, timezone, onTimezone }: {
  *  with the devices it governs. Every box here writes the same place the
  *  member's own Settings page writes, so a change on either side shows on
  *  the other. */
-function MemberNotifyRow({ n, busy, onChange }: {
+function MemberNotifyRow({ n, busy, sending, onChange }: {
   n: MemberNotify; busy: boolean;
+  // which kinds the household sends at all; one it does not send reads as
+  // off here, whatever this person chose for it
+  sending?: Partial<Record<string, boolean>>;
   onChange: (body: Parameters<typeof api.memberNotify>[1]) => void;
 }) {
   const devices = [
@@ -3135,14 +3248,17 @@ function MemberNotifyRow({ n, busy, onChange }: {
                    onChange={(e) => onChange({ email_muted: !e.target.checked })} />
             on
           </label>
-          {!n.email_muted && EMAIL_KINDS.map((k) => (
-            <label key={k} className="check">
-              <input type="checkbox" checked={prefOn(n.email_prefs, k)}
-                     disabled={busy}
+          {!n.email_muted && EMAIL_KINDS.map((k) => {
+            const off = sending ? kindOffNote(k, sending) : null;
+            return (
+            <label key={k} className="check" title={off ?? undefined}>
+              <input type="checkbox" checked={!off && prefOn(n.email_prefs, k)}
+                     disabled={busy || !!off}
                      onChange={(e) => onChange({ email_pref: { kind: k, on: e.target.checked } })} />
               {EMAIL_KIND_LABEL[k]}
-            </label>
-          ))}
+              {off && <span className="mut"> (off)</span>}
+            </label>);
+          })}
         </>)}
       </span>
       <span style={{ display: "flex", gap: ".6rem", flexWrap: "wrap",
@@ -3188,6 +3304,9 @@ function when(iso: string): string {
     + ` ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+// rows the activity log opens on before "show more"
+const ACTIVITY_SHORT = 10;
+
 function ActivityCard() {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const [who, setWho] = useState("");
@@ -3216,50 +3335,67 @@ function ActivityCard() {
   const mine = me.data?.email?.toLowerCase();
   const nameOf = (a: string) => a === mine ? "you"
     : a.startsWith("script:") ? `the ${a.slice(7)} script` : a;
+  // In a household of one every row would open with the same name, so the
+  // name goes; a script's rows keep theirs — they are not that person.
+  const members = useQuery({ queryKey: ["members"], queryFn: api.members });
+  const solo = members.data?.users.length === 1;
+  const actorOf = (a: string) => solo && !a.startsWith("script:")
+    ? null : nameOf(a);
+  // the log opens on its latest few; the rest is one tap away, and the
+  // server's own "show older" pages past what is loaded
+  const more = useShowMore(rows, ACTIVITY_SHORT);
   if (q.isPending && !first) return null;
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Activity</h2>
       <p className="mut">Who changed what, and when — categories, splits,
-        notes, bills, rules, receipts, merchant names, settings. What the
-        app does on its own (syncs, the nightly pass) is not listed; the
-        log keeps two years.</p>
+        notes, bills, rules, receipts, merchant names, settings.{" "}
+        <Link to="/help?topic=security">How this works</Link></p>
       <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                     marginBottom: ".6rem" }}>
-        <select value={who} title="who"
+        {(first?.actors?.length ?? 0) > 1 && (
+        <select aria-label="Who" value={who} title="who"
           onChange={(e) => { setWho(e.target.value); reset(); }}>
           <option value="">everyone</option>
           {(first?.actors ?? []).map((a) => (
             <option key={a} value={a}>{nameOf(a)}</option>))}
-        </select>
-        <select value={kind} title="what"
+        </select>)}
+        <select aria-label="What" value={kind} title="what"
           onChange={(e) => { setKind(e.target.value); reset(); }}>
           <option value="">everything</option>
           {(first?.kinds ?? []).map((k) => (
             <option key={k} value={k}>{KIND_LABEL[k] ?? k}</option>))}
         </select>
       </div>
-      {q.isError && <p className="mut">{errText(q.error)}</p>}
-      {rows.length === 0 && !q.isError && (
-        <p className="mut">Nothing yet — the first category you correct,
-          note you leave or bill you edit lands here, with your name on
-          it.</p>)}
+      {q.isError && <FailedLine q={q} what="the activity log" />}
+      {/* a filtered log that answered empty says so, not that the log is
+          (the phone's words) */}
+      {rows.length === 0 && !q.isError && (who || kind
+        ? <p className="mut">{EMPTY_LINES.filtered}</p>
+        : <p className="mut">Nothing yet — the first category you correct,
+            note you leave or bill you edit lands here, with your name on
+            it.</p>)}
       {rows.length > 0 && (
         <table>
           <tbody>
-            {rows.map((r) => (
+            {more.shown.map((r) => {
+              const who = actorOf(r.actor);
+              return (
               <tr key={r.id}>
                 <td className="mut" style={{ whiteSpace: "nowrap",
                                              verticalAlign: "top" }}>
                   {when(r.at)}</td>
                 <td style={{ verticalAlign: "top" }}>
-                  <b>{nameOf(r.actor)}</b> {r.summary}
+                  {who ? <><b>{who}</b> {r.summary}</>
+                    : r.summary.charAt(0).toUpperCase() + r.summary.slice(1)}
                 </td>
-              </tr>
-            ))}
+              </tr>);
+            })}
           </tbody>
         </table>)}
-      {last?.more && last.next && (
+      <ShowAllButton {...more} noun="entries"
+        more={last?.more ? "Show more activity" : undefined} />
+      {(more.all || rows.length <= ACTIVITY_SHORT) && last?.more && last.next && (
         <button style={{ marginTop: ".5rem" }} disabled={q.isFetching}
           onClick={() => setCursor(last.next)}>
           {q.isFetching ? "loading…" : "show older"}</button>)}
@@ -3276,6 +3412,8 @@ function FamilyCard({ onMemberRemoved }: {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const members = useQuery({ queryKey: ["members"], queryFn: api.members });
   const owner = me.data?.role === "owner";
+  const settingsQ = useQuery({ queryKey: ["settings"], queryFn: api.settings,
+                               enabled: owner });
   const invites = useQuery({ queryKey: ["invites"], queryFn: api.invites,
                              enabled: owner });
   const [label, setLabel] = useState("");
@@ -3369,21 +3507,29 @@ function FamilyCard({ onMemberRemoved }: {
       qc.invalidateQueries({ queryKey: ["settings"] });
     },
     onError: (e) => window.alert(errText(e)) });
-  if (members.isPending || members.isLoadingError) return null;
+  if (members.isPending) return null;
+  // a failed roster keeps the card, saying so: gone, it read as nobody
+  if (members.data === undefined)
+    return (
+      <div className="card" style={{ marginTop: "1rem" }}>
+        <FailedLine q={members} what="the household's people" />
+      </div>);
+  const sched = settingsQ.data ? schedOf(settingsQ.data.email_schedule) : null;
+  const sending = sched ? { daily: sched.daily.on, monthly: sched.monthly.on,
+                            yearly: sched.yearly.on } : undefined;
   // the roster carries each member's notices for the owner (older servers
   // send none, and the column stays out)
   const showNotify = owner && members.data.users.some((u) => u.notify);
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
-      <h2>Family</h2>
-      <p className="mut">Everyone signed into this household. Everyone
-        here sees everything; what differs is what they can change.
-        {owner && " A member can edit the money — transactions, bills, "
-                + "budgets, rules. Connections, exports, billing, who is in "
-                + "the household and deleting the account stay yours. "
-                + "Invitations are one-time and expire in 7 days"
-                + (hosted ? " — we email the link to the address you "
-                          + "enter, and only that address can use it." : ".")}
+      <p className="mut" style={{ marginTop: 0 }}>Everyone in the household
+        sees everything; what differs is
+        what they can change.
+        {owner && " A member can edit the money; connections, exports, "
+                + "billing, who is in the household and deleting the "
+                + "account stay yours. Invitations are one-time and "
+                + "expire in 7 days."}
+        {" "}<Link to="/help?topic=security">How this works</Link>
       </p>
       <table>
         <tbody>
@@ -3397,7 +3543,7 @@ function FamilyCard({ onMemberRemoved }: {
                 {owner && !u.me && (<>
                   {/* the picker offers only what an owner may hand out —
                       the server names the list, so the two cannot drift */}
-                  <select value={u.role}
+                  <select aria-label={`Role for ${u.email}`} value={u.role}
                     disabled={setRole.isPending && setRole.variables?.id === u.id}
                     title="what this person can do"
                     style={{ marginRight: ".4rem" }}
@@ -3419,13 +3565,16 @@ function FamilyCard({ onMemberRemoved }: {
             {showNotify && u.notify && (
             <tr className="notify-row">
               <td colSpan={3} style={{ paddingTop: 0, paddingBottom: ".7rem" }}>
-                <MemberNotifyRow n={u.notify}
+                <MemberNotifyRow n={u.notify} sending={sending}
                   busy={notify.isPending && notify.variables?.id === u.id}
                   onChange={(body) => notify.mutate({ id: u.id, ...body })} />
               </td>
             </tr>
             )}
           </Fragment>))}
+          {owner && invites.data === undefined && invites.isError && (
+            <tr><td colSpan={3}>
+              <FailedLine q={invites} what="the invitations" /></td></tr>)}
           {owner && (invites.data?.invites ?? []).map((i) => (
             <tr key={i.token_hash}>
               <td className="mut">{i.label || "pending invite"}</td>
@@ -3470,14 +3619,15 @@ function FamilyCard({ onMemberRemoved }: {
               </>)}
             </div>
           )}
-          {invErr && <div className="note bad"
-            onClick={() => setInvErr(null)}>{invErr}</div>}
+          {invErr && <Note tone="bad"
+            onDismiss={() => setInvErr(null)}>{invErr}</Note>}
           <div style={{ display: "flex", gap: ".5rem", marginTop: ".6rem",
                         flexWrap: "wrap" }}>
             {/* Hosted mints must NAME an address — the link is mailed
                 there and nowhere else — so ask for one on the field
                 instead of letting the owner learn it from a refusal. */}
-            <input value={label} type={hosted ? "email" : "text"}
+            <input aria-label={hosted ? "Their email address" : "Label"}
+                   value={label} type={hosted ? "email" : "text"}
               placeholder={hosted ? "their email address"
                                   : "who's it for? (name or email)"}
               onChange={(e) => setLabel(e.target.value)}
@@ -3485,7 +3635,8 @@ function FamilyCard({ onMemberRemoved }: {
                        background: "var(--hover)", color: "var(--ink)",
                        border: "1px solid var(--line)",
                        borderRadius: "var(--rs)" }} />
-            <select value={invRole} title="what this person can do"
+            <select aria-label="What this person can do"
+                    value={invRole} title="what this person can do"
               onChange={(e) => setInvRole(e.target.value)}
               style={{ padding: ".5rem", background: "var(--hover)",
                        color: "var(--ink)", border: "1px solid var(--line)",
@@ -3500,7 +3651,7 @@ function FamilyCard({ onMemberRemoved }: {
                 : hosted ? "Send invitation" : "Create invite link"}</button>
           </div>
           {create.isError && (
-            <p style={{ color: "var(--red)" }}>{String(create.error)}</p>
+            <p style={{ color: "var(--red)" }}>{errText(create.error)}</p>
           )}
         </>
       )}
@@ -3556,21 +3707,20 @@ function ConnectionsCard({ data, hosted = false, onSaved }: {
   );
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
-      <h2>Connections</h2>
+      {/* no card title: it would only repeat the section's name */}
       {hosted ? (
         /* The aggregator runs under the platform's credentials and /api
            refuses a tenant's own keys, so the SPA must not offer the
            buttons — otherwise the only way to learn that is to fill in the
            form and be told 403. Banks are linked from Accounts here; what
            remains tenant-owned is the push door. */
-        <p className="mut">Your banks connect through the operator's provider —
-          there are no keys to add. Everything account-shaped lives under{" "}
-          <b>Manage accounts</b> below (also on{" "}
-          <Link to="/accounts">Accounts</Link>).</p>
+        <p className="mut" style={{ marginTop: 0 }}>Your banks connect through the operator's provider —
+          there are no keys to add.{" "}
+          <Link to="/help?topic=accounts">How this works</Link></p>
       ) : (
-      <p className="mut">Provider credentials and live feeds. Keys are
-        stored encrypted and never shown back; validation happens against
-        the provider before anything saves.</p>)}
+      <p className="mut" style={{ marginTop: 0 }}>Provider credentials and live feeds — keys are
+        stored encrypted and never shown back.{" "}
+        <Link to="/help?topic=accounts">How this works</Link></p>)}
       {clearErr && <p style={{ color: "var(--red)" }}>{clearErr}</p>}
       <table style={{ fontSize: 14 }}>
         <tbody>
@@ -3661,7 +3811,7 @@ function SmtpCard({ data, onSaved }: {
   });
   const input = (v: string, set: (s: string) => void, ph: string,
                  type = "text") => (
-    <input type={type} value={v} placeholder={ph}
+    <input aria-label={ph} type={type} value={v} placeholder={ph}
       onChange={(e) => set(e.target.value)}
       style={{ width: "100%", padding: ".5rem", background: "var(--hover)",
                border: "1px solid var(--line)", borderRadius: "var(--rs)",
@@ -3672,20 +3822,18 @@ function SmtpCard({ data, onSaved }: {
   // recipients they exist to serve are six fields in the way. Open when it
   // IS configured here, because then it is state worth reading.
   return (
-    <details className="card" style={{ marginTop: "1rem" }}
+    <details className="card disclosure" style={{ marginTop: "1rem" }}
              open={!!data.smtp_host}>
-      <summary style={{ cursor: "pointer", display: "flex", gap: ".6rem",
-                        alignItems: "baseline", flexWrap: "wrap" }}>
+      <summary>
         <b>Email delivery (SMTP)</b>
         <span className="sub">{data.smtp_host
           ? `${data.smtp_host}:${data.smtp_port ?? 587}`
           : "using the operator's OIKONOME_SMTP_* settings"}</span>
       </summary>
       <p className="mut">Where the daily verdict, alerts, invites, and
-        feedback emails go OUT through — any provider works (Proton,
-        Fastmail, Gmail app-password…). Saved here it applies immediately;
-        leaving the host empty falls back to <code>OIKONOME_SMTP_*</code> in
-        docker/.env if the operator set those.</p>
+        feedback emails go out through — any provider works (Proton,
+        Fastmail, Gmail app-password…).{" "}
+        <Link to="/help?topic=quickstart">How this works</Link></p>
       {err && <p style={{ color: "var(--red)" }}>{err}</p>}
       <div className="field-grid">
         <label>SMTP host{input(host, setHost, "smtp.fastmail.com")}</label>
@@ -3767,28 +3915,35 @@ const LLM_TASKS: [string, string][] = [
 function LlmCard({ data, hosted = false, onSaved }: {
   data: SettingsData; hosted?: boolean; onSaved: () => void;
 }) {
-  const seed = (): LlmBackendRow[] => {
-    const rows: LlmBackendRow[] = (data.llm_backends ?? []).map((b) => ({
+  const seed = (v: SettingsData): LlmBackendRow[] => {
+    const rows: LlmBackendRow[] = (v.llm_backends ?? []).map((b) => ({
       id: b.id, name: b.name, url: b.url, model: b.model,
       vision_model: b.vision_model, extra_body: b.extra_body,
       extra_body_set: b.extra_body_set, api_key_set: b.api_key_set,
     }));
-    if (!rows.length && data.llm_url) {
+    if (!rows.length && v.llm_url) {
       // the legacy JSON options are masked like the per-backend twin, so
       // presence comes from the flag and the value starts blank —
       // "" keeps whatever is stored, and only the clear switch sends null
-      rows.push({ id: "legacy", name: "Custom endpoint", url: data.llm_url,
-                  model: data.llm_model ?? "",
-                  vision_model: data.llm_vision_model ?? "",
+      rows.push({ id: "legacy", name: "Custom endpoint", url: v.llm_url,
+                  model: v.llm_model ?? "",
+                  vision_model: v.llm_vision_model ?? "",
                   extra_body: "",
-                  extra_body_set: !!data.llm_extra_body_set,
-                  api_key_set: data.llm_api_key_set });
+                  extra_body_set: !!v.llm_extra_body_set,
+                  api_key_set: v.llm_api_key_set });
     }
     return rows;
   };
-  const [backends, setBackends] = useState<LlmBackendRow[]>(seed);
+  const [backends, setBackends] = useState<LlmBackendRow[]>(() => seed(data));
   const [roles, setRoles] = useState<Record<string, string>>(
     { ...(data.llm_roles ?? {}) });
+  // the view the rows on screen were built from: its list versions go
+  // with the save, so a list another device saved since is merged rather
+  // than replaced. `data` itself moves on every refetch; this does not.
+  const [basis, setBasis] = useState<SettingsData>(data);
+  const reseed = (v: SettingsData) => {
+    setBasis(v); setBackends(seed(v)); setRoles({ ...(v.llm_roles ?? {}) });
+  };
   const [editing, setEditing] = useState<string | null>(null);
   const [taxOk, setTaxOk] = useState(!!data.taxdocs_allow_remote_llm);
   // vision model for the bundled/env default backend — the top-level
@@ -3813,9 +3968,16 @@ function LlmCard({ data, hosted = false, onSaved }: {
       // without a bundled backend never touch the key
       ...(data.llm_bundled
         ? { llm_vision_model: bundledVision.trim() } : {}),
-    }),
-    onSuccess: () => { setErr(null); setEditing(null); onSaved(); },
-    onError: (e) => setErr(errText(e)),
+    }, basis),
+    // the reply is the stored view: the next save is based on it, and the
+    // key-set flags show presence instead of a typed secret
+    onSuccess: (v) => { setErr(null); setEditing(null); reseed(v); onSaved(); },
+    onError: (e) => {
+      // moved twice: the stored rows go on screen, as the sentence says
+      if (e instanceof SettingsMovedError && e.latest)
+        reseed(e.latest as SettingsData);
+      setErr(errText(e));
+    },
   });
   const isLocal = (url: string) => {
     const h = (url.split("//")[1] ?? "").split(/[/:]/)[0].toLowerCase();
@@ -3837,25 +3999,20 @@ function LlmCard({ data, hosted = false, onSaved }: {
   };
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
-      <h2>AI (optional)</h2>
-      <p className="mut">Everything core works without AI. Add one or more
-        OpenAI-compatible backends{hosted
+      <p className="mut" style={{ marginTop: 0 }}>Optional — everything core works without AI.
+        Add one or more OpenAI-compatible backends{hosted
           ? <> — <b>public</b> APIs only (OpenAI, OpenRouter, a cloud
             endpoint you run…); a model on your laptop or home network is
             not reachable from this server</>
           : <> — local (Ollama, LM Studio…, no API key needed) or cloud —
-            and pick which one handles each task</>}. They power the{" "}
-        <b>Assistant</b> page, categorize unknown merchants, summarize
-        matched Amazon orders, tag recurring proposals, and — with a
-        vision model — read receipts and paper documents.</p>
+            and pick which one handles each task</>}.{" "}
+        <Link to="/help?topic=assistant">How this works</Link></p>
       <p className="mut" style={{ fontSize: 13 }}>
-        Free options that work here: <b>Google Gemini</b> (AI Studio free
-        tier, OpenAI-compatible endpoint), <b>Groq</b>, and{" "}
-        <b>OpenRouter</b>'s free-routed models. One honest caveat: free
-        tiers generally reserve the right to use what you send them to
-        improve their models — and what this sends is merchant names from
-        your transactions. Read the provider's data policy before wiring
-        one in.</p>
+        Free options that work here: <b>Google Gemini</b>, <b>Groq</b>,
+        and <b>OpenRouter</b>'s free-routed models. Free tiers generally
+        reserve the right to use what you send them to improve their
+        models — and what this sends is merchant names from your
+        transactions. Read the provider's data policy first.</p>
       {err && <p style={{ color: "var(--red)" }}>{err}</p>}
 
       <h3 style={{ margin: ".6rem 0 .3rem" }}>Backends</h3>
@@ -3948,7 +4105,7 @@ function LlmCard({ data, hosted = false, onSaved }: {
                                  alignItems: "baseline", flexWrap: "wrap",
                                  margin: ".25rem 0" }}>
             <span style={{ minWidth: "11rem" }}>{label}</span>
-            <select value={roles[role] ?? ""}
+            <select aria-label={label} value={roles[role] ?? ""}
                     onChange={(e) => setRoles((r) => {
                       const next = { ...r };
                       if (e.target.value) next[role] = e.target.value;
@@ -4021,7 +4178,7 @@ function LlmBackendForm({ initial, hosted, onDone, onCancel }: {
     useState(initial?.extra_body === null);
   const field = (v: string, set: (s: string) => void, ph: string,
                  type = "text", disabled = false) => (
-    <input type={type} value={v} placeholder={ph} disabled={disabled}
+    <input aria-label={ph} type={type} value={v} placeholder={ph} disabled={disabled}
       onChange={(e) => set(e.target.value)}
       style={{ width: "100%", padding: ".45rem", background: "var(--hover)",
                border: "1px solid var(--line)", borderRadius: "var(--rs)",
@@ -4172,11 +4329,13 @@ function GuidedSetupCard() {
           three unrelated features. */}
       <p className="sub">Run any wizard again — nothing is deleted, and you
         can skip out at any step.</p>
-      {msg && <div className="note bad">{msg}</div>}
+      {msg && <Note tone="bad">{msg}</Note>}
       <div style={{ display: "flex", gap: ".6rem", flexWrap: "wrap",
                     alignItems: "center", marginTop: ".4rem" }}>
         {/* resumes at the first unfinished step, marks kept */}
-        {ob.data && !ob.data.wizard_done && (
+        {/* the server's test: everything the wizard sets up already
+            exists, whatever its marks say */}
+        {ob.data && !ob.data.setup_complete && (
           <button onClick={() => nav("/welcome")}>Finish setup</button>
         )}
         <button disabled={restart.isPending}
@@ -4237,8 +4396,8 @@ function MaintenanceCard({ onDone }: { onDone: () => void }) {
       <h2>Maintenance</h2>
       <p className="mut">Sync runs on its own schedule (hourly by default) — this
         runs one now.</p>
-      {msg && <div className={"note " + (msg.bad ? "bad" : "good")}
-                   onClick={() => setMsg(null)}>{msg.text}</div>}
+      {msg && <Note tone={msg.bad ? "bad" : "good"}
+                   onDismiss={() => setMsg(null)}>{msg.text}</Note>}
       <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap" }}>
         <button disabled={busy} onClick={() => sync.mutate()}>
           {sync.isPending ? "syncing…" : "Sync all connections now"}</button>
@@ -4344,13 +4503,18 @@ function RecipientsEditor({ recipients, muted, status, onChange,
   return (
     <div>
       <label style={{ display: "block" }}>Who receives it</label>
-      <div style={{ display: "grid", gap: ".35rem", margin: ".35rem 0 .6rem" }}>
+      {/* one track that may shrink below its content, and rows that wrap:
+          an address plus its badge and two buttons is wider than a phone,
+          and a grid item that cannot shrink widens the whole card */}
+      <div style={{ display: "grid", gap: ".35rem", margin: ".35rem 0 .6rem",
+                    gridTemplateColumns: "minmax(0, 1fr)" }}>
         {rows.map((r) => {
           const s = byEmail.get(r.email.toLowerCase());
           const rowMuted = isMuted(r.email);
           return (
             <div key={r.email}
                  style={{ display: "flex", alignItems: "center", gap: ".5rem",
+                          flexWrap: "wrap",
                           padding: ".45rem .6rem", background: "var(--hover)",
                           border: "1px solid var(--line)",
                           borderRadius: "var(--rs)",
@@ -4364,7 +4528,7 @@ function RecipientsEditor({ recipients, muted, status, onChange,
                      title={rowMuted ? "not receiving — tick to resume"
                                      : "receiving — untick to stop their copy"}
                      onChange={() => toggleMuted(r.email)} />
-              <span style={{ flex: 1, minWidth: 0, overflow: "hidden",
+              <span style={{ flex: "1 1 11rem", minWidth: 0, overflow: "hidden",
                              textOverflow: "ellipsis" }}>{r.email}</span>
               {rowMuted
                 ? <span style={{ fontSize: 12, whiteSpace: "nowrap",
@@ -4431,12 +4595,10 @@ function RecipientsEditor({ recipients, muted, status, onChange,
         <p className="sub" style={{ marginTop: ".3rem" }}>
           Not added yet — press Add (or Enter) to save and invite.</p>
       )}
-      {err && <p className="note bad" style={{ marginTop: ".3rem" }}
-                 role="alert">{err}</p>}
+      {err && <Note as="p" tone="bad" style={{ marginTop: ".3rem" }}>{err}</Note>}
       {resendMsg && (
-        <p className={"note " + (resendMsg.bad ? "bad" : "good")}
-           role="status" style={{ marginTop: ".3rem" }}
-           onClick={() => setResendMsg(null)}>{resendMsg.text}</p>)}
+        <Note as="p" tone={resendMsg.bad ? "bad" : "good"} style={{ marginTop: ".3rem" }}
+           onDismiss={() => setResendMsg(null)}>{resendMsg.text}</Note>)}
       <p className="sub" style={{ marginTop: ".3rem" }}>
         Adding someone emails them an invitation right away — they start
         receiving the summary once they accept.
@@ -4496,21 +4658,28 @@ function EmailPrefsGrid({ status, sending, onError }: {
                       fontSize: 13 }}>
         <thead>
           <tr>
-            <th style={{ ...cell, textAlign: "left" }} />
+
+              <th style={{ ...cell, textAlign: "left" }}>
+                <span className="sr-only">Recipient</span></th>
             {EMAIL_KINDS.map((k) => {
               const off = kindOffNote(k, sending);
               return (
                 <th key={k} title={off ?? undefined}
-                    style={{ ...cell, fontWeight: 500,
-                             opacity: off ? 0.5 : 1 }}>
-                  {EMAIL_KIND_LABEL[k]}</th>);
+                    style={{ ...cell, fontWeight: 500 }}>
+                  {EMAIL_KIND_LABEL[k]}
+                  {off && <span className="sub" style={{ display: "block",
+                    fontWeight: 400, textTransform: "none" }}>
+                    {k === "daily" ? "email off" : "report off"}</span>}
+                </th>);
             })}
           </tr>
         </thead>
         <tbody>
           {rows.map((r) => (
             <tr key={r.email} style={{ opacity: r.muted ? 0.6 : 1 }}>
-              <td style={{ ...cell, textAlign: "left", maxWidth: "16rem",
+              <td title={r.email}
+                  style={{ ...cell, textAlign: "left",
+                           maxWidth: "min(16rem, 22vw)",
                            overflow: "hidden", textOverflow: "ellipsis",
                            whiteSpace: "nowrap" }}>
                 {r.email}
@@ -4520,12 +4689,15 @@ function EmailPrefsGrid({ status, sending, onError }: {
                   </span>}
               </td>
               {EMAIL_KINDS.map((k) => {
+                // A kind the household does not send reads as OFF for
+                // everyone — a ticked box under it would claim a report
+                // that never goes out. Each person's choice is kept and
+                // shows again the moment the report is turned on.
                 const off = kindOffNote(k, sending);
                 return (
-                  <td key={k} style={{ ...cell, opacity: off ? 0.5 : 1 }}
-                      title={off ?? undefined}>
-                    <input type="checkbox" disabled={!!r.muted}
-                      checked={!r.muted && prefOn(r.prefs, k)}
+                  <td key={k} style={cell} title={off ?? undefined}>
+                    <input type="checkbox" disabled={!!r.muted || !!off}
+                      checked={!r.muted && !off && prefOn(r.prefs, k)}
                       aria-label={`${r.email} receives ${
                         EMAIL_KIND_LABEL[k].toLowerCase()} email`}
                       onChange={(e) => set.mutate({ email: r.email, kind: k,
@@ -4536,10 +4708,6 @@ function EmailPrefsGrid({ status, sending, onError }: {
           ))}
         </tbody>
       </table>
-      {EMAIL_KINDS.some((k) => kindOffNote(k, sending)) && (
-        <p className="sub" style={{ marginTop: ".3rem" }}>
-          {EMAIL_KINDS.map((k) => kindOffNote(k, sending)).filter(Boolean)
-            .join(" · ")}</p>)}
     </div>
   );
 }
@@ -4615,11 +4783,10 @@ function DeliveryProblemCard({ state, email }: {
       <h2>Your email isn't arriving</h2>
       <p className="mut">
         {complained
-          ? <>Mail to <b>{email}</b> was reported as spam, so we stopped
-              sending it. Scheduled emails are paused.</>
+          ? <>Mail to <b>{email}</b> was reported as spam, so the
+              scheduled emails are paused.</>
           : <>We couldn't deliver to <b>{email}</b>, so the scheduled emails
-              are paused. Sending to an address that bounces every morning
-              gets the rest of our mail treated as spam too.</>}
+              are paused.</>}
       </p>
       {state.reason && (
         <p className="sub" style={{ fontFamily: "monospace" }}>
@@ -4726,12 +4893,11 @@ function EmailCard({ current, pending, pendingUntil, onChanged }: {
   return (
     <div className="card">
       <h2>Email / username</h2>
-      <p className="mut">Your login email is <b>{current}</b>. Change it
-        below — you'll confirm it's you first. The email is your
-        login identifier, so changing it is a credential rotation: every
-        other session is signed out, and every passkey, signed-in phone,
-        script token and pending family invite is removed — re-add them
-        after.</p>
+      <p className="mut">Your login email is <b>{current}</b>. Changing it
+        signs out every other session and removes every passkey,
+        signed-in phone, script token and pending family invite — re-add
+        them after.{" "}
+        <Link to="/help?topic=security">How this works</Link></p>
       {pending && (
         <p>Waiting for confirmation: <b>{pending}</b>
           {pendingUntil && <span className="mut"> (the link works until{" "}
@@ -4740,8 +4906,8 @@ function EmailCard({ current, pending, pendingUntil, onChanged }: {
                   onClick={() => withdraw.mutate()}>
             {withdraw.isPending ? "withdrawing…" : "Withdraw"}</button>
         </p>)}
-      {msg && <div className={`note ${msg.bad ? "bad" : "good"}`}
-                   onClick={() => setMsg(null)}>{msg.text}</div>}
+      {msg && <Note tone={msg.bad ? "bad" : "good"}
+                   onDismiss={() => setMsg(null)}>{msg.text}</Note>}
       {recovery && (
         <div className="note good" style={{ display: "block" }}>
           <b>Recovery codes</b> — save these somewhere safe. Each works once
@@ -4777,7 +4943,12 @@ function PasswordCard() {
   const [confirm, setConfirm] = useState("");
   const [totp, setTotp] = useState("");
   const [needTotp, setNeedTotp] = useState(false);
-  const [msg, setMsg] = useState<{ text: string; bad: boolean } | null>(null);
+  // `on` names the field an error is about: that field is marked invalid
+  // and reads the banner as its description
+  type On = "current" | "next" | "confirm" | "totp";
+  const [msg, setMsg] = useState<{ text: string; bad: boolean; on?: On } | null>(null);
+  const errId = useId();
+  const errOn = (f: On) => !!msg?.bad && msg.on === f;
   // the change voided the recovery sheet; the new one is shown once
   const [recovery, setRecovery] = useState<string[] | null>(null);
 
@@ -4827,19 +4998,19 @@ function PasswordCard() {
       if (m.includes("totp_required")) {
         setNeedTotp(true);
         setMsg({ text: "Two-factor is on — enter your 6-digit code to confirm.",
-                 bad: true });
+                 bad: true, on: "totp" });
       } else if (m.includes("wrong password")) {
-        setMsg({ text: "Current password is wrong.", bad: true });
+        setMsg({ text: "Current password is wrong.", bad: true, on: "current" });
       } else if (/code_used|already (been )?used/i.test(m)) {
         setTotp("");
         setMsg({ text: "That code was already used — enter the next one " +
-                       "from your app.", bad: true });
+                       "from your app.", bad: true, on: "totp" });
       } else if (m.includes("one-time code")) {
         setMsg({ text: "That code didn't match — check your app's clock.",
-                 bad: true });
+                 bad: true, on: "totp" });
       } else if (m.includes("at least 10")) {
         setMsg({ text: "New password must be at least 10 characters.",
-                 bad: true });
+                 bad: true, on: "next" });
       } else if (m.includes("too many requests")) {
         setMsg({ text: "Too many attempts — try again later.", bad: true });
       } else {
@@ -4850,12 +5021,12 @@ function PasswordCard() {
 
   const submit = () => {
     if (next !== confirm) {
-      setMsg({ text: "New passwords don't match.", bad: true });
+      setMsg({ text: "New passwords don't match.", bad: true, on: "confirm" });
       return;
     }
     if (next.length < 10) {
       setMsg({ text: "New password must be at least 10 characters.",
-               bad: true });
+               bad: true, on: "next" });
       return;
     }
     setMsg(null);
@@ -4865,13 +5036,13 @@ function PasswordCard() {
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Change password</h2>
-      <p className="mut">Changing it is a full credential rotation: every
-        other session is signed out, and every passkey, signed-in phone,
-        script token and pending family invite is removed — re-add them
-        after. That is deliberate: nothing enrolled by a thief survives.</p>
+      <p className="mut">Changing it signs out every other session and
+        removes every passkey, signed-in phone, script token and pending
+        family invite — re-add them after.{" "}
+        <Link to="/help?topic=security">How this works</Link></p>
       {msg && (
-        <div className={"note " + (msg.bad ? "bad" : "good")}
-             onClick={() => setMsg(null)}>{msg.text}</div>
+        <Note tone={msg.bad ? "bad" : "good"} id={errId}
+             onDismiss={() => setMsg(null)}>{msg.text}</Note>
       )}
       {recovery && (
         <div className="note good" style={{ display: "block" }}>
@@ -4888,24 +5059,26 @@ function PasswordCard() {
         </div>
       )}
       <div className="field-grid">
-        <label>Current password
+        <Field label="Current password" error={errOn("current")} errorId={errId}>
           <input type="password" autoComplete="current-password"
                  value={current}
                  onChange={(e) => setCurrent(e.target.value)} />
-        </label>
-        <label>New password <span className="mut">(at least 10 characters)</span>
+        </Field>
+        <Field label={<>New password <span className="mut">(at least 10 characters)</span></>}
+               error={errOn("next")} errorId={errId}>
           <input type="password" autoComplete="new-password" value={next}
                  onChange={(e) => setNext(e.target.value)} />
-        </label>
-        <label>Confirm new password
+        </Field>
+        <Field label="Confirm new password" error={errOn("confirm")} errorId={errId}>
           <input type="password" autoComplete="new-password" value={confirm}
                  onChange={(e) => setConfirm(e.target.value)} />
-        </label>
+        </Field>
         {needTotp && (
-          <label>6-digit code from your authenticator
+          <Field label="6-digit code from your authenticator" error={errOn("totp")}
+                 errorId={errId}>
             <input inputMode="numeric" autoFocus value={totp}
                    onChange={(e) => setTotp(e.target.value)} />
-          </label>
+          </Field>
         )}
       </div>
       <button style={{ marginTop: ".5rem" }}
@@ -5047,8 +5220,8 @@ function TwoFactorCard() {
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Two-factor authentication</h2>
       {msg && (
-        <div className={"note " + (msg.bad ? "bad" : "good")}
-             onClick={() => setMsg(null)}>{msg.text}</div>
+        <Note tone={msg.bad ? "bad" : "good"}
+             onDismiss={() => setMsg(null)}>{msg.text}</Note>
       )}
       {/* one-time recovery codes shown once after enrol/regenerate */}
       {recovery && (
@@ -5102,7 +5275,7 @@ function TwoFactorCard() {
         <>
           <p className="mut">Scan this QR with your authenticator app (or type
             the secret in manually), then enter the 6-digit code it shows to
-            confirm. Your existing sign-in keeps working until you confirm.</p>
+            confirm.</p>
           {enroll.qr && (
             <img src={enroll.qr} alt="Authenticator setup QR code"
                  width={180} height={180}
@@ -5163,7 +5336,8 @@ function TwoFactorCard() {
         <>
           <p className="mut">Add a second factor: after your password, sign-in
             asks for a 6-digit code from an authenticator app. Confirming
-            enrollment signs out every other session.</p>
+            enrollment signs out every other session.{" "}
+            <Link to="/help?topic=security">How this works</Link></p>
           <p className="mut" style={{ fontSize: 13 }}>
             You'll confirm it's you first, so someone who steals a
             signed-in tab can't turn on 2FA and lock you out of your own
@@ -5195,9 +5369,12 @@ function MyEmailCard() {
     mutationFn: (muted: boolean) => api.meEmail(muted),
     // the label reads ["me"].daily_email.muted and the response says what
     // it now is — patch it; that key has observers on every page
-    onSuccess: (r) => { setErr(null);
+    // (the mute door answers `muted`, the kind door `prefs`; one reply
+    // shape covers both, so each reads its own key)
+    onSuccess: (r, muted) => { setErr(null);
       qc.setQueryData<Me>(["me"], (old) => old && old.daily_email && {
-        ...old, daily_email: { ...old.daily_email, muted: r.muted } }); },
+        ...old, daily_email: { ...old.daily_email,
+                               muted: r.muted ?? muted } }); },
     onError: (e) => setErr(errText(e)),
   });
   // one kind on or off for my own inbox; the box moves on the tap and the
@@ -5210,26 +5387,23 @@ function MyEmailCard() {
         prefs: { ...old.daily_email.prefs, [v.kind]: v.on } } }),
     onSuccess: (r) => { setErr(null);
       qc.setQueryData<Me>(["me"], (old) => old && old.daily_email && {
-        ...old, daily_email: { ...old.daily_email, prefs: r.prefs } }); },
+        ...old, daily_email: { ...old.daily_email,
+                               prefs: r.prefs ?? old.daily_email.prefs } }); },
     onError: (e) => { setErr(errText(e));
       qc.invalidateQueries({ queryKey: ["me"] }); },
   });
   if (!d) return null;
   const hourLabel = (h: number) =>
     h === 0 ? "12am" : h < 12 ? `${h}am` : h === 12 ? "12pm" : `${h - 12}pm`;
-  const line = myDailyLine({
-    me: me.data?.email ?? "", on: d.on, muted: d.muted, prefs: d.prefs,
-    verified: me.data?.verified, hosted: me.data?.hosted,
-    recipients: settings.data?.email_recipients,
-    status: settings.data?.email_recipient_status,
-    needBaseUrl: notify.data?.invites_need_base_url });
+  const line = myDailyFrom(me.data, settings.data,
+                           notify.data?.invites_need_base_url)!;
   return (
     <div className="card">
       <h2>Daily email</h2>
       <p className="mut">
         The household's verdict email goes out at <b>{hourLabel(d.hour)}</b>
         {" "}as {d.summary ? "the verdict-only card" : "the full report"} —
-        the owner sets that. Whether it reaches <b>your</b> inbox is yours:
+        whether it reaches <b>your</b> inbox is yours:
       </p>
       {!d.on && <p className="mut">The owner has the daily email turned off
         for the household right now.</p>}
@@ -5250,13 +5424,14 @@ function MyEmailCard() {
         {EMAIL_KINDS.map((k) => {
           const off = kindOffNote(k, d.cadences);
           return (
-            <label key={k} className="check" title={off ?? undefined}
-                   style={{ opacity: off ? 0.5 : 1 }}>
-              <input type="checkbox" disabled={d.muted || pref.isPending}
-                     checked={!d.muted && prefOn(d.prefs, k)}
+            <label key={k} className="check" title={off ?? undefined}>
+              <input type="checkbox" disabled={d.muted || pref.isPending || !!off}
+                     checked={!d.muted && !off && prefOn(d.prefs, k)}
                      onChange={(e) => pref.mutate({ kind: k,
                                                     on: e.target.checked })} />
               {EMAIL_KIND_LABEL[k]}
+              {off && <span className="mut">
+                {" "}({k === "daily" ? "email off" : "report off"})</span>}
             </label>);
         })}
       </div>
@@ -5315,9 +5490,11 @@ function MyPushCard() {
     <div className="card">
       <h2>Push</h2>
       <p className="mut">
-        The household's push notices — the daily verdict, alerts, reports —
-        go to every signed-in phone and browser. Whether they reach{" "}
-        <b>yours</b> is yours; notices about your own login, household security warnings and your own test push always arrive.
+        Whether the household's push notices — the daily verdict, alerts,
+        reports — reach your phones and browsers is yours. Notices about
+        your own login, household security warnings and your own test push
+        always arrive.{" "}
+        <Link to="/help?topic=security">How this works</Link>
       </p>
       <p>
         <b>{muted ? "Household push is off for you." : "You receive household push."}</b>{" "}
@@ -5347,82 +5524,6 @@ function MyPushCard() {
         </div>
       )}
       {err && <p className="mut">{err}</p>}
-    </div>
-  );
-}
-
-/** A household member deletes their OWN login — the owner's account and
- *  every household row stay. Same re-auth as the
- *  owner's erasure door; lands on the sign-in page afterwards. */
-function LeaveHouseholdCard() {
-  const [confirm, setConfirm] = useState("");
-  const [err, setErr] = useState<string | null>(null);
-  const leave = useMutation({
-    // elevation-gated; the typed phrase is the are-you-sure
-    mutationFn: () => api.accountLeave(),
-    onSuccess: () => { window.location.href = "/login"; },
-    onError: (e) => setErr(errText(e)),
-  });
-  return (
-    <div className="card" style={{ borderColor: "rgba(224,105,93,.45)" }}>
-      <h2 style={{ color: "var(--red)" }}>Delete my login</h2>
-      <p className="mut">Removes <b>your</b> login from this household and
-        signs you out. The household's data and the owner's account are not
-        affected — the owner can invite you again any time.</p>
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
-      <div className="field-grid" style={{ maxWidth: "26rem" }}>
-        <label>Type <b>delete my login</b> to confirm
-          <input value={confirm} placeholder="delete my login"
-                 onChange={(e) => setConfirm(e.target.value)} /></label>
-      </div>
-      <button className="pri" disabled={leave.isPending
-                || confirm !== "delete my login"}
-              style={{ marginTop: ".8rem", background: "var(--red)" }}
-              onClick={() => leave.mutate()}>
-        {leave.isPending ? "deleting…" : "Delete my login"}
-      </button>
-    </div>
-  );
-}
-
-// Delete-account GUI over the existing /api/account/delete (full
-// tenant erasure, FRESH elevation — the sheet asks again even inside an
-// open window — rate-limited). Hosted CCPA duty and self-host courtesy
-// alike; owner-only (viewers leave the household from Family, they don't
-// erase it).
-function DeleteAccountCard({ owner }: { owner: boolean }) {
-  const [confirm, setConfirm] = useState("");
-  const [err, setErr] = useState<string | null>(null);
-  const del = useMutation({
-    // the typed phrase is the are-you-sure; identity is the sheet's job
-    mutationFn: () => api.accountDelete(),
-    // land on the dedicated confirmation page, not a bare login form
-    onSuccess: () => { window.location.href = "/app/account-deleted"; },
-    onError: (e) => {
-      const m = String(e instanceof Error ? e.message : e);
-      setErr(m.includes("too many requests") ? "Too many attempts - try later."
-        : errText(e));
-    },
-  });
-  if (!owner) return null;
-  return (
-    <div className="card" style={{ borderColor: "rgba(224,105,93,.45)" }}>
-      <h2 style={{ color: "var(--red)" }}>Delete account</h2>
-      <p className="mut">Erases this household permanently: every account,
-        transaction, budget, and setting — and signs everyone out. There is
-        no undo. Export your data first (Data section) if you want a copy.</p>
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
-      <div className="field-grid" style={{ maxWidth: "26rem" }}>
-        <label>Type <b>delete everything</b> to confirm
-          <input value={confirm} placeholder="delete everything"
-                 onChange={(e) => setConfirm(e.target.value)} /></label>
-      </div>
-      <button className="pri" disabled={del.isPending
-                || confirm !== "delete everything"}
-              style={{ marginTop: ".8rem", background: "var(--red)" }}
-              onClick={() => del.mutate()}>
-        {del.isPending ? "deleting…" : "Delete my account forever"}
-      </button>
     </div>
   );
 }
@@ -5469,17 +5570,18 @@ function SupportAccessCard({ owner }: { owner: boolean }) {
       <h2>Support access</h2>
       <p className="mut">Whoever runs this instance can never see your data
         unless you grant it. A grant is time-boxed, revocable, and every access it
-        allows is logged.</p>
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+        allows is logged.{" "}
+        <Link to="/help?topic=security">How this works</Link></p>
+      {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
       {g.granted ? (
-        <div className="note good" style={{ display: "block" }}>
+        <Note tone="good" style={{ display: "block" }}>
           Support access is <b>on</b>{g.expires_at &&
             <> until {new Date(g.expires_at).toLocaleString()}</>}.
           {g.reason && <div className="sub">Reason: {g.reason}</div>}
           {owner && <button style={{ marginTop: ".5rem" }}
             disabled={revoke.isPending}
             onClick={() => revoke.mutate()}>revoke now</button>}
-        </div>
+        </Note>
       ) : owner ? (
         <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                       alignItems: "center" }}>
@@ -5490,7 +5592,7 @@ function SupportAccessCard({ owner }: { owner: boolean }) {
               <option value={72}>3 days</option>
               <option value={168}>7 days</option>
             </select></label>
-          <input value={reason} placeholder="reason (optional)"
+          <input aria-label="Reason (optional)" value={reason} placeholder="reason (optional)"
                  style={{ minWidth: "14rem" }}
                  onChange={(e) => setReason(e.target.value)} />
           <button className="pri" disabled={grant.isPending}
@@ -5539,7 +5641,15 @@ function SessionsCard() {
       if (v.all_others) qc.invalidateQueries({ queryKey: ["devices"] }); },
     onError: stepErr,
   });
-  if (q.isPending || q.isLoadingError) return null;
+  if (q.isPending) return null;
+  // a failed read keeps the card, saying so: gone, it read as signed in
+  // nowhere else
+  if (q.data === undefined)
+    return (
+      <div className="card" style={{ marginTop: "1rem" }}>
+        <h2>Sessions</h2>
+        <FailedLine q={q} what="the sessions" />
+      </div>);
   // a shared login's roster is other visitors' — the server withholds it,
   // and an empty "everywhere you're signed in" card would be untrue
   if (q.data.hidden) return null;
@@ -5547,25 +5657,35 @@ function SessionsCard() {
   return (
     <div className="card" style={{ marginTop: "1rem" }}>
       <h2>Sessions</h2>
-      <p className="mut">Everywhere you're signed in. Changing your password
-        (or confirming 2FA) signs out every other session automatically.</p>
+      <p className="mut">Everywhere you're signed in.{" "}
+        <Link to="/help?topic=security">How this works</Link></p>
+      <StaleLine query={q} />
       <table>
         <tbody>
           {rows.map((s) => (
             <tr key={s.id}>
               <td>{browserLabel(s.user_agent)}
-                {s.ip && <span className="mut"> · {s.ip}</span>}
+                {s.ip && <span className="mut" style={{ whiteSpace: "nowrap" }}>
+                  {" "}{s.ip}</span>}
                 {s.current && <span className="pill g" style={{ marginLeft: 6 }}>this device</span>}
               </td>
-              <td className="mut">signed in {mmdd(s.created_at)}
-                {s.last_seen && ` · active ${mmdd(s.last_seen)}`}
-                {` · expires ${mmdd(s.expires_at)}`}</td>
+              {/* each fact whole, spaced rather than dotted: in a narrow
+                  cell a separator would end one line or start the next */}
+              <td className="mut">
+                {[`signed in ${mmdd(s.created_at)}`,
+                  s.last_seen ? `active ${mmdd(s.last_seen)}` : null,
+                  `expires ${mmdd(s.expires_at)}`].filter(Boolean).map((t) => (
+                  <span key={t} style={{ display: "inline-block",
+                                         whiteSpace: "nowrap",
+                                         marginRight: ".7rem" }}>{t}</span>))}
+              </td>
               <td style={{ textAlign: "right" }}>
                 {!s.current && (
                   <button disabled={revoke.isPending
                               && (revoke.variables?.id === s.id
                                   || !!revoke.variables?.all_others)}
                           title="Sign this session out"
+                          style={{ whiteSpace: "nowrap" }}
                           onClick={() => revoke.mutate({ id: s.id })}>
                     {revoke.isPending && revoke.variables?.id === s.id
                       ? "signing out…" : "sign out"}
@@ -5576,6 +5696,9 @@ function SessionsCard() {
           ))}
         </tbody>
       </table>
+      {/* the phones are their own read: a failed one is not "no phones" */}
+      {devQ.data === undefined && devQ.isError && (
+        <FailedLine q={devQ} what="the mobile devices" />)}
       {(devQ.data?.devices.length ?? 0) > 0 && (
         <>
           <h3 style={{ marginTop: "1rem" }}>Mobile devices</h3>
@@ -5610,8 +5733,8 @@ function SessionsCard() {
       {(rows.filter((s) => !s.current).length > 0
         || (devQ.data?.devices.length ?? 0) > 0) && (
         <>
-          {allErr && <div className="note bad"
-            onClick={() => setAllErr(null)}>{allErr}</div>}
+          {allErr && <Note tone="bad"
+            onDismiss={() => setAllErr(null)}>{allErr}</Note>}
           <div style={{ display: "flex", gap: ".5rem", marginTop: ".5rem",
                         flexWrap: "wrap", alignItems: "center" }}>
             <button disabled={revoke.isPending}
@@ -5688,7 +5811,7 @@ function HomePageCard() {
       <h2>Home page</h2>
       <p className="mut">Where each app opens. Applied once per launch —
         the logo still goes to Today.</p>
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+      {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
       <div className="field-grid">
         <label>Web app opens on
           <select value={webHomes.some(([r]) => r === q.data?.home_web)

@@ -10,22 +10,27 @@ import { Alert, Linking, Modal, Pressable, ScrollView, StyleSheet, Text,
          TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card, H, HelpLink, KV, Pill } from "../components/ui";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, H, HelpLink, KV, Pill, Note } from "../components/ui";
 import { AccountChoice, discardPicked, errText, Batch, ColumnMappingNeeded, ImportOutcome,
          ImportResult, MappingNeeded, PickedFile, PlanFile, SyncStatus,
-         TaxdocPlan, TaxdocRow, YnabAccountsNeeded, YnabDestination }
+         ApiError, StoredDoc, TaxdocPlan, W2Match, TaxdocRow, YnabAccountsNeeded,
+         YnabDestination }
   from "../lib/api";
 import { BulkJob, BulkJobStatus, bulkJobHeadline, bulkJobLive, bulkJobPoll,
-         choiceDetail, describedChoiceOptions,
+         choiceDetail, describedChoiceOptions, importCountText,
          keptRowsNote, keptRowsQuestion, money, parseMoneyDraft,
-         planUnplaced, YNAB_SEVERAL, ynabAllAnswered } from "../lib/pure";
+         planUnplaced, YNAB_SEVERAL, ynabAllAnswered, EMPTY_LINES,
+         connectionStateWords }
+  from "../lib/pure";
 import { patchQuery, removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { useOwner, useSharedLock, useViewer } from "../lib/viewer";
 import { C, mmddyy } from "../lib/theme";
+import { checkbox, useSheetAnimation } from "../lib/a11y";
 import { HistoryChoice } from "../components/wizard-history";
 import { HISTORY_CHOICES, historyMonthsOf } from "../components/wizard-logic";
+import { fieldA11y } from "../components/field";
 
 // A whole-ledger restore runs as a background job on the server — a big
 // archive takes minutes, longer than any request should be held open — so
@@ -46,9 +51,26 @@ function RestoreProgressLine() {
       {st.progress.error ?? "the restore failed"}</Text>;
   if (st.state === "done") {
     const r = st.progress.result;
-    return <Text style={{ color: C.mut, fontSize: 12 }}>
-      Restored {r?.imported ?? 0} transactions.
-      {(r?.warnings ?? []).map((w) => ` ${w}.`).join("")}</Text>;
+    // rows the restore could not read are said apart from the result and
+    // above it, as the web does; an older server sends no `skipped`, and
+    // then nothing is shown for it
+    const skipped = r?.skipped ?? [];
+    const said = new Set(skipped.map((k) => k.sentence));
+    const warnings = (r?.warnings ?? []).filter((w) => !said.has(w));
+    return <View>
+      {skipped.length > 0 && (
+        <View style={{ marginBottom: 6 }} accessibilityLiveRegion="polite">
+          <Text style={{ color: C.warn, fontWeight: "600" }}>
+            Some rows could not be read and were left out</Text>
+          {skipped.map((k) => (
+            <Text key={k.table} style={{ color: C.warn }}>{k.sentence}</Text>
+          ))}
+        </View>
+      )}
+      <Text style={{ color: C.mut, fontSize: 12 }}>
+        Restored {r?.imported ?? 0} transactions.
+        {warnings.map((w) => ` ${w}.`).join("")}</Text>
+    </View>;
   }
   const p = st.progress ?? {};
   return (
@@ -143,7 +165,7 @@ function BulkJobCard({ onSettled }: { onSettled: (j: BulkJob) => void }) {
                            fontSize: 12 }}>
               • {f.name}: {f.state === "running" ? "importing…"
                 : f.ok ? (f.restore_started ? "restoring…"
-                          : `${f.imported ?? 0} transactions`
+                          : importCountText(f, "file")
                             + (n.corrected
                               ? ` · corrected ${n.corrected} an earlier `
                                 + "import read differently (sign or year)"
@@ -161,7 +183,7 @@ function BulkJobCard({ onSettled }: { onSettled: (j: BulkJob) => void }) {
         );
       })}
       {live && (
-        <Pressable style={[s.btn, s.btnQuiet,
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                            { alignSelf: "flex-start", marginTop: 8 },
                            (cancel.isPending || job.state === "cancelling")
                              && { opacity: 0.5 }]}
@@ -226,7 +248,8 @@ function AccountChoices({ choices, busy, onPick }: {
     <View style={{ marginTop: 6 }}>
       {choices.map((c) => (
         <View key={c.id} style={{ marginTop: 6 }}>
-          <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start" },
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet, { alignSelf: "flex-start" },
                              busy && { opacity: 0.5 }]}
                      disabled={busy} onPress={() => onPick(c.id)}>
             <Text style={s.btnText}>
@@ -245,8 +268,9 @@ function OptionSheet({ title, open, options, onPick, onClose }: {
   options: [string, string][];
   onPick: (v: string) => void; onClose: () => void;
 }) {
+  const sheetAnim = useSheetAnimation();
   return (
-    <Modal visible={open} animationType="slide" transparent
+    <Modal visible={open} animationType={sheetAnim} transparent
            onRequestClose={onClose}>
       <View style={s.sheetWrap}>
         <View style={s.sheet}>
@@ -255,13 +279,13 @@ function OptionSheet({ title, open, options, onPick, onClose }: {
             {options.map(([v, l], i) => (
               // index-qualified keys: duplicate column names are common
               // in bank exports and collide otherwise
-              <Pressable key={`${i}-${v}`} style={s.optRow}
+              <Pressable accessibilityRole="button" key={`${i}-${v}`} style={s.optRow}
                          onPress={() => { onPick(v); onClose(); }}>
                 <Text style={{ color: C.text, fontSize: 15 }}>{l}</Text>
               </Pressable>
             ))}
           </ScrollView>
-          <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "center" }]}
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet, { alignSelf: "center" }]}
                      onPress={onClose}>
             <Text style={[s.btnText, { color: C.mut }]}>Close</Text>
           </Pressable>
@@ -457,7 +481,7 @@ export default function Imports() {
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => Promise.all([
                                         batches.refetch(), status.refetch()])} />}>
-      <StaleBanner query={batches} />
+      <StaleLine query={batches} />
       <Card>
         <H>Sync</H>
         <Text style={s.mut}>
@@ -470,7 +494,7 @@ export default function Imports() {
         </Text>
         {!viewer && !demo && (
         <View style={{ flexDirection: "row", marginTop: 8 }}>
-          <Pressable
+          <Pressable accessibilityRole="button"
             style={[s.btn, (st === "running" || start.isPending)
                      && { opacity: 0.5 }]}
             disabled={st === "running" || start.isPending}
@@ -500,8 +524,10 @@ export default function Imports() {
                            (c) => c.status && c.status !== "ok"))
                            ? C.warn : C.mut,
                          fontSize: 12, marginTop: 6 }}>
+            {/* each connection's state in the words its Accounts row
+                uses, never the raw status string */}
             {conns.data!.connections.map((c) =>
-              `${c.institution_name ?? c.id}: ${c.status ?? "ok"}`)
+              `${c.institution_name ?? c.id}: ${connectionStateWords(c)}`)
               .join(" · ")}
           </Text>
         )}
@@ -521,7 +547,7 @@ export default function Imports() {
           )}
           <Card>
             <H>Import files</H>
-            <Pressable style={[s.btn, { alignSelf: "flex-start" },
+            <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start" },
                          (demo || escalate.isPending || restore.isPending)
                            && { opacity: 0.5 }]}
                        disabled={demo || escalate.isPending || restore.isPending}
@@ -564,9 +590,9 @@ export default function Imports() {
             <Card>
               {res.error ? (
                 <>
-                  <Text style={{ color: C.bad, fontSize: 13 }}>
+                  <Note bad style={{ color: C.bad, fontSize: 13 }}>
                     {res.error}
-                  </Text>
+                  </Note>
                   {/* the file goes to the card picked; the YNAB card asks
                       on its own row */}
                   {!!res.choices?.length && !mapping && escalate.variables && (
@@ -578,26 +604,19 @@ export default function Imports() {
                 </>
               ) : (
                 <>
-                  <Text style={{ color: C.good, fontSize: 13,
+                  <Note style={{ color: C.good, fontSize: 13,
                                  lineHeight: 19 }}>
                     {res.source ? (
                       <Text style={{ fontWeight: "700" }}>
                         {res.source} —{" "}
                       </Text>
                     ) : null}
-                    Imported{" "}
-                    <Text style={{ fontWeight: "700" }}>
-                      {res.imported ?? 0}
-                    </Text>
-                    {" transactions"}
-                    {res.skipped_duplicates
-                      ? ` · skipped ${res.skipped_duplicates} already covered`
-                      : ""}
+                    {importCountText(res)}
                     {res.corrected
                       ? ` · corrected ${res.corrected} an earlier import `
                         + "read differently (sign or year)"
                       : ""}.
-                  </Text>
+                  </Note>
                   <OlderRowsNote n={res.skipped_older} />
                   {res.note ? <Text style={s.mut}>{res.note}</Text> : null}
                   {res.kept_annotated ? (
@@ -684,12 +703,16 @@ export default function Imports() {
           {taxFiles.map((f, i) => (
             <TaxDocsCard key={`${i}:${f.uri}`} file={f} />
           ))}
+          <StoredDocuments readOnly={viewer || demo} />
         </>
       )}
 
       <Card>
         <H>Recent imports</H>
         {batches.isPending && <Text style={s.mut}>Loading…</Text>}
+        {/* a failed read is not "no imports": no undo, and it says so */}
+        {batches.data === undefined && batches.isError && (
+          <FailedLine q={batches} what="the recent imports" />)}
         {(batches.data?.batches ?? []).slice(0, 15).map((b) => (
           <View key={b.id} style={{ flexDirection: "row",
                                     alignItems: "center", gap: 8 }}>
@@ -722,8 +745,15 @@ export default function Imports() {
           </Text>
         )}
         {batches.data && batches.data.batches.length === 0 && (
-          <Text style={s.mut}>No file imports yet.</Text>
+          <Text style={s.mut}>{EMPTY_LINES.imports}</Text>
         )}
+        {/* accounts filled from files no batch here imported: the
+            server's words (web same) */}
+        {batches.data && batches.data.batches.length === 0
+          && batches.data.older_imports_line ? (
+          <Text style={[s.mut, { fontSize: 12 }]}>
+            {batches.data.older_imports_line}</Text>
+        ) : null}
       </Card>
       <HelpLink topic="import-history" />
     </ScrollView>
@@ -846,6 +876,7 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
                              gap: 8 }}>
                 <Text style={{ color: f.action === "import"
                                  ? C.accent : C.mut, fontSize: 18 }}
+                      {...checkbox(f.action === "import", `Import ${f.name}`)}
                       onPress={() => {
                         if (f.kind === "unsupported" || f.oversized) return;
                         patch(f.index, { action: f.action === "import"
@@ -872,7 +903,8 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
               )}
               {f.account_id === null && !f.choices?.length
                 && f.kind !== "Oikonome export ZIP" && (
-                <TextInput style={s.input} placeholder="new account name"
+                <TextInput {...fieldA11y(`New account name for ${f.name}`)}
+                           style={s.input} placeholder="new account name"
                            placeholderTextColor={C.mut}
                            value={f.new_account_name}
                            onChangeText={(v) =>
@@ -896,9 +928,9 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
             </View>
           ))}
           {err ? (
-            <Text style={{ color: C.bad, fontSize: 12 }}>{err}</Text>
+            <Note bad style={{ color: C.bad, fontSize: 12 }}>{err}</Note>
           ) : null}
-          <Pressable style={[s.btn, { alignSelf: "flex-start",
+          <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start",
                        marginTop: 8 },
                        (run.isPending || !importable.length || unplaced)
                          && { opacity: 0.5 }]}
@@ -1021,7 +1053,8 @@ function YnabAccountsCard({ need, onDone }: {
             </Text>
           </Text>
           {dest[a.name] === "__new__" && (
-            <TextInput style={s.input} placeholder="new account name"
+            <TextInput {...fieldA11y(`New account name for ${a.name}`)}
+                       style={s.input} placeholder="new account name"
                        placeholderTextColor={C.mut}
                        value={newName[a.name] ?? ""}
                        onChangeText={(v) =>
@@ -1038,6 +1071,9 @@ function YnabAccountsCard({ need, onDone }: {
           {a.stored_on_pick > 0 && !!dest[a.name]
             && dest[a.name] !== need.pick && (
             <Text style={s.mut}
+                  {...checkbox(!!remove[a.name], `remove the ${a.stored_on_pick} row`
+                    + `${a.stored_on_pick === 1 ? "" : "s"} an earlier import of `
+                    + `this file put on ${pickName}`)}
                   onPress={() => setRemove({ ...remove,
                                              [a.name]: !remove[a.name] })}>
               <Text style={{ color: C.accent, fontSize: 16 }}>
@@ -1056,7 +1092,8 @@ function YnabAccountsCard({ need, onDone }: {
           Undoing this import later does not bring removed rows back.
         </Text>
       )}
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 8 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 8 },
                    (!ready || finish.isPending) && { opacity: 0.5 }]}
                  disabled={!ready || finish.isPending}
                  onPress={() => finish.mutate()}>
@@ -1183,7 +1220,8 @@ function MappingCard({ need, onDone }: {
           ))}
         </>
       )}
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 8 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 8 },
                    (!ready || finish.isPending) && { opacity: 0.5 }]}
                  disabled={!ready || finish.isPending}
                  onPress={() => finish.mutate()}>
@@ -1237,6 +1275,213 @@ function settleW2Rows(rows: TaxdocRow[], drafts: Record<string, string>,
   return { ok: true, rows: out };
 }
 
+// The stored W-2s a refused save says each row looks like (a 409 that
+// carries `matches`), or null for any other failure.
+function w2LookalikesOf(e: unknown): W2Match[][] | null {
+  if (!(e instanceof ApiError) || e.status !== 409) return null;
+  const b = e.body as { matches?: unknown } | undefined;
+  return Array.isArray(b?.matches) ? b!.matches as W2Match[][] : null;
+}
+
+// The people a W-2 can belong to are the server's (w2_people,
+// taxdocs.w2_people): the primary earner, and the spouse only in a
+// household that has one — as on the web.
+type W2Person = "primary" | "spouse";
+type W2People = { owner: W2Person; label: string }[];
+function w2PeopleOf(sent: W2People | undefined): W2People {
+  return sent !== undefined ? sent
+    // older-server path: stands in for `w2_people`
+    : [{ owner: "primary", label: "Primary earner" },
+       { owner: "spouse", label: "Spouse" }];
+}
+const W2_WHOSE: Record<string, string> =
+  { primary: "the primary earner", spouse: "the spouse",
+    unassigned: "nobody yet" };
+
+function W2PersonPicker({ value, onPick, disabled, people }: {
+  value: W2Person | "unassigned"; onPick: (p: W2Person) => void;
+  disabled?: boolean; people: W2People;
+}) {
+  return (
+    <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap" }}>
+      {people.map(({ owner: v, label }) => (
+        <Pressable key={v} disabled={disabled || v === value}
+                   accessibilityRole="radio"
+                   accessibilityState={{ selected: v === value }}
+                   style={[s.btn, { paddingHorizontal: 10, paddingVertical: 5 },
+                           v !== value && s.btnQuiet,
+                           disabled && { opacity: 0.5 }]}
+                   onPress={() => onPick(v)}>
+          <Text style={[s.btnText, { fontSize: 12 },
+                        v !== value && { color: C.mut }]}>{label}</Text>
+        </Pressable>
+      ))}
+    </View>
+  );
+}
+
+// Every stored tax and income document: what each is, the years it wrote,
+// whose, the file and when — and the way to take one away (put back for 30
+// days). The words are the server's (GET /api/import/taxdoc/stored); a
+// W-2 keeps its whose-picker. Other forms feed no figure and sit
+// collapsed. Hidden until there is one. Web twin: StoredDocuments in
+// webapp/src/pages/Import.tsx.
+function StoredDocuments({ readOnly }: { readOnly: boolean }) {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const key = ["taxdoc-stored"];
+  const list = useQuery({ queryKey: key,
+    queryFn: () => client!.taxdocStored(), enabled: !!client, retry: false });
+  const [open, setOpen] = useState<Record<string, boolean>>({});
+  // every figure the stored income feeds is read again once one moved
+  const moved = () => {
+    qc.invalidateQueries({ queryKey: key });
+    qc.invalidateQueries({ queryKey: ["taxdoc-w2s"] });
+    qc.invalidateQueries({ queryKey: ["report", "cashflow"] });
+    qc.invalidateQueries({ queryKey: ["retirement"] });
+  };
+  const failed = (title: string) => (e: unknown) => {
+    Alert.alert(title, errText(e));
+    qc.invalidateQueries({ queryKey: key });
+  };
+  const remove = useMutation({
+    mutationFn: (d: StoredDoc) => client!.taxdocStoredDelete(d),
+    onSuccess: moved, onError: failed("Not removed"),
+  });
+  const putBack = useMutation({
+    mutationFn: (d: StoredDoc) => client!.taxdocStoredRestore(d),
+    onSuccess: moved, onError: failed("Not put back"),
+  });
+  const assign = useMutation({
+    mutationFn: (v: { w: StoredDoc["w2s"][number]; owner: W2Person }) =>
+      client!.taxdocW2Owner(v.w, v.owner),
+    onSuccess: moved, onError: failed("Not changed"),
+  });
+  // the payer's name, corrected in place: no figure reads it, so no confirm
+  const [naming, setNaming] = useState<{ id: number; draft: string } | null>(null);
+  const rename = useMutation({
+    mutationFn: (v: { d: StoredDoc; name: string }) =>
+      client!.taxdocStoredPayer(v.d, v.name),
+    onSuccess: () => { setNaming(null); moved(); },
+    onError: failed("Not renamed"),
+  });
+  // the confirm says what the removal does, in the server's words
+  const askRemove = async (d: StoredDoc) => {
+    try {
+      const fx = await client!.taxdocStoredEffect(d);
+      Alert.alert(`Remove the ${d.kind_label}?`,
+        `${d.years_label}\n\n${fx.effect_line}\n\nYou can put it back for 30 days.`,
+        [{ text: "Remove", style: "destructive",
+           onPress: () => remove.mutate(d) },
+         { text: "Cancel", style: "cancel" }]);
+    } catch (e) {
+      failed("Not removed")(e);
+    }
+  };
+  const docs = list.data?.documents ?? [];
+  if (list.data === undefined && list.isError)
+    return (
+      <Card>
+        <H>Stored tax & income documents</H>
+        <FailedLine q={list} what="the stored documents" />
+      </Card>);
+  if (!docs.length) return null;
+  const busy = remove.isPending || putBack.isPending || assign.isPending
+    || rename.isPending;
+  return (
+    <Card>
+      <H>Stored tax & income documents</H>
+      <Text style={[s.mut, { fontSize: 12, marginBottom: 4 }]}>
+        Each year uses the newest document that gives the figure. Remove one
+        and the next older document's figure takes its place, or the year
+        goes blank; a person's wages go back to the sum of their W-2s.
+      </Text>
+      {(list.data?.groups ?? []).map((g) => {
+        const rows = docs.filter((d) => d.group === g.key);
+        const shown = !g.collapsed || open[g.key];
+        return (
+          <View key={g.key} style={{ marginTop: 6 }}>
+            {g.collapsed ? (
+              <Text style={{ color: C.accent, fontSize: 13 }}
+                    accessibilityRole="button"
+                    accessibilityState={{ expanded: !!shown }}
+                    onPress={() => setOpen({ ...open, [g.key]: !shown })}>
+                {shown ? "▾" : "▸"} {g.label}</Text>
+            ) : (
+              <Text style={{ color: C.text, fontSize: 13, fontWeight: "600" }}>
+                {g.label}</Text>
+            )}
+            {shown && rows.map((d) => (
+              <View key={d.id} style={[s.planRow, d.removed && { opacity: 0.6 }]}>
+                <Text style={{ color: C.text, fontSize: 14 }}>
+                  {d.kind_label} · {d.years_label}
+                  {d.employer_shown ? ` · ${d.employer_shown}` : ""}
+                  {d.abbreviated ? " (as the IRS abbreviates it)" : ""}
+                </Text>
+                {naming?.id === d.id ? (
+                  <View style={{ flexDirection: "row", alignItems: "center",
+                                 gap: 8 }}>
+                    <TextInput {...fieldA11y("Payer's name")}
+                               style={[s.input, { flex: 1 }]} maxLength={120}
+                               value={naming.draft} autoFocus
+                               onChangeText={(t) => setNaming({ id: d.id, draft: t })} />
+                    <Text style={[{ color: C.accent, fontSize: 12, padding: 4 },
+                                  (busy || !naming.draft.trim()) && { opacity: 0.4 }]}
+                          accessibilityRole="button"
+                          onPress={() => !busy && naming.draft.trim()
+                            && rename.mutate({ d, name: naming.draft.trim() })}>
+                      save</Text>
+                    <Text style={{ color: C.mut, fontSize: 12, padding: 4 }}
+                          accessibilityRole="button"
+                          onPress={() => setNaming(null)}>cancel</Text>
+                  </View>
+                ) : !readOnly && d.payer && d.removable ? (
+                  <Text style={[{ color: C.accent, fontSize: 12, padding: 4,
+                                  alignSelf: "flex-start" },
+                                busy && { opacity: 0.4 }]}
+                        accessibilityRole="button"
+                        accessibilityLabel={`Rename the payer ${d.employer_shown ?? ""}`}
+                        onPress={() => !busy && setNaming(
+                          { id: d.id, draft: d.employer_shown ?? "" })}>
+                    rename payer</Text>
+                ) : null}
+                <Text style={{ color: C.mut, fontSize: 11 }}>
+                  {d.removed_label ?? d.stored_label}
+                  {d.whose_label ? ` · ${d.whose_label}` : ""}
+                  {d.filename ? ` · ${d.filename}` : ""}
+                </Text>
+                {d.w2s.map((w) => (
+                  <View key={w.id} style={{ flexDirection: "row",
+                                            alignItems: "center", gap: 8 }}>
+                    <Text style={{ color: C.mut, fontSize: 12 }}>
+                      {w.year} W-2 · box 1{" "}
+                      {w.box1 == null ? "unread" : money(w.box1, false)}
+                      {w.ein ? ` · EIN ${w.ein}` : ""}
+                    </Text>
+                    <W2PersonPicker value={w.owner} disabled={readOnly || busy}
+                      people={w2PeopleOf(list.data?.w2_people)}
+                      onPick={(owner) => assign.mutate({ w, owner })} />
+                  </View>
+                ))}
+                {!readOnly && (d.removable || d.restorable) && (
+                  <Text style={[{ color: C.accent, fontSize: 12, padding: 4,
+                                  alignSelf: "flex-end" },
+                                busy && { opacity: 0.4 }]}
+                        accessibilityRole="button"
+                        onPress={() => !busy && (d.removable
+                          ? askRemove(d) : putBack.mutate(d))}>
+                    {d.removable ? "remove" : "put back"}
+                  </Text>
+                )}
+              </View>
+            ))}
+          </View>
+        );
+      })}
+    </Card>
+  );
+}
+
 function TaxDocsCard({ file }: { file: PickedFile | null }) {
   const { client } = useSession();
   const qc = useQueryClient();
@@ -1262,6 +1507,14 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [picked, setPicked] = useState<Set<number>>(new Set());
   const [msg, setMsg] = useState<{ text: string; bad: boolean } | null>(null);
+  // A server older than the question has no stored-W-2 door: it stores
+  // every W-2 as the primary earner's whatever is picked here, so the
+  // choice is not offered against it
+  const w2door = useQuery({ queryKey: ["taxdoc-w2s"],
+    queryFn: () => client!.taxdocW2s(), enabled: !!client && !!plan,
+    retry: false });
+  const w2Owners = !(w2door.error instanceof ApiError
+                     && w2door.error.status === 404);
   const analyze = useMutation({
     mutationFn: (f: PickedFile) => client!.taxdocAnalyze(f),
     onSuccess: (p) => {
@@ -1282,14 +1535,31 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
       // projection; neither would notice for a minute otherwise
       qc.invalidateQueries({ queryKey: ["report", "cashflow"] });
       qc.invalidateQueries({ queryKey: ["retirement"] });
+      if (r.kind === "w2") qc.invalidateQueries({ queryKey: ["taxdoc-w2s"] });
       setMsg({ bad: false,
         text: r.kind === "w2"
-          ? `Stored ${r.documents} W-2 document${
-              r.documents === 1 ? "" : "s"}.`
+          ? (r.documents === 1 && r.replaced === 1
+              ? "The stored W-2 was updated."
+              : `Stored ${r.documents} W-2 document${
+                  r.documents === 1 ? "" : "s"}.`)
           : `Income history: ${r.created} year${
               r.created === 1 ? "" : "s"} added, ${r.updated} updated.` });
     },
-    onError: (e) => setMsg({ text: errText(e), bad: true }),
+    onError: (e) => {
+      // a lookalike the server found at the save (the person's own edit
+      // made the W-2 look like a stored one, or another device stored it
+      // meanwhile): its rows carry the stored W-2s back, so ask here
+      const lk = w2LookalikesOf(e);
+      if (lk && plan?.kind === "w2") {
+        const sent = rows.map((_, i) => i).filter((i) => picked.has(i));
+        setRows(rows.map((r, i) => {
+          const k = sent.indexOf(i);
+          return k >= 0 && lk[k]?.length
+            ? { ...r, matches: lk[k], replaces: undefined } : r;
+        }));
+      }
+      setMsg({ text: errText(e), bad: true });
+    },
   });
   if (!file && !plan && !msg) return null;
   const fields: [keyof TaxdocRow, string][] = plan?.kind === "ssa"
@@ -1339,10 +1609,10 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
           ? { color: C.bad, fontWeight: "600" } : undefined}>{whereLine}</Text>
       </Text>
       {msg && (
-        <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 13 }}
+        <Note bad={msg.bad} style={{ color: msg.bad ? C.bad : C.good, fontSize: 13 }}
               onPress={() => setMsg(null)}>
           {msg.text}
-        </Text>
+        </Note>
       )}
       {analyze.isPending && file && (
         <Text style={s.mut}>reading {file.name}…</Text>
@@ -1355,6 +1625,8 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
                              gap: 8 }}>
                 <Text style={{ color: picked.has(i) ? C.accent : C.mut,
                                fontSize: 18 }}
+                      accessibilityRole="checkbox" accessibilityLabel={`Import ${r.year}`}
+                      accessibilityState={{ checked: picked.has(i) }}
                       onPress={() => setPicked((p) => {
                         const n = new Set(p);
                         if (n.has(i)) n.delete(i); else n.add(i);
@@ -1374,7 +1646,8 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
                     <Text style={{ color: C.mut, fontSize: 10 }}>
                       {label}
                     </Text>
-                    <TextInput style={[s.input, { paddingVertical: 4 }]}
+                    <TextInput {...fieldA11y(String(label))}
+                               style={[s.input, { paddingVertical: 4 }]}
                                keyboardType="numbers-and-punctuation"
                                value={drafts[`${i}:${String(f)}`]
                                  ?? (r[f] == null ? "" : String(r[f]))}
@@ -1385,7 +1658,7 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
             </View>
           ))}
           <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-            <Pressable style={[s.btn,
+            <Pressable accessibilityRole="button" style={[s.btn,
                          (commit.isPending || !picked.size)
                            && { opacity: 0.5 }]}
                        disabled={commit.isPending || !picked.size}
@@ -1396,7 +1669,7 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
                       picked.size === 1 ? "" : "s"}`}
               </Text>
             </Pressable>
-            <Pressable style={[s.btn, s.btnQuiet]}
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                        onPress={() => { setPlan(null); setRows([]); }}>
               <Text style={[s.btnText, { color: C.mut }]}>cancel</Text>
             </Pressable>
@@ -1420,7 +1693,7 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
                   W-2{r.ein ? ` · EIN ${r.ein}` : ""}
                 </Text>
                 <Text style={{ color: C.mut, fontSize: 10 }}>Employer</Text>
-                <TextInput style={[s.input, { paddingVertical: 4 }]}
+                <TextInput {...fieldA11y("Employer")} style={[s.input, { paddingVertical: 4 }]}
                            placeholder="unknown employer"
                            placeholderTextColor={C.mut}
                            value={cell("employer", r.employer)}
@@ -1428,7 +1701,7 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
                 <View style={{ flexDirection: "row", gap: 6 }}>
                   <View style={{ width: "40%" }}>
                     <Text style={{ color: C.mut, fontSize: 10 }}>Year</Text>
-                    <TextInput style={[s.input, { paddingVertical: 4 }]}
+                    <TextInput {...fieldA11y("Year")} style={[s.input, { paddingVertical: 4 }]}
                                keyboardType="number-pad"
                                value={cell("year", r.year)}
                                onChangeText={(v) => setDraft(i, "year", v)} />
@@ -1437,7 +1710,8 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
                     <Text style={{ color: C.mut, fontSize: 10 }}>
                       Box 1 wages
                     </Text>
-                    <TextInput style={[s.input, { paddingVertical: 4 }]}
+                    <TextInput {...fieldA11y("Box 1 wages")}
+                               style={[s.input, { paddingVertical: 4 }]}
                                keyboardType="numbers-and-punctuation"
                                placeholder="unread"
                                placeholderTextColor={C.mut}
@@ -1445,22 +1719,88 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
                                onChangeText={(v) => setDraft(i, "box1", v)} />
                   </View>
                 </View>
+                {/* the form does not print which of the household it
+                    belongs to, and each person's wages are summed apart */}
+                {w2Owners ? (
+                  <>
+                    <Text style={{ color: C.mut, fontSize: 10 }}>Whose</Text>
+                    <W2PersonPicker value={r.owner ?? "unassigned"}
+                      people={w2PeopleOf(plan?.w2_people)}
+                      onPick={(owner) => setRows((all) => all.map((x, j) =>
+                        j === i ? { ...x, owner } : x))} />
+                  </>
+                ) : (
+                  <Text style={{ color: C.mut, fontSize: 11 }}>
+                    This server stores every W-2 as the primary earner's;
+                    update it to say whose each one is.
+                  </Text>
+                )}
+                {/* two people at one employer can earn the same box 1, so
+                    a lookalike is asked about, never merged */}
+                {r.matches?.length ? (
+                  <View style={{ gap: 4, marginTop: 4 }}>
+                    <Text style={{ color: C.text, fontSize: 12 }}>
+                      This looks like a W-2 already stored. Is it…
+                    </Text>
+                    {[...r.matches.map((m) => ({ id: m.id as number | null,
+                        label: `The same form as the one for ${
+                          W2_WHOSE[m.owner] ?? "nobody yet"} (${
+                          m.box1 == null ? "unread" : money(m.box1, false)
+                        }) — replace it` })),
+                      { id: null, label: "A second W-2 — keep both" },
+                    ].map((o) => {
+                      const on = r.replaces === o.id;
+                      return (
+                        <Pressable key={String(o.id)}
+                                   accessibilityRole="radio"
+                                   accessibilityState={{ selected: on }}
+                                   style={[s.btn, { paddingVertical: 5 },
+                                           !on && s.btnQuiet]}
+                                   onPress={() => setRows((all) => all.map(
+                                     (x, j) => j === i
+                                       ? { ...x, replaces: o.id } : x))}>
+                          <Text style={[s.btnText, { fontSize: 12 },
+                                        !on && { color: C.mut }]}>
+                            {o.label}
+                          </Text>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                ) : null}
               </View>
             );
           })}
           <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-            <Pressable style={[s.btn, commit.isPending && { opacity: 0.5 }]}
+            <Pressable accessibilityRole="button"
+                       style={[s.btn, commit.isPending && { opacity: 0.5 }]}
                        disabled={commit.isPending}
                        onPress={() => {
                          const v = settleW2Rows(rows, drafts, parseMoneyDraft);
                          if (!v.ok) { setMsg({ text: v.error, bad: true }); return; }
-                         commit.mutate(v.rows);
+                         // whose it is decides whose wages it adds to, and
+                         // a lookalike is the same form or a second one:
+                         // both are asked, never assumed
+                         if (w2Owners && v.rows.some((r) => !r.owner)) {
+                           setMsg({ text: "Say whose each W-2 is first.",
+                                    bad: true });
+                           return;
+                         }
+                         if (v.rows.some((r) => r.matches?.length
+                                          && r.replaces === undefined)) {
+                           setMsg({ text: "Say whether this is the W-2 "
+                                    + "already stored or a second one.",
+                                    bad: true });
+                           return;
+                         }
+                         commit.mutate(v.rows.map(
+                           ({ matches: _m, ...r }) => r));
                        }}>
               <Text style={s.btnText}>
                 {commit.isPending ? "saving…" : "Store W-2"}
               </Text>
             </Pressable>
-            <Pressable style={[s.btn, s.btnQuiet]}
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                        onPress={() => { setPlan(null); setRows([]); }}>
               <Text style={[s.btnText, { color: C.mut }]}>cancel</Text>
             </Pressable>
@@ -1474,14 +1814,14 @@ function TaxDocsCard({ file }: { file: PickedFile | null }) {
 const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   mut: { color: C.mut, fontSize: 12, lineHeight: 17 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 16, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 14, fontWeight: "600" },
   planRow: { borderTopColor: C.border,
              borderTopWidth: StyleSheet.hairlineWidth,
              paddingVertical: 8, gap: 4 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 7 },
   sheetWrap: { flex: 1, justifyContent: "flex-end",

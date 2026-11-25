@@ -155,8 +155,8 @@ class CardCompositionTests(unittest.TestCase):
         self.assertEqual(c["left"], 0.0)
         self.assertTrue(c["over"])
         self.assertEqual(c["status_tone"], "neg")
-        self.assertIn("over by $50", c["status"])
-        self.assertIn("variable", c["status"])
+        self.assertIn("$50 past the pool this month, counted in spending",
+                      c["status"])
 
     def test_fixed_pin_unpaid_says_due(self):
         due = TODAY + dt.timedelta(days=3)
@@ -216,12 +216,12 @@ class EmailMirrorTests(unittest.TestCase):
 
     def test_html_has_the_card(self):
         _, _, html = report.build(self.d)
-        self.assertIn("Pinned bills", html)
+        self.assertIn("Pinned", html)
         self.assertIn("used $300 of $1,200 this month", html)
 
     def test_plain_has_the_card(self):
         _, plain, _ = report.build(self.d)
-        self.assertIn("Pinned bills:", plain)
+        self.assertIn("Pinned:", plain)
         self.assertIn("Pet Care $900 left", plain)
 
     def test_no_pins_no_section(self):
@@ -229,8 +229,8 @@ class EmailMirrorTests(unittest.TestCase):
                  frequency=None, interval=1, category="PETS",
                  match_category=True, show_today=False)
         _, plain, html = report.build(report.gather(self.conn, self.NOW))
-        self.assertNotIn("Pinned bills", html)
-        self.assertNotIn("Pinned bills", plain)
+        self.assertNotIn("Pinned", html)
+        self.assertNotIn("Pinned", plain)
 
 
 class SaveBillFlagTests(unittest.TestCase):

@@ -75,7 +75,7 @@ export default function SplitPanel({ t, catGroups, known, onDone }:
     <div style={{ display: "flex", flexDirection: "column", gap: ".45rem",
                   padding: ".2rem 0" }}>
       <div className="sub">
-        Split <b>{fmt(total)}</b> at <b>{t.payee}</b> across categories —
+        Split <b>${fmt(total)}</b> at <b>{t.payee}</b> across categories —
         the parts must add up to the charge.
         {t.split_source && t.split_source !== "user" && (
           <> These parts follow the receipt's items; saving makes them yours,

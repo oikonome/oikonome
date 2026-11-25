@@ -152,7 +152,9 @@ class RestoreUploadRouteTests(unittest.TestCase):
         try:
             up = _ChunkedUpload(len(payload), head=payload)
             up.filename = "oikonome-export.zip"
+            import types
             asyncio.run(pages.import_submit(
+                request=types.SimpleNamespace(state=types.SimpleNamespace()),
                 user={"tenant_id": tid, "role": "owner"},
                 account_id="", amount_sign="bank", file=up,
                 password="", totp_code="", recovery_code=""))

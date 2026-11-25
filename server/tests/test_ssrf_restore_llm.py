@@ -115,7 +115,10 @@ class RestoreConfigGuardTests(unittest.TestCase):
     def test_happy_path_config_still_merges_and_keeps_secrets(self):
         # destination's credential-shaped keys survive; the ZIP's benign
         # config lands — the guard must not break real migration
+        # the key stays because the archive names the endpoint it was
+        # saved for; a key is never carried onto another endpoint
         cfg = budget.load_config(self.conn)
+        cfg["llm_url"] = "https://api.openai.com"
         cfg["llm_api_key"] = "enc:keep-me"
         budget.save_config(self.conn, cfg)
         data = _export_zip(

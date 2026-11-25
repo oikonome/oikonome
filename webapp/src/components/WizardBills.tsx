@@ -1,12 +1,15 @@
 import { useMutation, useQuery, useQueryClient, type QueryClient }
   from "@tanstack/react-query";
-import { useEffect, useRef, useState } from "react";
-import { api, errText, money as money$, proposalSuperseded, toast,
+import { useEffect, useId, useRef, useState } from "react";
+import { api, errText, mmdd, money as money$, proposalSuperseded, toast,
          type BillsData, type Proposal, type ProposalAdjust, type SetupMode }
   from "../api/client";
-import { cadenceChoices, cadenceWords } from "../cadence";
-import { TWICE_A_MONTH, cadencePick, onSeveralDays, withSeveralDays } from "../monthdays";
-import { parseMoneyDraft, scanAlreadyRunning, SCAN_RUNNING_RETRY_MS } from "../moneymath";
+import { cadenceChoices } from "../cadence";
+import { TWICE_A_MONTH, cadencePick, withSeveralDays } from "../monthdays";
+import { approveAllWords, parseMoneyDraft, scanAlreadyRunning,
+         SCAN_RUNNING_RETRY_MS } from "../moneymath";
+import { fieldProps } from "./Field";
+import { FailedLine } from "./Loaded";
 
 // The setup wizard's bills step: the question (find them, or type them),
 // then one of two panes. The Bills page stays the full editor; these panes
@@ -65,9 +68,10 @@ export const SETUP_CHOICES: { mode: SetupMode; title: string;
       + "still never adds a bill without your approval." },
 ];
 
-/** Two option cards; a tap is the choice (the wizard saves it). */
+/** Two option cards; a tap is the choice (the wizard saves it). `mode`
+ *  null: the stored answer has not been read, so neither card is marked. */
 export function SetupQuestion({ mode, onPick, busy }: {
-  mode: SetupMode; onPick: (m: SetupMode) => void; busy?: boolean;
+  mode: SetupMode | null; onPick: (m: SetupMode) => void; busy?: boolean;
 }) {
   return (
     <div className="wiz-choice two" role="radiogroup"
@@ -113,30 +117,39 @@ function AdjustForm({ p, cadences, busy, refused, onCancel, onSave }: {
   const [cad, setCad] = useState(cad0 ?? "");
   const [day, setDay] = useState<number | null>(day0);
   const [err, setErr] = useState<string | null>(null);
+  // which field the error is about, so that field is marked invalid and
+  // reads the error as its description
+  const [errOn, setErrOn] = useState<"name" | "amount" | null>(null);
+  const errId = useId();
   // the day picker follows the cadence as chosen now, not as offered
   const withDay = takesDueDay(cad || cad0);
   const save = () => {
     const a: ProposalAdjust = {};
     const n = name.trim();
-    if (!n) { setErr("The bill needs a name."); return; }
+    if (!n) { setErr("The bill needs a name."); setErrOn("name"); return; }
     if (n !== p.payee) a.name = n;
     const v = parseMoneyDraft(amt);
-    if (v === null || v <= 0) { setErr("The amount must be above $0."); return; }
+    if (v === null || v <= 0) {
+      setErr("The amount must be above $0."); setErrOn("amount"); return;
+    }
     if (Math.abs(v - Math.abs(p.amount)) >= 0.005) a.amount = v;
     if (cad && cad !== cad0) a.cadence = cad;
     // leaving the offer's two days for one is the explicit ask to drop one
     if (cad0 === TWICE_A_MONTH && cad === "MONTHLY:1")
       a.by_month_day = [day ?? day0 ?? 1];
     if (withDay && day !== null && day !== day0) a.due_day = day;
-    setErr(null);
+    setErr(null); setErrOn(null);
     onSave(a);
   };
   return (
     <div className="wiz-adjust">
       <div className="wiz-adjust-fields">
-        <input aria-label="Bill name" value={name}
+        <input {...fieldProps("Bill name", { error: errOn === "name",
+                 describedBy: [errOn === "name" && errId] })} value={name}
                onChange={(e) => setName(e.target.value)} />
-        <input aria-label="Amount" inputMode="decimal" value={amt}
+        <input {...fieldProps("Amount", { error: errOn === "amount",
+                 describedBy: [errOn === "amount" && errId] })}
+               inputMode="decimal" value={amt}
                onChange={(e) => setAmt(e.target.value)} />
         {cad0 ? (
           <select aria-label="Cadence" value={cad}
@@ -157,7 +170,7 @@ function AdjustForm({ p, cadences, busy, refused, onCancel, onSave }: {
               <option key={d} value={d}>due {ordinal(d)}</option>))}
           </select>)}
       </div>
-      {(err ?? refused) && <p className="neg" style={{ margin: ".3rem 0 0",
+      {(err ?? refused) && <p id={errId} className="neg" style={{ margin: ".3rem 0 0",
                                           fontSize: 13 }}>{err ?? refused}</p>}
       <div className="wiz-adjust-act">
         <button type="button" onClick={onCancel} disabled={busy}>Cancel</button>
@@ -168,24 +181,24 @@ function AdjustForm({ p, cadences, busy, refused, onCancel, onSave }: {
   );
 }
 
-/** A proposal's one line: what, how often, how much, when, and the
- *  evidence count the finder gives. */
+/** A proposal's one line, in the server's words — the Bills page's row:
+ *  how often (cadence_text), how much, when the next charge is expected
+ *  (upcoming_due, never a day already past), the advisory tag and the
+ *  evidence. A fee or merchant offer has no cadence of its own and shows
+ *  none, rather than a stand-in. */
 function proposalLine(p: Proposal): string {
-  const cad = cadenceOf(p);
-  const parts = [
-    p.bill_type === "envelope" ? "~/mo pooled"
-      : cad && !onSeveralDays(p.by_month_day) ? cadenceWords(cad) : p.cadence,
-    (p.income ? "+" : "") + money(Math.abs(p.amount)),
-  ];
-  const d = dayOf(p.next_due);
-  if (d && p.bill_type !== "envelope" && !onSeveralDays(p.by_month_day))
-    parts.push(ordinal(d));
-  return parts.filter(Boolean).join(" · ");
+  return [p.cadence_text,
+          (p.income ? "+" : "") + money(Math.abs(p.amount)),
+          p.upcoming_due ? `next ${mmdd(p.upcoming_due)}` : null,
+          p.tag_text, p.summary].filter(Boolean).join(" · ");
 }
 
-/** The automatic path: the finder runs once the list has loaded, and each
- *  proposal is approved, adjusted then approved, or dismissed in place. */
-export function AutoBillsPane() {
+/** The automatic path: each proposal is approved, adjusted then approved,
+ *  or dismissed in place. The finder runs when the person asks for it —
+ *  `scan` counts those asks (Continue on "find them for me", then "Scan
+ *  again" here) — never because the pane opened: a pane opened on a
+ *  re-run or a resume only reads what the last scan left. */
+export function AutoBillsPane({ scan = 0 }: { scan?: number }) {
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["bills"], queryFn: () => api.bills() });
   const [adjusting, setAdjusting] = useState<string | null>(null);
@@ -229,10 +242,7 @@ export function AutoBillsPane() {
   const approveAll = useMutation({
     mutationFn: api.billsApproveAll,
     onSuccess: (r) => {
-      toast(r.failed.length
-        ? `Approved ${r.approved}; ${r.failed.length} could not be applied `
-          + `and stayed pending (${r.failed.map((f) => f.error).join("; ")})`
-        : `Approved all ${r.approved} proposal${r.approved === 1 ? "" : "s"}`);
+      toast(approveAllWords(r));
       setAdjusting(null);
       refetchBills(qc);
       qc.invalidateQueries({ queryKey: ["settings"] });
@@ -252,17 +262,20 @@ export function AutoBillsPane() {
       toast(errText(e));
     },
   });
-  // The scan waits for the list's FIRST load: fired on mount it would race
-  // that load, and the invalidate after it would fold into the in-flight
-  // first fetch — the pane would show the pre-scan list until a reload.
-  const ran = useRef(false);
+  // An asked-for scan waits for the list's FIRST load: fired at once it
+  // would race that load, and the invalidate after it would fold into the
+  // in-flight first fetch — the pane would show the pre-scan list until a
+  // reload. Each ask runs once.
+  const ran = useRef(0);
   useEffect(() => {
-    if (q.isSuccess && !ran.current) { ran.current = true; detect.mutate(); }
+    if (q.isSuccess && scan > ran.current) {
+      ran.current = scan; detect.mutate();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q.isSuccess]);
+  }, [q.isSuccess, scan]);
 
   if (q.isPending) return <span className="mut">loading…</span>;
-  if (q.isLoadingError) return <p className="neg">Couldn't load bills: {errText(q.error)}</p>;
+  if (q.data === undefined) return <FailedLine q={q} what="bills" />;
   const { proposals, bills, cadences } = q.data;
   const tracked = bills.filter((b) => !b.disabled);
   const busy = (pid: string) => act.isPending && act.variables?.pid === pid;
@@ -275,7 +288,8 @@ export function AutoBillsPane() {
         <div style={{ display: "flex", justifyContent: "flex-end",
                       marginBottom: ".4rem" }}>
           <button className="pri" disabled={approveAll.isPending || act.isPending}
-                  onClick={() => approveAll.mutate()}>
+                  onClick={() => approveAll.mutate(
+                    proposals.map((p) => p.id))}>
             {approveAll.isPending ? "approving…"
               : `Approve all ${proposals.length}`}</button>
         </div>
@@ -287,13 +301,17 @@ export function AutoBillsPane() {
             <div className="wiz-row-main">
               <div style={{ minWidth: 0 }}>
                 <b>{p.payee}</b>
-                {p.income && <>{" "}<span className="pill g">income</span></>}
-                {p.kind !== "add" && <>{" "}<span className="pill a">
-                  {p.kind === "attach" ? "fee"
-                    : p.kind === "merchant" ? "add merchant" : p.kind}</span></>}
+                {/* the server's words for what approving does, in the
+                    Bills page's tones; an older server sends none */}
+                {p.change_text && <>{" "}<span className={"pill " + (
+                  p.kind === "remove" ? "r" : p.kind === "add" ? "g" : "a")}>
+                  {p.change_text}</span></>}
+                {p.kind === "attach" && p.bill_payee ? (
+                  <span className="mut"> — a fee of {p.bill_payee}</span>) : null}
+                {p.kind === "merchant" && p.bill_payee ? (
+                  <span className="mut"> — add to bill “{p.bill_payee}”</span>) : null}
                 <br />
                 <small className="mut">{proposalLine(p)}
-                  {p.summary ? ` · ${p.summary}` : ""}
                   {adjusting === p.id && <> — <span style={{
                     color: "var(--blue)" }}>adjusting</span></>}</small>
               </div>
@@ -342,7 +360,10 @@ export function AutoBillsPane() {
           </div>
         ))}
       </div>
-      {!detect.isPending && proposals.length === 0 && tracked.length === 0 && (
+      {/* "found nothing" only from a scan that ran: a failed one says why
+          in its toast and claims nothing here */}
+      {detect.isSuccess && proposals.length === 0
+        && tracked.length === 0 && (
         <p className="mut">The finder found nothing it could prove yet. Add
           the ones you know by hand below, or come back from Bills once more
           history has arrived.</p>)}
@@ -353,7 +374,11 @@ export function AutoBillsPane() {
         attached.{" "}
         <button type="button" className="linkish"
                 onClick={() => setAdding((a) => !a)}>
-          {adding ? "Close the form" : "Add a bill by hand"}</button></p>
+          {adding ? "Close the form" : "Add a bill by hand"}</button>
+        {" · "}
+        <button type="button" className="linkish"
+                disabled={detect.isPending}
+                onClick={() => detect.mutate()}>Scan again</button></p>
       {adding && <BillAddForm />}
     </div>
   );
@@ -375,9 +400,12 @@ function BillAddForm() {
   const [amt, setAmt] = useState("");
   const [day, setDay] = useState(1);
   const [err, setErr] = useState<string | null>(null);
+  const [errOn, setErrOn] = useState<"name" | "amount" | null>(null);
+  const errId = useId();
   const add = useMutation({
     mutationFn: async (income: boolean) => {
       const v = parseMoneyDraft(amt);
+      setErrOn(!name.trim() ? "name" : v === null || v <= 0 ? "amount" : null);
       if (!name.trim()) throw new Error("Give it a name first.");
       if (v === null || v <= 0) throw new Error("The amount must be above $0.");
       return api.billsSave({ payee: name.trim(), amount: v, cadence: cad,
@@ -385,7 +413,7 @@ function BillAddForm() {
     },
     onSuccess: (r, income) => {
       toast(`${income ? "Paycheck" : "Bill"} added: ${r.payee}`);
-      setName(""); setAmt(""); setErr(null);
+      setName(""); setAmt(""); setErr(null); setErrOn(null);
       refetchBills(qc);
       qc.invalidateQueries({ queryKey: ["settings"] });
     },
@@ -395,7 +423,8 @@ function BillAddForm() {
     <div className="wiz-addform">
       <div className="wiz-field">
         <input placeholder="Bill name (e.g. Rent)" value={name}
-               aria-label="Bill name"
+               {...fieldProps("Bill name", { error: err && errOn === "name",
+                 describedBy: [err && errOn === "name" && errId] })}
                onChange={(e) => setName(e.target.value)} />
         <select aria-label="Cadence" value={cad}
                 onChange={(e) => setCad(e.target.value)}>
@@ -405,7 +434,8 @@ function BillAddForm() {
       </div>
       <div className="wiz-field">
         <input placeholder="Amount" inputMode="decimal" value={amt}
-               aria-label="Amount"
+               {...fieldProps("Amount", { error: err && errOn === "amount",
+                 describedBy: [err && errOn === "amount" && errId] })}
                onChange={(e) => setAmt(e.target.value)} />
         <select aria-label="Due day" value={day}
                 onChange={(e) => setDay(+e.target.value)}>
@@ -420,7 +450,8 @@ function BillAddForm() {
         <button type="button" disabled={add.isPending}
                 onClick={() => add.mutate(true)}>+ Add paycheck</button>
       </div>
-      {err && <p className="neg" style={{ marginTop: 0, fontSize: 13 }}>{err}</p>}
+      {err && <p id={errId} className="neg" style={{ marginTop: 0, fontSize: 13 }}>
+        {err}</p>}
     </div>
   );
 }
@@ -452,10 +483,13 @@ export function ManualBillsPane() {
           </div>
         ))}
       </div>
+      {/* the tally only from a list that answered: never "0 bills" */}
+      {q.data === undefined && q.isError && <FailedLine q={q} what="bills" />}
+      {q.data !== undefined && (
       <p className="mut" style={{ fontSize: 13 }}>
         {nBills} bill{nBills === 1 ? "" : "s"} · {nInc} income. Nothing here
         was detected; the finder is off for this household until you turn it
-        on.</p>
+        on.</p>)}
     </div>
   );
 }

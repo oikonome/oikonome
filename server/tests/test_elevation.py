@@ -14,6 +14,7 @@ Legacy: older store app builds still send passwords in the body, and that
 path must keep working unchanged.
 """
 
+import datetime as dt
 import os
 import unittest
 import uuid
@@ -23,6 +24,17 @@ from fastapi.testclient import TestClient
 
 from oikonome.db import tenancy
 
+def _export_zip() -> bytes:
+    """The smallest ZIP the restore reads as an Oikonome export."""
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("manifest.json", "{}")
+    return buf.getvalue()
+
+
+from .push_keys import browser_keys
 from .util import (clear_totp_burn, _ensure_db, handler_source,
                    mutating_routes, route_key)
 
@@ -199,6 +211,23 @@ class ElevationWindowTests(_Base):
         self.assertEqual(r.status_code, 403, r.text)
         self.assertEqual(r.json()["detail"]["error"], "elevation_required")
 
+    def test_the_window_is_judged_as_of_the_requests_arrival(self):
+        """A restore upload can take minutes: the proof is judged against
+        the moment the request arrived, not the moment the body finished,
+        so the upload's own length does not spend the window."""
+        import time
+        import types
+        from unittest import mock
+        from fastapi import HTTPException
+        from oikonome.web import app as appmod
+        req = types.SimpleNamespace(state=types.SimpleNamespace(
+            arrived_at=time.monotonic() - 3 * 60))
+        with mock.patch.object(appmod, "_elevation_age",
+                               return_value=dt.timedelta(minutes=11)):
+            with self.assertRaises(HTTPException):
+                appmod._require_elevation({"user_id": "u"})
+            appmod._require_elevation({"user_id": "u"}, as_of_arrival=req)
+
     def test_fresh_door_refuses_a_five_minute_old_elevation(self):
         c, email = self._signup()
         c.post("/api/auth/elevate", json={"password": PW})
@@ -323,8 +352,24 @@ class ElevationWindowTests(_Base):
                                  session_id=me["sid"], mail_sent=False)
         finally:
             admin.close()
+        # removing a stored earnings record steps up (a multi-year
+        # document takes decades of figures in one tap); it can be put
+        # back for 30 days, so the window need not be fresh
+        from oikonome.engine import taxdocs
+        sconn = tenancy.tenant_connect(c.get("/api/me").json()["tenant_id"])
+        try:
+            with sconn.transaction():
+                upload = taxdocs.record_upload(sconn, "ssa", "record.xml")
+                taxdocs.write_upload_values(sconn, upload, 2019,
+                                            {"ss_earnings": 1.0})
+                taxdocs.resolve_year(sconn, 2019)
+        finally:
+            sconn.close()
         probes = {
             # route key: (client, method, path, kwargs, fresh?)
+            "DELETE /api/import/taxdoc/stored/{upload_id}": (
+                c, "request", f"/api/import/taxdoc/stored/{upload}",
+                {"json": {}}, False),
             "POST /api/totp/enroll": (c, "post", "/api/totp/enroll", {}, False),
             "POST /api/totp/confirm": (
                 c, "post", "/api/totp/confirm",
@@ -405,7 +450,7 @@ class ElevationWindowTests(_Base):
                 c, "post", "/api/notify/push/subscribe",
                 {"json": {"endpoint": "https://fcm.googleapis.com/fcm/send/"
                                       + uuid.uuid4().hex,
-                          "keys": {"p256dh": "p" * 20, "auth": "a" * 12}}},
+                          "keys": browser_keys()}},
                 False),
             "POST /api/connections/export": (
                 c, "post", "/api/connections/export",
@@ -447,9 +492,12 @@ class ElevationWindowTests(_Base):
             # a data-ZIP restore merges the archive's mail relay and AI
             # endpoints over the household's: every signed-in restore
             # door steps up before the job starts
+            # (an archive the restore would take: one it refuses as not
+            # an export is told so before any proof is asked, so a
+            # one-time recovery code is never spent on it)
             "POST /api/import": (
                 c, "post", "/api/import", {"files": {"file": (
-                    "export.zip", b"PK\x05\x06" + b"\0" * 18)}}, False),
+                    "export.zip", _export_zip())}}, False),
             "POST /import": (
                 c, "post", "/import", {"files": {"file": (
                     "export.zip", b"PK\x05\x06" + b"\0" * 18)}}, False),
@@ -924,6 +972,100 @@ class NonCookiePrincipalTests(_Base):
         self.assertFalse(c.get("/api/auth/elevation").json()["elevated"])
         self.assertEqual(c.post(GUARDED).status_code, 403)
         self.assertEqual(bare.post(GUARDED, headers=hdr).status_code, 200)
+
+
+class StoredDocumentRemovalStepUpTests(_Base):
+
+    def test_the_step_up_is_decided_over_what_the_removal_takes(self):
+        """The door's early step-up answer is read before the removal's
+        year locks. A document whose years moved after that answer — one
+        year when it was asked, two by the time the locks are held — must
+        not be removed without the step-up: the removal decides it again,
+        under its locks, over exactly what it takes."""
+        from oikonome.engine import taxdocs
+        c, _ = self._signup("taxstep")
+        tid = c.get("/api/me").json()["tenant_id"]
+        sconn = tenancy.tenant_connect(tid)
+        try:
+            with sconn.transaction():
+                upload = taxdocs.record_upload(sconn, "1040", "return.pdf")
+                for year in (2018, 2019):
+                    taxdocs.write_upload_values(sconn, upload, year,
+                                                {"agi": 1000.0})
+                    taxdocs.resolve_year(sconn, year)
+            seen = next(d["seen"] for d in taxdocs.list_stored(sconn)
+                        if d["id"] == upload)
+            self.assertEqual(seen["years"], [2018, 2019])
+            # when the door asks, the document reads as one year; a
+            # writer lands the second right after
+            sconn.execute("UPDATE income_upload_values SET fields = '{}' "
+                          "WHERE upload_id = %s AND year = 2019", (upload,))
+        finally:
+            sconn.close()
+        real = taxdocs.needs_step_up
+
+        def asked_then_moved(conn, upload_id):
+            got = real(conn, upload_id)
+            conn.execute("UPDATE income_upload_values SET fields = %s "
+                         "WHERE upload_id = %s AND year = 2019",
+                         ('{"agi": 1000.0}', upload_id))
+            return got
+
+        with mock.patch.object(taxdocs, "needs_step_up", asked_then_moved):
+            r = c.request("DELETE", f"/api/import/taxdoc/stored/{upload}",
+                          json={"seen": seen})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["detail"]["error"], "elevation_required")
+        sconn = tenancy.tenant_connect(tid)
+        try:
+            self.assertIsNone(sconn.execute(
+                "SELECT removed_at FROM income_uploads WHERE id = %s",
+                (upload,)).fetchone()["removed_at"])
+        finally:
+            sconn.close()
+
+    def test_put_back_needs_no_step_up_while_removal_does(self):
+        """Putting a removed document back only
+        restores what the household had, so it asks for no step-up; the
+        removal of the same document (two years) does."""
+        from oikonome.engine import taxdocs
+        c, email = self._signup("taxback")
+        tid = c.get("/api/me").json()["tenant_id"]
+        sconn = tenancy.tenant_connect(tid)
+        try:
+            with sconn.transaction():
+                upload = taxdocs.record_upload(sconn, "1040", "return.pdf")
+                for year in (2018, 2019):
+                    taxdocs.write_upload_values(sconn, upload, year,
+                                                {"agi": 1200.0})
+                    taxdocs.resolve_year(sconn, year)
+            seen = next(d["seen"] for d in taxdocs.list_stored(sconn)
+                        if d["id"] == upload)
+        finally:
+            sconn.close()
+        _set_elevated_age(email, 3600)
+        r = c.request("DELETE", f"/api/import/taxdoc/stored/{upload}",
+                      json={"seen": seen})
+        self.assertEqual(r.status_code, 403, r.text)
+        self.assertEqual(r.json()["detail"]["error"], "elevation_required")
+        self.assertEqual(c.post("/api/auth/elevate",
+                                json={"password": PW}).status_code, 200)
+        r = c.request("DELETE", f"/api/import/taxdoc/stored/{upload}",
+                      json={"seen": seen})
+        self.assertEqual(r.status_code, 200, r.text)
+        # the window lapses; the put-back still goes through
+        _set_elevated_age(email, 3600)
+        self.assertFalse(c.get("/api/auth/elevation").json()["elevated"])
+        sconn = tenancy.tenant_connect(tid)
+        try:
+            seen = next(d["seen"] for d in taxdocs.list_stored(sconn)
+                        if d["id"] == upload)
+        finally:
+            sconn.close()
+        r = c.post(f"/api/import/taxdoc/stored/{upload}/restore",
+                   json={"seen": seen})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["years"], [2018, 2019])
 
 
 if __name__ == "__main__":

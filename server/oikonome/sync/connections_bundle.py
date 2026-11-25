@@ -55,17 +55,22 @@ _CONFIG_KEYS = (
     "plaid_client_id", "plaid_env",              # Plaid aggregator
     "mx_client_id", "mx_env", "mx_user_guid",    # MX aggregator
     "llm_url", "llm_model", "llm_vision_model",  # legacy single endpoint
-    "smtp_host", "smtp_port", "smtp_user", "smtp_from",   # email delivery
+    "smtp_host", "smtp_port", "smtp_from",       # email delivery
 )
 # llm_extra_body sits here rather than in _CONFIG_KEYS because it can carry a
 # credential (an auth-in-body vendor, an org token) and is stored encrypted
 # for that reason. Copying the stored value across as plaintext config would
 # hand the destination ciphertext it has no key for; decrypt tolerates an
 # untagged legacy value, so both shapes travel correctly.
+# smtp_user is a secret too: Postmark takes its server API token as the
+# relay login. A bundle written before it moved here carries it in `config`,
+# and the import reads it from there as a secret (_legacy_secrets).
 _SECRET_KEYS = (
     "plaid_secret", "mx_api_key", "llm_api_key", "llm_extra_body",
-    "smtp_password",
+    "smtp_password", "smtp_user",
 )
+# secrets an older bundle carried as plaintext config
+_FORMERLY_CONFIG = ("smtp_user",)
 
 # A named AI backend, the shape Settings writes into `llm_backends`. Both
 # whitelists are enforced on import so a tampered bundle can neither inject
@@ -352,7 +357,12 @@ def _checked_shapes(payload: dict) -> tuple[dict, dict, list]:
         raise ValueError("this file's secrets entry is malformed")
     if items is not None and not isinstance(items, list):
         raise ValueError("this file's items entry is malformed")
-    config, secrets, items = config or {}, secrets or {}, items or []
+    config, secrets, items = dict(config or {}), dict(secrets or {}), \
+        items or []
+    for k in _FORMERLY_CONFIG:
+        v = config.pop(k, None)
+        if v not in (None, "") and k not in secrets:
+            secrets[k] = v
     for k, v in config.items():
         if k in _CONFIG_KEYS and v not in (None, "") and (
                 isinstance(v, bool) or not isinstance(v, (str, int))):
@@ -390,6 +400,17 @@ def _live_items(conn, aggregator: str) -> list[str]:
         (aggregator,)).fetchall()]
 
 
+def _instance_plaid_env() -> str:
+    """plaid.instance_env as this module's refusal: an OIKONOME_PLAID_ENV
+    naming no environment refuses the bundle (a 400) with the allowed
+    values, as every other Plaid call refuses it."""
+    from . import plaid as plaid_mod
+    try:
+        return plaid_mod.instance_env()
+    except plaid_mod.PlaidError as e:
+        raise ValueError(e.message)
+
+
 def _refuse_stranding_key_swaps(conn, config: dict) -> set:
     """Refuse (ValueError) a bundle whose Plaid or MX client or environment
     differs from the one this household's live connections were made
@@ -406,14 +427,13 @@ def _refuse_stranding_key_swaps(conn, config: dict) -> set:
     if inc_id or inc_env:
         had_id = (cur.get("plaid_client_id")
                   or os.environ.get("OIKONOME_PLAID_CLIENT_ID"))
-        default_env = os.environ.get("OIKONOME_PLAID_ENV", "production")
         had_env = ((cur.get("plaid_env") if cur.get("plaid_client_id")
-                    else None) or default_env)
+                    else None) or _instance_plaid_env())
         new_id = inc_id or had_id
         # a stored environment only counts beside a stored client id
         new_env = ((inc_env or cur.get("plaid_env"))
                    if (inc_id or cur.get("plaid_client_id")) else None
-                   ) or default_env
+                   ) or _instance_plaid_env()
         if (new_id, new_env) != (had_id, had_env):
             live = _live_items(conn, "plaid")
             if live:
@@ -526,8 +546,24 @@ def apply_payload(conn, payload: dict) -> dict:
             for k in drop:
                 cfg.pop(k, None)
             for k, v in secrets.items():
-                if k in _SECRET_KEYS and v is not None:
+                if k == "smtp_user" and v is not None:
+                    # the same login brought back keeps its stored
+                    # ciphertext: a fresh one would read as a moved relay
+                    from ..web.report import seal_relay_user
+                    cfg[k] = seal_relay_user(conn, before.get(k), v)
+                elif k in _SECRET_KEYS and v is not None:
                     cfg[k] = crypto.encrypt(conn, v)
+            # a stored key or relay password stays only for the endpoint
+            # or host it was saved for: a bundle naming another one without
+            # its own credential would otherwise hand the stored one to it.
+            # The restore's rule, one definition.
+            from .restore import _drop_moved_credentials, dropped_kinds
+            brought = {k: v for k, v in config.items()
+                       if k in _CONFIG_KEYS and v not in (None, "")}
+            brought.update({k: v for k, v in secrets.items()
+                            if k in _SECRET_KEYS and v is not None})
+            left_behind = dropped_kinds(
+                _drop_moved_credentials(before, brought, cfg))
             # keys the bundle brought in were saved now, as far as the
             # bank-link hold's banner is concerned (server-written only)
             for prov, fields in (
@@ -582,8 +618,10 @@ def apply_payload(conn, payload: dict) -> dict:
                 it.get("institution_name") or it["aggregator"],
                 it.get("access_token"), it.get("raw"))
             n_items += 1
+        # the stored credentials not carried onto a moved address, by the
+        # fixed names the clients word ("ai_key", "mail_password")
         return {"config": _summary_groups(config, secrets, backends),
-                "items": n_items}
+                "items": n_items, "credentials_dropped": left_behind}
 
 
 def import_bytes(conn, data: bytes, passphrase: str) -> dict:

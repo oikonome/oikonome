@@ -1,7 +1,7 @@
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { ext } from "./ext";
-import { MutationCache, QueryClient, QueryClientProvider }
+import { MutationCache, QueryCache, QueryClient, QueryClientProvider }
   from "@tanstack/react-query";
 import { BrowserRouter } from "react-router";
 import App, { notePreRoute } from "./App";
@@ -11,20 +11,23 @@ import { api, AuthError } from "./api/client";
 import { ElevationProvider } from "./elevation";
 import ErrorBoundary from "./components/ErrorBoundary";
 import { isReauthReply } from "./reauth";
+import { retryRead, retryReadDelay } from "./moneymath";
 import "./index.css";
 
 // last time the read-only (402) toast fired — module-level so repeated
 // blocked writes inside the window collapse into one banner
 let lastPaywallToast = 0;
 
-// The status a failed request came back with, read from where the client
-// puts it — AuthError for a 401, a leading "NNN: " for every other non-2xx —
-// and never from a number that happens to sit in the response body: a 503
-// whose detail says "450 rows" is still a 503.
-function httpStatus(e: unknown): number | null {
-  if (e instanceof AuthError) return 401;
-  const m = e instanceof Error ? /^(\d{3}): /.exec(e.message) : null;
-  return m ? Number(m[1]) : null;
+/** A read that comes back 401 means the session is gone, as a write's
+ *  does: back to sign-in, instead of the page showing its error until
+ *  /api/me is next asked. Not the ["me"] read itself (App shows the sign-in
+ *  page from it), not a step-up refusal, and only while this tab believed
+ *  it was signed in — after the sign-out clears the cache there is no
+ *  `me`, so a read still in flight cannot start a second one. */
+function readLostSession(err: unknown, key: readonly unknown[]): boolean {
+  if (!(err instanceof AuthError) || isReauthReply(err.message)) return false;
+  if (key[0] === "me") return false;
+  return qc.getQueryData(["me"]) !== undefined;
 }
 
 const qc = new QueryClient({
@@ -33,21 +36,20 @@ const qc = new QueryClient({
     // up: the first attempts can fail while the radio reconnects. Retry a
     // few times with backoff, and refetch when the browser reports the
     // connection is back, so returning to a backgrounded tab self-heals
-    // instead of needing a manual reload.
-    // Only a failure that can heal is worth another attempt: no status
-    // at all (the network dropped), a 5xx or a 408. Any other 4xx is the
-    // server's answer and asking again only delays it — a 429 included:
-    // every refused request counts as a strike toward the address ban,
-    // so retrying one would turn a busy minute into a lockout.
-    retry: (n: number, e: unknown) => {
-      if (n >= 3) return false;
-      const s = httpStatus(e);
-      return s === null || s >= 500 || s === 408;
-    },
-    retryDelay: (n: number) => Math.min(1000 * 2 ** n, 8000),
+    // instead of needing a manual reload. Which failures are asked again
+    // is one rule with the phone's (retryRead, moneymath.ts): no answer,
+    // a 5xx or a 408 — never a 429, which counts toward the address ban.
+    retry: retryRead,
+    retryDelay: retryReadDelay,
     refetchOnReconnect: true,
     staleTime: 30_000,
   } },
+  queryCache: new QueryCache({
+    onError: (err, query) => {
+      if (readLostSession(err, query.queryKey))
+        window.dispatchEvent(new Event("oiko-auth-lost"));
+    },
+  }),
   mutationCache: new MutationCache({
     onError: (err) => {
       // Session truly gone → bounce to login. Re-auth failures on an

@@ -16,6 +16,8 @@ import { C } from "../lib/theme";
 import { HISTORY_CHOICES, type HistoryMonths, historyMonthsOf, historyPhrase,
   latestWins, windowNarrower } from "./wizard-logic";
 import { PillRow, ws } from "./wizard-ui";
+import { FailedLine } from "./loaded";
+import { Note } from "./ui";
 
 /** A screen's handle on latestWins: the saver lives as long as the
  *  screen, so a re-render never starts a second queue beside the first,
@@ -109,6 +111,8 @@ export function HistoryChoice({ fallback, footnote = true, onBusy,
             History: {historyPhrase(stored)}</Text>
           <Text style={ws.mut}>the household owner sets this</Text>
         </View>
+      ) : settings.data === undefined && settings.isError ? (
+        <FailedLine q={settings} what="the history setting" />
       ) : null}
       {footnote && (
         <Text style={ws.mut}>Banks share up to two years. You can pull
@@ -121,7 +125,7 @@ export function HistoryChoice({ fallback, footnote = true, onBusy,
           Use <Text style={{ fontWeight: "700" }}>pull more history</Text>
           {" "}on the bank's row to relink it with this window.
         </Text>)}
-      {err && <Text style={[ws.mut, { color: C.warn }]}>{err}</Text>}
+      {err && <Note bad style={[ws.mut, { color: C.warn }]}>{err}</Note>}
     </View>
   );
 }

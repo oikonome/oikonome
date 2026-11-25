@@ -1,0 +1,24 @@
+-- Migrations 203, 204 and 206 cut card numbers out of file rows, their
+-- import file names, merchant names and the aliases, journal, rules and
+-- 1099 marks keyed on them, detected bills and what names them, offers and
+-- the activity log's label and sentence. Their cut was a frozen copy of the
+-- grammar that read a space, dash, dot or slash between a number's groups
+-- and nothing else. A spreadsheet cell joins them with a tab, a statement
+-- with a no-break space, and sync/card_number.py now reads any whitespace
+-- as a space; the text those three stored with such a number kept it whole,
+-- and it left the instance through every export.
+--
+-- The cut runs as db/migrate.py's PYTHON_STEPS step for this file
+-- (cut_whitespace_joined_numbers), in this file's transaction: 206's own
+-- statements run again from its file, with the module's cut in place of
+-- the frozen one and a selector that picks only a number such whitespace
+-- joins, so the SQL cut is fed only the rows holding one; then 208's step,
+-- whose cut is the module's in Python. Every rule 206 kept holds: a person's
+-- bill and merchant names stay, two bills are never made one, a bill's pins,
+-- offers and settings move with it, ids that are ids are never cut.
+--
+-- Idempotent: a cut number is "…" and four digits, which no cut changes
+-- again, and every statement writes only rows its cut changes. So this file
+-- changes no schema and no row; it is the record that the step ran.
+
+SELECT 1;

@@ -38,16 +38,24 @@ function normaliseMoneyText(v: string): string | null {
 
 /** the screens' loose amount-field parser: "$1,234.56 " → 1234.56,
  *  "12,50" → 12.5; anything that is not a number reads as 0 */
-export const numv = (v: string) =>
-  Number(normaliseMoneyText(v || "0") ?? "0") || 0;
+export const numv = (v: string) => {
+  // a typed run of digits past what a number holds reads as nothing typed
+  const n = Number(normaliseMoneyText(v || "0") ?? "0");
+  return Number.isFinite(n) ? n : 0;
+};
 
 /** A typed amount as a what-if query value. The GET doors type their
  *  amounts as numbers, so "1,000" from a phone keyboard is refused
  *  outright where the save door (which strips "$" and ",") would take
  *  it; parsing here first makes the what-if read the same amount the
- *  save would store. `whole` rounds for a door that takes whole dollars. */
+ *  save would store. `whole` rounds for a door that takes whole dollars.
+ *  A blank box is 0; text that is not an amount rides AS TYPED, so the
+ *  server refuses it and the screen shows why — as the web does — rather
+ *  than quietly projecting $0 (numv's reading, kept for its own callers). */
 export const moneyParam = (v: string, whole = false) => {
-  const n = numv(v);
+  if ((v ?? "").replace(/[$\s]/g, "") === "") return "0";
+  const n = parseMoneyDraft(v);
+  if (n === null) return v.trim();
   return String(whole ? pyround(n) : n);
 };
 
@@ -73,7 +81,11 @@ export const pyround = (v: number) => {
   return f % 2 === 0 ? f : f + 1;
 };
 
-export const money = (n: number, cents = true) => {
+/** A figure as the phone prints it; null or undefined is a figure not
+ *  known (a read that has not answered) and prints UNKNOWN_FIGURE, as the
+ *  web's money(null) does — never $0. */
+export const money = (n: number | null | undefined, cents = true) => {
+  if (n === null || n === undefined) return UNKNOWN_FIGURE;
   if (cents)
     return (n < 0 ? "-$" : "$") + Math.abs(n).toLocaleString("en-US",
       { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -143,6 +155,29 @@ export function birthdateIso(text: string, today = new Date()):
   return { iso: `${y}-${p2(mo)}-${p2(d)}` };
 }
 
+/** A typed "Owned since" (the day a hand-entered asset was acquired) as
+ *  the ISO date the settings door takes, or the sentence to show — read
+ *  like birthdateIso: YYYY-MM-DD or M/D/YYYY, a real day, not ahead of
+ *  today. Blank is iso "": the server keeps the stored date (a new item:
+ *  today), as the web's cleared date input does. */
+export function ownedSinceIso(text: string, today = new Date()):
+    { iso: string } | { error: string } {
+  const t = text.trim();
+  if (!t) return { iso: "" };
+  const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(t);
+  const u = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(t);
+  const [y, mo, d] = m ? [+m[1], +m[2], +m[3]]
+    : u ? [+u[3], +u[1], +u[2]] : [NaN, NaN, NaN];
+  const dt = new Date(y, mo - 1, d);
+  if ((!m && !u) || dt.getFullYear() !== y || dt.getMonth() !== mo - 1
+      || dt.getDate() !== d || y < 1900)
+    return { error: "Enter the owned-since date as YYYY-MM-DD or M/D/YYYY." };
+  if (dt > today)
+    return { error: "The owned-since date can't be in the future." };
+  const p2 = (n: number) => String(n).padStart(2, "0");
+  return { iso: `${y}-${p2(mo)}-${p2(d)}` };
+}
+
 /** one Savings-goals card row as drafted on screen (strings, unsaved) */
 export type GoalDraft = { name: string; target: string; target_date: string;
                           monthly_plan: string; account_id: string;
@@ -155,6 +190,7 @@ export type GoalDraft = { name: string; target: string; target_date: string;
 // (what this card saw at mount) missing from the live list means the
 // goal was deleted elsewhere and stays deleted; live goals the
 // baseline never knew were added elsewhere and are carried through.
+// Throws (savedAmount) when a touched row's amount is not an amount.
 export function mergeSavingsGoals(
   rows: readonly GoalDraft[],
   live: readonly SavingsGoal[],
@@ -171,13 +207,16 @@ export function mergeSavingsGoals(
       if (cur) { out.push(cur); continue; }
       if (baseNames.has(name)) continue;
     }
-    out.push({ name, target: numv(r.target),
+    // a typed amount that is not one refuses the save (savedAmount),
+    // as the web card does — never a silent $0
+    out.push({ name, target: savedAmount(r.target, `${name} target`),
                target_date: r.target_date || null,
-               monthly_plan: numv(r.monthly_plan),
+               monthly_plan: savedAmount(r.monthly_plan, `${name} plan`),
                account_id: r.account_id || null,
                tokens: r.tokens.split(",").map((t) => t.trim())
                  .filter(Boolean),
-               start_balance: numv(r.start_balance),
+               start_balance: savedAmount(r.start_balance,
+                                          `${name} starting balance`),
                mode: r.mode === "sweep" ? "sweep" : "monthly" });
   }
   for (const g of live)
@@ -218,38 +257,14 @@ export type DayHead = { kind: "day"; key: string; label: string;
                         count: number; spent: number };
 
 /** A ledger row, as far as day grouping cares. */
-type DatedRow = { id: string; date: string; amount: number;
-                  category?: string | null;
-                  counts_as_spend?: boolean | null;
-                  spend_amount?: number | null };
+type DatedRow = { id: string; date: string };
 
-/** What one ledger row adds to the day's spending.
- *
- *  The server sends the verdict's own figure (spend_amount: net of a
- *  partial reimbursement, a split row's matching parts' share under the
- *  search's category filter, 0 for any row the verdict does not count — transfers, money in, excluded
- *  or hidden accounts, linked shadows). Summing that, not the amount
- *  column, is what makes a day subtotal agree with the month hero; the
- *  client must not re-derive spend semantics, because the display
- *  category can't see overrides collapsing to transfers or loan-account
- *  rows.
- *
- *  Fallbacks exist only for a NEW app against an OLDER server: the
- *  counts_as_spend flag with the gross amount, and before that a category
- *  rule — without them every day would total $0. Mirrors the web's
- *  TxnTable rowSpend exactly. */
-export const rowSpend = (t: DatedRow): number => {
-  if (typeof t.spend_amount === "number") return t.spend_amount;
-  const counts = typeof t.counts_as_spend === "boolean"
-    ? t.counts_as_spend
-    : t.amount > 0 && !(t.category || "").includes("TRANSFER");
-  return counts ? t.amount : 0;
-};
-
-/** What one day of the ledger cost: the sum of rowSpend, never the
- *  amount column (see rowSpend). Mirrors the web's TxnTable daySpend. */
-export const daySpend = (group: readonly DatedRow[]) =>
-  group.reduce((sum, t) => sum + rowSpend(t), 0);
+/** The words after a narrowed month's listed spending: the server's
+ *  `listed_scope` says whose spending it is — a business's when every
+ *  listed row is a business's, else the household's. Shared with the web
+ *  (webapp/src/moneymath.ts). */
+export const listedSpendWord = (scope?: string | null) =>
+  scope === "business" ? "spent (business)" : "spent";
 
 /** "Thu · Aug 13" — the weekday is the reason the divider exists.
  *
@@ -272,9 +287,14 @@ export const dayLabel = (iso: string) => {
  *  are grouped exactly as given — the caller owns the ordering, and
  *  grouping a list that is not in date order would produce a header per
  *  row, which is why the ledger's sort and this feature travel together.
+ *  A header's spend is the server's whole-day figure (`day_spend`, keyed
+ *  by ISO date: every row of that day in the result, a page not yet
+ *  loaded included), never a sum of the rows listed so far; an older
+ *  server sends none and the header carries $0, which prints no amount.
  *  Mirrors the web's TxnTable dayGroups. */
 export function withDayHeads<T extends DatedRow>(
   rows: readonly T[],
+  daySpend?: Readonly<Record<string, number>> | null,
 ): (T | DayHead)[] {
   const out: (T | DayHead)[] = [];
   let start = 0;
@@ -289,7 +309,7 @@ export function withDayHeads<T extends DatedRow>(
       // key in the list, not just a cosmetic problem
       out.push({ kind: "day", key: `day:${group[0].id}`,
                  label: dayLabel(group[0].date), count: group.length,
-                 spent: daySpend(group) });
+                 spent: daySpend?.[group[0].date.slice(0, 10)] ?? 0 });
       out.push(...group);
     }
     start = i;
@@ -376,14 +396,84 @@ export function proposalSuperseded(replyOrError: unknown): boolean {
  *  so the box a custom name is typed into stops there. */
 export const CATEGORY_MAX = 64;
 
+/** "today" / "tomorrow" for a coming date, null for any other day (the
+ *  caller prints its own date form). `today` is the household's day. */
+export const nearDay = (iso: string | null | undefined,
+                        today: string): "today" | "tomorrow" | null => {
+  if (!iso) return null;
+  const day = iso.slice(0, 10);
+  if (day === today.slice(0, 10)) return "today";
+  const t = new Date(today.slice(0, 10) + "T00:00:00Z");
+  t.setUTCDate(t.getUTCDate() + 1);
+  return day === t.toISOString().slice(0, 10) ? "tomorrow" : null;
+};
+
+/** A holding's symbol as people read it: the aggregator spells a cash
+ *  position `CUR:USD`, which is its key, not its name. */
+export const holdingSymbol = (sym: string | null | undefined) => {
+  const m = /^CUR:([A-Z]{3})$/.exec(sym ?? "");
+  return m ? `Cash (${m[1]})` : (sym ?? "");
+};
+
+/** A category as the server SENDS it in a row: the key with its
+ *  underscores opened, upper-case for a bank key (`TRANSFER OUT`). This is
+ *  the form to test and to write back into a cached row — never catLabel,
+ *  which is for reading and changes with how a category is displayed. */
+export const catKey = (c: string | null | undefined) =>
+  (c ?? "").replace(/_/g, " ");
+
+/** Money moved, not spent or earned: a transfer either way, or a payment
+ *  arriving on a card or loan. Such a row is muted in a ledger and is
+ *  never offered as a bill. */
+export const isMovedMoney = (category: string | null | undefined,
+                             amount: number,
+                             detailed?: string | null) => {
+  // a card payment is money moved on BOTH sides — the checking row that
+  // pays the card as much as the card row it lands on — whatever category
+  // it shows; the server leaves it out of spending by this same key
+  if (detailed === CARD_PAYMENT_DETAILED) return true;
+  // a bank key arrives upper-case; a name somebody typed ("Transfer
+  // fees") is their own category and real spending, so the case matters
+  const k = catKey(category);
+  return k.includes("TRANSFER") || (k.includes("LOAN PAYMENTS") && amount < 0);
+};
+
+/** The aggregator's detailed key for a credit-card payment — the one key
+ *  every spending figure leaves out (SPEND_WHERE). */
+export const CARD_PAYMENT_DETAILED = "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT";
+
+/** A ledger row's category as it reads: a card payment says so, rather
+ *  than "Loan Payments", the name it shares with a mortgage that IS
+ *  spending. Every other row reads its category through catLabel. */
+export const rowCategoryLabel = (t: { category: string;
+                                      category_detailed?: string | null }) =>
+  t.category_detailed === CARD_PAYMENT_DETAILED
+    ? "Card payment" : catLabel(t.category);
+
+// the joining words a category title leaves small ("Food and Drink")
+const CAT_SMALL_WORDS = new Set(["and", "or", "of", "the", "to", "in", "for",
+                                 "a", "an", "at", "on"]);
+
 /** Display form of a category (or any underscored enum key such as a
- *  payment kind): `FOOD_AND_DRINK` → `FOOD AND DRINK`. Custom names
+ *  payment kind): `FOOD_AND_DRINK` → `Food and Drink`. Custom names
  *  pass through untouched. Every surface that shows a category goes
  *  through here so the same value never reads two ways. */
-export const catLabel = (c: string | null | undefined) =>
+export const catLabel = (c: string | null | undefined) => {
   // the server spells "no category at all" as "?" (EFF_CAT) — a reader
   // shouldn't have to know that
-  !c || c === "?" ? "Uncategorized" : c.replace(/_/g, " ");
+  if (!c || c === "?") return "Uncategorized";
+  const s = c.replace(/_/g, " ").trim();
+  // a name somebody typed (any lower-case letter) is theirs; a key with no
+  // letters to case has nothing to title
+  if (s !== s.toUpperCase() || s === s.toLowerCase()) return s;
+  // a joining word stays small between two words, never as the last
+  // one: "Transfer In" beside "Transfer Out", not "Transfer in"
+  const words = s.toLowerCase().split(" ");
+  return words.map((w, i) =>
+    i && i < words.length - 1 && CAT_SMALL_WORDS.has(w)
+      ? w : w.slice(0, 1).toUpperCase() + w.slice(1),
+  ).join(" ");
+};
 
 /** The category picker's option filter. The typed text is matched
  *  against each option's DISPLAY label, so "food and" finds
@@ -629,6 +719,17 @@ export function autopayMarks(series: [string, number][],
   }));
 }
 
+/** the server's card due-date marks (todayview.due_marks) as chart events:
+ *  one line per card per due date, its caption and the hovered day's line
+ *  in the server's words */
+export function dueMarks(series: [string, number][],
+                         marks: { date: string; label: string; words: string }[]) {
+  return marks.flatMap((m) => {
+    const i = series.findIndex(([d]) => d === m.date);
+    return i < 0 ? [] : [{ i, label: m.label, note: m.words }];
+  });
+}
+
 /** A SecureStore key scoped to a value that may contain anything.
  *
  *  SecureStore accepts only alphanumerics, '.', '-' and '_' in a key, and
@@ -667,6 +768,26 @@ export function awaitsEmailConfirm(
   return !!me?.hosted && me.verified === false;
 }
 
+// The days a new account is left alone about its unconfirmed address: the
+// tabs banner waits them out, and so does the sentence about freezing — a
+// person who signed up a minute ago has not ignored anything yet. An
+// unknown age fails toward saying it. And always once the freeze is a week
+// away: the deadline is the HOUSEHOLD's, counted from its oldest signup,
+// so a member invited yesterday can be days from a freeze they must be
+// told about. Mirrors webapp verifyNagDue.
+export function verifyNagDue(createdAt: string | null | undefined,
+                             deadline?: string | null,
+                             now: number = Date.now()): boolean {
+  if (deadline) {
+    const d = Date.parse(String(deadline));
+    if (Number.isFinite(d) && d - now <= 7 * 86_400_000) return true;
+  }
+  if (!createdAt) return true;
+  const t = Date.parse(String(createdAt));
+  if (!Number.isFinite(t)) return true;
+  return now - t >= 3 * 86_400_000;
+}
+
 // Whether the add-a-bank doors are closed until an owner confirms. The
 // server says so (`features.bank_awaits_confirm`), because only it knows
 // why the allowance is 0: an ordinary free trial waits on confirmation, a
@@ -697,14 +818,76 @@ export function bankAwaitsConfirm(
 export const TREND_RANGES =
   ["cur", "1m", "3m", "6m", "1y", "3y", "5y", "all"] as const;
 export type TrendRange = (typeof TREND_RANGES)[number];
+/** The window every over-time toggle opens on (Net Worth, Cash Flow) —
+ *  the web's DEFAULT_RANGE. */
+export const DEFAULT_TREND_RANGE: TrendRange = "1y";
+/** A range handed over in a link (`?range=`) as a window this screen
+ *  knows, else the default — the web reads its URL's range the same way,
+ *  so a screen opened from another keeps the window picked there. */
+export const trendRangeOf = (v: unknown): TrendRange =>
+  TREND_RANGES.includes(v as TrendRange) ? v as TrendRange
+    : DEFAULT_TREND_RANGE;
 export const RANGE_LABEL: Record<TrendRange, string> =
   { cur: "This month", "1m": "1m", "3m": "3m", "6m": "6m", "1y": "1y",
     "3y": "3y", "5y": "5y", all: "All" };
 /** How a caption names the window a figure was measured over ("+$120
  *  over this month"). Web twin: `rangeCaption` in RangePicker.tsx. */
+/** The Transactions route params a Spending figure opens: the rows that
+ *  figure summed over one range (GET /api/transactions?spend=…, the
+ *  server's reporting.spending_window_ledger) — a category, a merchant,
+ *  or with neither the window's whole spend; `previous` is the window a
+ *  dropped merchant was paid in. Web twin: spendDrillHref in
+ *  webapp/src/pages/Spending.tsx. */
+export function spendDrillParams(range: TrendRange, what: {
+  cat?: string; merchant?: string; previous?: boolean;
+} = {}): Record<string, string> {
+  return {
+    spend: range,
+    ...(what.cat ? { cat: what.cat } : {}),
+    ...(what.merchant ? { merchant: what.merchant } : {}),
+    ...(what.previous ? { side: "previous" } : {}),
+  };
+}
+
+/** Whether a Spending window's figures may link to their rows: only when
+ *  the server says it lists them (`figures_open_rows`). A server from
+ *  before the drill drops `spend=` and answers some other list, so its
+ *  figures stay plain text. The flag is read structurally so a phone
+ *  built against either schema compiles. */
+export function spendDrillOffered(
+  w: { figures_open_rows?: boolean | null } | object | null | undefined,
+): boolean {
+  // older-server path: stands in for `figures_open_rows`
+  return !!w && "figures_open_rows" in w && w.figures_open_rows === true;
+}
+
+/** What the Transactions tab makes of a Spending figure's reply:
+ *  "waiting" until the reply answering THIS link is on screen, "listed"
+ *  when the server named the rows (`drill_label`), "unsupported" when it
+ *  answered without one — a server from before the drill, which ignored
+ *  `spend=` and listed something else. */
+export function spendDrillState(
+  spend: string,
+  reply: { drill_label?: string | null } | null | undefined,
+  placeholder: boolean,
+): "none" | "waiting" | "listed" | "unsupported" {
+  if (!spend) return "none";
+  if (!reply || placeholder) return "waiting";
+  // older-server path: stands in for `drill_label`
+  return reply.drill_label ? "listed" : "unsupported";
+}
+
 export function rangeCaption(range: TrendRange): string {
   return range === "all" ? "all time" : range === "cur" ? "this month"
     : range === "1m" ? "last month" : range;
+}
+/** The words after a change measured over a window: "over 1y", "over all
+ *  time", and for the two calendar-month windows "this month" / "last
+ *  month" ("over this month" reads as nothing a person says). Web twin:
+ *  `overCaption` in webapp/src/components/RangePicker.tsx. */
+export function overCaption(range: TrendRange): string {
+  return range === "cur" || range === "1m" ? rangeCaption(range)
+    : `over ${rangeCaption(range)}`;
 }
 // the site-wide vocabulary in months (null = all); the web twin is
 // webapp/src/components/RangePicker.tsx — keep them identical. "1m"
@@ -712,35 +895,6 @@ export function rangeCaption(range: TrendRange): string {
 // complete one (the cash graph's history stops before the current month).
 export const RANGE_MONTHS: Record<TrendRange, number | null> =
   { cur: 1, "1m": 2, "3m": 3, "6m": 6, "1y": 12, "3y": 36, "5y": 60, all: null };
-
-/** The ledger's quick date ranges — the same eight windows instead of a
- *  vocabulary of its own. A range is a from-date on the first of the
- *  window's opening month with an open end: "3m" in September is Jul 1
- *  onward — the ledger shows what is there to edit, so it keeps the month
- *  in progress that Cash Flow's complete-month windows leave out; "This
- *  month" is from the 1st;
- *  "1m" is the last complete month CLOSED on its last day (in September:
- *  Aug 1 – Aug 31). "all" is no date filter at all. A calendar date is
- *  device-LOCAL (the `ymd` rule in dates.ts: never through UTC), and
- *  `today` is passed in so the boundaries are testable. The web twin is
- *  `ledgerRange` in webapp/src/components/RangePicker.tsx — keep them
- *  identical. */
-export function ledgerRange(range: TrendRange, today: Date):
-    { from: string; to: string } {
-  const months = RANGE_MONTHS[range];
-  if (months === null) return { from: "", to: "" };
-  const ymd = (d: Date) => `${d.getFullYear()}-${
-    String(d.getMonth() + 1).padStart(2, "0")}-${
-    String(d.getDate()).padStart(2, "0")}`;
-  if (range === "1m") {
-    // day 0 of this month = the last day of the month before
-    return { from: ymd(new Date(today.getFullYear(), today.getMonth() - 1, 1)),
-             to: ymd(new Date(today.getFullYear(), today.getMonth(), 0)) };
-  }
-  // Date's own month arithmetic on the 1st: no day-of-month to overflow
-  const d = new Date(today.getFullYear(), today.getMonth() - (months - 1), 1);
-  return { from: ymd(d), to: "" };
-}
 
 // ---- counting months backwards, safely ----
 // Date#setUTCMonth keeps the day-of-month, so shifting a 31st back into a
@@ -811,9 +965,13 @@ const CASHFLOW_COMPLETE_MONTHS: Record<TrendRange, number | null> =
  *  month rather than the clock here. `today` is only the fallback for a
  *  report with no forecast tail to read the household's month from.
  *  In October, "3m" opens in July (Jul+Aug+Sep, the server's window), "1m"
- *  in September and "cur" in October — whose history is empty, because the
- *  cash graph's history stops before the current month.
- *  The twin is `cashflowCutoffMonth` in webapp/src/components/RangePicker.tsx — keep them identical. */
+ *  in September and "cur" in October — whose `points` history is empty,
+ *  because it stops before the current month; the month in progress is
+ *  the graph's own `current` bar, which the pages add after the history.
+ *  Only `graphWindow` below reads it, for a server from before
+ *  `cash_graph.windows`; the web is served with its server and has no
+ *  such table. */
+// older-server path: stands in for `cash_graph.windows` (via graphWindow)
 export function cashflowCutoffMonth(
   graph: { points: [string, number][]; forecast_from: number },
   range: TrendRange, today: Date = new Date(),
@@ -825,6 +983,25 @@ export function cashflowCutoffMonth(
       .toISOString().slice(0, 7);
   // a window of `complete` months whose last month is the one before `cur`
   return monthsBackFrom(cur, complete + 1);
+}
+
+/** The months a range draws under "Left over, by month", and the line
+ *  under the chart: the server's (`cash_graph.windows`,
+ *  reporting._drawn_windows) — a range of complete months ends with its
+ *  last one, and the month in progress and the forecast follow only a
+ *  range that includes this month. A server from before `windows` sent
+ *  none: the chart is then cut as that server's phones cut it (from the
+ *  range's first month, the tail always drawn) and there is no line. */
+// older-server path: stands in for `cash_graph.windows`
+export function graphWindow(
+  graph: { points: [string, number][]; forecast_from: number;
+           windows?: Record<string, { first: string; last: string;
+                                      note: string }> },
+  range: TrendRange,
+): { first: string; last: string; note: string } {
+  return graph.windows?.[range]
+    ?? { first: cashflowCutoffMonth(graph, range) ?? "", last: "9999-12",
+         note: "" };
 }
 
 // ---- what a removal moved ----
@@ -917,40 +1094,6 @@ export function shiftMonthsUtc(iso: string, months: number): string {
     .toISOString().slice(0, 10);
 }
 
-export function trendWindow(
-  points: [string, number][], range: TrendRange,
-): { start: number; end: number; gain: number | null; pct: number | null;
-     full: boolean } {
-  const n = points.length;
-  if (n < 2) return { start: 0, end: n - 1, gain: null, pct: null, full: true };
-  // last point at or before an ISO cutoff; -1 when the data starts later
-  const at = (cutoff: string) => {
-    for (let i = n - 1; i >= 0; i--) if (points[i][0] <= cutoff) return i;
-    return -1;
-  };
-  let start = 0, end = n - 1;
-  if (range !== "all") {
-    const months = RANGE_MONTHS[range]!;
-    // clamped, not rolled: a series whose last point is a 31st would
-    // otherwise land the cutoff in the month AFTER the one asked for and
-    // measure the gain over a window short by a month
-    // none = the data is shorter than the range and the window IS the
-    // whole series
-    start = Math.max(0, at(shiftMonthsUtc(points[n - 1][0], months)));
-    if (range === "1m") {
-      // the last COMPLETE month closes at the point before the current
-      // one; a series too short to close it falls back to the open window
-      const close = at(shiftMonthsUtc(points[n - 1][0], 1));
-      if (close > start) end = close;
-    }
-  }
-  const base = points[start][1];
-  const gain = points[end][1] - base;
-  return { start, end, gain,
-           pct: base > 0 ? (100 * gain) / base : null,
-           full: start === 0 };
-}
-
 // ---- the business wizard and the Business page's own arithmetic ----
 //
 // Copied verbatim from the web's webapp/src/bizmath.ts; the pure-logic
@@ -989,103 +1132,6 @@ export function bizWizardEntryStep(
   return hasEntity ? steps.findIndex((s) => s.key === "accounts") : 0;
 }
 
-/** A business transaction as the P&L reads it (books.entity_transactions). */
-export interface BizProfitRow {
-  date: string | null; amount: number;
-  /** the amount net of partial reimbursement links, ledger sign kept */
-  net_amount?: number | null;
-  category: string | null; cat_detailed: string | null;
-  cat_original?: string | null;
-  /** a deposit whose links claim only part of it — still revenue */
-  partly_claimed?: boolean | null;
-  bucket: string | null;
-  /** the bucket the server's P&L counted this row in: a refund takes the
-   *  bucket of the cost it reverses, which only the server can find (the
-   *  charge may sit in another period or year). Null for money in that is
-   *  not a refund; absent from an older server. */
-  effective_bucket?: string | null;
-  /** the Schedule C line the user chose; a tax payment with one is a
-   *  business cost again (see bizPeriodProfit) */
-  sched_c_line?: string | null;
-}
-
-/** Money IN still carrying one of these spending categories is a merchant
- *  giving money back — a refund that reverses a cost in its own bucket, not
- *  revenue. The server's list (books._REFUND_CATEGORIES); the mobile
- *  pure-logic suite checks the two clients' copies against it. */
-export const BIZ_REFUND_CATEGORIES: ReadonlySet<string> = new Set([
-  "BANK_FEES", "ENTERTAINMENT", "FOOD_AND_DRINK", "GENERAL_MERCHANDISE",
-  "GENERAL_SERVICES", "GOVERNMENT_AND_NON_PROFIT", "HOME_IMPROVEMENT",
-  "MEDICAL", "PERSONAL_CARE", "RENT_AND_UTILITIES", "TRANSPORTATION",
-  "TRAVEL", "PROFESSIONAL_SERVICES", "INSURANCE",
-]);
-
-/** Operating profit over the rows whose date starts with `period`
- *  ("2026-08" for a month), by the server's P&L rules, so a period figure
- *  shown under the year's profit is the same arithmetic.
- *
- *  - Amounts are NET of reimbursement links: a charge paid back counts only
- *    what was not repaid, a deposit only the part no charge claimed. Gross
- *    figures would count one client check that repays two charges as both
- *    revenue and a cost.
- *  - Money in is revenue unless it is a transfer or a card payment, and
- *    money whose ORIGINAL category was a transfer stays capital unless it
- *    was made INCOME outright — except a partly-claimed deposit, whose
- *    unclaimed part is revenue whatever its category says.
- *  - Money in that still carries a spending category is a refund: it
- *    reverses a cost in its own bucket, so a start-up or organizational
- *    refund leaves the period untouched (its cost was capitalized) and an
- *    operating refund lowers operating cost. The row's `effective_bucket`
- *    names that bucket when the server sent it — a refund dated after the
- *    business opened can reverse a start-up purchase. Counted as revenue, a
- *    returned pre-opening purchase would show as profit.
- *  - Money out is an operating cost only in the operating bucket;
- *    organizational and start-up costs are capitalized, and an unbucketed
- *    cost dated before the business opened is a start-up cost.
- *  - An owner's tax payment (and a tax refund) is not a business cost:
- *    income and self-employment tax belong on the owner's return, so it is
- *    skipped like a transfer unless the user gave it a Schedule C line. */
-export function bizPeriodProfit(
-  rows: readonly BizProfitRow[], businessStart: string | null | undefined,
-  period: string,
-): number {
-  let revenue = 0;
-  let operating = 0;
-  for (const t of rows) {
-    if (!t.date || !t.date.startsWith(period)) continue;
-    const net = t.net_amount ?? t.amount;
-    const cat = (t.category || "").toUpperCase();
-    const card = (t.cat_detailed || "") === "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT";
-    const ownerTax = !t.sched_c_line
-      && (t.cat_detailed === "GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT"
-        || t.cat_detailed === "INCOME_TAX_REFUND");
-    // the server's own bucket first, so a refund nets against the cost it
-    // reverses rather than being re-bucketed by its own date
-    const bucket = t.effective_bucket ?? (t.bucket
-      || (businessStart && t.date < businessStart
-        ? "startup_195" : "operating"));
-    const capitalized = bucket === "organizational"
-      || bucket === "startup_195";
-    if (t.amount < 0) {
-      if (t.partly_claimed) { revenue += -net; continue; }
-      const wasTransfer = (t.cat_original || "").toUpperCase()
-        .includes("TRANSFER");
-      if (cat.includes("TRANSFER") || card || ownerTax
-          || (wasTransfer && cat !== "INCOME")) continue;
-      if (BIZ_REFUND_CATEGORIES.has(cat)) {
-        // net is negative: the refund lowers the cost it reverses
-        if (!capitalized) operating += net;
-      } else revenue += -net;
-      continue;
-    }
-    if (cat === "TRANSFER_OUT" || cat === "TRANSFER_IN" || card
-        || ownerTax) continue;
-    if (capitalized) continue;
-    if (net > 0) operating += net;
-  }
-  return pyround((revenue - operating) * 100) / 100;
-}
-
 /** The tax years the year-end package and the 1099 list offer, newest
  *  first: this year back to the year the business was formed or started,
  *  whichever is earlier (pre-opening costs sit in the formation year), at
@@ -1115,22 +1161,6 @@ export function bizDefaultTaxYear(
 ): number {
   const now = today.getFullYear();
   return today.getMonth() <= 3 && years.includes(now - 1) ? now - 1 : now;
-}
-
-/** What the year's tax estimate still asks for: the estimate less what the
- *  business already paid toward it (the P&L's estimated_tax_paid), never
- *  below zero. A tax reserve is measured against this, not the whole
- *  year's figure, or paying the estimates out of it reads as a shortfall
- *  that grows each quarter. */
-export function bizTaxStillDue(
-  estimated: number, paid: number | null | undefined,
-): number {
-  // The estimate is the tax on profit earned so far, so it already grows
-  // with the calendar; the payments are simply taken off it. The books
-  // cannot tell April's prior-year balance due from the first estimate
-  // paid the same day, so the card says that such a payment is in `paid`
-  // rather than guessing a split.
-  return pyround(Math.max(0, estimated - (paid ?? 0)) * 100) / 100;
 }
 
 // ---- what a household-invite mint actually did ----
@@ -1203,34 +1233,11 @@ export const MERCHANT_FILTERS = [
   ["all", "all"], ["oneoff", "one-off"], ["unnamed", "unnamed"], ["month", "seen this month"],
 ] as const;
 export type MerchantFilter = (typeof MERCHANT_FILTERS)[number][0];
-// A filter or a spend/recency sort is cut from whatever the capped catalog
-// sent, so it asks for the widest window the server allows (500) before
-// cutting; the plain orders keep the 200-row page.
+// The server filters and sorts before it caps the page, and the list is
+// printed in its order; a filter or a spend/recency sort still asks for the
+// widest page the server allows (500), the plain orders the 200-row one.
 export const catalogLimit = (order: MerchantOrder, flt: MerchantFilter): number =>
   flt !== "all" || order === "spend" || order === "recent" ? 500 : 200;
-// a name the aggregator never resolved: a digits run, a terminal's * or #,
-// or an all-caps string no one would call a name
-export const looksUnnamed = (name: string) =>
-  /\d{3,}|[*#]/.test(name) || (/[A-Z]{4,}/.test(name) && name === name.toUpperCase());
-export function sortMerchants<T extends { display: string; rows: number; total: number;
-                                          last?: string | null }>(
-    rows: T[], order: MerchantOrder, flt: MerchantFilter, today: Date): T[] {
-  let r = rows;
-  if (flt === "oneoff") r = r.filter((m) => m.rows === 1);
-  else if (flt === "unnamed") r = r.filter((m) => looksUnnamed(m.display));
-  else if (flt === "month") {
-    // the local month, as the web's twin reads it: the UTC one is already
-    // next month on the evening of the last day west of Greenwich, and
-    // "this month" would empty
-    const m0 = localYmd(today).slice(0, 7);
-    r = r.filter((m) => (m.last ?? "").slice(0, 7) >= m0);
-  }
-  if (order === "alpha") r = [...r].sort((a, b) => a.display.localeCompare(b.display));
-  else if (order === "spend") r = [...r].sort((a, b) => b.total - a.total);
-  else if (order === "recent")
-    r = [...r].sort((a, b) => (b.last ?? "").localeCompare(a.last ?? ""));
-  return r;
-}
 
 // ---- the debt planner's two labels (web: pages/Debt.tsx) ------------------
 
@@ -1282,6 +1289,20 @@ export function parseMoneyDraft(v: string): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+/** A typed amount as the number a settings save stores, or a refusal.
+ *  Blank is 0. Text that is not an amount throws, naming `what` — sent
+ *  on, it would be stored as $0 without a word, replacing the figure the
+ *  person meant to type. The bucket-rule and savings-goal saves on both
+ *  clients read their amounts through this one rule. */
+export function savedAmount(text: string, what: string): number {
+  if ((text ?? "").replace(/[$\s]/g, "") === "") return 0;
+  const n = parseMoneyDraft(text);
+  if (n === null)
+    throw new Error(`${what}: "${text.trim()}" is not an amount — `
+                    + "type it like 1,250.50.");
+  return n;
+}
+
 /** The split editor's arithmetic: each part's cents as typed (null when
  *  the text is not an amount yet), what is left to place against the
  *  charge, and whether the split can be saved — at least two parts, each
@@ -1308,9 +1329,12 @@ export function splitDraftCheck(charge: number,
  *  for POST /api/receipts/{id}/details — or the reason it is not yet.
  *  The total is money in: positive, rounded to the cent ("$27.35",
  *  "1,204.5"). The date is a real calendar day, YYYY-MM-DD. The store is
- *  optional, trimmed, 80 characters at most; blank sends none. */
+ *  optional, trimmed, 80 characters at most; blank sends "" (clears the
+ *  store read off the slip), and none passed — or the `stored` one,
+ *  untouched — sends none (keeps it). */
 export function receiptDetailsDraft(total: string, date: string,
-                                    merchant = ""):
+                                    merchant?: string,
+                                    stored?: string | null):
     { ok: true; body: { total: number; date: string; merchant?: string } }
   | { ok: false; error: string } {
   const n = parseMoneyDraft(total);
@@ -1330,10 +1354,74 @@ export function receiptDetailsDraft(total: string, date: string,
   })();
   if (!real) return { ok: false, error: "Enter the date on the receipt" };
   const store = (merchant ?? "").trim();
-  if (store.length > 80)
+  // the store the form was filled with (`stored`), saved untouched, is
+  // kept as stored: one read before the server's bound may be longer, and
+  // the person never typed it
+  const kept = merchant === undefined
+    || (store !== "" && store === (stored ?? "").trim());
+  // the server's STORE_MAX (engine/receipts.py)
+  if (!kept && store.length > 80)
     return { ok: false, error: "The store name is 80 characters at most" };
+  // a store field the person emptied is sent empty, which clears the
+  // store read off the slip; no field at all keeps it
   return { ok: true, body: { total: cents / 100, date: d,
-                             ...(store ? { merchant: store } : {}) } };
+                             ...(kept ? {} : { merchant: store }) } };
+}
+
+// The bank feed's "type/subtype" pair, said the way a statement would:
+// "depository/money market" is a money market, "credit/credit card" a
+// credit card. Web twin: `kindWords` in webapp/src/moneymath.ts.
+const KIND_WORDS: Record<string, string> = {
+  cd: "CD", ira: "IRA", roth: "Roth IRA", hsa: "HSA", "401k": "401(k)",
+  "401a": "401(a)", "403b": "403(b)", "457b": "457(b)", "529": "529 plan",
+  hsa_cash: "HSA", "roth 401k": "Roth 401(k)", sep: "SEP IRA",
+};
+export function kindWords(kind: string | null | undefined): string {
+  const sub = (kind ?? "").split("/").pop()!.trim();
+  if (!sub) return "";
+  return KIND_WORDS[sub.toLowerCase()]
+    ?? sub.charAt(0).toUpperCase() + sub.slice(1);
+}
+
+/** An account named with its institution, the institution said once: an
+ *  account the bank already names after itself ("Fabrikam (daily)" at
+ *  Fabrikam) read "Fabrikam Fabrikam (daily)". Web twin: `accountLabel`
+ *  in webapp/src/moneymath.ts. */
+export function accountLabel(a: { institution_name?: string | null;
+                                  name: string; mask?: string | null }): string {
+  const inst = (a.institution_name ?? "").trim();
+  const name = (a.name ?? "").trim();
+  const said = inst && name.toLowerCase().startsWith(inst.toLowerCase());
+  return `${inst && !said ? `${inst} ` : ""}${name}${a.mask ? ` ${a.mask}` : ""}`;
+}
+
+/** How a connection's last sync ended, in the words its Accounts row
+ *  uses for the same state (the server's `status_kind`), never the raw
+ *  status string. */
+export function connectionStateWords(c: { status?: string | null;
+                                          status_kind?: string }): string {
+  const kind = c.status_kind
+    ?? (c.status && c.status !== "ok" ? "attention" : "ok");
+  return kind === "ok" ? "ok"
+    : kind === "retrying" ? "bank having trouble — retrying"
+    : kind === "reauth" ? "sign-in expired"
+    : kind === "gone" ? "connection removed"
+    : "needs attention";
+}
+
+/** Which of the account editor's two budget switches an account is
+ *  offered. The SERVER decides (the accounts reply's `can_pin` and
+ *  `can_exclude`): the exclusion wherever a row on the account can be
+ *  spending, by the predicate the budget itself reads, and the forecast
+ *  anchor on the type the forecast picks among. A switch that is already
+ *  ON is always offered, so it can be turned off; a server too old to say
+ *  gets both switches, never a hidden one. Web twin:
+ *  `accountSwitches` in webapp/src/moneymath.ts. */
+export function accountSwitches(a: { can_pin?: boolean; can_exclude?: boolean;
+                                     pinned: boolean; excluded: boolean }):
+    { primary: boolean; excluded: boolean } {
+  return { primary: a.pinned || (a.can_pin ?? true),
+           excluded: a.excluded || (a.can_exclude ?? true) };
 }
 
 /** An account's contribution to a headline total. Card and loan
@@ -1391,8 +1479,11 @@ export function mergePlannerBuckets(
       continue;                    // untouched: live copy, or deleted
     }
     const name = r.name.trim();
-    const monthly = numv(r.monthly);
-    if (!name || monthly <= 0) continue;
+    const monthly = Math.max(0, numv(r.monthly));
+    // $0 on a stored bucket is a plan ("nothing allowed here") that keeps
+    // the rules claiming its spending; the row's ✕ is what removes one. A
+    // row that was never a bucket has nothing to keep until it has money.
+    if (!name || (monthly <= 0 && r.orig === undefined)) continue;
     push({ name, parent: "other", monthly,
            categories: cur?.categories
              ?? r.cats ?? (r.category ? [r.category] : []),
@@ -1402,6 +1493,148 @@ export function mergePlannerBuckets(
   for (const b of liveBy.values())
     if (!baseNames.has(b.name) && !kept.has(b.name)) push(b);
   return out;
+}
+
+/** What the budget planner's bucket rows start from — at open, and again
+ *  after each save with the list the server stored: the merge base (the
+ *  "other" buckets' names) and their rows, each remembering the bucket it
+ *  came from. Food buckets belong to the Bucket-rules card and are never
+ *  planner rows. See savedMergeBase for `sent`. */
+export function plannerBucketsSaved(saved: readonly CustomBucket[],
+                                    sent?: readonly PlannerRow[]): {
+  base: string[]; rows: PlannerRow[];
+} {
+  const rows = saved.filter((b) => b.parent === "other")
+    .map((b) => ({ name: b.name, monthly: String(b.monthly || 0),
+                   cats: b.categories ?? [], merch: b.merchants ?? [],
+                   orig: b.name }));
+  return { base: savedMergeBase(rows.map((r) => r.name),
+                                sent?.filter((r) => !r.food)), rows };
+}
+
+/** The merge base after a save of a whole named list (buckets, goals):
+ *  the names the card's rows are now known to stand for. A record added
+ *  here and saved is no longer "added elsewhere", so a later removal or
+ *  rename must not carry it back through. When the rows are re-seeded
+ *  from the saved list (`sent` absent) that is every stored name. When
+ *  the save landed mid-edit the rows stay as typed, so:
+ *  - of the stored names, only those the rows SENT: a record another card
+ *    saved, carried through by this save but absent from the rows, stays
+ *    "added elsewhere" — in the base, the next save would read it as
+ *    removed here and drop it;
+ *  - plus the previous base's names that are no longer stored: they were
+ *    this card's and were deleted or renamed elsewhere, and their rows
+ *    may still be on screen. In the base, the next merge reads such an
+ *    untouched row as "deleted elsewhere" and drops it; out of it, the
+ *    row would be written back as new. A row the person edited (touched)
+ *    is theirs and is written either way. */
+export function savedMergeBase(stored: readonly string[],
+                               sent?: readonly { name: string }[],
+                               prevBase: readonly string[] = []): string[] {
+  if (!sent) return [...stored];
+  const mine = new Set(sent.map((r) => r.name.trim()));
+  const now = new Set(stored);
+  return [...stored.filter((n) => mine.has(n)),
+          ...prevBase.filter((n) => !now.has(n))];
+}
+
+/** one Bucket-rules card row as drafted on screen: the amount and the
+ *  merchant list are text while being typed. `touched` marks a row edited
+ *  here since it was seeded. */
+export type BucketRuleDraft = {
+  name: string; parent: "food" | "other"; monthly: string;
+  categories: string[]; merchants: string; touched?: boolean;
+};
+
+/** The custom_buckets list the Bucket-rules card saves.
+ *
+ *  POST /api/settings replaces the list wholesale, and the card's rows
+ *  were seeded from `baselineNames`' list — the planner or another device
+ *  may have saved since. Against the server's CURRENT list: a touched row
+ *  wins; an untouched row follows its live copy (deleted elsewhere →
+ *  stays deleted); a bucket the person removed here stays removed; and a
+ *  live bucket the base never knew was added elsewhere and is carried
+ *  through. `amount` turns a typed amount into a number (and may refuse
+ *  it by throwing). */
+export function mergeBucketRules(
+  rows: readonly BucketRuleDraft[],
+  live: readonly CustomBucket[],
+  baselineNames: readonly string[],
+  amount: (text: string, name: string) => number,
+): CustomBucket[] {
+  const liveBy = new Map(live.map((b) => [b.name, b] as const));
+  const baseNames = new Set(baselineNames);
+  const out: CustomBucket[] = [];
+  for (const r of rows) {
+    const name = r.name.trim();
+    if (!name) continue;
+    if (!r.touched) {
+      const cur = liveBy.get(name);
+      if (cur) { out.push(cur); continue; }
+      if (baseNames.has(name)) continue;   // deleted elsewhere
+    }
+    out.push({ name, parent: r.parent, monthly: amount(r.monthly, name),
+               categories: r.categories,
+               merchants: r.merchants.split(",").map((m) => m.trim())
+                 .filter(Boolean) });
+  }
+  for (const b of live)
+    if (!baseNames.has(b.name) && !out.some((o) => o.name === b.name))
+      out.push(b);                          // added elsewhere since the base
+  return out;
+}
+
+/** What the Bucket-rules card starts from — at mount, and again after
+ *  each save with the list the server stored: the merge base and the rows
+ *  seeded from it. `sent` (and the base it was merged on) is passed when
+ *  the save landed mid-edit and the rows stay as typed (see
+ *  savedMergeBase). */
+export function bucketRulesSaved(saved: readonly CustomBucket[],
+                                 sent?: readonly BucketRuleDraft[],
+                                 prevBase?: readonly string[]): {
+  base: string[]; rows: BucketRuleDraft[];
+} {
+  return {
+    base: savedMergeBase(saved.map((b) => b.name), sent, prevBase),
+    rows: saved.map((b) => ({
+      name: b.name, parent: b.parent,
+      monthly: b.monthly ? String(b.monthly) : "",
+      categories: b.categories ?? [],
+      merchants: (b.merchants ?? []).join(", ") })),
+  };
+}
+
+const PICKED_TYPES: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+  webp: "image/webp", gif: "image/gif", heic: "image/heic",
+  heif: "image/heif" };
+
+/** The upload identity of a photo the image picker returned (picked at
+ *  quality < 1, as every receipt picker here is), read from the file it
+ *  actually wrote — the server stores the declared type as the file's, so
+ *  a label that disagrees with the bytes is kept and served wrong.
+ *  expo-image-picker 57, from its source:
+ *  - Android re-encodes the photo (CompressionImageExporter): the bytes
+ *    are PNG when the written file is .png and JPEG for everything else —
+ *    a HEIC, WebP, GIF or BMP source included, even when the file is
+ *    named .webp/.gif — while `mimeType` and `fileName` still describe
+ *    the SOURCE. So only the written file's extension counts, png or jpeg.
+ *  - iOS writes the bytes its extension names and derives `mimeType` from
+ *    that same extension, so the written file's extension, then mimeType,
+ *    then the camera's JPEG.
+ *  (Mobile only: the web's file input carries the browser's own type.) */
+export function pickedImagePart(
+  a: { uri: string; mimeType?: string | null },
+  platform: "ios" | "android" | string,
+  kind: "receipt" | "check" = "receipt",
+): { uri: string; name: string; type: string } {
+  const ext = /\.([a-z0-9]+)(?:[?#].*)?$/i.exec(a.uri)?.[1]
+    ?.toLowerCase() ?? "";
+  const type = platform === "android"
+    ? (ext === "png" ? "image/png" : "image/jpeg")
+    : PICKED_TYPES[ext] || a.mimeType || "image/jpeg";
+  const named = Object.entries(PICKED_TYPES).find(([, t]) => t === type);
+  return { uri: a.uri, name: `${kind}.${named ? named[0] : "jpg"}`, type };
 }
 
 // ---- a whole-value save, rebased onto what is stored now ----
@@ -1499,7 +1732,8 @@ export function assetListLanded(
     return String(a.name ?? "").trim().slice(0, 60) === b.name
       && String(a.kind || "other").trim().slice(0, 30) === b.kind
       && cents(a.value) === cents(b.value)
-      && (!a.as_of || String(a.as_of) === String(b.as_of));
+      && (!a.as_of || String(a.as_of) === String(b.as_of))
+      && (!a.acquired_on || String(a.acquired_on) === String(b.acquired_on));
   });
 }
 
@@ -1549,6 +1783,588 @@ export function rebaseNamedSave<T extends { name: string }>(
   };
 }
 
+// ---- whole-list settings: compare-and-swap twin block ----
+// These settings are stored as whole values the server replaces on save.
+// Two devices that each read a list, each change a different item and
+// each save would otherwise leave only the second device's change. So a
+// save names the version of each such list it was built on; the server
+// refuses (409 settings_moved) when the stored list moved since, and the
+// client lays the person's own changes over the fresh list and tries
+// once more. This block is kept character-for-character equal in
+// webapp/src/moneymath.ts and mobile/src/lib/pure.ts, and one case
+// table runs against both.
+
+export const WHOLE_LIST_KEYS = ["savings_goals", "custom_buckets",
+                                "income_scenarios", "email_schedule",
+                                "llm_backends", "llm_roles",
+                                "manual_assets"] as const;
+
+/** What a second refusal tells the person: the screen now holds the
+ *  stored copy, and their change did not land. */
+export const SETTINGS_MOVED_TEXT =
+  "Changed on another device. Reloaded the latest; make your change again.";
+
+type Versions = Readonly<Record<string, unknown>> | null | undefined;
+
+/** The list_versions to send with `body`: the version, from the settings
+ *  view the edit was built on, of each whole-list key the body carries.
+ *  Null when there are none — a body with no whole-list key, or a server
+ *  that publishes no versions, saves exactly as before. */
+export function listVersionsFor(
+  body: Readonly<Record<string, unknown>>, versions: Versions,
+): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const k of WHOLE_LIST_KEYS) {
+    const v = versions?.[k];
+    if (k in body && typeof v === "string") out[k] = v;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+/** Each row of a list keyed by `key`, numbered by occurrence so two rows
+ *  of one key stay two. */
+const keyedRows = <T>(rows: unknown, key: (r: T) => string) => {
+  const list = Array.isArray(rows) ? (rows as T[]) : [];
+  const seen = new Map<string, number>();
+  return Object.fromEntries(list.map((r) => {
+    const k = key(r);
+    const n = seen.get(k) ?? 0;
+    seen.set(k, n + 1);
+    return [`${k}\u0000${n}`, r];
+  })) as Record<string, T & object>;
+};
+
+/** One whole-list setting after this save's changes are laid over the
+ *  list stored now. `base` is the list the edit started from, `mine` the
+ *  list being saved, `theirs` the fresh stored list: an item added here
+ *  is added, one removed here is removed, a field changed here takes this
+ *  save's value (it wins when both devices changed the same field), and
+ *  everything the other device changed or added stands. Goals and buckets
+ *  are identified by name, and so are hand-valued assets; scenarios by
+ *  name compared as the server compares them (trimmed, any case); AI
+ *  backends by id, and the AI routing per task; the email schedule per
+ *  cadence, and only the cadences this save names are sent, since the
+ *  server keeps the ones a body leaves out. */
+export function remergeWholeList(
+  key: string, base: unknown, mine: unknown, theirs: unknown,
+): unknown {
+  const name = (r: { name?: unknown }) => String(r?.name ?? "");
+  if (key === "savings_goals" || key === "custom_buckets"
+      || key === "income_scenarios" || key === "manual_assets"
+      || key === "llm_backends") {
+    type Row = { name?: unknown; id?: unknown };
+    const k = key === "income_scenarios"
+      ? (r: Row) => name(r).trim().toLowerCase()
+      : key === "llm_backends" ? (r: Row) => String(r?.id ?? "") : name;
+    return Object.values(rebaseKeyed(keyedRows(mine, k), keyedRows(base, k),
+                                     keyedRows(theirs, k)));
+  }
+  if (key === "llm_roles") {
+    const obj = (v: unknown) => (v && typeof v === "object" && !Array.isArray(v)
+      ? v : {}) as Record<string, unknown>;
+    // one task's route is one field: a task re-routed or unrouted here
+    // moves, every other task keeps what is stored
+    return mine && typeof mine === "object"
+      ? rebaseFields(obj(mine), obj(base), obj(theirs)) : mine;
+  }
+  if (key === "email_schedule") {
+    const obj = (v: unknown) => (v && typeof v === "object" && !Array.isArray(v)
+      ? v : {}) as Record<string, object>;
+    // a reset (null or {}) means "back to the default" — nothing to merge
+    if (!mine || typeof mine !== "object" || !Object.keys(mine).length)
+      return mine;
+    const m = obj(mine);
+    const out = rebaseKeyed(m, obj(base), obj(theirs));
+    for (const c of Object.keys(out)) if (!(c in m)) delete out[c];
+    return out;
+  }
+  return mine;
+}
+
+/** The keys a 409 settings_moved names, or null for any other failure.
+ *  Reads both clients' error shapes: the phone's ApiError (status + the
+ *  structured body) and the web's Error("409: <json body>"). */
+export function settingsMovedOf(e: unknown): { keys: string[] } | null {
+  const o = e as { status?: unknown; body?: unknown; message?: unknown } | null;
+  if (!o || typeof o !== "object") return null;
+  let status = o.status;
+  let body = o.body;
+  if (body === undefined && typeof o.message === "string") {
+    const m = /^(\d{3}):\s*([\s\S]*)$/.exec(o.message);
+    if (m) {
+      status = Number(m[1]);
+      try { body = JSON.parse(m[2]); } catch { body = null; }
+    }
+  }
+  if (status !== 409 || !body || typeof body !== "object") return null;
+  type Moved = { error?: unknown; keys?: unknown; detail?: unknown };
+  const b = body as Moved;
+  const d = b.error === "settings_moved" ? b
+    : (b.detail && typeof b.detail === "object"
+       && (b.detail as Moved).error === "settings_moved")
+      ? (b.detail as Moved) : null;
+  if (!d) return null;
+  return { keys: Array.isArray(d.keys)
+    ? d.keys.filter((x): x is string => typeof x === "string") : [] };
+}
+
+/** A form saves only what it was seeded with from a successful read.
+ *  Until then its Save waits and says why: still loading, or the read
+ *  failed, so whatever the form holds is a default nobody saw stored. */
+export const SAVE_WAITS_LOADING = "Loading…";
+export const SAVE_WAITS_FAILED =
+  "Couldn't load what's saved, so nothing can be saved over it yet.";
+
+/** Why a form's Save is held, or null once the form was seeded. */
+export function saveWaits(seeded: boolean, readFailed: boolean): string | null {
+  if (seeded) return null;
+  return readFailed ? SAVE_WAITS_FAILED : SAVE_WAITS_LOADING;
+}
+
+/** A whole-list save with no settings view under it: the list on screen
+ *  was never seeded from what is stored, so sending it would replace the
+ *  stored list with a default. Refused before anything is sent. */
+export class SettingsUnreadError extends Error {
+  constructor() {
+    super(SAVE_WAITS_FAILED);
+    this.name = "SettingsUnreadError";
+  }
+}
+
+/** The second refusal: `latest` is the stored view read after it, for the
+ *  caller to put on screen. */
+export class SettingsMovedError extends Error {
+  latest: object | null;
+  constructor(latest: object | null) {
+    super(SETTINGS_MOVED_TEXT);
+    this.name = "SettingsMovedError";
+    this.latest = latest;
+  }
+}
+
+/** Send a settings body under compare-and-swap. `basis` is the settings
+ *  view the body was built from (its lists and list_versions); `send`
+ *  posts a body, `read` fetches the stored view. A moved list is re-read,
+ *  this save's changes are laid over it, and the save goes again ONCE
+ *  with the fresh versions; a second refusal throws SettingsMovedError,
+ *  never a third try — another device saving in a loop must not keep
+ *  this one sending. Any other failure is handed back as it came. */
+export async function saveWholeLists<V>(
+  body: Record<string, unknown>, basis: object | null | undefined,
+  send: (b: Record<string, unknown>) => Promise<V>, read: () => Promise<object>,
+): Promise<V> {
+  type View = Record<string, unknown> & { list_versions?: Versions };
+  // no view at all means the lists in the body were never read: refuse
+  // rather than replace what is stored (a view without versions is an
+  // older server, and saves as before)
+  if (basis == null && WHOLE_LIST_KEYS.some((k) => k in body))
+    throw new SettingsUnreadError();
+  const was = (basis ?? {}) as View;
+  const versions = listVersionsFor(body, was.list_versions);
+  if (!versions) return send(body);
+  try {
+    return await send({ ...body, list_versions: versions });
+  } catch (e) {
+    if (!settingsMovedOf(e)) throw e;
+  }
+  const fresh = (await read()) as View;
+  const again: Record<string, unknown> = { ...body };
+  for (const k of WHOLE_LIST_KEYS) {
+    if (!(k in body)) continue;
+    // a list whose version did not move is sent exactly as built
+    if (versions[k] === fresh.list_versions?.[k]) continue;
+    again[k] = remergeWholeList(k, was[k], body[k], fresh[k]);
+  }
+  const fv = listVersionsFor(again, fresh.list_versions);
+  try {
+    return await send(fv ? { ...again, list_versions: fv } : again);
+  } catch (e) {
+    if (!settingsMovedOf(e)) throw e;
+    let latest: object | null = fresh;
+    try { latest = await read(); } catch { /* keep the read we have */ }
+    throw new SettingsMovedError(latest);
+  }
+}
+// ---- end of the whole-list settings twin block ----
+
+// ---- figures that wait for their inputs: twin block ----
+// A figure worked out on the client from a query's answer (the planner's
+// Bills, the savings left over) may only be shown, or saved, once that
+// query has answered. While it loads or after it failed the figure is the
+// unknown mark, and Save says why it waits. Kept character-for-character
+// equal in webapp/src/moneymath.ts and mobile/src/lib/pure.ts; the shared
+// case table runs against both.
+
+/** The mark for a figure that is not known: never $0, which is a claim
+ *  about the household. One constant, so the mark is a one-line change. */
+export const UNKNOWN_FIGURE = "·";
+
+/** Where a query stands for a figure built from it: it has an answer,
+ *  is still loading, or failed with nothing to show. */
+export type InputPhase = "ready" | "loading" | "failed";
+
+export function inputPhase(q: { data?: unknown; isError: boolean }): InputPhase {
+  if (q.data !== undefined) return "ready";
+  return q.isError ? "failed" : "loading";
+}
+
+export const PLANNER_BILLS_FAILED =
+  "Couldn't load your bills, so the plan can't be worked out or saved yet.";
+export const PLANNER_HISTORY_FAILED =
+  "Couldn't load your spending history, so the plan can't be filled in or saved yet.";
+
+/** Why the budget planner shows no worked-out figure and holds Save, or
+ *  null once every input it computes from has answered. `bills` is the
+ *  read the Bills figure comes from; `history` is the suggestion a first
+ *  run is filled in from ("ready" when nothing waits on it). */
+export function plannerWaits(bills: InputPhase, history: InputPhase):
+    string | null {
+  if (bills === "failed") return PLANNER_BILLS_FAILED;
+  if (history === "failed") return PLANNER_HISTORY_FAILED;
+  if (bills === "loading" || history === "loading") return SAVE_WAITS_LOADING;
+  return null;
+}
+// ---- end of the figures-wait twin block ----
+
+// ---- screen states: twin block ----
+// What a screen says when a read failed, or when what it shows is the copy
+// from before a refetch that failed; when a failed read is asked again; and
+// which figure a screen may print from a read. Kept character-for-character
+// equal in webapp/src/moneymath.ts and mobile/src/lib/pure.ts; the shared
+// case table runs against both (specs/screen-states.md).
+
+/** Which client is speaking. Only the words for a request that got no
+ *  answer differ: a phone with no answer is offline, while a browser
+ *  cannot tell a dropped connection from a server that is down. */
+export type StatesClient = "web" | "phone";
+
+/** "a moment." or "N seconds." — the wait the two sentences below share */
+function inWait(retryAfter?: string | null): string {
+  const secs = parseInt(retryAfter ?? "", 10);
+  return secs > 0 && secs <= 120
+    ? `${secs} second${secs === 1 ? "" : "s"}.`
+    : "a moment.";
+}
+
+/** "The server is busy — try again in a moment.", or in N seconds when
+ *  the server named a short wait: a 503 is the server shedding load. The
+ *  sign-in page (pages.js) says the same words. */
+export function busyText(retryAfter?: string | null): string {
+  return "The server is busy — try again in " + inWait(retryAfter);
+}
+
+/** The same shape for the proxy's "back in a moment" answer: the app is
+ *  restarting, not overloaded, so it says that. */
+export function restartingText(retryAfter?: string | null): string {
+  return "The server is restarting — try again in " + inWait(retryAfter);
+}
+
+/** The status a failed request came back with: the client's own field
+ *  (the phone's ApiError; the web's AuthError and BusyError), else the
+ *  leading "NNN: " the web puts on every other refusal — never a number
+ *  that happens to sit in the reply's text. Null when no answer came. */
+export function failureStatus(e: unknown): number | null {
+  const s = (e as { status?: unknown } | null | undefined)?.status;
+  if (typeof s === "number" && s > 0) return s;
+  const m = e instanceof Error ? /^(\d{3}): /.exec(e.message) : null;
+  return m ? Number(m[1]) : null;
+}
+
+/** expo/fetch's FetchError messages that are not a missing answer: the
+ *  request's own signal cancelled it, or the server answered with a
+ *  redirect the request refused. */
+const FETCH_ERROR_ANSWERED =
+  /^fetch failed: (The operation was aborted|Fetch request has been canceled|Redirect is not allowed)/;
+
+/** A request that never got an answer, so no status: the browser's and
+ *  React Native's fetch reject with a TypeError ("Failed to fetch",
+ *  "Network request failed"); expo/fetch, the phone's fetch on a device,
+ *  with its FetchError, a plain Error reading "fetch failed: <the native
+ *  cause>". A cancelled request says nothing about the connection. */
+export function noAnswer(e: unknown): boolean {
+  if (failureStatus(e) !== null) return false;
+  if ((e as { name?: unknown } | null | undefined)?.name === "TypeError")
+    return true;
+  return e instanceof Error && e.name === "Error"
+    && e.message.startsWith("fetch failed: ")
+    && !FETCH_ERROR_ANSWERED.test(e.message);
+}
+
+/** The server's own sentence in a refusal, or "" when it sent none: the
+ *  phone's parsed detail, else the JSON body behind the web's "NNN: ". A
+ *  markup page is never read out. */
+function serverSentence(e: unknown): string {
+  const d = (e as { detail?: unknown } | null | undefined)?.detail;
+  if (typeof d === "string" && d.trim()) return d.trim();
+  const raw = e instanceof Error ? e.message : "";
+  const m = /^(\d{3}):\s*([\s\S]*)$/.exec(raw);
+  const body = (m ? m[2] : raw).trim();
+  try {
+    const p = JSON.parse(body);
+    const t = p?.detail ?? p?.message;
+    if (typeof t === "string") return t.trim();
+    if (Array.isArray(t) && typeof t[0]?.msg === "string") return t[0].msg;
+    return "";
+  } catch { /* not JSON: the body is the sentence */ }
+  return body.startsWith("<") ? "" : body;
+}
+
+/** `s` as the end of "Couldn't load bills — …": first letter lowered
+ *  unless the first word is an initialism, a full stop added if it ends
+ *  without one. */
+function asReason(s: string): string {
+  const t = /^[A-Z](?![A-Z0-9])/.test(s) ? s[0].toLowerCase() + s.slice(1) : s;
+  return /[.!?…]$/.test(t) ? t : t + ".";
+}
+
+/** One failed read, said once: the words in place of the section that
+ *  needed it, and whether a "Try again" beside them can help. `what` names
+ *  the section ("bills", "investment fees"). `doing` is the verb when the
+ *  request was a write ("send", "save"): "Couldn't send your report — …". */
+export function failLine(e: unknown, what: string, client: StatesClient,
+                         doing = "load"): { text: string; retry: boolean } {
+  const head = `Couldn't ${doing} ${what} — `;
+  const status = failureStatus(e);
+  const retryAfter = (e as { retryAfter?: unknown } | null | undefined)
+    ?.retryAfter;
+  const wait = typeof retryAfter === "string" ? retryAfter : null;
+  if (status === null) {
+    if (!noAnswer(e))
+      return { text: head + "something went wrong.", retry: true };
+    return { text: head + (client === "phone" ? "you're offline."
+                                              : "can't reach the server."),
+             retry: true };
+  }
+  if ((e as { restarting?: unknown }).restarting === true)
+    return { text: restartingText(wait), retry: true };
+  if (status === 503)
+    return { text: busyText(wait), retry: true };
+  if (status >= 500)
+    return { text: head + "something went wrong on the server.", retry: true };
+  if (status === 429)
+    return { text: "Too many requests — wait a minute, then try again.",
+             retry: true };
+  if (status === 408)
+    return { text: head + "the server took too long to answer.", retry: true };
+  if (status === 401)
+    return { text: head + "sign in again.", retry: false };
+  const said = serverSentence(e);
+  if (status === 403)
+    return { text: said ? head + asReason(said)
+                        : doing === "load" ? `Your role doesn't include ${what}.`
+                        : "Your role doesn't allow that.",
+             retry: false };
+  if (!said)
+    return { text: head + `the server refused the request (${status}).`,
+             retry: status === 409 || status < 400 };
+  return { text: head + asReason(said), retry: status === 409 || status < 400 };
+}
+
+/** A failed request as one sentence of its own, for the lines that say
+ *  why a write did not land: the cause when the server sent no sentence
+ *  of its own (no answer, a restart, busy, a 5xx, a 429, a bare refusal),
+ *  else null and the server's sentence stands. Never the raw text of the
+ *  failure: no "TypeError: …", no status, no JSON, no page. */
+export function failCause(e: unknown, client: StatesClient): string | null {
+  const status = failureStatus(e);
+  const retryAfter = (e as { retryAfter?: unknown } | null | undefined)
+    ?.retryAfter;
+  const wait = typeof retryAfter === "string" ? retryAfter : null;
+  if (status === null)
+    return noAnswer(e) ? (client === "phone" ? "You're offline."
+                                             : "Can't reach the server.")
+      : null;
+  if ((e as { restarting?: unknown }).restarting === true)
+    return restartingText(wait);
+  if (status === 503) return busyText(wait);
+  const said = serverSentence(e);
+  if (said && !/^\d{3}\b/.test(said)) return null;
+  if (status >= 500) return "Something went wrong on the server.";
+  if (status === 429) return "Too many requests — wait a minute, then try again.";
+  if (status === 408) return "The server took too long to answer.";
+  return "The server refused the request.";
+}
+
+const MONTH_ABBR = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** When a copy was fetched, as the stale line names it: a clock time
+ *  today ("9:41 AM"), a date this year ("Mar 3"), else with its year. */
+export function shownAt(updatedAt: number, now: number): string {
+  const t = new Date(updatedAt), n = new Date(now);
+  if (t.getFullYear() === n.getFullYear() && t.getMonth() === n.getMonth()
+      && t.getDate() === n.getDate()) {
+    const h = t.getHours();
+    const mm = String(t.getMinutes()).padStart(2, "0");
+    return `${h % 12 || 12}:${mm} ${h < 12 ? "AM" : "PM"}`;
+  }
+  const day = `${MONTH_ABBR[t.getMonth()]} ${t.getDate()}`;
+  return t.getFullYear() === n.getFullYear() ? day
+    : `${day}, ${t.getFullYear()}`;
+}
+
+/** The one line above data kept from before a refetch that failed. Only
+ *  the phone calls a request with no answer offline. */
+export function staleLine(e: unknown, updatedAt: number,
+                          client: StatesClient, now: number): string {
+  const when = updatedAt > 0
+    ? `what was here at ${shownAt(updatedAt, now)}.`
+    : "what was here before.";
+  return (client === "phone" && noAnswer(e) ? "Offline" : "Couldn't refresh")
+    + " — showing " + when;
+}
+
+/** Whether a failed read is asked again on its own: only a failure that
+ *  can heal — no answer at all, a 5xx, a 408 — and at most three times.
+ *  Any other 4xx is the server's answer, and asking again only delays it;
+ *  a 429 included, since every refused request counts as a strike toward
+ *  the address ban. */
+export function retryRead(failures: number, e: unknown): boolean {
+  if (failures >= 3) return false;
+  // each attempt abandoned at the read limit already cost the whole
+  // limit: one more, then the failed line with its "Try again"
+  if (timedOut(e)) return failures < 1;
+  const s = failureStatus(e);
+  return s === null || s >= 500 || s === 408;
+}
+
+/** The wait before automatic attempt n + 1: 1 s, 2 s, 4 s, capped at 8 s. */
+export function retryReadDelay(n: number): number {
+  return Math.min(1000 * 2 ** n, 8000);
+}
+
+/** The figure a screen may print from a read: the picked value once the
+ *  read has an answer on screen, else null, which prints as
+ *  UNKNOWN_FIGURE. That answer may be the last one kept after a refetch
+ *  failed, or the previous filter's standing in while the next loads;
+ *  the screen greys both (figureGreyed). The replacement for
+ *  `q.data?.x ?? 0`, which reads a read that never answered as zero. */
+export function knownOr<D, T>(q: { data?: D },
+                              pick: (d: D) => T | null | undefined): T | null {
+  if (q.data === undefined) return null;
+  const v = pick(q.data);
+  return v === undefined ? null : v;
+}
+
+/** A figure is greyed while it is not this read's current answer: the
+ *  last one kept after the latest attempt failed, or a previous filter's
+ *  standing in while this one loads. */
+export function figureGreyed(q: { data?: unknown; isError: boolean;
+                                  isPlaceholderData?: boolean }): boolean {
+  if (q.data === undefined) return false;
+  return q.isError || !!q.isPlaceholderData;
+}
+/** The empty lines: one short line per screen, the same words on both
+ *  clients, with at most one action beside it. A filtered list that
+ *  answered empty always says `filtered` and offers nothing — the way out
+ *  is the filter just used; `noAccounts` with the `connect` action is
+ *  offered only when the household has no accounts at all. */
+export const EMPTY_LINES = {
+  filtered: "Nothing matches these filters.",
+  noAccounts: "No accounts linked yet.",
+  connect: "Connect or import",
+  monthNoTransactions: "No transactions this month.",
+  range: "None in this range.",
+  noSpending: "No spending.",
+  noSpendingPosted: "No spending posted.",
+  spendingRange: "No spending in this range.",
+  incomeRange: "No income in this range.",
+  businessBooks: "No business transactions yet.",
+  merchants: "No merchants yet.",
+  imports: "No file imports yet.",
+  lineItems: "No parsed line items yet.",
+  lineItemsAction: "Add a receipt",
+  reimburse: "Nothing waiting to be paid back.",
+  reimburseAction: "Go to Transactions",
+  assistantOff: "The assistant needs a language model, and none is set up.",
+  assistantAction: "Set one up in Settings",
+  bills: "No bills or income tracked yet.",
+  billsAction: "Find bills & income",
+} as const;
+
+/** The household has no accounts at all: only from an accounts read that
+ *  answered, never from one that failed or has not answered yet. */
+export function noAccountsYet(q: { data?: { accounts?: unknown[] } }): boolean {
+  return q.data !== undefined && Array.isArray(q.data.accounts)
+    && q.data.accounts.length === 0;
+}
+/** How long a read waits for the server's first word before it is
+ *  abandoned (specs/screen-states.md, "A read that never answers"). */
+export const READ_LIMIT_MS = 30_000;
+
+/** Whether a request only asks: a GET or a HEAD, fetch's default included. */
+export function isRead(method?: string | null): boolean {
+  const m = (method || "GET").toUpperCase();
+  return m === "GET" || m === "HEAD";
+}
+
+/** Whether a failed read is one this client abandoned at the limit. */
+export function timedOut(e: unknown): boolean {
+  return (e as { timedOut?: unknown } | null | undefined)?.timedOut === true;
+}
+
+// the outer signal each answered read is still tied to, until its body
+// has been read (readFinished)
+const openReads = new WeakMap<object, () => void>();
+
+/** `send` under the read limit. A read with no answer after `ms` is
+ *  cancelled and fails as a request that got no answer does — a TypeError
+ *  with no status, marked `timedOut` — so the failed line, the stale line
+ *  and the phone's offline gate treat it as the dead connection it looks
+ *  like, and never as a sign-out or a cancelled request. The limit ends
+ *  when `send` resolves, which for fetch is the response's headers: a
+ *  long body or a stream is not cut off. `outer` (the caller's or the
+ *  account epoch's signal) still cancels the read, before the answer and
+ *  while its body is read; hand the answer to readFinished once that is
+ *  done. Signals are combined by hand: AbortSignal.any is not on every
+ *  engine the clients run on.
+ *
+ *  A write is sent with `outer` untouched and is never timed: abandoning
+ *  it would leave its outcome unknown and invite a second attempt that
+ *  doubles it, and uploads and the assistant's answers run long. */
+export async function fetchRead<R extends object>(
+    send: (signal: AbortSignal | undefined) => Promise<R>,
+    method: string | null | undefined,
+    outer: AbortSignal | null | undefined,
+    ms: number = READ_LIMIT_MS): Promise<R> {
+  if (!isRead(method)) return send(outer ?? undefined);
+  const ctl = new AbortController();
+  let expired = false;
+  const cut = () => ctl.abort();
+  if (outer?.aborted) ctl.abort();
+  else outer?.addEventListener("abort", cut);
+  const unlink = () => outer?.removeEventListener("abort", cut);
+  const timer = setTimeout(() => {
+    // an outer abort already ended it: that is not a timeout
+    if (ctl.signal.aborted) return;
+    expired = true;
+    ctl.abort();
+  }, ms);
+  try {
+    const r = await send(ctl.signal);
+    openReads.set(r, unlink);
+    return r;
+  } catch (e) {
+    unlink();
+    if (!expired) throw e;
+    throw Object.assign(new TypeError("no answer in time"), { timedOut: true });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** The answer fetchRead returned has been read to its end (or dropped):
+ *  stop watching the outer signal for it. Anything else is ignored. */
+export function readFinished(r: object | null | undefined): void {
+  if (!r) return;
+  const unlink = openReads.get(r);
+  if (!unlink) return;
+  openReads.delete(r);
+  unlink();
+}
+
+// ---- end of the screen-states twin block ----
+
 /** The list of device tokens still to revoke, after this sign-out's
  *  revoke did not reach its server: the token joins it once, and the list
  *  keeps only tokens the server could still honour (a device token lives
@@ -1597,17 +2413,16 @@ export function linkPollMayRetry(e: unknown): boolean {
 }
 
 /** True when the household has no checking account the cash runway can
- *  start from (card-only or savings-only). The server says so outright;
+ *  start from (card-only or savings-only). The runway says so outright;
  *  an older payload is read by its null checking balance. Cash ahead is
  *  then unknown, not $0, so no "short" or "tight" line may be drawn from
- *  it. (web: Today.tsx noChecking) */
+ *  it (and the server sends no forecast for such a household). (web:
+ *  Today.tsx noChecking) */
 export function noCheckingLinked(
   runway: { checking: number | null; no_checking?: boolean } | null
     | undefined,
-  forecast: { no_checking?: boolean } | null | undefined,
 ): boolean {
-  return !!forecast?.no_checking || !!runway?.no_checking
-    || (!!runway && runway.checking == null);
+  return !!runway?.no_checking || (!!runway && runway.checking == null);
 }
 
 /** What a bank saved but not yet pulled says on its connection row and in
@@ -1635,6 +2450,29 @@ export function linkedLine(institution: string | undefined,
     + (firstSync === "pending" ? ` — ${FIRST_SYNC_RUNNING}` : "");
 }
 
+/** The line a finished add earns: the server's sentence for a session
+ *  that came back with several banks, printed as it is; else the one-bank
+ *  line. The web's plaidLinkOutcome. */
+export function addedLine(r: { institution?: string; first_sync?: string;
+                               summary?: string }): string {
+  if (r.summary !== undefined) return r.summary;
+  // older-server path: stands in for `summary`
+  return linkedLine(r.institution, r.first_sync);
+}
+
+/** The line under the add-a-bank buttons: the server's, printed as it is
+ *  (how many more banks, and whether several can be connected in one
+ *  sign-in). The web's BankLinkLine. */
+export function bankLinkLine(me: { features?: { bank_link_line?: string }
+                                   | null } | undefined | null
+): string | null {
+  const v = me?.features?.bank_link_line;
+  if (v !== undefined) return v || null;
+  // older-server path: stands in for `bank_link_line` — a server that
+  // sends none asks Plaid for one bank per sign-in, so nothing is said
+  return null;
+}
+
 /** What the in-app browser's answer says about the bank sign-in window.
  *  iOS resolves only when the window closes ("cancel"/"dismiss"), so that
  *  answer IS the close. Android resolves "opened" the moment the Custom
@@ -1651,13 +2489,14 @@ export function linkWindowAnswer(type: string | undefined):
 
 /** The bucket a business cost shows on the Books control: the one the
  *  server's P&L counts it in (a cost dated before the business started is
- *  start-up there), else the stored class, else operating. A control that
- *  showed "Operating" for a start-up cost could not send Operating: the
- *  choice would already be selected. */
+ *  start-up there), else the stored class. A control that showed
+ *  "Operating" for a start-up cost could not send Operating: the choice
+ *  would already be selected. Money that moved is in no bucket and shows
+ *  none. */
 export function bizShownBucket(
   t: { bucket: string | null; effective_bucket?: string | null },
 ): string {
-  return t.effective_bucket || t.bucket || "operating";
+  return t.effective_bucket ?? t.bucket ?? "";
 }
 
 /** Whether a Books row still needs a Schedule C line: a cost given an
@@ -1790,29 +2629,6 @@ export function pairSelection(
 // ---- reimbursements, the category pickers, local dates, the device zone ----
 // The web keeps a twin of each in webapp/src/moneymath.ts under the same
 // name; the shared case table (scripts/money-cases.mjs) runs against both.
-
-/** What is still owed back across the charges awaiting reimbursement.
- *
- *  Each charge's target is its EXPECTED amount when one is set (a partial
- *  expectation — the insurer's share of a bill), else the charge itself;
- *  receipts already linked come off it, floored at 0. This is the figure
- *  the Today strip and the daily email state, and the one the link path
- *  clears a flag against, so the page's headline must not sum the charges'
- *  face value instead. */
-export function reimbOwed(pending: readonly {
-  amount: number; expected?: number | null; received?: number | null;
-}[]): number {
-  return pending.reduce((a, t) => {
-    // the signed amount, as the server takes it: a flagged deposit (money
-    // that came IN) with no expectation owes nothing back, where its
-    // absolute value would add the whole deposit to the headline. An
-    // expectation is capped at the charge, as the server caps it: no link
-    // can bring back more than the charge, and a flag saved before that
-    // rule (or restored from an archive) may still expect more.
-    const target = Math.min(t.expected ?? t.amount, t.amount);
-    return a + Math.max(0, target - (t.received ?? 0));
-  }, 0);
-}
 
 /** The categories a merchant rule or a split part can take, grouped.
  *
@@ -1977,6 +2793,22 @@ export type ListPhase = "loading" | "failed" | "empty" | "rows";
 // alerts at the top of a sixty-row log were the three things the page is
 // for, and they read as three more rows. `active` is what needs a person
 // now; `history` is every row, for the toggle's count and its list.
+// The alert log stores no link, so an alert's own target (a drift alert's
+// /bills/history?payee=…) exists only on the live alert Today carries. An
+// active log row takes the link of the live alert with the same kind and
+// message; anything else falls back to the kind's page.
+export function withLiveLinks<
+    T extends { kind: string; message: string; active: number | boolean;
+                link?: string | null }>(
+    rows: T[], live: { kind: string; message: string;
+                       link?: string | null }[] | undefined): T[] {
+  if (!live?.length) return rows;
+  return rows.map((r) => {
+    if (r.link || !r.active) return r;
+    const hit = live.find((a) => a.kind === r.kind && a.message === r.message);
+    return hit?.link ? { ...r, link: hit.link } : r;
+  });
+}
 export type AlertLike = { active: number | boolean; dismissed: number | boolean };
 export function alertSections<T extends AlertLike>(rows: T[]): {
   active: T[]; dismissed: T[]; resolved: T[]; history: T[];
@@ -2166,6 +2998,18 @@ export function accountTheme(
     ? stored : null;
 }
 
+/** Whether this login's theme is the household's (settings.theme, saved
+ *  from the picker and adopted at launch) rather than this phone's alone.
+ *  The web's rule (App.tsx perDeviceTheme): anyone who may change data,
+ *  owner or member, follows the household; a viewer's save would be
+ *  refused and the demo refuses every settings write, so both keep a
+ *  per-device choice, as does a login not yet known. */
+export function themeFollowsHousehold(
+    me: { role?: string | null; demo?: boolean | null } | null | undefined,
+): boolean {
+  return !!me && !!me.role && me.role !== "viewer" && !me.demo;
+}
+
 // Bill cadence words and the edit picker's option list. The web keeps an
 // identical copy in webapp/src/cadence.ts; the pure-logic suite runs both
 // and checks the two are the same text.
@@ -2340,14 +3184,23 @@ export function recipientDuplicate(
  *  until anyone has verified). So the sentence is worked out from the
  *  same facts. `recipients`/`status` come from the settings view and are
  *  undefined until it loads; `needBaseUrl` from /api/notify, absent on an
- *  older server. */
+ *  older server. A member's view carries only their own entry of the
+ *  roster, so it also carries `listConfigured` (a list is set) and
+ *  `onList` (that list, split as the worker splits it, names them); when
+ *  present they decide, and an owner's view or an older server falls back
+ *  to the roster. A member on the list gets one status row for their own
+ *  mailbox however the entry was stored: `mailed` is the mailer's answer
+ *  and `not_mailed` why it says no (`held`, or the invitation's state). */
 export function myDailyLine(x: {
   me: string; on: boolean; muted: boolean;
   prefs?: Partial<Record<string, boolean>> | null;
   verified?: boolean | null; hosted?: boolean;
   recipients?: string[] | null;
+  listConfigured?: boolean | null; onList?: boolean | null;
   status?: { email: string; verified?: boolean | null;
-             invite?: string | null; delivery?: string | null }[] | null;
+             invite?: string | null; delivery?: string | null;
+             mailed?: boolean | null; not_mailed?: string | null }[]
+           | null;
   needBaseUrl?: boolean;
 }): { receiving: boolean; text: string } {
   const no = (text: string) => ({ receiving: false, text });
@@ -2358,15 +3211,24 @@ export function myDailyLine(x: {
   const row = x.status?.find((r) => r.email.toLowerCase() === low);
   if (row?.delivery === "bouncing" || row?.delivery === "complained")
     return no("Held — mail to your address isn't being delivered.");
-  if (x.status && x.recipients?.length) {
-    if (!row) return no("The owner's mail list doesn't include you.");
-    if (row.invite !== "accepted") {
+  const listed = x.listConfigured != null ? x.listConfigured
+    : !!x.recipients?.length;
+  if (x.status && listed) {
+    if (x.onList === false || !row)
+      return no("The owner's mail list doesn't include you.");
+    // a member's own row carries the mailer's verdict and, when it does
+    // not mail them, why; an older server's row has only the invitation
+    const state = row.mailed == null ? row.invite
+      : row.mailed ? "accepted" : row.not_mailed ?? row.invite;
+    if (state === "held")
+      return no("Held until the owner confirms the mail list.");
+    if (state !== "accepted") {
       if (x.needBaseUrl)
         return no("Your invitation can't be sent until the server has a "
           + "public address (OIKONOME_BASE_URL).");
-      if (row.invite === "invited")
+      if (state === "invited")
         return no("Accept the invitation in your inbox to start receiving it.");
-      if (row.invite === "declined")
+      if (state === "declined")
         return no("You declined the invitation — ask the owner to send another.");
       return no("You haven't accepted an invitation yet — ask the owner to "
         + "send one.");
@@ -2431,16 +3293,6 @@ export function missedBillPill(withdrawnOn: string | null | undefined): {
   const [y, m, d] = withdrawnOn.slice(0, 10).split("-");
   return { text: "withdrawn", tone: "warn",
            note: `charge withdrawn by the bank feed (${m}/${d}/${y.slice(2)})` };
-}
-
-/** Interest a plan saves against paying only the minimums, or 0 when there
- *  is no honest figure. A baseline that never pays off stops at the
- *  simulation horizon, so its interest is a truncation total, not a cost. */
-export function interestSaved(
-  base: { debt_free: string | null; total_interest: number },
-  plan: { total_interest: number },
-): number {
-  return base.debt_free ? base.total_interest - plan.total_interest : 0;
 }
 
 // Which 401 replies are a step-up refusal rather than a lost session. A
@@ -2535,6 +3387,9 @@ export function pushRoute(event: string,
     return Number.isInteger(n) && n >= lo && n <= hi ? n : null;
   };
   if (event === "alert") return "/alerts";
+  // an account-security change opens the screen where it can be reviewed
+  // and undone; Alerts has nothing to show for it
+  if (event === "security") return "/security";
   if (event === "monthly") {
     let y = int(data?.y, 1900, 2100), m = int(data?.m, 1, 12);
     if (y === null || m === null) {
@@ -2551,9 +3406,10 @@ export function pushRoute(event: string,
   return "/";
 }
 
-/** Where a push tap goes once the account's state is known. The relay
- *  sends one textless "alert" event for budget alerts and security notices
- *  alike, so the event cannot say which one it was. A recovery that would
+/** Where a push tap goes once the account's state is known. Security
+ *  notices travel as their own "security" event, but a server whose relay
+ *  predates it sends them as the textless "alert" a budget alert uses, so
+ *  that event cannot say which one it was. A recovery that would
  *  strip this account's two-factor is the notice that can still be undone,
  *  and only the Security screen can cancel it — so while one is pending,
  *  an alert tap opens Security instead of Alerts. */
@@ -2705,8 +3561,17 @@ export async function runChunked(
  *  months to hold, so the server shows the month so far instead and says
  *  `live_month` — the heading names that, so a partial month never reads
  *  as the whole range the picker promised. */
-export const windowLabel = (w: { label: string; live_month?: boolean }) =>
-  w.live_month ? `${w.label} so far` : w.label;
+// older-server path: stands in for `heading`
+export const windowLabel = (w: { label: string; live_month?: boolean;
+                                  heading?: string }) =>
+  // the server's heading ("Nov 1–17 so far"); an older server sends none
+  w.heading || (w.live_month ? `${w.label} so far` : w.label);
+
+/** The window runs to today (the month so far): no per-month pace beside
+ *  it. An older server says so only for a first-month ledger. */
+// older-server path: stands in for `so_far`
+export const windowSoFar = (w: { live_month?: boolean; so_far?: boolean }) =>
+  w.so_far ?? !!w.live_month;
 
 /** The search list's "Load more" pile, kept as one slot per page so a
  *  later edit can reach it. Each slot is refreshed from that page's cached
@@ -2774,6 +3639,9 @@ export interface BulkJobFile {
   index: number; name: string;
   state: "pending" | "running" | "done" | "failed" | "skipped";
   ok?: boolean; imported?: number; error?: string;
+  // lines already stored (left as they were or updated in place); absent
+  // on an older server, where `imported` counted them too
+  matched?: number;
   account_id?: string | null;
   warnings?: string[];
   corrected?: number;
@@ -2926,6 +3794,17 @@ export const YNAB_SEVERAL = /covers \d+ YNAB accounts/;
  *  refused as a duplicate. The web client applies the same predicate. */
 export const isPlanSavingsGoal = (name: string): boolean =>
   name.trim().toLowerCase() === "savings";
+
+/** The plan's Savings line with nothing of a goal's own yet — no account,
+ *  no target, no date, no words — which the goals card collapses to its
+ *  account picker. One that carries a target, a date or words keeps the
+ *  full editor, so those stay readable, editable and removable. */
+export const isPlanOnlySavingsGoal = (r: {
+  name: string; target: string; target_date: string; account_id: string;
+  tokens: string;
+}): boolean =>
+  isPlanSavingsGoal(r.name) && !r.account_id && !(Number(r.target) > 0)
+  && !r.target_date && !r.tokens.split(",").some((t) => t.trim() !== "");
 
 /** A typed take-home by the server's separator rules ("12,50" is
  *  twelve-fifty, "1,234.56" a thousands comma). Blank is 0; text that is
@@ -3215,3 +4094,654 @@ export function scanAlreadyRunning(e: unknown): boolean {
   const m = e instanceof Error ? e.message : String(e ?? "");
   return st === 409 || /already running/i.test(m);
 }
+
+// ---- the retirement walkthrough's saved progress ----
+// Each step is saved as it is answered — its mark in ret_wizard_steps and
+// its own answers in ret_wizard_answers — so a reload or another device
+// resumes where the person stopped instead of starting over with blank
+// boxes. The web wizard carries a twin of these in RetireWizard.tsx.
+
+/** The range the server holds each walkthrough answer to (the settings
+ *  save refuses anything outside it, and the projection clamps age at
+ *  the same top), as [lowest, highest]. The checks and the boxes' hints
+ *  read it, and the pure-logic suite compares it with the server's table,
+ *  so a bound cannot drift on one side. Nothing is clamped against it. */
+export const RET_WIZARD_BOUNDS: Record<string, [number, number]> = {
+  age: [18, 90],
+  end: [19, 110],
+  spend: [0, 100_000_000],
+  employer_mo: [0, 10_000_000],
+  roth_mo: [0, 10_000_000],
+  taxable_mo: [0, 10_000_000],
+  ret: [-20, 30],
+  infl: [-20, 30],
+  ssage: [62, 70],
+};
+
+export const RET_WIZARD_STEPS =
+  ["age", "spend", "saving", "assumptions", "done"] as const;
+export type RetWizardStep = typeof RET_WIZARD_STEPS[number];
+export type RetWizardMarks = Record<string, string | null> | null | undefined;
+export type RetWizardKey = "age" | "spend" | "employer_mo" | "roth_mo"
+  | "taxable_mo" | "ret" | "infl" | "end" | "ssage";
+export type RetWizardAnswers =
+  Partial<Record<RetWizardKey | "answers_v2", unknown>>;
+const RET_WIZARD_KEYS: readonly RetWizardKey[] =
+  ["age", "spend", "employer_mo", "roth_mo", "taxable_mo", "ret", "infl",
+   "end", "ssage"];
+
+/** the answers each question owns, in the order it asks them */
+export const RET_STEP_ANSWERS: Record<RetWizardStep, readonly RetWizardKey[]> = {
+  age: ["age"], spend: ["spend"],
+  saving: ["employer_mo", "roth_mo", "taxable_mo"],
+  assumptions: ["ret", "infl", "end", "ssage"], done: [],
+};
+const RET_MONEY = new Set<RetWizardKey>(["spend", "employer_mo", "roth_mo",
+                                         "taxable_mo"]);
+
+/** The step to open on: the first question with no saved mark, or the
+ *  summary once all are answered. A finished or skipped walkthrough that
+ *  is opened again starts from the top, with its answers prefilled. */
+export function retWizardResumeAt(marks: RetWizardMarks): number {
+  if (!marks || marks.done) return 0;
+  const i = RET_WIZARD_STEPS.findIndex((k) => k !== "done" && !marks[k]);
+  return i === -1 ? RET_WIZARD_STEPS.length - 1 : i;
+}
+
+/** Started and not finished. The first answer saves the birthdate, and
+ *  "no birthdate yet" is what offers the walkthrough on a first visit —
+ *  without this, a person who stopped after step one never saw it again. */
+export function retWizardMidway(marks: RetWizardMarks): boolean {
+  return !!marks && !marks.done
+    && RET_WIZARD_STEPS.some((k) => k !== "done" && !!marks[k]);
+}
+
+/** One step's save: its mark and EVERY box on it, as the person's answers
+ *  (walking the wizard is answering it; each box shows what the projection
+ *  would use, so leaving it as it is confirms it). A cleared box is the
+ *  server's default, so it clears the saved answer (null); text that is not
+ *  a number does the same instead of being stored as $0. `ret_answers_v: 2`
+ *  marks the answers as typed into this walkthrough, so the projection may
+ *  read them; it, the claim age and the Roth saving ride BESIDE
+ *  `ret_wizard_answers`, as top-level fields an older server ignores (it
+ *  refuses a whole save over an answer key it does not know). */
+export function retWizardStepBody(
+  step: RetWizardStep, draft: Partial<Record<RetWizardKey, string>>,
+): Record<string, unknown> {
+  const answers: Record<string, number | null> = {};
+  let ssage: number | null | undefined;
+  let roth: number | null | undefined;
+  for (const k of RET_STEP_ANSWERS[step]) {
+    const t = (draft[k] ?? "").trim();
+    const n = t === "" ? null : RET_MONEY.has(k) ? parseMoneyDraft(t) : Number(t);
+    const v = n !== null && Number.isFinite(n) ? n : null;
+    if (k === "ssage") ssage = v;
+    // a draft with no Roth box (a phone on an older server) leaves the
+    // stored Roth answer alone; a blank Roth box is an answered $0, so
+    // "answered nothing" and "never asked" stay apart
+    else if (k === "roth_mo") { if (draft[k] !== undefined) roth = v ?? 0; }
+    else answers[k] = v;
+  }
+  const out: Record<string, unknown> = { ret_wizard_steps: { [step]: "done" } };
+  if (Object.keys(answers).length || ssage !== undefined
+      || roth !== undefined) {
+    out.ret_answers_v = 2;
+    if (Object.keys(answers).length) out.ret_wizard_answers = answers;
+    if (ssage !== undefined) out.ret_wizard_ssage = ssage;
+    if (roth !== undefined) out.ret_wizard_roth_mo = roth;
+  }
+  return out;
+}
+
+/** The wizard's boxes: an answer a current client saved (listed in the
+ *  answers' `answers_v2`), else what the projection used, else blank. An
+ *  answer an older client saved — it stored every prefilled box — is
+ *  never shown: it is not the household's answer. */
+export function retWizardPrefill(
+  saved: RetWizardAnswers | null | undefined,
+  defaults: Partial<Record<RetWizardKey, number | null>>,
+  splitSeed = false,
+): Record<RetWizardKey, string> {
+  const out = {} as Record<RetWizardKey, string>;
+  const marked = saved?.answers_v2;
+  const has = (k: string) => Array.isArray(marked) && marked.includes(k);
+  // The projection's figures can be a what-if, so a saved answer wins.
+  // One exception: a saved tax-deferred figure with no Roth answer beside
+  // it may hold the Roth saving, and when the server says its figures are
+  // that saved total split by the ledger (`splitSeed`: the reply carries
+  // `saving_hint`), both saving boxes open on them, so saving them stores
+  // a split of the same total (specs/retirement-figures.md). A saved block
+  // with no Roth answer otherwise opens its Roth box on the $0 it is
+  // projected as, never on a what-if's Roth figure.
+  const seeded = splitSeed && typeof defaults.roth_mo === "number"
+    && !has("roth_mo");
+  const savedSaving = typeof defaults.roth_mo === "number" && !has("roth_mo")
+    && (has("employer_mo") || has("taxable_mo"));
+  for (const k of RET_WIZARD_KEYS) {
+    const v = seeded && (k === "employer_mo" || k === "roth_mo") ? undefined
+      : has(k) ? saved?.[k]
+      : k === "roth_mo" && savedSaving ? 0
+      : undefined;
+    const d = defaults[k];
+    out[k] = typeof v === "number" && Number.isFinite(v) ? String(v)
+      : typeof d === "number" && Number.isFinite(d) ? String(d) : "";
+  }
+  return out;
+}
+
+/** The sentence a finished restore or connections-bundle import adds when
+ *  it did not keep a stored credential: an AI key or a mail password is
+ *  never carried onto an address the file moved, so it is not sent to a
+ *  new destination. `dropped` is the server's `credentials_dropped` (a
+ *  list of fixed names); absent, empty or unknown names say nothing. The
+ *  phone and the web carry the same words (mobile/src/lib/pure.ts,
+ *  webapp/src/moneymath.ts). */
+export function droppedCredentialsNote(dropped: unknown): string | null {
+  if (!Array.isArray(dropped)) return null;
+  const says: [string, string][] = [
+    ["ai_key", "The AI service's address changed, so its key was not "
+      + "kept. Enter it again under Settings → AI."],
+    ["mail_password", "The mail server changed, so its password was not "
+      + "kept. Enter it again under Settings → Email & Push."]];
+  const out = says.filter(([k]) => dropped.includes(k)).map(([, t]) => t);
+  return out.length ? out.join(" ") : null;
+}
+
+/** An import's count line, without its closing period. `imported` is the
+ *  rows the import ADDED and `matched` the lines already stored (left as
+ *  they were, or updated in place); an older server sends no `matched`
+ *  and gets exactly the old words. `skipped_duplicates` (lines another
+ *  source's row already covers) closes a single upload's line; a
+ *  folder's per-file line (`"file"`) carries neither the verb nor that
+ *  tail, as it never has. Rows older than the history window are their
+ *  own note on both screens, so `skipped_older` is never said here. The
+ *  phone and the web carry the same words (mobile/src/lib/pure.ts,
+ *  webapp/src/moneymath.ts). */
+export function importCountText(
+  r: { imported?: number | null; matched?: number | null;
+       skipped_duplicates?: number | null; skipped_older?: number | null },
+  kind: "upload" | "file" = "upload",
+): string {
+  const added = r.imported ?? 0;
+  const here = r.matched ?? 0;
+  const head = here > 0
+    ? (added > 0 ? `Imported ${added} new, ${here} already here`
+                 : `Nothing new: ${here} already here`)
+    : kind === "file" ? `${added} transactions`
+      : `Imported ${added} transactions`;
+  const covered = kind === "upload" && r.skipped_duplicates
+    ? ` · skipped ${r.skipped_duplicates} already covered` : "";
+  return head + covered;
+}
+
+// ---- months with no bank feed ----
+// Cash Flow's month series carry only the months whose income is known: a
+// month no bank account posted in (a broken link, a missing statement) is
+// left out by the server rather than drawn as a loss. A chart must still
+// keep that month's place, or March sits beside July and the gap reads as
+// time that never passed. These put each missing month back as a null —
+// drawn as an empty, labelled slot ("no bank feed").
+/** Fill missing 'YYYY-MM' keys between consecutive points with null. */
+export function fillMonthKeyGaps(
+  points: [string, number][],
+): [string, number | null][] {
+  const out: [string, number | null][] = [];
+  const next = (k: string) => {
+    const y = Number(k.slice(0, 4)), m = Number(k.slice(5, 7));
+    return m === 12 ? `${y + 1}-01` : `${y}-${String(m + 1).padStart(2, "0")}`;
+  };
+  for (const p of points) {
+    const prev = out.length ? out[out.length - 1][0] : null;
+    if (prev !== null && /^\d{4}-\d{2}$/.test(prev)
+        && /^\d{4}-\d{2}$/.test(p[0])) {
+      // bounded: a malformed or reversed pair never loops
+      for (let k = next(prev), n = 0; k < p[0] && n < 1200; k = next(k), n++) {
+        out.push([k, null]);
+      }
+    }
+    out.push(p);
+  }
+  return out;
+}
+
+const MONTH_ABBRS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
+                     "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** One year's bars, labelled 'Jan'..'Dec': fill the missing months between
+ *  the first and the last bar with null. */
+// older-server path: stands in for `months_by_year`
+export function fillMonthLabelGaps(
+  points: [string, number][],
+): [string, number | null][] {
+  const at = new Map(points.map((p) => [p[0], p[1]] as const));
+  const idx = points.map((p) => MONTH_ABBRS.indexOf(p[0]));
+  if (!points.length || idx.some((i) => i < 0)) return points;
+  const out: [string, number | null][] = [];
+  for (let i = Math.min(...idx); i <= Math.max(...idx); i++) {
+    const m = MONTH_ABBRS[i];
+    out.push([m, at.has(m) ? at.get(m)! : null]);
+  }
+  return out;
+}
+
+/** The ages the "Retire at each age" table opens on: today's age, the
+ *  earliest age that works and the one just before it (where the answer
+ *  turns), the age the stress test is read at, every fifth birthday, and
+ *  the last age the plan looks at. Every other age is one tap away.
+ *  Mirrored in webapp/src/keyages.ts. */
+export function keyRetireAges(ages: readonly number[],
+                              earliest: number | null | undefined,
+                              refAge?: number | null): Set<number> {
+  const keep = new Set<number>();
+  if (!ages.length) return keep;
+  keep.add(ages[0]);
+  keep.add(ages[ages.length - 1]);
+  if (earliest != null) { keep.add(earliest); keep.add(earliest - 1); }
+  if (refAge != null) keep.add(refAge);
+  for (const a of ages) if (a % 5 === 0) keep.add(a);
+  return new Set(ages.filter((a) => keep.has(a)));
+}
+
+/** The tone of a script source's status on the Doctor screen: the web's
+ *  pill (Doctor.tsx) — fresh green, stale amber, and anything else (an
+ *  unwatched source is "off") plain, because a source nobody expects to
+ *  push has not failed. The row carries `status` and nothing else. */
+export type ScriptTone = "good" | "warn" | "plain";
+
+export function scriptStatusTone(status: string): ScriptTone {
+  return status === "fresh" ? "good" : status === "stale" ? "warn" : "plain";
+}
+
+/** The Accounts screen's institution cards: one per bank LOGIN, as the
+ *  web groups them, so each card can print the subtotal the server sends
+ *  for that login (`shown.by_item`). Two logins at one bank are two cards
+ *  under the same name; an account an older server sends without its
+ *  login falls back to its bank's name. Sorted by name, then as listed. */
+export function groupByLogin<A extends { item_id?: string | null;
+                                         institution_name?: string | null }>(
+  list: A[]): { key: string; inst: string; list: A[] }[] {
+  const g = new Map<string, { key: string; inst: string; list: A[] }>();
+  for (const a of list) {
+    const key = a.item_id ?? a.institution_name ?? "Other";
+    const cur = g.get(key);
+    if (cur) cur.list.push(a);
+    else g.set(key, { key, list: [a],
+                      inst: a.institution_name || a.item_id || "Other" });
+  }
+  return [...g.values()].sort((x, y) =>
+    x.inst.toLowerCase().localeCompare(y.inst.toLowerCase()));
+}
+
+/** The budget planner's "where each dollar goes" shares: each positive
+ *  part's whole-percent share of `income`, by largest remainder, exactly
+ *  as the server's reporting.shown_shares(parts, base=income) decides
+ *  them: the parts' shares add up to their own share of the income in
+ *  whole percent (100 when they are all of it, halves to even), each the
+ *  whole below its exact share or the one above, the points still missing
+ *  going to the largest remainders (earlier parts first on a tie). Null
+ *  for a part that is not positive, and for every part when there is no
+ *  income. This stays on the client because it echoes figures still
+ *  being typed; one case table (mobile/scripts/share-cases.json) runs
+ *  through this, its twin and the server's function. */
+export function plannerShares(parts: readonly number[],
+                              income: number): (number | null)[] {
+  // cents as Python's round() takes them: halves to even
+  const cent = (v: number) => {
+    const x = v * 100, f = Math.floor(x), d = x - f;
+    return d > 0.5 ? f + 1 : d < 0.5 ? f : f % 2 === 0 ? f : f + 1;
+  };
+  const cents = parts.map(cent);
+  const out: (number | null)[] = parts.map(() => null);
+  const drawn = cents.map((c, i) => [c, i] as const).filter(([c]) => c > 0);
+  const den = cent(income);
+  // a value typed past what a number holds draws nothing, never a hang
+  if (!drawn.length || !(den > 0) || !Number.isFinite(den)
+      || drawn.some(([c]) => !Number.isFinite(c))) return out;
+  const whole = drawn.reduce((t, [c]) => t + c, 0);
+  const q = Math.floor((100 * whole) / den), r = 100 * whole - q * den;
+  const target = q + (2 * r > den || (2 * r === den && q % 2 === 1) ? 1 : 0);
+  const nums = drawn.map(([c]) => 100 * c);
+  const base = nums.map((n) => Math.floor(n / den));
+  const order = nums.map((n, j) => [n - base[j] * den, j] as const)
+    .sort((a, b) => b[0] - a[0] || a[1] - b[1]).map(([, j]) => j);
+  let k = target - base.reduce((t, b) => t + b, 0);
+  for (let i = 0, steps = Math.abs(k); i < steps; i++) {
+    const j = k > 0 ? order[i % order.length]
+                    : order[order.length - 1 - (i % order.length)];
+    base[j] += k > 0 ? 1 : -1;
+    k += k > 0 ? -1 : 1;
+  }
+  drawn.forEach(([, i], j) => { out[i] = base[j]; });
+  return out;
+}
+
+/** How a server change (reporting.change: the shown figure minus the
+ *  shown figure) reads: nothing without one (no earlier period, or an
+ *  older server that sends none); "unchanged" for $0; otherwise its sign,
+ *  whole dollars, whether it is the good way (spend going down, income
+ *  going up — the caller says which), and its percent, left out past
+ *  ±1000% where it says nothing a reader can use. Prints, never derives. */
+export type ChangeLook =
+  | { unchanged: true }
+  | { unchanged: false; up: boolean; sign: "+" | "−"; dollars: number;
+      pct: number | null; good: boolean };
+export function changeLook(
+  ch: { amount: number; pct: number | null; unchanged: boolean }
+    | null | undefined,
+  downIsGood: boolean): ChangeLook | null {
+  if (!ch) return null;
+  if (ch.unchanged) return { unchanged: true };
+  const up = ch.amount > 0;
+  return { unchanged: false, up, sign: up ? "+" : "−",
+           dollars: Math.abs(ch.amount),
+           pct: ch.pct !== null && Math.abs(ch.pct) < 1000
+             ? Math.abs(ch.pct) : null,
+           good: downIsGood ? !up : up };
+}
+
+/** A money-map row link's filters as route params. The server writes the
+ *  link as a path ("/transactions?bucket=Food&y=2026&m=3"), the tiles as
+ *  a bare query ("bucket=Food&y=2026&m=3"); either reads the same. A
+ *  bucket is named by the household, so its name can contain "=" — each
+ *  pair splits on its FIRST one only, or "Rent = home" loses its tail —
+ *  and a bare "%" in it would make decodeURIComponent throw, so the raw
+ *  text is kept then. */
+export function ledgerParams(to: string): Record<string, string> {
+  const q = to.indexOf("?");
+  const query = q < 0 ? to : to.slice(q + 1);
+  const params: Record<string, string> = {};
+  for (const kv of query.split("&")) {
+    if (!kv) continue;
+    const eq = kv.indexOf("=");
+    const k = eq < 0 ? kv : kv.slice(0, eq);
+    const raw = eq < 0 ? "" : kv.slice(eq + 1);
+    let v = raw;
+    try { v = decodeURIComponent(raw); } catch { v = raw; }
+    params[k] = v;
+  }
+  return params;
+}
+
+/** The caption a money-map row prints under its bar — the web's
+ *  terseCaption (MoneyMap.tsx): the "· not counted in the verdict" tail
+ *  is dropped, since which rows carry a pace tick already says it. The
+ *  Bills row's caption ("posted $P · plan $Z") is printed when the reply
+ *  carries the row's `breakdown` key (null on a past day, whose caption
+ *  is printed too, as on the web).
+ *  older-server path: stands in for `breakdown` — no Bills caption, the
+ *  old one restated the words on its right. */
+export function terseCaption(label: string,
+                             caption: string | null | undefined,
+                             breakdown?: unknown)
+  : string | null {
+  if (!caption) return null;
+  if (label === "Bills" && breakdown === undefined) return null;
+  const c = caption.replace(/\s*·\s*not counted in the verdict\s*$/, "");
+  return c || null;
+}
+
+/** The pages a paged log keeps on screen, by the question they answer.
+ *  `key` names the filter, `cursor` the page within it (null = the
+ *  first). A first page for a filter replaces what was held; a later page
+ *  replaces itself and anything after it (a refetch of a page already
+ *  held never appends a copy). A page for another filter than the one
+ *  held is never merged into it. */
+export function pagesAfter<P>(held: { key: string; pages: { cursor: string | null; page: P }[] },
+                              key: string, cursor: string | null, page: P):
+    { key: string; pages: { cursor: string | null; page: P }[] } {
+  if (cursor === null || held.key !== key)
+    return { key, pages: [{ cursor, page }] };
+  const at = held.pages.findIndex((x) => x.cursor === cursor);
+  const kept = at >= 0 ? held.pages.slice(0, at) : held.pages;
+  return { key, pages: [...kept, { cursor, page }] };
+}
+
+// ---- the connection, as far as the app can tell (phone only) ----
+// No native network module: the app reads what its own requests already
+// say. A request that got no answer at all (the shared failed-read cause
+// noAnswer) means offline; any answer — a 5xx and a refusal included —
+// means the phone reached the server. specs/screen-states.md.
+
+/** What a write button says beside itself while the phone is offline. */
+export const OFFLINE_WRITE = "You're offline.";
+
+/** Whether the phone is offline once one request settled: `e` null is an
+ *  answer; no answer at all is offline; an answer with a status is
+ *  online; anything else (an aborted request, a client-side throw) says
+ *  nothing about the connection, so the last state stands. */
+export function offlineAfter(wasOffline: boolean, e: unknown): boolean {
+  if (e === null) return false;
+  if (noAnswer(e)) return true;
+  return failureStatus(e) !== null ? false : wasOffline;
+}
+
+// ---- the offline copy: which reads the phone keeps on disk ----
+// The encrypted persisted cache is the offline read layer: what the next
+// launch shows before the network answers, under "Offline — showing what
+// was here at 9:41 AM.". It holds each screen's landing view only — never
+// every month, year or search paged through, which a week of gcTime would
+// grow into a blob re-encrypted on every cache event.
+
+/** The reads kept whole, by the first part of their key. */
+export const OFFLINE_KEYS: ReadonlySet<string> = new Set([
+  "today", "bills", "accounts", "alerts", "me", "settings", "onboarding",
+  "connections", "calendar", "categories", "report", "holdings",
+  "account-links", "assistant-status", "reimburse", "help"]);
+
+/** Whether a successful read is kept on disk for offline: the keys above,
+ *  the Month lens for the current month and the Year lens for the current
+ *  year, and the Transactions tab's opening page (the current month, no
+ *  search, filter, bucket or page). `now` is the household's day. */
+export function keptOffline(key: readonly unknown[], now: Date): boolean {
+  const head = String(key[0]);
+  if (OFFLINE_KEYS.has(head)) return true;
+  const y = now.getFullYear(), m = now.getMonth() + 1;
+  if (head === "lens")
+    return (key[1] === "month" && key[2] === y && key[3] === m)
+      || (key[1] === "year" && key[2] === y && key.length === 3);
+  if (head !== "transactions" || key.length < 2) return false;
+  const p = key[1];
+  if (!p || typeof p !== "object") return false;
+  const q = p as Record<string, unknown>;
+  if (q.q || q.page || q.bucket || q.acct || q.cat) return false;
+  return Number(q.y) === y && Number(q.m) === m;
+}
+
+
+/** The planner's "where each dollar goes" figures when what it shows IS
+ *  the saved plan — nothing typed away from it: the server's plan line in
+ *  the whole dollars and shares every other surface prints
+ *  (budget.plan_line), so the planner never says $6,001 under a header
+ *  saying $6,000, or 24 % where the plan says 25. Null while the figures
+ *  being typed differ from the plan (then the live figures show), and
+ *  without a plan line. */
+export function plannerAtRest(
+  pl: { income: number; bills: number; to_spend: number;
+        saved: number | null; excess: number;
+        shares?: { bills: number | null; to_spend: number | null;
+                   saved: number | null; excess: number | null } } | null | undefined,
+  live: { income: number; out: number; saved: number; excess: number }):
+    { income: number; out: number; saved: number; excess: number;
+      outPct: number; savePct: number; overPct: number } | null {
+  if (!pl || !pl.shares) return null;
+  const near = (a: number, b: number, tol: number) => Math.abs(a - b) <= tol;
+  if (!near(live.income, pl.income, 1) || !near(live.out, pl.bills + pl.to_spend, 2)
+      || !near(live.saved, pl.saved ?? 0, 1) || !near(live.excess, pl.excess, 1))
+    return null;
+  const sh = pl.shares;
+  return { income: pl.income, out: pl.bills + pl.to_spend,
+           saved: pl.saved ?? 0, excess: pl.excess,
+           outPct: (sh.bills ?? 0) + (sh.to_spend ?? 0),
+           savePct: sh.saved ?? 0, overPct: sh.excess ?? 0 };
+}
+
+/** Approve-all's toast. An offer that failed because what it offered is
+ *  already tracked (`superseded`) was withdrawn, not left pending: it is
+ *  not counted as one that "stayed pending". Web twin: `approveAllWords`
+ *  in webapp/src/moneymath.ts. */
+export function approveAllWords(r: {
+  approved: number;
+  failed: { pid: string; error: string; superseded?: boolean }[];
+}): string {
+  const stayed = r.failed.filter((f) => !f.superseded);
+  const gone = r.failed.length - stayed.length;
+  const head = stayed.length
+    ? `Approved ${r.approved}; ${stayed.length} could not be applied `
+      + `and stayed pending (${stayed.map((f) => f.error).join("; ")})`
+    : `Approved ${gone ? "" : "all "}${r.approved} proposal${r.approved === 1 ? "" : "s"}`;
+  return head + (gone
+    ? `; ${gone} withdrawn — already tracked` : "");
+}
+
+/** A change as the pages print it: "unchanged" when it rounds to $0, else
+ *  signed whole dollars ("+$120", "−$45"), with its tone. Web twin:
+ *  `changeWords` in webapp/src/moneymath.ts. */
+export function changeWords(v: number, money: (n: number) => string):
+    { text: string; tone: "pos" | "neg" | "mut" } {
+  if (Math.abs(v) < 0.5) return { text: "unchanged", tone: "mut" };
+  return v > 0 ? { text: `+${money(v)}`, tone: "pos" }
+               : { text: `−${money(-v)}`, tone: "neg" };
+}
+
+/** How wide a bar chart's x label is drawn, from its longest text: a bare
+ *  month needs `floor`, a month with its year more. Web twin:
+ *  `netBarsLabelWidth` in webapp/src/moneymath.ts. */
+export function netBarsLabelWidth(labels: string[], charW: number,
+                                  floor: number): number {
+  return Math.max(floor, ...labels.map((l) => l.length * charW + 6));
+}
+
+/** Whether a bar chart writes each labelled bar's amount on it: only while
+ *  a bar is wide enough to carry one (about 6px of bar, a slot of 9.7). On
+ *  hundreds of thin bars the amounts land on their neighbours. Web twin:
+ *  `netBarsShowValues` in webapp/src/moneymath.ts. */
+export function netBarsShowValues(slot: number): boolean {
+  return slot * 0.62 >= 6;
+}
+
+/** A percent with its sign, the minus a true minus ("+2.5%", "−7.0%") —
+ *  the sign the dollar change beside it wears (`changeWords`), so one line
+ *  never carries two kinds of minus. Web twin: `signedPct` in
+ *  webapp/src/moneymath.ts. */
+export function signedPct(p: number, digits = 1): string {
+  return `${p >= 0 ? "+" : "−"}${Math.abs(p).toFixed(digits)}%`;
+}
+
+/** A dollar figure that may be negative, the minus a true minus
+ *  ("−$12"), and a plus on a gain when `plus`. Web twin: `signedMoney`
+ *  in webapp/src/moneymath.ts. */
+export function signedMoney(v: number, money: (n: number) => string,
+                            plus = false): string {
+  return v < 0 ? `−${money(-v)}` : `${plus && v > 0 ? "+" : ""}${money(v)}`;
+}
+
+/** A net's sign in the whole dollars money() prints it (halves to even):
+ *  1, 0 or −1. A net's tone, its words and whether a rate is printed
+ *  beside it read this, never the cents: a year that lost under a dollar
+ *  prints $0 and is even, neither green nor red, with no rate. Twin:
+ *  `netSign` in webapp/src/moneymath.ts. */
+export function netSign(v: number): -1 | 0 | 1 {
+  const f = Math.floor(v), d = v - f;
+  const r = d > 0.5 ? f + 1 : d < 0.5 ? f : f % 2 === 0 ? f : f + 1;
+  return r > 0 ? 1 : r < 0 ? -1 : 0;
+}
+
+/** "Nov '25" for a "YYYY-MM" key — a month named with its year. Web
+ *  twin: `monthWithYear` in webapp/src/moneymath.ts. */
+export function monthWithYear(key: string): string {
+  const MON = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug",
+               "Sep", "Oct", "Nov", "Dec"];
+  return `${MON[Number(key.slice(5, 7))] ?? key} '${key.slice(2, 4)}`;
+}
+
+/** How many days one cycle of a bill lasts, from its cadence value
+ *  ("MONTHLY:1", "WEEKLY:2" — the row's `cadence_value`, never the human
+ *  label): what the Bills cycle bar measures the days to the due date
+ *  against. 0 for a cadence with no cycle (an envelope) or none sent.
+ *  Twin: webapp/src/moneymath.ts ↔ mobile/src/lib/pure.ts. */
+export function billCycleDays(cad: string | null | undefined): number {
+  const [freq, n] = (cad ?? "").split(":");
+  const iv = parseInt(n, 10) || 1;
+  const per = freq === "DAILY" ? 1 : freq === "WEEKLY" ? 7
+    : freq === "MONTHLY" ? 30.44 : freq === "YEARLY" ? 365.25 : 0;
+  return per * iv;
+}
+
+
+/** The Bills row's "How this adds up" table as the phone draws it
+ *  (components/bills-table.tsx; the web twin is webapp's BillsTable.tsx):
+ *  the server's rows as sent, the total marked, and the late bills below
+ *  it under their heading — or null when the reply carries no table (an
+ *  older server, or any row but Bills), so no button is drawn. Nothing
+ *  here adds or words a figure. */
+export interface BillsTableLine { label: string; figure: string; total: boolean }
+interface SignedRow { label: string; figure: string; sign: string }
+interface PoolLine { label: string; text: string }
+interface PoolFigure { label: string; figure: string }
+export function billsTableLines(breakdown: {
+  items?: unknown;
+  table?: {
+    rows: (SignedRow | PoolLine)[];
+    outside_heading?: string | null;
+    outside: SignedRow[] | PoolFigure[] | null;
+    total?: PoolFigure;
+  } | null;
+} | null | undefined): {
+  rows: BillsTableLine[]; heading: string | null; outside: BillsTableLine[];
+  toggle: [string, string];
+} | null {
+  const t = breakdown?.table;
+  if (!t) return null;
+  if (breakdown && "items" in breakdown) {
+    // the Envelopes row's list of pools (envelope_breakdown.table): each
+    // pool's line as sent, the line for pools used outside the plan's
+    // months, and the plan's set-aside — a list, not a sum
+    const rows: BillsTableLine[] = (t.rows as PoolLine[]).map((r) =>
+      ({ label: r.label, figure: r.text, total: false }));
+    // on the Year, why a pool did not draw all of it, by cause
+    for (const o of (t.outside as PoolFigure[] | null) ?? [])
+      rows.push({ label: o.label, figure: o.figure, total: false });
+    if (t.total) rows.push({ label: t.total.label, figure: t.total.figure,
+                             total: true });
+    return { rows, heading: null, outside: [],
+             toggle: ["Each pool", "Hide the pools"] };
+  }
+  const line = (r: SignedRow) =>
+    ({ label: r.label, figure: r.figure, total: r.sign === "=" });
+  const outside = (t.outside as SignedRow[] | null) ?? [];
+  return { rows: (t.rows as SignedRow[]).map(line),
+           heading: outside.length ? t.outside_heading ?? null : null,
+           outside: outside.map(line),
+           toggle: ["How this adds up", "Hide how this adds up"] };
+}
+
+// ---- flagged-business unflag patch: twin block, byte-identical in
+// webapp/src/moneymath.ts and mobile/src/lib/pure.ts ----
+
+/** One cached view of the flagged-on-personal-cards worksheet after `row`
+ *  was unflagged. `year` is the view's scope (undefined or "all": every
+ *  year). The view's `count` and `total` cover its whole scope, not only
+ *  the rows fetched, so a view of another year is returned as it was —
+ *  none of its rows changed — and a view whose scope holds the row loses
+ *  it from both, even when the fetch cap had left it out of `rows`.
+ *  A row comes off a view once: a second success for it (two taps, two
+ *  requests) finds it gone from `rows` — or, past the fetch cap, listed
+ *  in the view's own `unflagged` — and returns the view as it was; so
+ *  does a view whose rows are its whole scope and do not hold it. A
+ *  refetch replaces the view, and with it that list. */
+export function bizViewWithout<V extends {
+  rows: { id: string }[]; count: number; total: number;
+}>(view: V, year: number | "all" | undefined,
+   row: { id: string; date: string; amount: number }): V {
+  if (year !== undefined && year !== "all"
+      && Number(row.date.slice(0, 4)) !== year) return view;
+  const done = (view as { unflagged?: string[] }).unflagged ?? [];
+  const fetched = view.rows.some((r) => r.id === row.id);
+  if (!fetched && (done.includes(row.id)
+                   || view.count <= view.rows.length)) return view;
+  return { ...view, rows: view.rows.filter((r) => r.id !== row.id),
+           count: Math.max(0, view.count - 1),
+           total: view.total - row.amount,
+           unflagged: [...done, row.id] };
+}
+// ---- end of the flagged-business unflag patch twin block ----

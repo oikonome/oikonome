@@ -42,6 +42,19 @@ class CleanBillRawTests(unittest.TestCase):
             self.assertEqual(restore.clean_bill_raw(bad), {})
             self.assertEqual(restore._raw_dict(bad), {})
 
+    def test_a_malformed_owner_list_lands_owned_by_nobody(self):
+        """A row with no owner list is owned by its latest import batch, so
+        dropping a malformed list would hand the row to that batch and let
+        its undo delete it. It lands as an empty list instead."""
+        got = restore._raw_dict({"_batches": {"x": 1}, "_batch": "b1",
+                                 "memo": "m"})
+        self.assertEqual(got, {"_batch": "b1", "memo": "m", "_batches": []})
+        # the other list-shaped keys are still dropped
+        self.assertEqual(restore._raw_dict({"companions": "x", "a": 1}),
+                         {"a": 1})
+        self.assertEqual(restore._raw_dict({"_batches": ["b1"]}),
+                         {"_batches": ["b1"]})
+
     def test_malformed_recurrence_fields_are_dropped_not_the_bill(self):
         raw = restore.clean_bill_raw({
             "recurrence": {"frequency": "MONTHLY", "byMonthDay": ["x", 15],

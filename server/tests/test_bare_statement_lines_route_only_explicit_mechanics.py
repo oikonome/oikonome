@@ -59,7 +59,7 @@ class StatementLineReaderTests(unittest.TestCase):
 
     def test_a_loan_payment_line_still_reads_as_one(self):
         self.assertEqual(
-            merchant_seed.flow_match_line("CONTOSO DES:STD LN PMT"),
+            merchant_seed.flow_match_line("CONTOSO STD LN PMT REF 0042"),
             ("LOAN_PAYMENTS", "LOAN_PAYMENTS_STUDENT_LOAN_PAYMENT"))
 
     def test_a_debit_card_purchase_is_never_a_card_payment(self):

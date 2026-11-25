@@ -127,6 +127,30 @@ class MergeCarriesTheBill(unittest.TestCase):
         self._undo(changes)
         self.assertNotIn(TWIN, self._raw()["merchant_names"])
 
+    def test_an_amount_edit_after_the_merge_keeps_the_undo(self):
+        # an edit that leaves the merchant list alone is not an edit of it:
+        # the merge's undo must still put the old chip back
+        self._bill([TWIN])
+        changes = self._merge()
+        add_bill(self.conn, PAYEE, 95.0, frequency="MONTHLY",
+                 next_due=TODAY + dt.timedelta(days=9),
+                 last_seen=TODAY - dt.timedelta(days=34))
+        self.assertIn("merchant_merges", self._raw())
+        self._undo(changes)
+        self.assertEqual(self._raw()["merchant_names"], [TWIN])
+
+    def test_an_approved_amount_change_after_the_merge_keeps_the_undo(self):
+        self._bill([TWIN])
+        changes = self._merge()
+        bills._insert_proposal(
+            self.conn, pid="prop:amt-after-merge", kind="amount_change",
+            payee=PAYEE, amount=95.0,
+            evidence={"old": 80.0, "new": 95.0})
+        out = bills.apply_proposal(self.conn, "prop:amt-after-merge", "approve")
+        self.assertNotIn("error", out)
+        self._undo(changes)
+        self.assertEqual(self._raw()["merchant_names"], [TWIN])
+
     def test_a_pending_offer_of_the_old_name_offers_the_survivor(self):
         self._bill([])
         bills._insert_proposal(
@@ -138,6 +162,45 @@ class MergeCarriesTheBill(unittest.TestCase):
         self.assertEqual(p["status"], "pending")
         self.assertEqual(p["payee"], SURVIVOR)
         self.assertEqual(as_dict(p["evidence"])["merchant_name"], SURVIVOR)
+
+
+class AnEditKeepsWhatItDoesNotOwn(unittest.TestCase):
+    """save_bill writes the fields a save decides and nothing else: a key
+    another writer put on the bill (a newer build's, a restore's) survives
+    an ordinary edit, and the keys the save does own are still replaced."""
+
+    def setUp(self):
+        self.conn = make_db()
+        self.addCleanup(self.conn.close)
+        write_config(self.conn)
+
+    def _raw(self):
+        return as_dict(self.conn.execute(
+            "SELECT raw FROM bills WHERE payee=%s", (PAYEE,)).fetchone()["raw"])
+
+    def test_a_key_another_writer_stored_survives_an_edit(self):
+        add_bill(self.conn, PAYEE, 40.0, frequency="MONTHLY",
+                 next_due=TODAY + dt.timedelta(days=5), show_today=True,
+                 txn_category="Utilities")
+        self.conn.execute(
+            "UPDATE bills SET raw = raw || %s::jsonb WHERE payee=%s",
+            (jsonb({"some_later_note": {"kept": True}}), PAYEE))
+        add_bill(self.conn, PAYEE, 45.0, frequency="MONTHLY",
+                 next_due=TODAY + dt.timedelta(days=6), show_today=False,
+                 txn_category="")
+        raw = self._raw()
+        self.assertEqual(raw.get("some_later_note"), {"kept": True})
+        # what the save owns is still the save's to clear
+        self.assertNotIn("show_today", raw)
+        self.assertNotIn("txn_category", raw)
+
+    def test_an_envelope_turned_back_into_a_bill_drops_its_pool_length(self):
+        add_bill(self.conn, PAYEE, 120.0, bill_type="envelope", interval=12,
+                 frequency=None)
+        self.assertEqual(self._raw().get("envelope_months"), 12)
+        add_bill(self.conn, PAYEE, 40.0, frequency="MONTHLY",
+                 next_due=TODAY + dt.timedelta(days=5))
+        self.assertNotIn("envelope_months", self._raw())
 
 
 class MergeTakesProposalsBeforeBills(unittest.TestCase):

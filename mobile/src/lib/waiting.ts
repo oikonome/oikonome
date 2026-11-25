@@ -189,6 +189,27 @@ export function useMatchReceipt() {
   });
 }
 
+/** A person's answer about two receipts read alike (specs/receipts.md, "A
+ *  receipt is one slip"; the web client's useSlipAnswer). Which copy
+ *  counts moves on the receipt panel, the waiting list, the Receipts
+ *  screen and the expense report, so all refetch: the server alone
+ *  decides which counts. */
+export function useSlipAnswer() {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, other, same }: { id: string; other: string;
+                                         same: boolean }) =>
+      client!.receiptSlipAnswer(id, other, same),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["receipts"] });
+      qc.invalidateQueries({ queryKey: WAITING_KEY });
+      qc.invalidateQueries({ queryKey: ["receipt-items"] });
+      qc.invalidateQueries({ queryKey: ["receipt-report"] });
+    },
+  });
+}
+
 /** Put a matched receipt back to waiting. */
 export function useUnmatchReceipt() {
   const { client } = useSession();

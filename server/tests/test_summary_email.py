@@ -43,9 +43,9 @@ class SummaryRenderTests(unittest.TestCase):
         subject, plain, html = report.build(self.d, summary=True)
         # the pane is all there: verdict tiles + pinned bills
         self.assertIn("Left to spend today", html)
-        self.assertIn("Pinned bills", html)
+        self.assertIn("Pinned", html)
         self.assertIn("LEFT TO SPEND TODAY", plain)
-        self.assertIn("Pinned bills:", plain)
+        self.assertIn("Pinned:", plain)
         # and nothing of the report survives, in either render
         for mark in EXTENSIVE_MARKS:
             self.assertNotIn(mark, html, mark)

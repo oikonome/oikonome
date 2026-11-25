@@ -19,6 +19,14 @@ import datetime as dt
 DEFAULT_DAILY_HOUR = 7
 
 
+def legacy_hour_counts(cfg: dict) -> bool:
+    """Whether `email_send_hour_utc` still decides when the daily mail goes:
+    only while no `email_schedule` is saved. Once one is, the old hour is
+    read nowhere, so a save of it is not taken (the settings doors keep
+    answering 200 for an older client, and read back the stored value)."""
+    return not isinstance(cfg.get("email_schedule"), dict)
+
+
 def effective_email_schedule(cfg: dict, now_utc: dt.datetime | None = None) -> dict:
     sched = cfg.get("email_schedule")
     if isinstance(sched, dict):

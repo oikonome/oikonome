@@ -12,9 +12,13 @@ the verdict sees."""
 from __future__ import annotations
 
 import base64
+import collections
 import datetime as dt
+import itertools
 import logging
 import math
+import re
+import time
 
 from ..envnum import env_float, env_int
 import threading
@@ -85,8 +89,71 @@ def _knob(name: str, default: float) -> float:
     return env_float(name, default)
 
 
+class _FairTurns:
+    """Read turns shared fairly between households. A plain semaphore hands
+    turns out in arrival order, so one household's batch of uploads takes
+    every turn and another household's single read waits behind all of it.
+    Here a freed turn goes to the waiting household holding the fewest turns
+    at that moment, ties to whoever arrived first; a household with nobody
+    else waiting still gets every turn, so none is ever left idle. A read
+    already running is never interrupted: a newcomer waits for the next turn
+    that comes free. Fair within this process only — the web process runs
+    every person-initiated read."""
+
+    def __init__(self, slots: int):
+        self.slots = slots
+        self._cond = threading.Condition()
+        self._held: collections.Counter = collections.Counter()
+        self._free = slots
+        self._waiting: list[tuple[int, object]] = []
+        self._seq = itertools.count()
+
+    def _rank(self, waiter: tuple[int, object]) -> tuple[int, int]:
+        return (self._held[waiter[1]], waiter[0])
+
+    def acquire(self, tenant, timeout: float | None = None) -> bool:
+        with self._cond:
+            me = (next(self._seq), tenant)
+            self._waiting.append(me)
+            end = None if timeout is None else time.monotonic() + timeout
+            try:
+                while True:
+                    if (self._free > 0
+                            and min(self._waiting, key=self._rank) == me):
+                        self._free -= 1
+                        self._held[tenant] += 1
+                        return True
+                    left = None if end is None else end - time.monotonic()
+                    if left is not None and left <= 0:
+                        return False
+                    self._cond.wait(left)
+            finally:
+                # leaving the queue, granted or not, can make someone else
+                # the one to serve: a waiter that gives up never strands the
+                # one behind it
+                self._waiting.remove(me)
+                self._cond.notify_all()
+
+    def release(self, tenant) -> None:
+        with self._cond:
+            if self._held[tenant] <= 0:
+                # the over-release guard a BoundedSemaphore gives: a turn
+                # handed back twice would let one more read run than allowed
+                raise ValueError("this household holds no read turn")
+            self._held[tenant] -= 1
+            if not self._held[tenant]:
+                del self._held[tenant]
+            self._free += 1
+            self._cond.notify_all()
+
+    def snapshot(self) -> dict:
+        with self._cond:
+            return {"free": self._free, "held": dict(self._held),
+                    "waiting": [t for _, t in self._waiting]}
+
+
 PARSE_SLOTS = max(1, int(min(_knob("OIKONOME_RECEIPT_READ_SLOTS", 3), 64)))
-_PARSE_TURNS = threading.BoundedSemaphore(PARSE_SLOTS)
+_PARSE_TURNS = _FairTurns(PARSE_SLOTS)
 _PARSE_SLOT_WAIT_S = min(480.0, max(1.0, _knob("OIKONOME_RECEIPT_READ_WAIT_S", 300)))
 # A receipt that failed only because the gate was busy is taken up again by
 # the nightly sweep while it is younger than this. The bound is what stops
@@ -131,8 +198,10 @@ _PROMPT = (
     '{"merchant": str|null, "date": "YYYY-MM-DD"|null, "total": number|null,'
     ' "tax": number|null, "tip": number|null,'
     ' "items": [{"description": str, "qty": number|null, "amount": number}]}'
-    "\nAmounts are positive numbers. items = individual purchased lines "
-    "(omit subtotals/tax/change lines). If unreadable, return "
+    "\nAmounts are positive numbers; a line's amount is what the line "
+    "cost in all (quantity times unit price). items = individual purchased "
+    "lines (omit subtotals, tax, change and payment/card lines). If "
+    "unreadable, return "
     '{"items": []}.')
 
 # Check images: the ledger row for a written check is bank mechanics
@@ -196,10 +265,17 @@ def add(conn, txn_id: str | None, image: bytes, mime: str,
                VALUES (%s,%s,%s,%s,%s,%s) RETURNING id""",
             (txn_id, image, mime, kind, opt[0] if opt else None,
              opt[1] if opt else None)).fetchone()
+        # the same file stored before is the same slip: decided under the
+        # pairing lock the insert holds, so two copies uploaded at once
+        # still see each other (receipt_identity, specs/receipts.md); the
+        # storage lock above comes first, the order a restore takes them in
+        from . import receipt_identity
+        receipt_identity.decide_quietly(conn, row["id"])
     return str(row["id"])
 
 
 def for_txn(conn, txn_id: str) -> list[dict]:
+    from . import receipt_identity
     receipts = conn.execute(
         f"""SELECT id, mime, kind, status, parsed, error, created_at,
                   matched_at, match_method, {PARSE_STATE_SQL},
@@ -208,13 +284,35 @@ def for_txn(conn, txn_id: str) -> list[dict]:
         (txn_id,)).fetchall()
     txn = conn.execute("SELECT amount FROM transactions WHERE id = %s",
                        (txn_id,)).fetchone()
+    slip = receipt_identity.twins(conn, [str(r["id"]) for r in receipts])
     out = []
     for r in receipts:
         items = conn.execute(
             """SELECT line, description, qty, amount, tag
                FROM receipt_items WHERE receipt_id = %s ORDER BY line""",
             (r["id"],)).fetchall()
-        row = {**r, "id": str(r["id"]), "items": items}
+        rid = str(r["id"])
+        s = slip.get(rid) or {}
+        row = {**r, "id": rid, "items": items, "listed_items": [],
+               "counts": s.get("counts", True),
+               "duplicate_of": None, "lines_gap": None,
+               "slip_twins": s.get("slip_twins", []),
+               "suspected": s.get("suspected", [])}
+        if r["kind"] == "receipt" and items:
+            # what the lines count as, as the Receipts page counts them
+            # (reconcile); a copy of a slip counted on another receipt
+            # lists its lines apart, as counted there
+            t_amt = _finite(txn["amount"]) if txn else None
+            got = reconcile([dict(i) for i in items], r["parsed"], t_amt)
+            lines = [{k: v for k, v in ln.items() if k != "counted"}
+                     for ln in got["lines"] if ln["counted"]]
+            if s.get("why") == "same_slip":
+                row["duplicate_of"] = s["counted"]
+                row["items"] = []
+                row["listed_items"] = lines
+            else:
+                row["items"] = lines
+                row["lines_gap"] = got["gap"]
         # a parsed check whose amount disagrees with the transaction gets a
         # quiet mismatch flag — display only, the transaction never changes.
         # Compare against abs(): positive = money out, and a check's
@@ -311,15 +409,17 @@ def is_manual(conn, receipt_id: str) -> bool:
     return bool(r) and r["source"] == MANUAL
 
 
-def wait_for_parse_turn() -> bool:
-    """Queue for a background read's turn; False when none came in time.
-    Called holding no connection. The caller gives a True back through
-    end_parse_turn, after closing the connection the read used."""
-    return _PARSE_TURNS.acquire(timeout=_PARSE_SLOT_WAIT_S)
+def wait_for_parse_turn(tenant_id: str | None = None) -> bool:
+    """Queue for a background read's turn on behalf of a household; False
+    when none came in time. Called holding no connection. The caller gives a
+    True back through end_parse_turn with the same household, after closing
+    the connection the read used. Callers that name no household queue
+    together as one."""
+    return _PARSE_TURNS.acquire(tenant_id, _PARSE_SLOT_WAIT_S)
 
 
-def end_parse_turn() -> None:
-    _PARSE_TURNS.release()
+def end_parse_turn(tenant_id: str | None = None) -> None:
+    _PARSE_TURNS.release(tenant_id)
 
 
 def fail_busy(conn, receipt_id: str) -> int:
@@ -1013,6 +1113,12 @@ def _clean_check_meta(parsed: dict, near: dt.date | None = None) -> dict:
             "bank": s("bank", 80)}
 
 
+# The most of a receipt's store name kept: what a parse reads, what the
+# details door takes and set_details stores. Both clients' details forms
+# check the same bound (receiptDetailsDraft).
+STORE_MAX = 80
+
+
 def _clean_receipt_meta(parsed: dict, near: dt.date | None = None) -> dict:
     """The plain-receipt sibling of _clean_check_meta — the vision model's
     reply is not the prompted schema by contract, only by habit: a
@@ -1025,7 +1131,7 @@ def _clean_receipt_meta(parsed: dict, near: dt.date | None = None) -> dict:
         if isinstance(v, dict):
             v = v.get("name") or v.get("value") or ""
         return str(v).strip()[:n] or None
-    return {"merchant": s("merchant", 120),
+    return {"merchant": s("merchant", STORE_MAX),
             "date": iso_date(parsed.get("date"), near),
             "total": _finite(parsed.get("total")),
             "tax": _finite(parsed.get("tax")),
@@ -1050,7 +1156,7 @@ def set_details(conn, receipt_id: str, *, total: float, date: dt.date,
         if row is None or row["kind"] != "receipt":
             return None
         was = row["parsed"] if isinstance(row["parsed"], dict) else {}
-        store = (merchant or "").strip()[:80] or None
+        store = (merchant or "").strip()[:STORE_MAX] or None
         if store is None and keep_merchant:
             store = was.get("merchant")
         meta = {"merchant": store, "date": date.isoformat(),
@@ -1065,12 +1171,24 @@ def set_details(conn, receipt_id: str, *, total: float, date: dt.date,
     return {"txn_id": row["txn_id"], "parsed": meta}
 
 
+# The nightly pass reads households one after another, so one household's
+# slow reads delay every household behind it in the same step. Each
+# household's pass stops claiming new receipts once this much time has gone;
+# the first read always runs, and whatever is left stays queued, oldest
+# first, for the next night. Worst case per household is this plus one
+# read's request timeout.
+NIGHTLY_READ_S = 300.0
+_clock = time.monotonic
+
+
 def parse_pending(conn, limit: int = 10, transport=None) -> dict:
     """Nightly sweep: parse stored-but-unparsed receipts (PDFs included —
     they rasterize) when an LLM is configured. Silent no-op otherwise
     (attachment-only mode). Also reclaims receipts stuck 'parsing' for
     over 10 minutes (a died worker/thread mid-parse), and receipts that
-    failed only because the decode gate was busy (see BUSY_RETRY_DAYS)."""
+    failed only because the decode gate was busy (see BUSY_RETRY_DAYS).
+    Stops claiming after NIGHTLY_READ_S, leaving the rest for the next
+    night."""
     from . import llm_categorize as llm
     if not llm.configured(conn, role="vision"):
         return {"parsed": 0, "failed": 0, "skipped": "no-llm"}
@@ -1087,7 +1205,10 @@ def parse_pending(conn, limit: int = 10, transport=None) -> dict:
            ORDER BY (error IS NOT NULL), created_at LIMIT %s""",
         (BUSY_ERROR, BUSY_RETRY_DAYS, limit)).fetchall()
     parsed = failed = 0
-    for r in rows:
+    started = _clock()
+    for i, r in enumerate(rows):
+        if i and _clock() - started >= NIGHTLY_READ_S:
+            return {"parsed": parsed, "failed": failed, "stopped": "time"}
         try:
             out = parse_one(conn, str(r["id"]), transport=transport)
             if out["status"] == "parsed":
@@ -1106,35 +1227,195 @@ def parse_pending(conn, limit: int = 10, transport=None) -> dict:
 
 # ---- expense report ---------------------------------------------------------
 
+# ---- what a receipt's lines count as (specs/receipts.md) ---------------
+
+# a line that is how the receipt was PAID, not something bought: the
+# tender ("VISA 1234", "card payment"), change, a subtotal or
+# total the model listed as an item
+_TENDER_RE = re.compile(
+    r"^\W*(total|sub\W?total|balance( due)?|amount (due|paid|tendered)|"
+    r"change( due)?|tender(ed)?|cash( tendered)?|(sales )?tax)\b"
+    r"|^\W*(visa|master\W?card|amex|american express|discover|debit|"
+    r"credit)( card)?\b"
+    r"|\bpayment\b.*\b(card|credit|debit|visa|mastercard|amex|web|online|"
+    r"cash|check|cheque)\b"
+    r"|\b(card|credit|debit|visa|mastercard|amex|web|online)\b.*\bpayment\b",
+    re.I)
+
+
+def is_tender_line(description: str | None) -> bool:
+    return bool(_TENDER_RE.search(description or ""))
+
+
+def _tolerance(ref: float) -> float:
+    return max(0.05, 0.005 * abs(ref))
+
+
+def reconcile(items: list[dict], parsed: dict | None,
+              charge: float | None) -> dict:
+    """What each of a receipt's lines counts as, and whether they add up —
+    the ONE place the Receipts page, the receipt panel and the itemized
+    report learn it (specs/receipts.md).
+
+    `items` are the stored lines ({line, description, qty, amount, ...}),
+    `parsed` the receipt's printed total/tax/tip, `charge` the ledger
+    amount as signed (positive = money out, negative = a refund) or None
+    while it waits. Returns {"lines": [{**item, "amount": the line's
+    total, "counted": bool}], "gap": the size of the charge less the size
+    of lines + tax + tip when that is more than a few cents, else None —
+    positive means the lines come to less, on a refund as on a charge}.
+
+    - A payment/tender line is not counted.
+    - The counted lines are read so they net positive (a slip netting
+      negative is the model's sign and is flipped whole; a coupon beside
+      its item stays negative). On a refund they are then negated: the
+      slip counts as money back.
+    - A quantity is read as the model meant it: where lines × quantity
+      (+ tax + tip) reconcile with the printed total (or the charge) and
+      the lines as read do not, each amount was a unit price."""
+    parsed = parsed if isinstance(parsed, dict) else {}
+    lines = [{**it, "counted": not is_tender_line(it.get("description"))}
+             for it in items]
+    kept = [ln for ln in lines if ln["counted"]]
+    amounts = [float(ln.get("amount") or 0.0) for ln in kept]
+    refund = charge is not None and charge < 0
+    # the rest is worked in the size of the money: the slip's NET sign
+    # decides (a coupon beside its item is not a return), and a refund's
+    # lines are put back to negative at the end
+    if amounts and sum(amounts) < 0:
+        for ln in kept:
+            ln["amount"] = -float(ln.get("amount") or 0.0)
+    if charge is not None:
+        charge = abs(charge)
+    extras = sum(abs(v) if refund else v
+                 for v in (_finite(parsed.get("tax")),
+                           _finite(parsed.get("tip")))
+                 if v is not None and (v != 0 if refund else v > 0))
+    total = _finite(parsed.get("total"))
+    if refund and total is not None:
+        total = abs(total)
+    ref = total if total is not None and total > 0 else charge
+    plain = sum(float(ln.get("amount") or 0.0) for ln in kept)
+
+    def times(ln):
+        q = _finite(ln.get("qty"))
+        a = float(ln.get("amount") or 0.0)
+        return a * q if q is not None and q > 1 else a
+    multiplied = sum(times(ln) for ln in kept)
+    if (ref is not None and abs(multiplied - plain) > 0.005
+            and abs(multiplied + extras - ref) <= _tolerance(ref)
+            and abs(plain + extras - ref) > _tolerance(ref)):
+        for ln in kept:
+            ln["amount"] = round(times(ln), 2)
+    counted = sum(float(ln.get("amount") or 0.0) for ln in kept)
+    against = charge if charge is not None else ref
+    gap = None
+    if against is not None and kept:
+        diff = round(against - (counted + extras), 2)
+        if abs(diff) > _tolerance(against):
+            gap = diff
+    if refund:
+        for ln in kept:
+            ln["amount"] = -float(ln.get("amount") or 0.0)
+    return {"lines": lines, "gap": gap}
+
+
+def _counted_lines_query(conn, where: str, params: list
+                         ) -> tuple[str, list, list[str]]:
+    """The SQL _counted_lines runs, its parameters, and the receipts the
+    search hit (found first, so only their slips are read)."""
+    hit = [r["receipt_id"] for r in conn.execute(
+        f"""SELECT DISTINCT ri.receipt_id::text AS receipt_id
+              FROM receipt_items ri
+              JOIN receipts r ON r.id = ri.receipt_id
+              LEFT JOIN transactions t ON t.id = r.txn_id
+             WHERE {where}""", params).fetchall()]
+    names = [_waiting_store_names(conn), _household_zone(conn)]
+    return (f"""WITH hit AS (
+                SELECT unnest(%s::uuid[]) AS receipt_id)
+            SELECT ri.receipt_id::text AS receipt_id, ri.line,
+                   ri.description, ri.qty, ri.amount, ri.tag,
+                   r.txn_id, r.parsed AS r_parsed, t.amount AS t_amount,
+                   {_ITEM_DATE} AS date, {_ITEM_PAYEE} AS payee
+              FROM receipt_items ri
+              JOIN hit ON hit.receipt_id = ri.receipt_id
+              JOIN receipts r ON r.id = ri.receipt_id
+              LEFT JOIN transactions t ON t.id = r.txn_id
+              {MC_JOIN}
+              {_WM_JOIN}
+             ORDER BY ri.receipt_id, ri.line""",
+        [hit] + names, hit)
+
+
+def _counted_lines(conn, where: str, params: list, *,
+                   tag: str | None = None) -> list[dict]:
+    """Every counted line of the receipts having a line that matches
+    `where` (over ri / r / t), with its line total, its receipt's date and
+    store, and the receipt's `gap` — the receipt's other lines are read too,
+    because whether an amount is a unit price is a question about the
+    whole receipt. Each line says whether it `counts`: only the lines of
+    the receipt counted for its slip do, and never one off the ledger
+    (`why`: 'same_slip' | 'off_ledger'; receipt_identity.slips, ranked
+    for `tag` on a tag report). A counted line of a receipt another
+    counted receipt reads exactly like is `suspected` (the total may hold
+    the purchase twice until the person answers), and `note` is the words
+    printed beside a line, decided here."""
+    from . import receipt_identity
+    sql, args, hit = _counted_lines_query(conn, where, params)
+    if not hit:
+        return []
+    slip = receipt_identity.slips(conn, hit, tag=tag)
+    twice = receipt_identity.doubled(conn, slip, tag=tag)
+    rows = conn.execute(sql, args).fetchall()
+    out: list[dict] = []
+    for _, grp in itertools.groupby(rows, key=lambda r: r["receipt_id"]):
+        grp = [dict(r) for r in grp]
+        head = grp[0]
+        t_amt = _finite(head["t_amount"])
+        got = reconcile(grp, head["r_parsed"], t_amt)
+        for ln in got["lines"]:
+            if not ln["counted"]:
+                continue
+            ln.pop("r_parsed", None)
+            ln.pop("t_amount", None)
+            ln.pop("counted", None)
+            ln["gap"] = got["gap"]
+            one = slip.get(head["receipt_id"])
+            ln["counts"] = one["counts"] if one else True
+            ln["why"] = one["why"] if one else None
+            ln["suspected"] = ln["counts"] and head["receipt_id"] in twice
+            ln["note"] = receipt_identity.line_note(one, ln["suspected"])
+            out.append(ln)
+    return out
+
+
 def report(conn, tag: str, year: int, month: int) -> dict:
     """Tag + month → the Schedule-C rows: every tagged line item with its
     transaction context and receipt link."""
     start = dt.date(year, month, 1)
     end = (start.replace(year=year + 1, month=1) if month == 12
            else start.replace(month=month + 1))
-    # the same rows the item search lists: a receipt still waiting for its
-    # charge is a real purchase a person can tag, and belongs on the report
-    # under the date and store it printed (the snap day when it printed
-    # none); one whose charge left the ledger does not
-    rows = conn.execute(
-        f"""SELECT * FROM (
-               SELECT ri.receipt_id::text AS receipt_id, ri.line,
-                      ri.description, ri.qty, ri.amount, ri.tag,
-                      r.txn_id, {_ITEM_DATE} AS date, {_ITEM_PAYEE} AS payee
-                 FROM receipt_items ri
-                 JOIN receipts r ON r.id = ri.receipt_id
-                 LEFT JOIN transactions t ON t.id = r.txn_id
-                 {MC_JOIN}
-                 {_WM_JOIN}
-                WHERE ri.tag = %s
-                  AND (r.txn_id IS NULL OR t.removed = 0)) x
-           WHERE x.date >= %s AND x.date < %s
-           ORDER BY x.date, x.receipt_id, x.line""",
-        (_waiting_store_names(conn), _household_zone(conn), tag.strip(),
-         start, end)).fetchall()
+    # the same lines the item search lists, counted the same way: a receipt
+    # still waiting for its charge is a real purchase a person can tag, and
+    # belongs on the report under the date and store it printed (the snap
+    # day when it printed none); one whose charge left the ledger does not
+    lines = _counted_lines(
+        conn, "ri.tag = %s AND (r.txn_id IS NULL OR t.removed = 0)",
+        [tag.strip()], tag=tag.strip())
+    rows = sorted(
+        (ln for ln in lines if ln["tag"] == tag.strip() and ln["counts"]
+         and ln["date"] is not None and start <= _as_day(ln["date"]) < end),
+        key=lambda r: (_as_day(r["date"]), r["receipt_id"], r["line"]))
+    for r in rows:
+        r.pop("gap", None)
+        r.pop("why", None)
     total = round(sum(r["amount"] or 0 for r in rows), 2)
+    from . import receipt_identity
     return {"tag": tag, "year": year, "month": month,
-            "total": total, "count": len(rows), "rows": rows}
+            "total": total, "count": len(rows), "rows": rows,
+            # the total may hold a purchase twice: said where it is read
+            "note": receipt_identity.group_note(
+                len({r["receipt_id"] for r in rows if r["suspected"]}))}
 
 
 # ---- item search & grouping ----------------------------------------
@@ -1262,42 +1543,76 @@ def search_items(conn, q: str = "", group: str = "item",
     """Line items across every parsed receipt — searchable like
     transactions and groupable ('how much do I spend on shampoo'). Returns
     the newest matching rows (capped) plus aggregates by `group`. Items of
-    a receipt still waiting for its charge are included (txn_id null); an
-    item whose charge was removed from the ledger is not."""
-    # r.txn_id IS NULL, not t.id IS NULL: a receipt pointing at a charge
-    # that is gone must stay hidden like its removed charge
-    where, params = "(r.txn_id IS NULL OR t.removed = 0)", []
-    if (q or "").strip():
+    a receipt still waiting for its charge are included (txn_id null), and
+    so are those of a receipt whose charge has left the ledger: the slip is
+    still the person's record of what they bought, and the pass that moves
+    it to the posted charge or back to waiting (`receipt_match
+    .release_stranded`) may not have run yet."""
+    where, params = "TRUE", []
+    needle = (q or "").strip()[:100]
+    if needle:
         # a typed search is a literal, not a pattern: % and _ in it must
         # not widen the match, and it is bounded like any search box
         where += " AND ri.description ILIKE %s ESCAPE '\\'"
-        params.append(f"%{_like_literal(q.strip()[:100])}%")
-    names = [_waiting_store_names(conn), _household_zone(conn)]
-    rows = conn.execute(
-        f"""SELECT ri.receipt_id::text AS receipt_id, ri.line,
-                   ri.description, ri.qty, ri.amount, ri.tag,
-                   r.txn_id, {_ITEM_DATE} AS date,
-                   {_ITEM_PAYEE} AS payee
-            FROM receipt_items ri
-            JOIN receipts r ON r.id = ri.receipt_id
-            LEFT JOIN transactions t ON t.id = r.txn_id
-            {MC_JOIN}
-            {_WM_JOIN}
-            WHERE {where}
-            ORDER BY 8 DESC, ri.receipt_id, ri.line
-            LIMIT %s""", names + params + [limit + 1]).fetchall()
-    truncated = len(rows) > limit
-    key = _GROUP_KEYS.get(group, _GROUP_KEYS["item"])
-    groups = conn.execute(
-        f"""SELECT {key} AS key, COUNT(*) AS n,
-                   ROUND(SUM(ri.amount)::numeric, 2)::float8 AS total,
-                   MAX({_ITEM_DATE}) AS last_date
-            FROM receipt_items ri
-            JOIN receipts r ON r.id = ri.receipt_id
-            LEFT JOIN transactions t ON t.id = r.txn_id
-            {MC_JOIN}
-            {_WM_JOIN}
-            WHERE {where}
-            GROUP BY key ORDER BY total DESC LIMIT 150""",
-        names + params).fetchall()
-    return {"rows": rows[:limit], "groups": groups, "truncated": truncated}
+        params.append(f"%{_like_literal(needle)}%")
+    lines = _counted_lines(conn, where, params)
+    # a slip whose counted lines net negative sits on a refund (reconcile
+    # nets every other slip positive): its negative lines were brought
+    # back, and take their items off what was bought
+    net: dict = {}
+    for ln in lines:
+        net[ln["receipt_id"]] = (net.get(ln["receipt_id"], 0.0)
+                                 + float(ln["amount"] or 0.0))
+    if needle:
+        low = needle.casefold()
+        lines = [ln for ln in lines
+                 if low in (ln["description"] or "").casefold()]
+    lines.sort(key=lambda r: (r["receipt_id"], r["line"]))
+    lines.sort(key=lambda r: _as_day(r["date"]) or dt.date.min, reverse=True)
+    truncated = len(lines) > limit
+
+    def key_of(ln):
+        if group == "merchant":
+            return ln["payee"] or UNKNOWN_STORE
+        if group == "month":
+            day = _as_day(ln["date"])
+            return f"{day.year:04d}-{day.month:02d}" if day else None
+        return (ln["description"] or "").strip().lower()
+    acc: dict = {}
+    for ln in lines:
+        # a copy of a slip counted elsewhere, and a line whose charge has
+        # left the ledger, are listed, never added up
+        if not ln["counts"]:
+            continue
+        k = key_of(ln)
+        g = acc.setdefault(k, {"key": k, "n": 0, "bought": 0,
+                               "receipts": set(), "total": 0.0,
+                               "last_date": None, "twice": set()})
+        if ln["suspected"]:
+            g["twice"].add(ln["receipt_id"])
+        g["n"] += 1
+        # how many were bought: a whole quantity counts as itself, a line
+        # with none (or a weighed one) as one item (specs/receipts.md)
+        qty = ln.get("qty")
+        n = (int(qty) if qty is not None and qty >= 1
+             and float(qty).is_integer() else 1)
+        returned = (net[ln["receipt_id"]] < 0
+                    and float(ln["amount"] or 0.0) < 0)
+        g["bought"] += -n if returned else n
+        g["receipts"].add(ln["receipt_id"])
+        g["total"] += float(ln["amount"] or 0.0)
+        day = _as_day(ln["date"])
+        if day and (g["last_date"] is None or day > g["last_date"]):
+            g["last_date"] = day
+    groups = sorted(acc.values(), key=lambda g: (-round(g["total"], 2),
+                                                 str(g["key"])))[:150]
+    from . import receipt_identity
+    for g in groups:
+        g["total"] = round(g["total"], 2)
+        g["receipts"] = len(g["receipts"])
+        # a total holding a receipt another counted one reads like says so
+        g["note"] = receipt_identity.group_note(len(g.pop("twice")))
+    rows = lines[:limit]
+    for r in rows:
+        r.pop("gap", None)
+    return {"rows": rows, "groups": groups, "truncated": truncated}

@@ -8,8 +8,8 @@ years of a business account's history. A month the bank feed covers is
 known even when nothing was deposited in it — its income is a measured
 $0, and it is often the month that lost the most, so the month series
 must keep it. And a month in a year with no bank feed at all has unknown
-income, not $0: the flow picture must leave it out rather than set all its
-spend against nothing and call the difference overspending."""
+income, not $0: the flow picture still counts it (every Cash Flow tab reads
+the same months) and marks it incomplete, so the page says so."""
 
 import datetime as dt
 import unittest
@@ -64,6 +64,13 @@ class _Tenant(unittest.TestCase):
     def pay(conn, day, amount, account="chk"):
         add_txn(conn, day, -amount, "NORTHWIND PAYROLL", account=account,
                 primary="INCOME", detailed="INCOME_WAGES")
+
+    @staticmethod
+    def autopay(conn, day, amount, account="chk"):
+        """The card paid from checking: a checking row that is neither
+        income nor spend, the feed's sign of life in a month with no pay."""
+        add_txn(conn, day, amount, "CARD AUTOPAY", account=account,
+                primary="TRANSFER_OUT")
 
     @staticmethod
     def card(conn, day, amount):
@@ -128,15 +135,17 @@ class IncomeLiveMonthIgnoresBusinessHistory(_WithBusinessChecking):
         self.assertEqual(w["total"], 6000.0)
 
 
-class CoveredMonthWithoutDeposit(_Tenant):
-    """Bank feed from Jan 2024; nothing deposited in Jul 2025; $4,000 of
-    card spend every month."""
+class NoDepositButOtherCheckingActivityIsAMeasuredZero(_Tenant):
+    """Bank feed from Jan 2024; nothing deposited in Jul 2025, but checking
+    still paid the card that month, so the feed was on file and July's
+    income is a measured $0. $4,000 of card spend every month."""
 
     def seed(self, conn):
         for d in _months(dt.date(2024, 1, 1), dt.date(2026, 9, 1)):
             if (d.year, d.month) != (2025, 7):
                 self.pay(conn, d, 5000.0)
             self.card(conn, d, 4000.0)
+            self.autopay(conn, d + dt.timedelta(days=5), 4000.0)
 
     def test_the_month_without_pay_is_a_saved_by_month_bar(self):
         """The covered month with spend and no deposit is the month that
@@ -167,6 +176,55 @@ class CoveredMonthWithoutDeposit(_Tenant):
             :cf["cash_graph"]["forecast_from"]]))
 
 
+class NoCheckingRowAtAllIsUnknown(_Tenant):
+    """The mirror: in Jul 2025 checking has no row of any kind — no pay, no
+    autopay — while the card keeps spending. That is a hole in the bank
+    feed, so July's income is unknown: no bar, no point, and 2025 saves
+    over its other eleven months, rather than July reading as a $4,000
+    loss."""
+
+    def seed(self, conn):
+        for d in _months(dt.date(2024, 1, 1), dt.date(2026, 9, 1)):
+            if (d.year, d.month) != (2025, 7):
+                self.pay(conn, d, 5000.0)
+                self.autopay(conn, d + dt.timedelta(days=5), 4000.0)
+            self.card(conn, d, 4000.0)
+
+    def test_the_month_with_no_checking_row_is_no_bar(self):
+        cf = reporting.compute_cashflow(self.conn, TODAY)
+        points = dict(cf["cash_graph"]["points"][
+            :cf["cash_graph"]["forecast_from"]])
+        self.assertNotIn("2025-07", points)
+        self.assertEqual(points.get("2025-06"), 1000.0)
+        bars = dict(cf["monthly_by_year"]["2025"])
+        self.assertNotIn("Jul", bars)
+        self.assertEqual(len(bars), 11)
+        self.assertEqual(reporting.month_income(self.conn, 2025, 7), None)
+
+    def test_the_year_with_the_hole_saves_over_its_measured_months(self):
+        """Out covers all of 2025; July is incomplete, so Saved and the
+        rate are the other eleven months' and the row is flagged — July's
+        spend is not a loss (specs/counted-figures.md, "one rule")."""
+        cf = reporting.compute_cashflow(self.conn, TODAY)
+        rows = {r[0]: r for r in cf["savings_by_year"]}
+        self.assertEqual(rows["2025"],
+                         ["2025", 55000.0, 48000.0, 11000.0, 20.0])
+        self.assertEqual(cf["savings_by_year_months"]["2025"], [11, 12])
+        self.assertEqual(cf["savings_by_year_notes"]["2025"],
+                         "income incomplete — left over counts 11 of 12 months")
+        self.assertEqual(dict(cf["months_by_year"]["2025"])["Jul"], None)
+        self.assertEqual(rows["2024"][1:4], [60000.0, 48000.0, 12000.0])
+
+    def test_the_flow_picture_counts_the_hole_and_marks_it(self):
+        # 3m on Sep 9 is Jun-Aug on every tab: July's spend is counted, as
+        # the Spending tab counts it, and July is marked incomplete
+        f = reporting.flow_breakdown(self.conn, dt.date(2025, 9, 9), "3m")
+        self.assertEqual(f["in"]["total"], 10000.0)
+        self.assertEqual(f["out"]["total"], 12000.0)
+        self.assertEqual(f["incomplete_months"], ["2025-07"])
+        self.assertEqual(f["label"], "Jun–Aug 2025")
+
+
 class FlowPictureSkipsYearsWithoutABankFeed(_Tenant):
     """Checking rows in 2019 only, then none until Jan 2025; card spend of
     $1,000 every month throughout and pay of $3,000 whenever checking is
@@ -178,17 +236,19 @@ class FlowPictureSkipsYearsWithoutABankFeed(_Tenant):
             if d.year == 2019 or d >= dt.date(2025, 1, 1):
                 self.pay(conn, d, 3000.0)
 
-    def test_gap_years_are_left_out_on_both_sides(self):
-        """5y is Oct 2021–Sep 2026; 2021–2024 have no bank rows, so their
-        spend is not set against $0 of income — only the 21 known months
-        are summed, and the label names what was left out."""
+    def test_gap_years_are_counted_and_marked(self):
+        """5y is Oct 2021–Sep 2026; 2021–2024 have no bank rows. Their
+        spend is counted, as on the Spending tab, and each of their 39
+        months is marked incomplete, so the page says the income there is
+        missing rather than leaving the months out."""
         f = reporting.flow_breakdown(self.conn, TODAY, "5y")
         self.assertFalse(f["income_unknown"])
         self.assertEqual(f["in"]["total"], 21 * 3000.0)
-        self.assertEqual(f["out"]["total"], 21 * 1000.0)
-        self.assertEqual(f["saved"], 21 * 2000.0)
-        self.assertEqual(f["income_gap_months"], 39)
-        self.assertIn("without Oct 2021–Dec 2024 (no bank feed)", f["label"])
+        self.assertEqual(f["out"]["total"], 60 * 1000.0)
+        self.assertEqual(len(f["incomplete_months"]), 39)
+        self.assertEqual(f["incomplete_months"][0], "2021-10")
+        self.assertEqual(f["incomplete_months"][-1], "2024-12")
+        self.assertEqual(f["label"], "Oct 2021–Sep 2026")
 
     def test_a_window_entirely_in_a_feedless_stretch_is_unknown(self):
         """A window whose every month lies in a year without bank rows has
@@ -204,7 +264,7 @@ class FlowPictureSkipsYearsWithoutABankFeed(_Tenant):
 
     def test_a_fully_covered_window_is_unchanged(self):
         f = reporting.flow_breakdown(self.conn, TODAY, "1y")
-        self.assertEqual(f["income_gap_months"], 0)
+        self.assertEqual(f["incomplete_months"], [])
         self.assertEqual(f["label"], "Oct 2025–Sep 2026")
         self.assertEqual(f["saved"], 24000.0)
 

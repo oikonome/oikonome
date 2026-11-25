@@ -1,27 +1,34 @@
-// Alerts — what the app has flagged, newest first.
+// Alerts — what the app has flagged: one line per subject, live first.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card, HelpLink, Pill } from "../components/ui";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, HelpLink, Pill, Skeleton } from "../components/ui";
 import { alertCta, alertRoute } from "../lib/alert-routes";
 import type { Alert, AlertRow, TodayFull } from "../lib/api";
 import { patchList, removeFromList } from "../lib/cache";
-import { alertSections, historyToggleLabel, listPhase,
-         pendingRecoveryLine } from "../lib/pure";
+import { alertSections, withLiveLinks, historyToggleLabel, listPhase,
+         pendingRecoveryLine, EMPTY_LINES } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, mmddyy } from "../lib/theme";
+import SegmentedControl from "../components/segmented-control";
 
-const FILTERS = ["all", "connection", "bills", "cash", "dismissed"] as const;
-const FILTER_KINDS: Record<string, string[]> = {
-  connection: ["stale-pull", "connection-removed", "setup"],
-  bills: ["proposals", "drift"],
-  cash: ["funding", "transfer", "bonus", "anomaly", "reimb"],
-};
+// which chip lists a line is the server's (`group`), as are its name
+// (`kind_label`) and where it is acted on (`link`) — the web's page reads
+// the same fields
+const FILTERS = ["all", "connection", "bills", "merchants", "cash",
+                 "dismissed"] as const;
+
+// older-server path: stands in for `group` (the chips' kinds before it)
+const OLD_GROUP: Record<string, string> = {
+  "stale-pull": "connection", "connection-removed": "connection",
+  setup: "connection", proposals: "bills", drift: "bills",
+  funding: "cash", transfer: "cash", bonus: "cash", anomaly: "cash",
+  reimb: "cash" };
 
 export default function Alerts() {
   const { client } = useSession();
@@ -37,8 +44,9 @@ export default function Alerts() {
   // the server refuses. Today's banner list is patched for a dismiss;
   // a restore has to refetch Today to get the banner back.
   const act = useMutation({
+    // dismiss and restore answer different counts; only success matters
     mutationFn: ({ kind, message, on }:
-        { kind: string; message: string; on: boolean }) =>
+        { kind: string; message: string; on: boolean }): Promise<unknown> =>
       on ? client!.alertRestore(kind, message)
          : client!.alertDismiss(kind, message),
     onMutate: async ({ kind, message, on }) => {
@@ -71,16 +79,18 @@ export default function Alerts() {
                         enabled: !!client });
   const recovery = pendingRecoveryLine(me.data?.factor_reset_pending,
                                        mmddyy);
-  const all = query.data?.alerts ?? [];
+  // the live alerts Today already fetched carry each one's own target
+  const live = qc.getQueryData<TodayFull>(["today"])?.alerts;
+  const all = withLiveLinks(query.data?.alerts ?? [], live);
   const { active, dismissed, resolved, history } = alertSections(all);
   const alerts = filter === "all" ? history
     : filter === "dismissed" ? dismissed
-    : history.filter((a) => (FILTER_KINDS[filter] ?? []).includes(a.kind));
+    : history.filter((a) => (a.group !== undefined ? a.group : OLD_GROUP[a.kind]) === filter);
 
   const row = (a: AlertRow, i: number) => (
     <View key={`${a.kind}-${i}`} style={s.row}>
       <View style={s.top}>
-        <Pill text={a.kind}
+        <Pill text={a.kind_label ?? a.kind}
               tone={a.severity === "warn" ? "warn"
                 : a.severity === "bad" || a.severity === "error"
                   ? "bad"
@@ -96,12 +106,19 @@ export default function Alerts() {
           {a.dismissed ? " · dismissed" : ""}
         </Text>
       </View>
-      <Text style={s.msg}>{a.message}</Text>
+      {/* the server's words for the line; `message` stays the key
+          dismiss and restore send back */}
+      <Text style={s.msg}>{a.text !== undefined
+        ? a.text
+        // older-server path: stands in for `text`
+        : a.message}</Text>
       <View style={{ flexDirection: "row", gap: 16 }}>
-        {alertRoute(a) && !!a.active && (
+        {/* every line opens where its subject is acted on; a resolved
+            one has nothing left to fix, so it only opens */}
+        {alertRoute(a) && (
           <Text style={{ color: C.accent, fontSize: 12 }}
                 onPress={() => router.push(alertRoute(a) as never)}>
-            {alertCta(a.kind)} ›
+            {a.active ? alertCta(a.kind) : "Open"} ›
           </Text>
         )}
         {!viewer && (a.active || a.dismissed) ? (() => {
@@ -128,7 +145,7 @@ export default function Alerts() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
-      <StaleBanner query={query} />
+      <StaleLine query={query} />
       {recovery && (
         <Pressable onPress={() => router.push("/security" as never)}
                    accessibilityRole="link">
@@ -137,7 +154,7 @@ export default function Alerts() {
           </Card>
         </Pressable>
       )}
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      {query.isPending && <Skeleton />}
       {!query.isPending && all.length > 0 && (
         <Text style={[s.center, { paddingBottom: 4 }]}>
           {active.length > 0
@@ -149,9 +166,7 @@ export default function Alerts() {
       )}
       {listPhase({ isError: query.isError, hasData: !!query.data },
                  all.length) === "failed" && (
-        <Text style={[s.center, { color: C.bad }]}>
-          Couldn't reach the server — pull down to retry.
-        </Text>
+        <FailedLine q={query} what="alerts" />
       )}
       {listPhase({ isError: query.isError, hasData: !!query.data },
                  all.length) === "empty" && (
@@ -179,15 +194,11 @@ export default function Alerts() {
         </View>
       )}
       {showHistory && all.length > 0 && (
-        <View style={s.filterRow}>
-          {FILTERS.map((f) => (
-            <Pressable key={f} style={[s.fchip, filter === f && s.fchipOn]}
-                       onPress={() => setFilter(f)}>
-              <Text style={{ color: filter === f ? C.text : C.mut,
-                             fontSize: 12 }}>{f}</Text>
-            </Pressable>
-          ))}
-        </View>
+        <SegmentedControl label="Show" size="sm" value={filter}
+          onChange={setFilter}
+          style={{ marginHorizontal: 12, marginBottom: 8 }}
+          options={FILTERS.map((f) => (
+            { value: f, label: f[0].toUpperCase() + f.slice(1) }))} />
       )}
       {showHistory && alerts.length > 0 && (
         <Card>
@@ -195,7 +206,7 @@ export default function Alerts() {
         </Card>
       )}
       {showHistory && all.length > 0 && alerts.length === 0 && (
-        <Text style={s.center}>Nothing under this filter.</Text>
+        <Text style={s.center}>{EMPTY_LINES.filtered}</Text>
       )}
       <HelpLink topic="alerts" />
     </ScrollView>
@@ -211,15 +222,10 @@ const s = StyleSheet.create({
          alignItems: "center" },
   msg: { color: C.text, fontSize: 13, lineHeight: 18 },
   mut: { color: C.mut, fontSize: 12 },
-  filterRow: { flexDirection: "row", flexWrap: "wrap", gap: 6,
-               paddingHorizontal: 12 },
   section: { color: C.mut, fontSize: 12, fontWeight: "600",
              textTransform: "uppercase", letterSpacing: 0.5,
              paddingBottom: 4 },
   historyHead: { flexDirection: "row", justifyContent: "space-between",
                  alignItems: "center", paddingHorizontal: 16,
                  paddingTop: 12, paddingBottom: 6 },
-  fchip: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
-           borderRadius: 999, paddingHorizontal: 12, paddingVertical: 5 },
-  fchipOn: { borderColor: C.accent, backgroundColor: C.hover },
 });

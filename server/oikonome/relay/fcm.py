@@ -137,6 +137,10 @@ _DISPLAY = {
     "monthly": ("Oikonome", "Your monthly summary is ready"),
     "yearly":  ("Oikonome", "Your yearly summary is ready"),
     "alert":   ("Oikonome", "Something on your budget needs a look"),
+    # an account-security change: names nothing, because the person most
+    # needing it is the one who did not make the change
+    "security": ("Security change on your account",
+                 "Open the app to review it."),
     "test":    ("Oikonome", "Test notification from your server"),
 }
 

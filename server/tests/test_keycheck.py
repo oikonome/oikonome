@@ -292,6 +292,20 @@ class RotateMasterKeyTests(_KeyFixture):
     def test_missing_envs_refused(self):
         self.assertFalse(cli.rotate_master_key())   # no OLD set
 
+    def test_a_rotation_that_found_nothing_to_rewrap_does_not_report_success(self):
+        """A rotation run against the wrong database — compose pointed at
+        a freshly initialised bundled Postgres instead of the instance's
+        external one — finds no wrapped key at all. Reporting success there
+        tells the operator the old key can go while the real database
+        still holds everything under it."""
+        old = os.environ["OIKONOME_MASTER_KEY"]
+        os.environ["OIKONOME_MASTER_KEY"] = Fernet.generate_key().decode()
+        os.environ["OIKONOME_MASTER_KEY_OLD"] = old
+        try:
+            self.assertFalse(cli.rotate_master_key())
+        finally:
+            os.environ.pop("OIKONOME_MASTER_KEY_OLD")
+
 
 if __name__ == "__main__":
     unittest.main()

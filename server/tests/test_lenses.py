@@ -14,7 +14,7 @@ import uuid
 from oikonome.engine import budget
 from oikonome.web import lenses
 
-from .util import (TODAY, add_bill, add_ledger_history, add_txn, make_db,
+from .util import (freeze_month, TODAY, add_bill, add_ledger_history, add_txn, make_db,
                    seed_accounts, write_config)
 
 
@@ -45,6 +45,7 @@ class TestMonthFinality(LensBase):
         add_ledger_history(self.conn, dt.date(2026, 6, 1))
         add_txn(self.conn, dt.date(2026, 6, 10), 2000.0, "JUNE SPEND")
         add_txn(self.conn, dt.date(2026, 7, 2), 9000.0, "JULY SPEND")
+        freeze_month(self.conn, 2026, 6)
         r = lenses.month_summary(self.conn, 2026, 6, today=TODAY)
         self.assertEqual(r["status"], "final")
         self.assertEqual(r["as_of"], "2026-06-30")
@@ -56,11 +57,13 @@ class TestMonthFinality(LensBase):
         self.assertEqual(r["verdict"], "UNDER BUDGET")
 
     def test_past_month_matches_bills(self):
-        """The report card decomposes past months with the live schedule:
-        a bill paid back then reads as FIXED, not variable overage."""
+        """The report card decomposes a past month with the schedule it
+        closed under: a bill paid back then reads as FIXED, not variable
+        overage."""
         add_bill(self.conn, "Rent", 2000.0, next_due=dt.date(2026, 7, 1),
                  last_seen=dt.date(2026, 6, 1))
         add_txn(self.conn, dt.date(2026, 6, 1), 2000.0, "RENT")
+        freeze_month(self.conn, 2026, 6)
         r = lenses.month_summary(self.conn, 2026, 6, today=TODAY)
         self.assertEqual(r["variable_actual"], 0.0)
         self.assertEqual(r["bills"]["posted"], 2000.0)
@@ -69,6 +72,70 @@ class TestMonthFinality(LensBase):
                            "payee": "RENT",
                            "category": "GENERAL MERCHANDISE",
                            "detailed": None}])
+
+    def test_the_posted_count_counts_what_the_figure_counts(self):
+        """The card's posted figure holds the envelope charges as well as
+        the bill payments, as an installed client reads it: its count says
+        both. The bills-only figures a current client prints travel apart,
+        with the Envelopes row beside them."""
+        add_bill(self.conn, "Rent", 2000.0, next_due=dt.date(2026, 8, 1),
+                 last_seen=dt.date(2026, 7, 1))
+        add_bill(self.conn, "Bean Haus", 100.0, bill_type="envelope",
+                 frequency=None, interval=1)
+        add_txn(self.conn, dt.date(2026, 7, 1), 2000.0, "RENT")
+        r = lenses.month_summary(self.conn, 2026, 7, today=TODAY)
+        self.assertEqual(r["bills"]["posted_counts"], "1")
+        add_txn(self.conn, dt.date(2026, 7, 3), 20.0, "BEAN HAUS")
+        add_txn(self.conn, dt.date(2026, 7, 9), 30.0, "BEAN HAUS")
+        r = lenses.month_summary(self.conn, 2026, 7, today=TODAY)
+        self.assertEqual(r["bills"]["posted"], 2050.0)
+        self.assertEqual(r["bills"]["posted_counts"],
+                         "1 bill + 2 envelope charges")
+        self.assertEqual((r["bills"]["bills_posted"],
+                          r["bills"]["bills_posted_counts"]), (2000.0, "1"))
+        env = next(x for x in r["plan_rows"] if x["label"] == "Envelopes")
+        self.assertEqual((env["actual"], env["budget"]), (50.0, 100.0))
+
+    def test_an_installed_phone_reads_the_card_as_it_always_added_up(self):
+        """An older phone prints the card's posted and planned alone: for
+        a household with only pools, only bills, or both, they are the
+        month's whole fixed spend and plan, as main sent them, and the
+        current client's bills-only figures and the set-aside add up to
+        the same plan."""
+        cases = {"only pools": [("Bean Haus", 100.0, "envelope")],
+                 "only bills": [("Rent", 2000.0, "bill")],
+                 "both": [("Rent", 2000.0, "bill"),
+                          ("Bean Haus", 100.0, "envelope")]}
+        for name, made in cases.items():
+            with self.subTest(household=name):
+                conn = make_db()
+                self.addCleanup(conn.close)
+                write_config(conn, food_monthly=600, other_monthly=400,
+                             budgeted_income_monthly=4800)
+                for payee, amt, kind in made:
+                    if kind == "bill":
+                        add_bill(conn, payee, amt,
+                                 next_due=dt.date(2026, 7, 1),
+                                 last_seen=dt.date(2026, 6, 1))
+                        add_txn(conn, dt.date(2026, 7, 1), amt, payee.upper())
+                    else:
+                        add_bill(conn, payee, amt, bill_type="envelope",
+                                 frequency=None, interval=1)
+                        add_txn(conn, dt.date(2026, 7, 3), 45.0,
+                                payee.upper())
+                r = lenses.month_summary(conn, 2026, 7, today=TODAY)
+                fixed = r["buckets"]["fixed"]
+                card = r["bills"]
+                # the older phone's reading: Posted, Planned
+                older = (card["posted"], card["planned"])
+                self.assertEqual(older, (fixed["actual"],
+                                         fixed["month_budget"]))
+                self.assertEqual(older, {
+                    "only pools": (45.0, 100.0), "only bills": (2000.0, 2000.0),
+                    "both": (2045.0, 2100.0)}[name])
+                self.assertEqual(card["bills_planned"]
+                                 + card["envelopes_set_aside"],
+                                 card["planned"])
 
     def test_current_month_projects(self):
         add_txn(self.conn, TODAY.replace(day=5), 1500.0, "EARLY BURN")
@@ -177,8 +244,17 @@ class TestYearGrid(LensBase):
                 primary="FOOD_AND_DRINK")
         add_txn(self.conn, dt.date(2025, 6, 12), 600.0, "SAFEWAY",
                 primary="FOOD_AND_DRINK")
+        # checking is on file every month in between: a transfer to savings
+        # (neither spend nor income) marks each month no paycheck landed in,
+        # so January's income is a measured $0 rather than a feed hole
+        for d in (dt.date(2025, m, 20) for m in range(7, 13)):
+            add_txn(self.conn, d, 25.0, "TO SAVINGS", account="chk",
+                    primary="TRANSFER_OUT")
+        add_txn(self.conn, dt.date(2026, 1, 20), 25.0, "TO SAVINGS",
+                account="chk", primary="TRANSFER_OUT")
         y = lenses.year_summary(self.conn, 2026, today=TODAY)
-        self.assertEqual(y["totals"],
+        self.assertEqual({k: y["totals"][k]
+                          for k in ("income", "spend", "saved", "rate")},
                          {"income": 5000.0, "spend": 900.0,
                           "saved": 4100.0, "rate": 82.0})
         self.assertEqual(y["prev_totals"]["spend"], 600.0)
@@ -331,7 +407,8 @@ class TestYearLensHonoursExcludedAccounts(LensBase):
 
     def test_totals_and_categories_leave_the_excluded_account_out(self):
         y = lenses.year_summary(self.conn, 2026, today=TODAY)
-        self.assertEqual(y["totals"],
+        self.assertEqual({k: y["totals"][k]
+                          for k in ("income", "spend", "saved", "rate")},
                          {"income": 5000.0, "spend": 900.0,
                           "saved": 4100.0, "rate": 82.0})
         self.assertEqual(y["categories"],

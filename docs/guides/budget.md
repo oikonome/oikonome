@@ -8,14 +8,18 @@ language.
 
 ## The planner
 
-- **Income** — one field, "Expected income / month" (take-home),
-  suggested from the paychecks in your ledger as the average of what
-  landed over the last twelve months (the same figure the Bills page
-  shows). Once an income series is tracked on the Bills page, the plan's
-  **in** figure is this month's actual income instead: the deposits that
+- **Income** — the planner and the line above it always plan on the
+  same income. Until a paycheck is tracked it is one field, "Expected
+  income / month" (take-home), suggested from the paychecks in your
+  ledger as the average of what landed over the last twelve months (the
+  same figure the Bills page shows). With an active income scenario the
+  planner shows the scenario's take-home instead, and you change it under
+  Income scenarios. Once an income series is tracked on the Bills page,
+  the planner shows this month's actual income (not typeable; you change
+  it on Bills): the deposits that
   have landed plus the paychecks still due before month end, each at
   your latest deposit amount (the line under the plan shows the two
-  halves), so a three-paycheck month shows three checks and a check that
+  halves; a paycheck already posted as pending counts as landed), so a three-paycheck month shows three checks and a check that
   changed carries its new size forward. A check counts for the month
   it pays, not the day it lands: a paycheck due Sunday the 1st that the
   bank deposits on Friday the 30th is the next month's income. The
@@ -33,11 +37,23 @@ language.
   one owner for bill data.
 - **Budget categories** — Food and Everything else are the two fixed
   buckets the verdict judges. You can add custom categories (Gas,
-  Pets, …) that carve spending out of one of them.
+  Pets, …) that carve spending out of one of them. Setting a category
+  to $0 keeps it and its matching rules — $0 is a plan; the row's
+  remove button is what removes a category.
 - **Savings** — a planned $/month. It reduces excess cash and appears
   in the forecast as an outflow, but never affects the daily verdict.
-  An explicit $0 is remembered — the field won't silently refill; a
-  "suggested $X" chip appears when the computed leftover differs.
+  The planner lists every fixed-plan goal's monthly plan above the excess
+  line, and the excess subtracts all of them, not only the goal edited here.
+  Until you type one, the box shows a suggestion: what an ordinary month
+  leaves after bills, budgets and your other goals, measured on what your
+  paychecks usually bring in — not on this month alone, so a refund or a
+  third paycheck this month does not become a standing plan. When no
+  paychecks have been found yet, the suggestion is measured on the
+  take-home you type in the income box, and follows it as you type.
+  Typing in the other boxes does not move it; the excess line shows what your plan
+  leaves. Your own number always wins, and an explicit $0 is remembered —
+  the field won't silently refill; a "suggested $X" chip appears when the
+  suggestion differs.
 - **Excess cash** — the named residual: income − average bills −
   budgets − fixed savings plans. It stays in checking (the forecast
   shows it accumulating); it is not spendable headroom in the verdict.
@@ -45,14 +61,23 @@ language.
   month provides it, so they don't subtract here. The line is absent
   until income is set — without a top line there is no residual to name.
 
+While anything in the planner is unsaved, an **Unsaved changes** bar
+stays on screen with **Discard** (back to what is saved) and **Save
+budgets**.
+
 The planner prefills each category from your history (its suggestion
 chips say "3-month median"). The **Suggest from history** button in
 the Bucket rules card proposes a budget per bucket from roughly the
-last six months, the month in progress included: the median month,
-rounded to $10, with outlier months more than twice the median dropped
+last six finished months: the median month, rounded to $10, with
+outlier months more than twice the median dropped (the month in
+progress counts only for a bucket no finished month has spending in)
 — and for a category that shows up in only a few of those months, the
-median of the months it did. You approve each suggestion; nothing
-applies itself.
+median of the months it did. A category is offered as a budget of its
+own only when it had spending in at least half of those finished months:
+a one-off purchase (a set of tyres, a laptop) is never proposed as a
+monthly budget at its full price — it stays inside Everything else,
+which already counts it. You approve each suggestion; nothing applies
+itself.
 
 A ledger shorter than a month (a new account, a first file import) has
 no complete month to take a median of, so its suggestions are the
@@ -72,7 +97,10 @@ month end, and the verdict, the Today tiles, the hero's "$X of $Y left",
 and the forecast all read that same window, so spending exactly what
 the tiles hand out never reads as over. (The Month lens's per-category
 rows still show each category's whole-month budget.) From the next month
-on, the whole budget applies again.
+on, the whole budget applies again. Wherever the variable-spending
+progress uses a different budget from the plan's, it says why beside the
+figure: "scaled to $X this month" when the dynamic budget compressed it,
+"paced from mm/dd" when the ledger began inside the month.
 
 ## Fixed vs variable
 
@@ -87,7 +115,7 @@ Every transaction lands in exactly one of:
   occurrence rather than reading as a stray purchase. A bill you track
   by hand as a card payment is left out while a linked card carries a
   balance; the card's own payoff covers it.
-- **Food** — the **FOOD AND DRINK** category, plus rows recategorized to
+- **Food** — the **Food and Drink** category, plus rows recategorized to
   **Amazon - Food & Drink** or **Costco - Food & Drink** by receipt
   matching (your recategorizations move rows in or out). A matched
   receipt with items of several kinds is split by those items, so only
@@ -123,6 +151,14 @@ in size but irregular in timing (groceries at one store, vet visits).
 Either way the cap is the promise: spend past it and the overflow is
 judged like any other variable spending.
 
+On Today, Budget and the lenses the pools are their own **Envelopes**
+row under Bills — what they paid out of what they held — and the Bills
+row is the bills with due dates. The plan itself does not change: its
+bills leg holds both ("bills & envelopes"), and the month's plan, the
+verdict and the excess read the same as before. A yearly pool set up
+during the year counts spending from the month it was set up; one set
+up before this was so counts from January 1.
+
 ## Bucket rules
 
 The collapsed **Bucket rules** card holds the advanced pieces:
@@ -141,8 +177,35 @@ Named funds (trip fund, emergency fund) live here too. A goal matches
 transfer transactions into its destination account (optional
 description tokens let several goals share one account), plus an
 optional starting balance — progress is measured from the ledger, not
-self-reported. A goal can carry a target amount and date; pace projects
-from your trailing three months of actual contributions.
+self-reported. Goals sharing one account split its transfers so each
+counts once: a transfer goes to the first goal, in your list's order,
+whose match words all appear in it, else to the first goal with no
+words. So a transfer whose text carries two goals' words counts for the
+first of them only, and a second goal with no words reads $0 until you
+give it words of its own. A goal can carry a target amount and date. A goal with
+both is **on pace** when what you have saved is at least what a straight
+line, from the day you set that target and date to the date itself, asked
+for 38 days ago, however your deposits arrive (weekly, monthly, a
+windfall). It reads **off pace** when you are further behind than that,
+and on pace again once you are back within a week of the line; changing
+the target or the date starts a new line from that day. Four days after
+its target date, a goal that has not reached its amount reads off pace.
+A goal with no target shows what your last 3 months saved ("$1,000 in
+the last 3 months" — from the same day three months back, so each
+month's deposit counts once). A goal with a target but no date shows
+roughly when you would arrive at the rate of your last 3 months of
+contributions.
+
+The account picker lists the accounts a goal can measure: open checking,
+savings and other cash accounts, and investment accounts whose ledger
+has rows (a holdings-only account never shows a transfer) — each with
+its last four. Hidden accounts and the backup copy of a linked pair are
+not offered; an account a goal already uses stays listed. The plan's
+own **Savings** line, while it is plan-only — no account, target, date
+or match words — is shown as the plan's savings line: its amount is set
+on the planner, and an account picker beside it chooses the account the
+savings land in. Once it has an account (or a target, date or words),
+it is measured and edited like any other goal.
 
 A goal with **no account (plan only)** is not measured: its monthly plan
 still lowers excess cash and rides the forecast (the forecast always
@@ -187,10 +250,18 @@ Each goal has a **contribution mode**:
   not red — red is reserved for over-budget.
 - The planner and Bucket rules edit the same underlying config; save
   in one and the other refreshes.
+- Savings goals, custom categories and income scenarios are each saved
+  as a whole list, and an edit made on one device is merged onto what
+  another device saved in the meantime, so two people editing different
+  goals both keep their change. Only if the list moves again while that
+  merge is being saved does the save stop with *"Changed on another
+  device. Reloaded the latest; make your change again."* — the screen
+  then holds the stored list, and your change did not land.
 - Bills shown here are the evened yearly average; the actual heavy and
   light months show up in Today's irregular-bills list and the
-  forecast, not as a broken plan. Income is the month's own, so the
-  **excess** line moves with it — a third paycheck is excess that month.
+  forecast, not as a broken plan. Income is the month's own, so
+  the **excess** line moves with it — a third paycheck is excess that
+  month.
 - A charge split by hand on the Transactions page lands in the buckets
   part by part — the grocery half of a big-box run is Food, the rest is
   Everything else (or a custom bucket that names its category).

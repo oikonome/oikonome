@@ -147,6 +147,17 @@ class RoundTripKeepsEveryColumnTests(unittest.TestCase):
     # Anything NOT here that exists on the live table must be restored.
     # tenant_id is ambient via RLS in every table: never in the ZIP.
     SKIP = {
+        "forecast_nights": {
+            # the grading as of that night, computed from the kept rows
+            # again when read (a restored night is graded with its own)
+            "score": "recomputed from the restored nights when read",
+        },
+        "income_annual": {
+            # migration 221's flags, superseded by migration 226's *_w2
+            # values (specs/w2-wages.md): nothing reads or writes them
+            "primary_wages_from_w2": "superseded by primary_wages_w2",
+            "spouse_wages_from_w2": "superseded by spouse_wages_w2",
+        },
         "accounts": {
             # when THIS instance's sync loop last wrote the row. The source
             # instance's stamp would claim a sync that never happened here;
@@ -185,6 +196,12 @@ class RoundTripKeepsEveryColumnTests(unittest.TestCase):
         "income_documents": {
             "ein": "only the last four are kept (_ein_last4_for_restore)",
         },
+        "income_uploads": {
+            # who stored or removed a document is a user of the source
+            # instance; the id names nobody here (the lander writes NULL)
+            "stored_by": "a person of the source instance",
+            "removed_by": "a person of the source instance",
+        },
         "items": {
             "access_token": "credentials never travel",
             "bank_failed_at": "this instance's pull state",
@@ -212,6 +229,8 @@ class RoundTripKeepsEveryColumnTests(unittest.TestCase):
     # members whose rows are not written by a column list of their own
     NOT_TABLES = {
         "recurring": "bills' old member name, read by the bills pass",
+        "recurring_proposals": "bill offers' old member name, read by the "
+                               "offers lander",
         "tenant_settings": "one document merged over the destination's",
     }
 
@@ -252,8 +271,11 @@ class RoundTripKeepsEveryColumnTests(unittest.TestCase):
         # shell that delegates, so reading its source would find no SQL at
         # all — and this test would pass by finding nothing, which is the
         # one way it must never pass
+        from oikonome.sync.landers import LANDERS
         src = (inspect.getsource(_restore._restore_zip)
-               + inspect.getsource(_restore._restore_recipient_invites))
+               + inspect.getsource(_restore._restore_recipient_invites)
+               # a declared lander's INSERT is generated from its columns
+               + "\n".join(lander.sql for lander in LANDERS.values()))
         self.assertIn("INSERT INTO accounts", src)
         return src
 

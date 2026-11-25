@@ -11,6 +11,10 @@ from __future__ import annotations
 import datetime as dt
 import html as _html
 
+from ..engine.categories import display_label
+from ..engine.reporting import (INCOME_INCOMPLETE as _INCOMPLETE,
+                                income_incomplete_note, shown_dollars,
+                                shown_shares, whole_dollars, year_dollars)
 from ..notify.render import verdict_phrase
 from . import lenses
 
@@ -32,27 +36,57 @@ _TONES = {"UNDER": ("rgba(92,181,107,.16)", "#5cb56b"),
 
 
 def _signed(v) -> str:
-    """+$1,280 / −$310 — the Year lens's sign convention (a real minus)."""
+    """+$1,280 / −$310 / $0 — the Year lens's sign convention (a real
+    minus; $0 carries no sign, as the clients' signedMoney prints it)."""
     r = round(v or 0)
-    return f"−${-r:,.0f}" if r < 0 else f"+${r:,.0f}"
+    return f"−${-r:,.0f}" if r < 0 else f"+${r:,.0f}" if r > 0 else "$0"
+
+
+def _net_sign(v) -> int:
+    """A net's sign in the whole dollars it prints (`_signed`, `_money`):
+    1, 0 or −1. The words, the tone and whether a rate is printed read
+    this, never the cents, so a net that prints $0 is even — a year that
+    lost under a dollar never reads "you made money"."""
+    r = round(v or 0)
+    return (r > 0) - (r < 0)
+
+
+def _year_left_over(yr: dict | None):
+    """A year-strip year's left over as the Year lens and Cash Flow print it
+    (reporting.year_dollars): the printed income less the printed spend
+    when every month's income is known, else the net in its own whole
+    dollars. None when the year has no net."""
+    if not yr or yr.get("net") is None:
+        return None
+    return year_dollars(yr.get("income"), yr.get("spend") or 0, yr["net"],
+                        every_month=(yr.get("income") is not None
+                                     and not yr.get("incomplete")))["saved"]
 
 
 def _tone_of(v) -> str:
-    return "" if v is None else ("pos" if v >= 0 else "neg")
+    """pos, neg, or no tone for a net not known or printed as $0."""
+    if v is None:
+        return ""
+    return {1: "pos", -1: "neg"}.get(_net_sign(v), "")
 
 
 def _budget_rows(bills_posted: float, bills_planned: float, bills_note: str,
                  buckets: dict, children: list[dict], pinned: list[dict],
-                 months: int = 1) -> list[dict]:
-    """The budget bars both cadences draw: Bills (without any envelope
-    pinned to Today), Food, Everything else, each carve-out, then each
-    pinned envelope — every bar red or green by whether it ran over.
-    `months` > 1 is a year: the envelope's cap is its monthly cap times
-    the budgeted months."""
+                 envelopes: dict | None = None) -> list[dict]:
+    """The budget bars both cadences draw: Bills (the due-dated bills,
+    against their plan, with the Bills row's words), Envelopes (the
+    pools not pinned to Today: what they paid out of what they held,
+    `envelopes`), Food, Everything else, each carve-out, then each pinned
+    envelope — every bar red or green by whether it ran over. A pool's
+    bar is the Envelopes row's item (envelope_breakdown): drawn of cap —
+    on the month and on the Year, a yearly pool's cap is the pool, never
+    its monthly shares summed — red only when the pool's period spent
+    past it."""
     rows = []
 
-    def row(label, actual, plan, note=""):
-        over = (actual or 0) > (plan or 0) + 0.5
+    def row(label, actual, plan, note=None, over=None):
+        if over is None:
+            over = (actual or 0) > (plan or 0) + 0.5
         diff = (actual or 0) - (plan or 0)
         frac = 0.0
         if plan and plan > 0:
@@ -63,15 +97,24 @@ def _budget_rows(bills_posted: float, bills_planned: float, bills_note: str,
                      "actual_text": _money(actual), "plan_text": _money(plan),
                      "frac": round(frac * 100, 1),
                      "bar": "#e0695d" if over else "#5cb56b",
-                     "note": note or (f"{_money(diff)} over" if over else
+                     "note": note if note is not None else (
+                                      f"{_money(diff)} over" if over else
                                       f"{_money(-diff)} under" if diff < -0.5
                                       else "on the plan"),
                      "note_tone": ("neg" if over else
                                    "pos" if diff < -0.5 else ""),
                      "child": False,
+                     # $0 of $0: the words alone, no figures
+                     "words_only": not (actual or plan),
                      "actual_tone": "neg" if over else ""})
 
-    row("Bills", bills_posted, bills_planned, note=bills_note)
+    # a period with no dated bill has no Bills bar (bills_posted None)
+    if bills_posted is not None:
+        row("Bills", bills_posted, bills_planned, note=bills_note)
+    if envelopes is not None:
+        row("Envelopes", envelopes["drawn"], envelopes["cap"],
+            over=envelopes["overflow"] > 0.5 or None,
+            note=envelopes["note"])
     for key, name in (("food", "Food"), ("other", "Everything else")):
         b = buckets.get(key) or {}
         actual = b.get("display_actual", b.get("actual", 0)) or 0
@@ -86,26 +129,31 @@ def _budget_rows(bills_posted: float, bills_planned: float, bills_note: str,
             row(c["name"], c.get("actual") or 0, c.get("month_budget") or 0)
     for c in children:
         row(c["name"], c.get("actual") or 0, c.get("month_budget") or 0)
-    for e in sorted(pinned, key=lambda e: -(e.get("monthly") or 0)):
-        em = int(e.get("period_months") or 1)
+    for e in sorted(pinned, key=lambda e: (-(e.get("cap") or 0),
+                                           e["payee"])):
+        # The bar is what the pool absorbed, never the swipes past it: a
+        # spill is everyday spending (the Food / Everything else bars
+        # already count it), so adding it here too would make the bars sum
+        # to more than the month's out by exactly the spill. The spill is
+        # said in the note and turns the bar red.
+        cap, used = e.get("cap") or 0, e.get("drawn") or 0
         overflow = e.get("overflow") or 0
-        if months == 1 and em > 1:
-            # a pool over several months: the period's swipes against the
-            # period's cap, or a $25/mo envelope paid once a year reads as
-            # nine times over on the month it is paid
-            cap = e.get("pool") or (e.get("monthly") or 0) * em
-            used = (e.get("period_used") if e.get("period_used") is not None
-                    else e.get("used") or 0) + overflow
-            scope = f"{em}-month envelope"
+        em = int(e.get("period_months") or 1)
+        # the words every other surface names a pool by
+        scope = "yearly pool" if em > 1 else "monthly pool"
+        spilled = overflow > 0.5
+        if "words" in e:
+            # a current reply: the pool's own line says what went past
+            # it and in which period (envelope_breakdown.pool_figures)
+            tail = e.get("words") or (f"{_money(cap - used)} left"
+                                      if cap - used > 0.5 else
+                                      "used in full")
         else:
-            cap = e.get("monthly") or 0
-            used = (e.get("used") or 0) + overflow
-            scope = "envelope"
-        row(e["payee"], used, cap,
-            note=(scope + " · " + (f"{_money(overflow)} spilled past the cap"
-                                   if overflow > 0.5 else
-                                   f"{_money(cap - used)} of the cap left"
-                                   if cap - used > 0.5 else "cap used exactly")))
+            tail = (f"{_money(overflow)} past the pool, counted in spending"
+                    if spilled else f"{_money(cap - used)} left"
+                    if cap - used > 0.5 else "used in full")
+        row(e["payee"], used, cap, over=spilled or None,
+            note=scope + " · " + tail)
     return rows
 
 
@@ -151,10 +199,112 @@ def _pie(cats_source, posted: float, bill_cats=(), *,
             tail += v
     if tail > 0.5 and total:
         slices.append(("Other", tail, tail / total))
-    return {"cats": [{"label": c, "amount_text": _money(v), "amount": v,
-                      "pct": round(100 * sh)} for c, v, sh in slices],
-            "cat_slices": slices, "cat_total_text": _money(total),
+    # the legend as printed, after the fold: whole dollars adding up to the
+    # total under the ring and shares adding up to 100, as on the screens
+    vals = [v for _c, v, _sh in slices]
+    dollars = shown_dollars(vals, total)
+    pcts = shown_shares(vals, total)
+    return {"cats": [{"label": c, "amount_text": _money(d), "amount": v,
+                      "pct": p}
+                     for (c, v, _sh), d, p in zip(slices, dollars, pcts)],
+            "cat_slices": slices,
+            "cat_total_text": _money(whole_dollars(total)),
             "cat_total": total, "cat_pie": None}
+
+
+def _names(pools: list[dict]) -> list[str]:
+    """Pools' names in the one order lists print in (by name, then the
+    stable id: envelope_breakdown.listed)."""
+    from . import envelope_breakdown
+    return [p["payee"] for p in sorted(pools, key=envelope_breakdown.listed)]
+
+
+def _pinned_bar(it: dict) -> dict:
+    """A pinned pool's own bar from its line (envelope_breakdown
+    .pool_figures, sent as `pair_*`): the period's spend of the pool, the
+    spill the matcher counted in spending over the same period, and the
+    line's spill phrase ("$15 past the pool this month, counted in
+    spending")."""
+    text = it.get("pair_text") or ""
+    return {"payee": it["payee"], "uid": it.get("uid"),
+            "drawn": float(it["pair_spent"]),
+            "cap": float(it["pair_of"]),
+            "overflow": float(it["pair_past"]),
+            "period_months": it["period_months"],
+            # the card's own figures, for a reply with no Bills breakdown
+            "used": float(it.get("used", it.get("drawn", 0)) or 0),
+            "monthly": float(it.get("monthly", 0) or 0),
+            # the line's spill phrase, its period said
+            "words": " · ".join(w for w in text.split(" · ")
+                                if "past the pool" in w) or None}
+
+
+def _pools(env_row: dict | None, pinned_payees: set[str], *, when: str,
+           card: list[dict] | None = None
+           ) -> tuple[dict | None, list[dict] | None]:
+    """The Envelopes bar and the pinned pools' bars from the Envelopes
+    row a lens sends (envelope_breakdown): a pool the household pinned
+    to Today keeps a bar of its own and leaves the Envelopes bar; the
+    Envelopes bar is the rest, its note the row's words (a "without"
+    when a pool left it). `when` is the row's period in words.
+
+    A current reply with no Envelopes row — its pools had nothing to say
+    this period — is told from an older one by its card (`card`, the
+    Month card's pools): a current server sends each pool's line
+    (`pair_text`), so its pinned pools still print theirs. (None, None)
+    only for an older reply, whose pools are still in its Bills figures
+    (_legacy_pinned)."""
+    if env_row is None or not env_row.get("breakdown"):
+        if card and all(e.get("pair_text") is not None for e in card):
+            return None, [_pinned_bar(e) for e in card
+                          if e["payee"] in pinned_payees]
+        return None, None
+    bd = env_row["breakdown"]
+    pinned = [_pinned_bar(it)
+              for it in bd["items"] if it["payee"] in pinned_payees]
+    rest = [it for it in bd["items"] if it["payee"] not in pinned_payees]
+    drawn = sum(it["drawn"] for it in rest)
+    cap = sum(it["cap"] for it in rest)
+    if not rest:
+        return None, pinned
+    bits = [bd["text"]] if bd.get("text") and not pinned else []
+    if pinned:
+        over = sum(it["overflow"] for it in rest)
+        if over > 0:
+            bits.append(f"{_money(over)} past the pool {when}, counted in "
+                        "spending")
+        bits.append("without " + ", ".join(_names(pinned)))
+    if not (drawn or cap or [w for w in bits
+                             if not w.startswith("without ")]):
+        # nothing in the Envelopes bar and nothing to say: no "$0 of $0"
+        # (envelope_breakdown.has_row's rule for the map row)
+        return None, pinned
+    return ({"drawn": float(drawn), "cap": float(cap),
+             "overflow": float(sum(it["overflow"] for it in rest)),
+             "note": " · ".join(bits)}, pinned)
+
+
+def _legacy_pinned(envs: list[dict], *, year: bool) -> list[dict]:
+    """The pinned pools of a reply with no Envelopes row, whose Bills
+    figures still hold every pool: each as a bar of its own — a month's
+    pool over several months its period's draw of its pool; the Year's
+    its draw of its monthly shares summed, the only cap such a reply
+    has."""
+    out = []
+    for e in envs:
+        em = int(e.get("period_months") or 1)
+        if not year and em > 1:
+            cap = e.get("pool") or (e.get("monthly") or 0) * em
+            used = (e.get("period_used") if e.get("period_used") is not None
+                    else e.get("used") or 0)
+        else:
+            cap, used = e.get("monthly") or 0, e.get("used") or 0
+        out.append({"payee": e["payee"], "drawn": used, "cap": cap,
+                    "overflow": e.get("overflow") or 0,
+                    "period_months": 1 if year else em,
+                    "used": e.get("used") or 0,
+                    "monthly": e.get("monthly") or 0})
+    return out
 
 
 def _verdict_words(verdict: str) -> tuple[str, str]:
@@ -198,14 +348,13 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
     verdict = (d.get("verdict") or "").upper()
     variance = d.get("variance") or 0
     tolerance = d.get("tolerance") or 0
-    income = (d.get("income") or {}).get("actual")
-    spend = d.get("spend_total") or 0
-    net = (income - spend) if income is not None else None
+    # the month's net as the Month lens prints it (lenses.month_summary)
+    net = d.get("net")
 
     # ---- the year strip: a month's net, coloured by its sign; months
     #      after the report month are not yet ----
     strip, ytd_net, counted, judged, kept = [], 0.0, 0, 0, 0
-    net_known, unknown_months = True, False
+    with_net, unknown_months = 0, False
     for c in year.get("cells") or []:
         cm = c["m"]
         if cm > m or c.get("status") == "future":
@@ -219,13 +368,15 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
             # income unknown for the month: nothing to colour, the spend
             # alone is shown so the cell is not blank
             bg, fg = _TONES["net"]
-            text = _money(c.get("spend") or 0) + " out"
+            # a month with no rows at all says so (lenses.cell_words)
+            text = ("no data" if c.get("label") == "no data"
+                    else _money(c.get("spend") or 0) + " out")
             unknown_months = True
-            net_known = False
         else:
-            bg, fg = _TONES["UNDER" if cnet >= 0 else "OVER"]
+            bg, fg = _TONES["UNDER" if _net_sign(cnet) >= 0 else "OVER"]
             text = _signed(cnet)
             ytd_net += cnet
+            with_net += 1
         strip.append({"abbr": _MONTHS[cm - 1], "text": text, "bg": bg,
                       "fg": fg, "current": cm == m, "net": cnet})
         counted += 1
@@ -234,11 +385,17 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
             if v.startswith(("UNDER", "ON")):
                 kept += 1
     plural = "s" if counted != 1 else ""
+    # by the month, as the Year lens totals: the net sums the months whose
+    # income is complete and says so when some are left out; only a year
+    # with none so far has no net
+    net_known = with_net > 0
+    ytd_note = income_incomplete_note(with_net, counted) if net_known else None
     ytd = {"net_text": _signed(ytd_net) if net_known else "—",
            "tone": _tone_of(ytd_net) if net_known else "",
-           "months_text": (f"{counted} month{plural} so far · on or under "
-                           f"budget {kept} of {judged}" if judged else
-                           f"{counted} month{plural} so far"),
+           "months_text": ((f"{counted} month{plural} so far · on or under "
+                            f"budget {kept} of {judged}" if judged else
+                            f"{counted} month{plural} so far")
+                           + (f" · {ytd_note}" if ytd_note else "")),
            "months": counted, "net": ytd_net if net_known else None,
            "unknown_months": unknown_months}
 
@@ -248,13 +405,19 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
     if net is None:
         sentence = ("Income is not known for this month (no bank account "
                     "feeds it), so there is no net.")
-    elif net >= 0:
+    elif _net_sign(net) == 0:
+        sentence = "You broke even this month: as much came in as went out."
+    elif net > 0:
         sentence = f"You made money this month: {_money(net)} more in than out."
     else:
         sentence = f"You lost money this month: {_money(-net)} more out than in."
     flow = {"net_text": _signed(net) if net is not None else "—",
             "tone": _tone_of(net), "sentence": sentence, "net": net}
-    if d.get("budget_set") is False:
+    if d.get("standing") in lenses.PAST_STANDINGS:
+        # a month from before the household had a budget: the Month
+        # view's own sentence (lenses.STANDING_WORDS)
+        variable_line = d["standing_text"]
+    elif d.get("budget_set") is False:
         # the household never saved a budget: there is nothing to judge
         # the month against, so the line says so instead of a $0 verdict
         variable_line = (f"Variable spend {_money(d.get('variable_actual') or 0)} "
@@ -267,7 +430,8 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
                                        variance, tolerance,
                                        final=status == "final")
     notes = []
-    if status == "final" and d.get("budget_source") == "live":
+    if (status == "final" and d.get("budget_source") == "live"
+            and d.get("budget_set") is not False):
         notes.append("No budget snapshot exists for this month — the verdict "
                      "compares it against the current budget, applied "
                      "retroactively.")
@@ -286,22 +450,67 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
     # and leaves the Bills bar, which otherwise counts it. The other
     # envelopes stay inside Bills: eight bars for eight small caps is
     # noise.
-    pinned = [e for e in bills.get("envelopes") or [] if e.get("show_today")]
-    bills_posted = posted - sum(e.get("used") or 0 for e in pinned)
-    bills_planned = planned - sum(e.get("monthly") or 0 for e in pinned)
+    env_row = next((r for r in d.get("plan_rows") or ()
+                    if r.get("label") == "Envelopes"), None)
+    shown = [e for e in bills.get("envelopes") or [] if e.get("show_today")]
+    envelopes, pinned = _pools(
+        env_row, {e["payee"] for e in shown},
+        when=("this month" if status == "in_progress"
+              else f"in {dt.date(y, m, 1):%B}"),
+        card=bills.get("envelopes") or [])
+    legacy = pinned is None
+    if legacy:
+        pinned = _legacy_pinned(shown, year=False)
+    bd = bills.get("breakdown")
     bits = [f"{paid_n} paid"]
-    if awaiting:
-        bits.append(f"{_money(awaiting)} due, not posted")
     if overdue:
         bits.append(f"{len(overdue)} overdue")
-    bdiff = bills_posted - bills_planned
-    bits.append(f"{_money(bdiff)} over the plan" if bdiff > 0.5 else
-                f"{_money(-bdiff)} under the plan" if bdiff < -0.5 else
-                "on the plan")
-    if pinned:
-        bits.append("without " + ", ".join(e["payee"] for e in pinned))
+    if bd is not None:
+        # the Month lens's Bills row: posted against the month's plan and
+        # the row's words, in the page's dollars, and — as the Month card
+        # lists them — each bill a closed month did not pay; the table
+        # the page opens is not mailed
+        bills_posted = bd["posted"]
+        bills_planned = bd["plan"]
+        notes = bills.get("notes") or []
+        # a bill not paid is said once, by name, when the card lists it
+        said = [w for w in (bd.get("text") or "").split(" · ")
+                if w and not (notes and w.endswith(" not paid"))]
+        if said:
+            bits += said
+        elif bd.get("settled") and not notes:
+            # nothing not paid, nothing under or over: the mail's words
+            bits.append("on the plan")
+        bits += notes
+    else:
+        # a reply with no breakdown: the card's figures, every pool in
+        # them, less the pools drawn on their own
+        bills_posted = posted - sum(e["used"] for e in pinned)
+        bills_planned = planned - sum(e["monthly"] for e in pinned)
+        if awaiting:
+            bits.append(f"{_money(awaiting)} due, not posted")
+        bdiff = bills_posted - bills_planned
+        if bills.get("notes"):
+            # a closed month's own lines; a month that paid more than its
+            # plan says so beside them
+            if posted - planned > 0.5 and bdiff > 0.5:
+                bits.append(f"{_money(bdiff)} over the plan")
+            bits += bills["notes"]
+        else:
+            bits.append(f"{_money(bdiff)} over the plan" if bdiff > 0.5 else
+                        f"{_money(-bdiff)} under the plan" if bdiff < -0.5
+                        else "on the plan")
+        if pinned:
+            bits.append("without " + ", ".join(_names(pinned)))
+    # the plan here is the bills due in this month — not the evened-out
+    # monthly figure Bills & Income and Budget history print — so it says so
+    bits.append("planned from the month's due dates")
+    from . import bills_breakdown as _bb
+    if _bb.nothing_dated(bd):
+        # no dated bill in the month: no Bills bar
+        bills_posted = None
     rows = _budget_rows(bills_posted, bills_planned, " · ".join(bits),
-                        d.get("buckets") or {}, [], pinned)
+                        d.get("buckets") or {}, [], pinned, envelopes)
 
     source = d.get("by_category_variable")
     if source is None:
@@ -311,9 +520,12 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
         if r.get("category"):
             lab = lenses.ring_label(r["category"], r.get("detailed"))
             bill_cats[lab] = bill_cats.get(lab, 0.0) + (r.get("amount") or 0)
+    pool_out = 0.0
     for e in bills.get("envelopes") or []:
         if e.get("used"):
             bill_cats[e["payee"]] = bill_cats.get(e["payee"], 0.0) + e["used"]
+            pool_out += e["used"]
+    # the card's posted is the month's fixed spend, the pools' part in it
     pie = _pie(source, posted, list(bill_cats.items()))
     month_name = f"{dt.date(y, m, 1):%B}"
     status_text = ("final" if status == "final" else
@@ -326,7 +538,7 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
             "verdict_tone": verdict_tone, "variance": variance,
             "strip": strip, "ytd": ytd,
             "flow": flow, "variable_line": variable_line, "notes": notes,
-            "rows": rows, "year_strip": [], **pie,
+            "rows": rows, "year_strip": [], "year_strip_legend": "", **pie,
             # the shared template's fields
             "headline": f"{month_name} {y}: {verdict_text}",
             "tiles": [{"eyebrow": f"Net for {month_name}",
@@ -336,16 +548,18 @@ def month_mail_context(d: dict, year: dict, y: int, m: int,
                        "tone": ytd["tone"], "sub": ytd["months_text"]}],
             "strip_legend": ("Green made money, red lost money · the number "
                              "is income − spending"
-                             + (" · grey = income unknown"
+                             + (f" · grey = {_INCOMPLETE}"
                                 if unknown_months else "")),
             "bars_title": "Monthly budget",
-            "bars_intro": ("The bills in one bar, then the variable budget as "
-                           "you split it, then any bill pinned to Today. Each "
-                           "bar is the plan, the fill is what happened: green "
-                           "under, red over."),
+            "bars_intro": ("The bills in one bar and the envelopes in "
+                           "another, then the variable budget as you split "
+                           "it, then any envelope pinned to Today. Each bar "
+                           "is the plan (an envelope's, what its pools held), "
+                           "the fill is what happened: green under, red "
+                           "over."),
             "pie_title": "Spending by category",
             "pie_sub": f"{pie['cat_total_text']} out · the bills under "
-                       f"their categories."}
+                       f"their categories, an envelope under its name."}
 
 
 def _plain(ctx: dict) -> str:
@@ -362,14 +576,19 @@ def _plain(ctx: dict) -> str:
     if ctx.get("year_strip"):
         lines.append("Net by year: " + " · ".join(
             f"{c['abbr']} {c['text']}" for c in ctx["year_strip"]))
+        if ctx.get("year_strip_legend"):
+            lines.append("  " + ctx["year_strip_legend"])
     if ctx["rows"]:
         lines.append(ctx["bars_title"] + ":")
     for r in ctx["rows"]:
+        if r.get("words_only"):
+            lines.append(f"  {r['label']}: {r['note']}")
+            continue
         lines.append(f"  {r['label']}: {r['actual_text']} of {r['plan_text']}"
                      + (f" — {r['note']}" if r["note"] else ""))
     if ctx["cats"]:
         lines.append(f"{ctx['pie_title']} ({ctx['cat_total_text']}): "
-                     + ", ".join(f"{c['label']} {c['pct']}% {c['amount_text']}"
+                     + ", ".join(f"{display_label(c['label'])} {c['pct']}% {c['amount_text']}"
                                  for c in ctx["cats"]))
     return "\n".join(lines)
 
@@ -423,7 +642,7 @@ def year_mail_context(d: dict, year: int) -> dict:
     det = d.get("detail") or {}
     cells = d.get("cells") or []
     strip, net_sum, counted, judged, kept, over_months = [], 0.0, 0, 0, 0, []
-    net_known, unknown_months = True, False
+    unknown_months = False
     for c in cells:
         cm = c["m"]
         if c.get("status") == "future":
@@ -435,11 +654,13 @@ def year_mail_context(d: dict, year: int) -> dict:
         cnet = c.get("net")
         if cnet is None:
             bg, fg = _TONES["net"]
-            text = _money(c.get("spend") or 0) + " out"
+            # the Year grid's own word for a month with no rows at all
+            # (lenses.cell_words); otherwise what went out, never a net
+            text = ("no data" if c.get("label") == "no data"
+                    else _money(c.get("spend") or 0) + " out")
             unknown_months = True
-            net_known = False
         else:
-            bg, fg = _TONES["UNDER" if cnet >= 0 else "OVER"]
+            bg, fg = _TONES["UNDER" if _net_sign(cnet) >= 0 else "OVER"]
             text = _signed(cnet)
             net_sum += cnet
         strip.append({"abbr": _MONTHS[cm - 1], "text": text, "bg": bg,
@@ -451,32 +672,50 @@ def year_mail_context(d: dict, year: int) -> dict:
                 kept += 1
             else:
                 over_months.append(_MONTHS[cm - 1])
-    net = net_sum if net_known else None
+    # by the month, as the Year lens totals and Cash Flow: the net sums
+    # the months whose income is complete, and the sentence says so when
+    # some are left out; only a year with none has no net
+    t = d.get("totals") or {}
+    net = net_sum if any(c["net"] is not None for c in strip) else None
+    # the year's left over in the whole dollars the Year lens prints
+    # (lenses.totals_dollars: the printed income less the printed spend),
+    # when the strip's net is that same sum of months
+    shown = (t.get("dollars") or {}).get("saved")
+    if (net is not None and shown is not None
+            and t.get("saved") is not None and abs(net - t["saved"]) < 0.01):
+        net = float(shown)
     final = counted == 12
     if net is None:
         headline, tone = f"{year}: income unknown", "warn"
-        sentence = ("Income is not known for part of the year (no bank "
-                    "account feeds it), so there is no yearly net.")
-    elif net >= 0:
+        sentence = ("Income is not known for any month of the year (no "
+                    "bank account feeds it), so there is no yearly net.")
+    elif _net_sign(net) == 0:
+        headline, tone = f"{year}: you broke even", ""
+        sentence = "as much came in as went out"
+    elif net > 0:
         headline, tone = f"{year}: you made money", "pos"
         sentence = f"{_money(net)} more in than out"
     else:
         headline, tone = f"{year}: you lost money", "neg"
         sentence = f"{_money(-net)} more out than in"
-    t = d.get("totals") or {}
-    if net is not None and t.get("income"):
-        sentence += (f" · {100 * net / t['income']:.1f}% of income kept"
-                     if net >= 0 else "")
+    # a rate only beside a printed gain: $0 is even, a loss keeps nothing
+    if net is not None and t.get("income") and _net_sign(net) > 0:
+        sentence += f" · {100 * net_sum / t['income']:.1f}% of income kept"
+    if net is not None and t.get("incomplete_text"):
+        sentence += f" · {t['incomplete_text']}"
     prev = d.get("prev_totals") or {}
     prev_net = prev.get("saved")
     # last year's net from the year strip when the payload carries it:
-    # that figure is unknown when any month of the year had no bank feed,
-    # the rule this year's headline follows, so the two tiles compare like
-    # with like
+    # that figure counts the months with a bank feed, the rule this
+    # year's headline follows, so the two tiles compare like with like
     prev_year = next((yr for yr in det.get("years") or []
                       if yr.get("y") == year - 1), None)
     if det.get("years") is not None:
-        prev_net = prev_year.get("net") if prev_year else None
+        prev_net = _year_left_over(prev_year)
+    elif prev_net is not None and (prev.get("dollars") or {}).get(
+            "saved") is not None:
+        # last year's totals, printed by the same rule as this year's
+        prev_net = prev["dollars"]["saved"]
     prev_tile = {"eyebrow": f"Net for {year - 1}",
                  "value": _signed(prev_net) if prev_net is not None else "—",
                  "tone": _tone_of(prev_net),
@@ -503,23 +742,53 @@ def year_mail_context(d: dict, year: int) -> dict:
                      " had no budget on record; the bars and the verdict count "
                      "cover the budgeted months only.")
 
-    # bars: annual sums over the budgeted months; a pinned envelope's annual
-    # cap is its monthly cap over those months
+    # bars: annual sums over the budgeted months; the pools are the Year
+    # Envelopes row's items (envelope_breakdown.year), so a pinned yearly
+    # pool's cap is its pool, never its monthly shares summed
     envs = det.get("envelopes") or {}
-    pinned = [{"payee": k, "used": v["used"], "monthly": v["monthly"],
-               "overflow": v["overflow"], "period_months": 1}
-              for k, v in envs.items() if v.get("show_today")]
+    env_row = next((r for r in d.get("plan_rows") or ()
+                    if r.get("label") == "Envelopes"), None)
+    envelopes, pinned = _pools(env_row, {
+        k for k, v in envs.items() if v.get("show_today")},
+        card=[dict(v, payee=k) for k, v in envs.items()],
+        when=f"in {year}")
+    legacy = pinned is None
+    if legacy:
+        pinned = _legacy_pinned([dict(v, payee=k) for k, v in envs.items()
+                                 if v.get("show_today")], year=True)
     fixed = ba.get("fixed") or {}
-    bills_posted = (fixed.get("actual") or 0) - sum(e["used"] for e in pinned)
-    bills_planned = ((fixed.get("month_budget") or 0)
-                     - sum(e["monthly"] for e in pinned))
-    bdiff = bills_posted - bills_planned
     bits = [f"{det.get('bills_paid', 0)} paid"]
-    bits.append(f"{_money(bdiff)} over the plan" if bdiff > 0.5 else
-                f"{_money(-bdiff)} under the plan" if bdiff < -0.5 else
-                "on the plan")
-    if pinned:
-        bits.append("without " + ", ".join(e["payee"] for e in pinned))
+    bills_row = next((r for r in d.get("plan_rows") or ()
+                      if r.get("label") == "Bills" and not r.get("judged")),
+                     None)
+    bd = bills_row.get("breakdown") if bills_row is not None else None
+    # a map with no Bills row is a year with no dated bill: no Bills bar
+    no_bills = bool(d.get("plan_rows")) and bills_row is None
+    if no_bills:
+        bills_posted = bills_planned = None
+    elif bd is not None:
+        # the Year lens's Bills row: posted against its plan and the row's
+        # words; no table
+        bills_posted = bd["posted"]
+        bills_planned = bd["plan"]
+        if bd.get("text"):
+            bits.append(bd["text"])
+        elif bd.get("settled"):
+            # nothing not paid, nothing under or over: the mail's words
+            bits.append("on the plan")
+    else:
+        # a Year with no breakdown: its sums, every pool in them, less
+        # the pools drawn on their own
+        bills_posted = ((fixed.get("actual") or 0)
+                        - sum(e["used"] for e in pinned))
+        bills_planned = ((fixed.get("month_budget") or 0)
+                         - sum(e["monthly"] for e in pinned))
+        bdiff = bills_posted - bills_planned
+        bits.append(f"{_money(bdiff)} over the plan" if bdiff > 0.5 else
+                    f"{_money(-bdiff)} under the plan" if bdiff < -0.5 else
+                    "on the plan")
+        if pinned:
+            bits.append("without " + ", ".join(_names(pinned)))
     children = [{"name": k, "actual": v["actual"],
                  "month_budget": v["month_budget"]}
                 for k, v in (det.get("children") or {}).items()]
@@ -538,7 +807,7 @@ def year_mail_context(d: dict, year: int) -> dict:
                               "month_budget": c["month_budget"]} for c in kids]
         buckets[k] = b
     rows = _budget_rows(bills_posted, bills_planned, " · ".join(bits),
-                        buckets, [], pinned, months=max(1, budgeted))
+                        buckets, [], pinned, envelopes)
     if not budgeted:
         # a year before the household budgeted: nothing to draw bars
         # against, and a "$0 of $0" bar says less than saying so
@@ -555,17 +824,24 @@ def year_mail_context(d: dict, year: int) -> dict:
     pie = _pie(det.get("categories_variable") or [],
                det.get("fixed_total") or 0, bill_cats, max_slices=12, floor=0.02)
     # every year back to the ledger's first, each its net coloured by sign;
-    # a year without bank coverage shows what went out, in grey
+    # a year without bank coverage shows what went out, in grey, and a
+    # year with an incomplete month its net over the others, in grey too
     year_strip = []
+    incomplete_years = False
     for yr in det.get("years") or []:
         if yr.get("net") is None:
             bg, fg = _TONES["net"]
             # a year with no bank coverage: what went out, or nothing on
             # record at all (a gap in the ledger reads as a gap)
             text = (_money(yr["spend"]) + " out") if yr.get("spend") else "·"
+        elif yr.get("incomplete"):
+            bg, fg = _TONES["net"]
+            text = _signed(_year_left_over(yr))
+            incomplete_years = True
         else:
-            bg, fg = _TONES["UNDER" if yr["net"] >= 0 else "OVER"]
-            text = _signed(yr["net"])
+            shown_net = _year_left_over(yr)
+            bg, fg = _TONES["UNDER" if shown_net >= 0 else "OVER"]
+            text = _signed(shown_net)
         year_strip.append({"abbr": str(yr["y"]), "text": text, "bg": bg,
                            "fg": fg, "current": yr["y"] == year,
                            "net": yr.get("net")})
@@ -579,20 +855,25 @@ def year_mail_context(d: dict, year: int) -> dict:
             "strip": strip,
             "strip_legend": ("Green made money, red lost money · the number "
                              "is income − spending"
-                             + (" · grey = income unknown"
+                             + (f" · grey = {_INCOMPLETE}"
                                 if unknown_months else "")),
+            # under the years: what a grey year with a figure means
+            "year_strip_legend": (
+                f"grey = {_INCOMPLETE}: the net counts the months with "
+                "bank data" if incomplete_years else ""),
             "variable_line": variable_line, "notes": notes,
             "rows": rows, "year_strip": year_strip, **pie,
             "net": net, "kept": kept, "judged": judged, "counted": counted,
             "bars_title": "Yearly budget",
             "bars_intro": (f"Annual totals over the {budgeted} budgeted month"
                            f"{'s' if budgeted != 1 else ''}: the bills in one "
-                           "bar, then the variable budget as you split it, "
-                           "then any bill pinned to Today. Green under, red over."),
+                           "bar and the envelopes in another, then the "
+                           "variable budget as you split it, then any "
+                           "envelope pinned to Today. Green under, red over."),
             "pie_title": f"Spending by category — {year}",
             "pie_sub": f"{pie['cat_total_text']} out over {walked} month"
                        f"{'s' if walked != 1 else ''} · the bills under "
-                       f"their categories."}
+                       f"their categories, an envelope under its name."}
 
 
 def build_yearly(conn, today: dt.date) -> tuple[str, str, str]:
@@ -605,6 +886,9 @@ def build_yearly(conn, today: dt.date) -> tuple[str, str, str]:
     subject = f"{year} in review"
     if ctx["net"] is not None:
         subject += f": net {_signed(ctx['net'])}"
+        if (d.get("totals") or {}).get("incomplete_text"):
+            # the net counts only the months with bank data
+            subject += f" ({_INCOMPLETE})"
     if ctx["judged"]:
         subject += f" · on or under budget {ctx['kept']} of {ctx['judged']} months"
     html = _render(f"{year} — the year in review", ctx)

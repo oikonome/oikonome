@@ -470,10 +470,11 @@ class PhoneDrawer(unittest.TestCase):
     def test_escape_and_the_scrim_return_focus_to_the_button(self):
         """Closing while focus sits on a control that just slid off-screen
         strands the keyboard: the next Tab resumes from a hidden element."""
-        for closer in ("Escape", "navscrim"):
-            i = self.app.index(closer)
-            self.assertIn("burgerRef.current?.focus()", self.app[i:i + 500],
-                          closer)
+        i = self.app.index("navscrim")
+        self.assertIn("burgerRef.current?.focus()", self.app[i:i + 500])
+        # Escape is the dialog primitive's, which hands focus to returnFocus
+        call = self.app[self.app.index("useDialog(navRef"):]
+        self.assertIn("returnFocus: burgerRef", call[:call.index(");")])
 
     def test_choosing_the_current_route_still_closes_the_drawer(self):
         """loc.pathname does not change when you pick the page you are

@@ -14,6 +14,7 @@ import { householdDay } from "../moneymath";
 import Today from "./Today";
 import MonthLens from "./MonthLens";
 import YearLens from "./YearLens";
+import SegmentedControl from "../components/SegmentedControl";
 
 const MONTHS = ["January", "February", "March", "April", "May", "June", "July",
                 "August", "September", "October", "November", "December"];
@@ -26,6 +27,9 @@ const addDays = (iso: string, n: number) => {
   const [y, m, d] = iso.split("-").map(Number);
   return isoOf(new Date(y, m - 1, d + n));
 };
+
+// what one press of the ‹ › stepper moves, in the words a screen reader says
+const lensUnit = (l: "today" | "month" | "year") => (l === "today" ? "day" : l);
 
 export default function Home() {
   const [sp, setSp] = useSearchParams();
@@ -102,8 +106,12 @@ export default function Home() {
   // nowhere to go). Unknown while the payload loads → allow the click;
   // the server clamps.
   const minDate = todayQ.data?.min_date;
-  const atFloor = lens === "today" && !!todayQ.data
-    && (!minDate || date <= minDate);
+  // the year lens stops at the ledger's first year, as the phone's ‹ does
+  // (unknown while the year loads → allow the click)
+  const atFloor = (lens === "today" && !!todayQ.data
+    && (!minDate || date <= minDate))
+    || (lens === "year" && yearQ.data?.first_year != null
+        && y <= yearQ.data.first_year);
 
   return (
     <>
@@ -113,7 +121,7 @@ export default function Home() {
           {/* Today steps a day at a time like every other lens (no
               dropdowns — ‹ › and the URL's ?date= carry the state) */}
           <button onClick={() => step(-1)} disabled={atFloor}
-                  title="previous">‹</button>
+                  title="previous" aria-label={`Previous ${lensUnit(lens)}`}>‹</button>
           {lens !== "today" && (
             <>
               {lens === "month" && (
@@ -137,14 +145,11 @@ export default function Home() {
               )}
             </>
           )}
-          <button onClick={() => step(1)} disabled={atCurrent} title="next">›</button>
-          <span className="lenspick">
-            {(["today", "month", "year"] as const).map((l) => (
-              <button key={l} className={l === lens ? "on" : ""}
-                      onClick={() => setLens(l)}>
-                {l[0].toUpperCase() + l.slice(1)}</button>
-            ))}
-          </span>
+          <button onClick={() => step(1)} disabled={atCurrent} title="next"
+                  aria-label={`Next ${lensUnit(lens)}`}>›</button>
+          <SegmentedControl label="Lens" value={lens} onChange={setLens}
+            options={(["today", "month", "year"] as const).map((l) => ({
+              value: l, label: l[0].toUpperCase() + l.slice(1) }))} />
         </span>
       </div>
       {lens === "today" && <Today date={backDate} />}

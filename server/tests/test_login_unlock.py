@@ -82,9 +82,40 @@ class UnlockTokenTests(unittest.TestCase):
         """Not a ten-minute window for unlimited guessing."""
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-            self.assertTrue(login_unlock.consume(c, self.email))
-            self.assertFalse(login_unlock.consume(c, self.email))
+            proof = login_unlock.follow(c, tok)["proof"]
+            self.assertTrue(login_unlock.consume(c, self.email, proof))
+            self.assertFalse(login_unlock.consume(c, self.email, proof))
+            self.assertFalse(login_unlock.is_unlocked(c, self.email))
+
+    def test_without_its_proof_the_exemption_is_neither_spent_nor_burned(self):
+        """Knowing the address is not enough: a sign-in that does not carry
+        the unlock's proof must leave it exactly as it was, so a stranger
+        polling the door can neither use the owner's unlock nor burn it."""
+        with _ctl() as c:
+            tok = login_unlock.create(c, self.user_id)
+            proof = login_unlock.follow(c, tok)["proof"]
+            self.assertFalse(login_unlock.consume(c, self.email, ""))
+            self.assertFalse(login_unlock.consume(c, self.email, "0" * 64))
+            self.assertFalse(login_unlock.consume(c, self.email, "é" * 64))
+            self.assertTrue(login_unlock.is_unlocked(c, self.email))
+            self.assertTrue(login_unlock.consume(c, self.email, proof))
+
+    def test_the_proof_and_code_are_not_stored(self):
+        with _ctl() as c:
+            tok = login_unlock.create(c, self.user_id)
+            got = login_unlock.follow(c, tok)
+            row = c.execute("SELECT * FROM login_unlocks WHERE user_id=%s",
+                            (self.user_id,)).fetchone()
+        stored = [str(v) for v in row.values()]
+        self.assertNotIn(got["proof"], stored)
+        self.assertNotIn(got["code"], stored)
+
+    def test_refund_by_address_alone_re_arms_nothing(self):
+        with _ctl() as c:
+            tok = login_unlock.create(c, self.user_id)
+            proof = login_unlock.follow(c, tok)["proof"]
+            self.assertTrue(login_unlock.consume(c, self.email, proof))
+            login_unlock.refund(c, self.email, ())
             self.assertFalse(login_unlock.is_unlocked(c, self.email))
 
     def test_refund_rearms_a_just_spent_exemption(self):
@@ -95,14 +126,14 @@ class UnlockTokenTests(unittest.TestCase):
         passkey_required (password verified, flow unfinished)."""
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-            self.assertTrue(login_unlock.consume(c, self.email))   # step 1
-            login_unlock.refund(c, self.email)                     # totp_required
+            proof = login_unlock.follow(c, tok)["proof"]
+            self.assertTrue(ids := login_unlock.consume(c, self.email, proof))   # step 1
+            login_unlock.refund(c, self.email, ids)                     # totp_required
             self.assertTrue(login_unlock.is_unlocked(c, self.email))
-            self.assertTrue(login_unlock.consume(c, self.email),   # step 2
+            self.assertTrue(login_unlock.consume(c, self.email, proof),   # step 2
                             "the refunded exemption did not cover the "
                             "code step of the same sign-in")
-            self.assertFalse(login_unlock.consume(c, self.email))
+            self.assertFalse(login_unlock.consume(c, self.email, proof))
 
     def test_refund_covers_one_retry_not_a_cycle(self):
         """One unlock buys ONE refund. The two-step form needs exactly
@@ -113,14 +144,14 @@ class UnlockTokenTests(unittest.TestCase):
         one-attempt spend into a ten-minute pass."""
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-            self.assertTrue(login_unlock.consume(c, self.email))
-            login_unlock.refund(c, self.email)     # the form's second post
-            self.assertTrue(login_unlock.consume(c, self.email))
-            login_unlock.refund(c, self.email)     # a replayed empty-code post
+            proof = login_unlock.follow(c, tok)["proof"]
+            self.assertTrue(ids := login_unlock.consume(c, self.email, proof))
+            login_unlock.refund(c, self.email, ids)     # the form's second post
+            self.assertTrue(ids := login_unlock.consume(c, self.email, proof))
+            login_unlock.refund(c, self.email, ids)     # a replayed empty-code post
             self.assertFalse(login_unlock.is_unlocked(c, self.email),
                              "a second refund re-armed the same unlock")
-            self.assertFalse(login_unlock.consume(c, self.email))
+            self.assertFalse(login_unlock.consume(c, self.email, proof))
 
     def test_a_fresh_link_refunds_even_after_an_earlier_one_was_spent(self):
         """The refund stamp is per unlock row, not per account — a NEW
@@ -128,15 +159,15 @@ class UnlockTokenTests(unittest.TestCase):
         unlock yesterday still gets the two-step allowance today."""
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-            self.assertTrue(login_unlock.consume(c, self.email))
-            login_unlock.refund(c, self.email)
-            self.assertTrue(login_unlock.consume(c, self.email))
+            proof = login_unlock.follow(c, tok)["proof"]
+            self.assertTrue(ids := login_unlock.consume(c, self.email, proof))
+            login_unlock.refund(c, self.email, ids)
+            self.assertTrue(ids := login_unlock.consume(c, self.email, proof))
             # a fresh link: its refund allowance is its own
             tok2 = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok2)
-            self.assertTrue(login_unlock.consume(c, self.email))
-            login_unlock.refund(c, self.email)
+            proof = login_unlock.follow(c, tok2)["proof"]
+            self.assertTrue(ids := login_unlock.consume(c, self.email, proof))
+            login_unlock.refund(c, self.email, ids)
             self.assertTrue(login_unlock.is_unlocked(c, self.email),
                             "the new unlock's one refund was refused")
 
@@ -145,21 +176,21 @@ class UnlockTokenTests(unittest.TestCase):
         attempt someone is retrying) stays spent."""
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-            self.assertTrue(login_unlock.consume(c, self.email))
+            proof = login_unlock.follow(c, tok)["proof"]
+            self.assertTrue(ids := login_unlock.consume(c, self.email, proof))
             c.execute("UPDATE login_unlocks SET consumed_at = now() - "
                       "interval '5 minutes' WHERE user_id=%s",
                       (self.user_id,))
-            login_unlock.refund(c, self.email)
+            login_unlock.refund(c, self.email, ids)
             self.assertFalse(login_unlock.is_unlocked(c, self.email))
 
     def test_refund_without_a_spend_is_a_noop(self):
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-            login_unlock.refund(c, self.email)   # nothing consumed yet
-            self.assertTrue(login_unlock.consume(c, self.email))
-            self.assertFalse(login_unlock.consume(c, self.email))
+            proof = login_unlock.follow(c, tok)["proof"]
+            login_unlock.refund(c, self.email, ())   # nothing consumed yet
+            self.assertTrue(login_unlock.consume(c, self.email, proof))
+            self.assertFalse(login_unlock.consume(c, self.email, proof))
 
     def test_expired_link_is_dead(self):
         with _ctl() as c:
@@ -171,19 +202,34 @@ class UnlockTokenTests(unittest.TestCase):
     def test_expired_exemption_does_not_unlock(self):
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
+            proof = login_unlock.follow(c, tok)["proof"]
             c.execute("UPDATE login_unlocks SET unlocked_until = now() - "
                       "interval '1 second' WHERE user_id=%s", (self.user_id,))
             self.assertFalse(login_unlock.is_unlocked(c, self.email))
-            self.assertFalse(login_unlock.consume(c, self.email))
+            self.assertFalse(login_unlock.consume(c, self.email, proof))
 
-    def test_minting_burns_older_live_links(self):
-        """The reset rule: five clicks must not leave five working
-        keys under the mat."""
+    def test_minting_leaves_older_live_links_working(self):
+        """Anyone may ask for a link to any address. If asking burned the
+        address's earlier links, a stranger's request would kill the one the
+        owner is about to open; the hourly cap bounds how many are live."""
         with _ctl() as c:
             first = login_unlock.create(c, self.user_id)
             login_unlock.create(c, self.user_id)
-            self.assertIsNone(login_unlock.follow(c, first))
+            self.assertIsNotNone(login_unlock.follow(c, first))
+
+    def test_the_sign_in_code_is_the_proofs_short_form(self):
+        """The code spends exactly like the proof — once, and only for its
+        own unlock — and survives how a person types what they read."""
+        with _ctl() as c:
+            tok = login_unlock.create(c, self.user_id)
+            row = login_unlock.follow(c, tok)
+            code = row["code"]
+            self.assertRegex(code, r"^[A-Z2-7]{5}-[A-Z2-7]{5}$")
+            self.assertFalse(login_unlock.consume(c, self.email, code[:-1]))
+            self.assertTrue(login_unlock.is_unlocked(c, self.email))
+            typed = code.lower().replace("-", "").replace("o", "0")
+            self.assertTrue(login_unlock.consume(c, self.email, typed))
+            self.assertFalse(login_unlock.consume(c, self.email, code))
 
     def test_token_is_not_stored_in_the_clear(self):
         with _ctl() as c:
@@ -278,8 +324,8 @@ class UnlockDoesNotLaunderTheGateTests(unittest.TestCase):
         self.assertTrue(security.challenge_warranted(ip))
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-            login_unlock.consume(c, self.email)
+            proof = login_unlock.follow(c, tok)["proof"]
+            login_unlock.consume(c, self.email, proof)
         self.assertTrue(
             security.challenge_warranted(ip),
             "an emailed unlock cleared the per-IP gate — an attacker can "
@@ -293,8 +339,8 @@ class UnlockDoesNotLaunderTheGateTests(unittest.TestCase):
         self.assertTrue(security.challenge_warranted("203.0.113.90"))
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-            login_unlock.consume(c, self.email)
+            proof = login_unlock.follow(c, tok)["proof"]
+            login_unlock.consume(c, self.email, proof)
         self.assertTrue(security.challenge_warranted("203.0.113.91"),
                         "one unlocked account disarmed the instance burst gate")
 
@@ -342,8 +388,8 @@ class UnlockAnswersTheCheckTests(unittest.TestCase):
         self._arm(ip)
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-        self.assertTrue(turnstile.verify_login("", ip, self.email))
+            proof = login_unlock.follow(c, tok)["proof"]
+        self.assertTrue(turnstile.verify_login("", ip, self.email, proof))
 
     def test_the_unlock_covers_one_attempt_only(self):
         from oikonome.web import turnstile
@@ -351,9 +397,9 @@ class UnlockAnswersTheCheckTests(unittest.TestCase):
         self._arm(ip)
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-        self.assertTrue(turnstile.verify_login("", ip, self.email))
-        self.assertFalse(turnstile.verify_login("", ip, self.email),
+            proof = login_unlock.follow(c, tok)["proof"]
+        self.assertTrue(turnstile.verify_login("", ip, self.email, proof))
+        self.assertFalse(turnstile.verify_login("", ip, self.email, proof),
                          "the exemption survived the attempt it was for")
 
     def test_an_unlock_for_one_account_does_not_pass_another(self):
@@ -362,8 +408,9 @@ class UnlockAnswersTheCheckTests(unittest.TestCase):
         self._arm(ip)
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
-        self.assertFalse(turnstile.verify_login("", ip, "someone@else.com"))
+            proof = login_unlock.follow(c, tok)["proof"]
+        self.assertFalse(turnstile.verify_login("", ip, "someone@else.com",
+                                                proof))
 
     def test_a_clean_attempt_never_spends_an_unlock(self):
         """No challenge is being asked for, so the exemption must still be
@@ -371,9 +418,9 @@ class UnlockAnswersTheCheckTests(unittest.TestCase):
         from oikonome.web import turnstile
         with _ctl() as c:
             tok = login_unlock.create(c, self.user_id)
-            login_unlock.follow(c, tok)
+            proof = login_unlock.follow(c, tok)["proof"]
         self.assertTrue(turnstile.verify_login("", "198.51.100.200",
-                                               self.email))
+                                               self.email, proof))
         with _ctl() as c:
             self.assertTrue(login_unlock.is_unlocked(c, self.email))
 

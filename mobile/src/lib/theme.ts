@@ -15,7 +15,7 @@ const DARK = {
   bg: "#0f141a",
   card: "#1a212b",
   border: "#2a323d",
-  hover: "#232c38",
+  hover: "#1f2833",
   text: "#dbe3ea",
   mut: "#8b98a3",
   accent: "#4f9bd6",
@@ -24,6 +24,15 @@ const DARK = {
   bad: "#e0695d",
   // a business entity's own money — the web's --entity, no other mark uses it
   entity: "#b79af0",
+  // the fill under a primary button's label: deeper than the accent,
+  // which the label cannot sit on legibly
+  btn: "#1f66a8",
+  // a field's edge: 3:1 against the card, the page and a hovered row
+  // (WCAG 1.4.11), where `border` is a divider and need not be
+  field: "#6b7682",
+  // a destructive button's fill under a white label (`onDanger`)
+  danger: "#b64438",
+  onDanger: "#ffffff",
   r: 12,
   rs: 8,
 };
@@ -35,11 +44,14 @@ const LIGHT = {
   hover: "#e7edf2",
   text: "#1f2933",
   mut: "#5b6875",
-  accent: "#2673b8",
-  good: "#2f8f46",
-  warn: "#a97b0d",
-  bad: "#c44b3e",
+  accent: "#246eb1",
+  good: "#287a3c",
+  warn: "#89640b",
+  bad: "#b64438",
   entity: "#6f47c4",
+  field: "#7d8894",
+  // light palette: the label is dark ink, so the fill is a light blue
+  btn: "#8fc1ea",
 };
 
 // Nothing stored means Auto: the app follows the phone's light/dark

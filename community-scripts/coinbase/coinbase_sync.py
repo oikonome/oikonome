@@ -58,8 +58,9 @@ Conventions honored (see docs/community-scripts.md):
     These match the native connector's ids, so if you later switch to it,
     it takes over the same rows instead of duplicating them.
   * every transaction is mapped to TRANSFER_IN/OUT (spend-excluded);
-    crypto txn signs are informational, Coinbase's native_amount is kept
-    verbatim. The account balance carries net worth.
+    each row's amount is Coinbase's native_amount in the ledger's sign
+    (+ = money out of the account, so Coinbase's own sign negated), and the
+    full record rides in `raw`. The account balance carries net worth.
   * restatements: rows with this script's id prefix that disappear from a
     pull are marked removed=1 in the app (soft, reversible), mirroring
     what the sync layer does for aggregator-removed rows.
@@ -244,19 +245,22 @@ def collect_label(client, label: str) -> tuple[dict, dict, list[dict]]:
     for w in wallets:  # zero-balance wallets still hold history
         for t in client.paginate(f"/v2/accounts/{w['id']}/transactions?limit=100"):
             nat = t.get("native_amount") or {}
-            amount = float(nat.get("amount") or 0)  # CB sign: + = into wallet
+            # Coinbase's sign is the wallet's (+ = value arriving); the
+            # ledger's is the other way round (+ = money out). The app
+            # derives the same figure from `raw` and keeps that one.
+            amount = -float(nat.get("amount") or 0) or 0.0
             code = (t.get("amount") or {}).get("currency")
             ttype = t.get("type") or "unknown"
             txns.append({
                 "id": f"{PREFIX}{t['id']}",         # stable original id
                 "account_id": aid,
                 "date": (t.get("created_at") or "")[:10],
-                "amount": amount,                    # verbatim; spend-excluded
+                "amount": amount,                    # ledger sign; spend-excluded
                 "name": f"Coinbase {ttype}" + (f" {code}" if code else ""),
                 "merchant_name": "Coinbase",
                 # TRANSFER_* keeps crypto out of spend math; sign picks label
-                "category_primary": "TRANSFER_OUT" if amount > 0
-                                    else "TRANSFER_IN",
+                "category_primary": "TRANSFER_IN" if amount < 0
+                                    else "TRANSFER_OUT",
                 "category_detailed": f"COINBASE_{ttype.upper()}",
                 "pending": 0 if t.get("status") == "completed" else 1,
                 "raw": t,                            # full object, kept in app

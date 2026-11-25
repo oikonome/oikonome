@@ -189,7 +189,7 @@ class FiniteMoneyTests(unittest.TestCase):
 
     def test_tax_commit_refuses_non_finite_numbers(self):
         with self.assertRaises(ValueError):
-            taxdocs._commit_rows(self.conn, "irs",
+            taxdocs._commit_rows(self.conn, "transcript",
                                  [{"year": 2020, "agi": math.nan}], [2020])
         with self.assertRaises(ValueError):
             taxdocs._commit_rows(self.conn, "w2",

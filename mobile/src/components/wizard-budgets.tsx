@@ -4,7 +4,8 @@
 // answer, and offers the history's suggestion as a chip beside each field
 // — one tap to take it, nothing taken unasked.
 //
-// A budget that is already stored (budgets_set) is shown, never hidden
+// A budget the household saved (planSaved — never the first-run seed the
+// server may have stored) is shown, never hidden
 // behind blank boxes: a blank box would otherwise save as $0 and wipe a
 // figure the person could not see. For the same reason a box left blank
 // over a stored figure keeps that figure rather than sending zero. The
@@ -15,12 +16,14 @@ import { Pressable, Text, TextInput, View } from "react-native";
 
 import { errText } from "../lib/api";
 import { SETTINGS_SAVES, saveSettings } from "../lib/cache";
-import { isPlanSavingsGoal, parseMoneyDraft } from "../lib/pure";
+import { inputPhase, isPlanSavingsGoal, parseMoneyDraft, plannerWaits,
+         SAVE_WAITS_FAILED, UNKNOWN_FIGURE } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
 import { keptBudget, manualBudgetsBody, manualBudgetsPrefill,
-         manualBudgetsRefusal } from "./wizard-logic";
+         manualBudgetsRefusal, planSaved } from "./wizard-logic";
 import { TAP, ws } from "./wizard-ui";
+import { Note } from "./ui";
 
 const whole = (v: number) => `$${Math.round(v).toLocaleString("en-US")}`;
 
@@ -41,7 +44,7 @@ function Field({ label, value, onChange, suggestion, from, kept = 0 }: {
                    placeholderTextColor={C.mut}
                    keyboardType="decimal-pad" accessibilityLabel={label} />
         {sug > 0 && (
-          <Pressable onPress={() => onChange(String(sug))}
+          <Pressable accessibilityRole="button" onPress={() => onChange(String(sug))}
                      accessibilityHint="Use the suggestion from your history"
                      style={{ minHeight: TAP, justifyContent: "center",
                               paddingHorizontal: 12, borderRadius: 999,
@@ -80,16 +83,21 @@ export function ManualBudgets({ viewer, onSaved }: {
   }, [init, st.data, ob.data]);
 
   const num = (v: string) => parseMoneyDraft(v) ?? 0;
-  const hasBudget = !!ob.data?.budgets_set;
+  const hasBudget = !!ob.data && planSaved(ob.data);
   const keepIncome = keptBudget(st.data?.budgeted_income_monthly, true);
   const keepFood = keptBudget(st.data?.food_monthly, hasBudget);
   const keepOther = keptBudget(st.data?.other_monthly, hasBudget);
   const eff = (v: string, kept: number) => (num(v) > 0 ? num(v) : kept);
   const s0 = sug.data?.suggestions;
   const months = sug.data?.months?.length ?? 0;
-  const bills = sug.data?.avg_bills_monthly ?? 0;
-  const savings = Math.round(eff(income, keepIncome) - bills
-    - eff(food, keepFood) - eff(other, keepOther));
+  // Bills come from the suggestion read: until it has answered there is
+  // no Bills figure, no savings worked out from it, and no save (the
+  // web's rule)
+  const waits = plannerWaits(inputPhase(sug), "ready");
+  const bills = sug.data ? (sug.data.avg_bills_monthly ?? null) : null;
+  const savings = bills === null ? null
+    : Math.round(eff(income, keepIncome) - bills
+                 - eff(food, keepFood) - eff(other, keepOther));
   const save = useMutation({
     scope: SETTINGS_SAVES,
     mutationFn: async (): Promise<boolean> => {
@@ -104,14 +112,14 @@ export function ManualBudgets({ viewer, onSaved }: {
       const curGoal = (cur.savings_goals ?? [])
         .find((g) => isPlanSavingsGoal(g.name));
       const { body, monthlyPlan } = manualBudgetsBody(
-        { income, food, other }, cur, !!o.budgets_set, bills);
+        { income, food, other }, cur, planSaved(o), bills);
       await saveSettings(qc, client!, {
         ...body,
         savings_goals: [...others,
           { ...(curGoal ?? { name: "Savings", target: 0, tokens: [],
                              start_balance: 0 }),
             monthly_plan: monthlyPlan }],
-      });
+      }, cur);
       // "Saved" is only true when the step's own gate now passes; read it
       // back rather than assume, and hand the wizard the fresh answer
       const after = await client!.onboarding();
@@ -128,6 +136,15 @@ export function ManualBudgets({ viewer, onSaved }: {
     },
     onError: (e) => setMsg({ text: errText(e), bad: true }),
   });
+  if (!init && ((!st.data && st.isError) || (!ob.data && ob.isError)))
+    return (
+      <View style={ws.body}>
+        <Text style={ws.mut}>{SAVE_WAITS_FAILED}</Text>
+        <Text style={{ color: C.accent }}
+              onPress={() => { void st.refetch(); void ob.refetch(); }}>
+          Try again</Text>
+      </View>
+    );
   if (!init) return <Text style={ws.mut}>loading…</Text>;
   // an edit makes the last save's line stale
   const edit = (set: (v: string) => void) => (v: string) => {
@@ -140,7 +157,8 @@ export function ManualBudgets({ viewer, onSaved }: {
              kept={keepIncome} />
       <View style={[ws.row, { justifyContent: "space-between" }]}>
         <Text style={{ color: C.text, fontSize: 14 }}>Bills (approved)</Text>
-        <Text style={{ color: C.text, fontSize: 14 }}>{whole(bills)}</Text>
+        <Text style={{ color: C.text, fontSize: 14 }}>
+          {bills === null ? UNKNOWN_FIGURE : whole(bills)}</Text>
       </View>
       <Field label="Food & drink" value={food} onChange={edit(setFood)}
              suggestion={s0?.food_monthly} from={months || undefined}
@@ -150,16 +168,17 @@ export function ManualBudgets({ viewer, onSaved }: {
       <View style={[ws.row, { justifyContent: "space-between" }]}>
         <Text style={{ color: C.text, fontSize: 14 }}>
           Savings (what's left)</Text>
-        <Text style={{ color: C.mut, fontSize: 14 }}>{whole(savings)}</Text>
+        <Text style={{ color: C.mut, fontSize: 14 }}>
+          {savings === null ? UNKNOWN_FIGURE : whole(savings)}</Text>
       </View>
-      {savings < 0 && (
+      {savings !== null && savings < 0 && (
         <Text style={[ws.mut, { color: C.warn }]}>
           The plan is {whole(-savings)} over income.</Text>
       )}
       {!viewer && (
-        <Pressable style={[ws.btn, { alignSelf: "flex-start" },
-                           save.isPending && { opacity: 0.5 }]}
-                   disabled={save.isPending}
+        <Pressable accessibilityRole="button" style={[ws.btn, { alignSelf: "flex-start" },
+                           (save.isPending || !!waits) && { opacity: 0.5 }]}
+                   disabled={save.isPending || !!waits}
                    onPress={() => {
                      const refusal = manualBudgetsRefusal(food, other);
                      if (refusal) { setMsg({ text: refusal, bad: true }); return; }
@@ -169,8 +188,9 @@ export function ManualBudgets({ viewer, onSaved }: {
             {save.isPending ? "Saving…" : "Save budgets"}</Text>
         </Pressable>
       )}
-      {msg ? <Text style={[ws.mut, { color: msg.bad ? C.warn : C.good }]}>
-        {msg.text}</Text> : null}
+      {!viewer && waits && <Text style={ws.mut}>{waits}</Text>}
+      {msg ? <Note bad={!!msg.bad} style={[ws.mut, { color: msg.bad ? C.warn : C.good }]}>
+        {msg.text}</Note> : null}
     </View>
   );
 }

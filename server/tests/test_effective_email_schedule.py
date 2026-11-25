@@ -86,5 +86,38 @@ class SettingsRepliesAgreeTests(unittest.TestCase):
         self.client.post("/api/settings", json={"email_schedule": None})
 
 
+    def test_an_old_utc_hour_is_not_taken_once_a_schedule_is_saved(self):
+        """The UTC hour is read only while no schedule is saved, so a save
+        of it afterwards is not stored and the reply reads back what the
+        mail still does; an older client posting it keeps getting a 200.
+        With no schedule saved, it is still the hour the mail goes at."""
+        # a household of its own: the stored hour cannot be cleared again
+        import uuid
+
+        from fastapi.testclient import TestClient
+
+        import oikonome.web.app as appmod
+        c = TestClient(appmod.app)
+        c.post("/api/signup", data={
+            "email": f"sched-{uuid.uuid4().hex[:8]}@example.dev",
+            "password": "correct-horse-battery"})
+        r = c.post("/api/settings", json={"email_send_hour_utc": 5})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json().get("email_send_hour_utc"), 5)
+        c.post("/api/settings", json={
+            "email_schedule": {"daily": {"on": True, "hour": 9}}})
+        r = c.post("/api/settings", json={"email_send_hour_utc": 20})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json().get("email_send_hour_utc"), 5)
+        self.assertEqual(r.json()["email_schedule"]["daily"]["hour"], 9)
+        # the form door keeps the same rule
+        r = c.post("/settings/email", data={
+            "email_recipients": "", "email_send_hour_utc": 21},
+            follow_redirects=False)
+        self.assertEqual(r.status_code, 303, r.text)
+        self.assertEqual(c.get("/api/settings").json()
+                         .get("email_send_hour_utc"), 5)
+
+
 if __name__ == "__main__":
     unittest.main()

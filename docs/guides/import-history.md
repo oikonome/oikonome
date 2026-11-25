@@ -14,6 +14,14 @@ a batch removes that batch's claim and deletes **only rows no other
 batch still owns** — undoing a re-import can't destroy rows an earlier
 import legitimately created.
 
+An import reports two numbers: the rows it **added**, and the lines the
+ledger **already held** (importing the same file twice says "nothing
+new"). **Rows** in the list is what undoing that import alone would
+remove today, so it reads 0 while another import still holds the same
+lines, and goes up when that one is undone. A row no import added — one
+a bank feed brought, or one from before imports were tracked — is never
+removed by an undo, however many imports matched it since.
+
 When a newer version reads a line differently from an earlier import —
 its sign, or the year a December→January statement's January lines fall
 in — importing the same file again corrects the rows that import made,
@@ -73,3 +81,6 @@ the rows' amounts, dates or accounts changes.
   file recovers them.
 - Aggregator syncs aren't batches — rollback is for file imports.
   Connected data corrects itself on the next sync.
+- Tax documents aren't batches either, so a stored tax document has no
+  undo here: remove it from **Stored tax & income documents** on this
+  page instead (put back within 30 days; see the Tax documents guide).

@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 from oikonome.db import tenancy
 from oikonome.notify import render, sms
 
+from .push_keys import browser_keys
 from .util import _ensure_db
 
 
@@ -73,12 +74,14 @@ class ShortFormRenderTests(unittest.TestCase):
                            "rows": []}}}
         t = render.short_daily(d)
         _a, _k, tiles = todayview.allowances(d)
+        # the tiles' own whole dollars, floored once (budget.shown_daily)
         for label, a in tiles:
-            self.assertIn(f"${a['rate']:,.0f}/day {label}", t)
+            self.assertIn(f"${a['rate_dollars']:,}/day {label}", t)
         # (750 - 350) / 22 days, not the raw (900 - 550) / 22
         self.assertIn("$18/day Food", t)
         self.assertIn("$0/day Coffee", t)
-        self.assertIn("$14/day Everything else", t)
+        # 300 / 22 = $13.64: at most $13, never a rounded-up $14
+        self.assertIn("$13/day Everything else", t)
         self.assertNotIn("$16/day", t)
         self.assertNotIn(" else,", t.replace("Everything else", ""))
         self.assertNotIn("other", t)
@@ -122,7 +125,7 @@ class ShortFormRenderTests(unittest.TestCase):
                        "rate": 20.0}}, 2025)
         self.assertIn("2025", y)
         self.assertIn("1 of 2", y)
-        self.assertIn("saved $20,000 (20%)", y)
+        self.assertIn("— $20,000 left over (20%)", y)
 
 
 class SmsHelperTests(unittest.TestCase):
@@ -565,7 +568,7 @@ class NotifyApiTests(unittest.TestCase):
 
     def test_push_subscribe_roundtrip(self):
         sub = {"endpoint": f"https://fcm.googleapis.com/fcm/send/{uuid.uuid4().hex}",
-               "keys": {"p256dh": "k1", "auth": "a1"}}
+               "keys": browser_keys()}
         r = self.client.post("/api/notify/push/subscribe", json=sub)
         self.assertEqual(r.status_code, 200, r.text)
         self.assertTrue(self.client.get("/api/notify").json()["push_subscribed"])
@@ -587,7 +590,7 @@ class NotifyApiTests(unittest.TestCase):
         which only the real browser has."""
         endpoint = f"https://fcm.googleapis.com/fcm/send/{uuid.uuid4().hex}"
         victim = {"endpoint": endpoint,
-                  "keys": {"p256dh": "victim-key", "auth": "victim-auth"}}
+                  "keys": browser_keys()}
         r = self.client.post("/api/notify/push/subscribe", json=victim)
         self.assertEqual(r.status_code, 200, r.text)
 
@@ -595,7 +598,7 @@ class NotifyApiTests(unittest.TestCase):
         other = self._second_account_client()
         r = other.post("/api/notify/push/subscribe", json={
             "endpoint": endpoint,
-            "keys": {"p256dh": "thief-key", "auth": "thief-auth"}})
+            "keys": browser_keys()})
         self.assertEqual(r.status_code, 409, r.text)
         self.assertFalse(other.get("/api/notify").json()["push_subscribed"])
         # the victim still owns it
@@ -605,7 +608,7 @@ class NotifyApiTests(unittest.TestCase):
         """The legitimate case the guard must NOT break: a shared browser
         profile presents the same keys, so a second login may claim it."""
         endpoint = f"https://fcm.googleapis.com/fcm/send/{uuid.uuid4().hex}"
-        keys = {"p256dh": "same-browser", "auth": "same-auth"}
+        keys = browser_keys()
         r = self.client.post("/api/notify/push/subscribe",
                              json={"endpoint": endpoint, "keys": keys})
         self.assertEqual(r.status_code, 200, r.text)
@@ -661,7 +664,7 @@ class NotifyApiTests(unittest.TestCase):
     def test_push_subscribe_accepts_real_service(self):
         r = self.client.post("/api/notify/push/subscribe", json={
             "endpoint": f"https://fcm.googleapis.com/fcm/send/{uuid.uuid4().hex}",
-            "keys": {"p256dh": "k", "auth": "a"}})
+            "keys": browser_keys()})
         self.assertEqual(r.status_code, 200, r.text)
 
     def test_sms_account_throttle(self):

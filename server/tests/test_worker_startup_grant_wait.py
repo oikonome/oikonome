@@ -51,19 +51,24 @@ class StartupGrantWaitTests(unittest.TestCase):
         with mock.patch.object(worker, "_startup_grants_ready",
                                side_effect=lambda: next(ready)) as g, \
              mock.patch("oikonome.db.migrate.reencrypt_tenant_secrets",
-                        return_value=0) as reenc:
+                        return_value=0) as reenc, \
+             mock.patch.object(worker, "decide_receipt_backlogs",
+                               return_value=0) as receipts:
             _run(worker._startup({}))
         self.assertEqual(g.call_count, 3)
         reenc.assert_called_once()
+        receipts.assert_called_once()
 
     def test_sweeps_skipped_when_grants_never_arrive(self):
         with mock.patch.object(worker, "_startup_grants_ready",
                                return_value=False) as g, \
              mock.patch("oikonome.db.migrate.reencrypt_tenant_secrets") as reenc, \
+             mock.patch.object(worker, "decide_receipt_backlogs") as receipts, \
              self.assertLogs(worker.log, level="WARNING") as cm:
             _run(worker._startup({}))
         self.assertEqual(g.call_count, 3)
         reenc.assert_not_called()
+        receipts.assert_not_called()
         self.assertTrue(any("startup sweeps skipped" in m for m in cm.output))
 
 

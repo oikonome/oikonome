@@ -21,25 +21,42 @@ import re
 import unittest
 
 import oikonome
+from oikonome.web.schemas.business import BalanceSheet, Capital, EstimatedTax
+
+from .generated_types import aliases, ts_field
 
 _APP = pathlib.Path(oikonome.__file__).parent.parent.parent
 _WEB = (_APP / "webapp/src/pages/Business.tsx").read_text()
-_WEB_T = (_APP / "webapp/src/api/client.ts").read_text()
 _MOB = (_APP / "mobile/src/app/business.tsx").read_text()
-_MOB_T = (_APP / "mobile/src/lib/api.ts").read_text()
 
 
 class HouseholdMemberScreens(unittest.TestCase):
 
     def test_the_set_aside_uses_the_households_own_footing(self):
+        # the card's figures are selfemploy.tax_set_aside's, which reads
+        # the estimate's covered figures; both clients print set_aside
+        import inspect
+
+        from oikonome.engine import selfemploy
+        src = inspect.getsource(selfemploy.tax_set_aside)
+        self.assertIn("covered_profit", src)
+        self.assertIn("covered_tax_paid", src)
         for name, src in (("web", _WEB), ("mobile", _MOB)):
             with self.subTest(name):
-                self.assertIn("covered_profit", src)
-                self.assertIn("covered_tax_paid", src)
-        for name, src in (("web", _WEB_T), ("mobile", _MOB_T)):
+                self.assertIn("set_aside", src)
+        # the server documents both figures and the reason (so the hook
+        # proves each reply carries them), and both clients compile against
+        # the generated EstimatedTax that holds them
+        for f in ("covered_profit", "covered_tax_paid",
+                  "household_unavailable"):
+            self.assertIn(f, EstimatedTax.model_fields)
+        for name in ("web", "mobile"):
             with self.subTest(name):
-                self.assertIn("covered_profit?: number", src)
-                self.assertIn("household_unavailable?:", src)
+                self.assertTrue(aliases(name, "EstimatedTax", "EstimatedTax"))
+                self.assertEqual(ts_field(name, "EstimatedTax",
+                                          "covered_profit"), "number")
+                self.assertIn("s_corp", ts_field(name, "EstimatedTax",
+                                                 "household_unavailable"))
 
     def test_the_hint_follows_the_servers_reason(self):
         for name, src in (("web", _WEB), ("mobile", _MOB)):
@@ -53,10 +70,16 @@ class HouseholdMemberScreens(unittest.TestCase):
             with self.subTest(name):
                 self.assertIn("cap.household_capital", src)
                 self.assertRegex(src, r"(b|bs\.data)\.household_capital")
-        for name, src in (("web", _WEB_T), ("mobile", _MOB_T)):
+        # the capital account and the balance sheet both carry the share
+        for model in (Capital, BalanceSheet):
+            self.assertIn("household_capital", model.model_fields)
+        for name in ("web", "mobile"):
             with self.subTest(name):
-                self.assertGreaterEqual(
-                    src.count("household_capital?: number | null"), 2)
+                for shape in ("Capital", "BalanceSheet"):
+                    self.assertEqual(ts_field(name, shape, "household_capital"),
+                                     "number | null")
+                self.assertTrue(aliases(name, "Capital", "Capital"))
+        self.assertTrue(aliases("web", "BalanceSheet", "BalanceSheet"))
 
     def test_adding_a_member_on_the_phone_resets_the_household_switch(self):
         i = _MOB.index("const addMember = useMutation(")

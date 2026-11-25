@@ -157,7 +157,7 @@ class EmailRenderTests(unittest.TestCase):
 
     def test_over_budget_recovery_sentence_reaches_both_email_mirrors(self):
         """month_status composes a way back when over budget ("To get
-        back on track over the last N days: …") for the page, the app —
+        back on track over the N days left: …") for the page, the app —
         and the email. The HTML and the plain text must both carry the
         same server-composed sentence — computed but unrendered on the
         email surfaces is exactly the drift the one-source rule exists to
@@ -207,9 +207,10 @@ class EmailRenderTests(unittest.TestCase):
         for surface in (html, plain):
             self.assertIn("daily reduced from $32 to $0", surface)
             # food ($42.50 spent today of $1,000) is AHEAD → raised: the
-            # $1,000 left at midnight is $59 a day over 17 days, and today's
-            # spend is inside today's allowance, so the days after keep it
-            self.assertIn("daily raised from $32 to $59", surface)
+            # $1,000 left at midnight is $58.82 a day over 17 days — at most
+            # $58, floored like every allowance — and today's spend is
+            # inside today's allowance, so the days after keep it
+            self.assertIn("daily raised from $32 to $58", surface)
 
     def test_note_and_pace_carry_their_polarity_color(self):
         """The pace phrase beside the verdict word and each tile's daily
@@ -227,7 +228,7 @@ class EmailRenderTests(unittest.TestCase):
         self.assertRegex(
             html, rf'<div style="[^"]*color:{green}[^"]*">daily raised')
         self.assertRegex(
-            html, rf'<span style="[^"]*color:{red}[^"]*">\$[\d,]+ ahead of pace')
+            html, rf'<span style="[^"]*color:{red}[^"]*">\$[\d,]+ more than planned')
 
     def test_carveout_child_note_uses_its_own_numbers(self):
         """A carve-out child's daily note speaks in the CHILD's plan and
@@ -250,16 +251,17 @@ class EmailRenderTests(unittest.TestCase):
                          "daily reduced from $3 to $1")
         self.assertEqual(tiles["Coffee"]["daily_note_tone"], "neg")
         # parent: the carved remainder ($900 budget, $42.50 own spend,
-        # all of it today and inside today's $53 allowance, so the days
-        # after today keep $53) — raw numbers would read "from $32 to $55"
+        # all of it today and inside today's $52.94 allowance, so the days
+        # after today keep it: at most $52) — raw numbers would read "from
+        # $32 to $55"
         self.assertEqual(tiles["Food"]["daily_note"],
-                         "daily raised from $29 to $53")
+                         "daily raised from $29 to $52")
         self.assertEqual(tiles["Food"]["daily_note_tone"], "pos")
         # both notes reach the email surfaces verbatim
         _, plain, html = report.build(d)
         for surface in (html, plain):
             self.assertIn("daily reduced from $3 to $1", surface)
-            self.assertIn("daily raised from $29 to $53", surface)
+            self.assertIn("daily raised from $29 to $52", surface)
 
     def test_why_names_custom_buckets_as_first_class(self):
         """Every budget category is an entry — food, everything-else AND
@@ -481,7 +483,9 @@ class SimpleFaceTests(unittest.TestCase):
 
     def setUp(self):
         self.conn = make_db()
-        write_config(self.conn)   # no today_view → the PAGE's simple default
+        # no today_view → the PAGE's simple default; an income, so the
+        # detail face has a plan line to print
+        write_config(self.conn, budgeted_income_monthly=6000)
         add_bill(self.conn, "Rent", 2000.0, next_due=TODAY.replace(day=1),
                  last_seen=TODAY.replace(day=1))
         add_txn(self.conn, TODAY, 42.50, "SAFEWAY", primary="FOOD_AND_DRINK")
@@ -500,10 +504,10 @@ class SimpleFaceTests(unittest.TestCase):
         from oikonome.web.todayview import build_context
         ctx = build_context(self.d)
         simple = ctx["day"]["simple"]
-        # the one number is the sum of what each bucket still allows today
-        want = sum(max(0.0, a["left_today"])
-                   for _, a in ctx["day"]["allow_tiles"])
-        self.assertAlmostEqual(simple["left_today"], want, places=2)
+        # the one number is the sum of what each bucket still allows today,
+        # in the whole dollars its chips print
+        want = sum(a["left_dollars"] for _, a in ctx["day"]["allow_tiles"])
+        self.assertEqual(simple["left_today"], want)
         self.assertIn(f"${simple['left_today']:,.0f}", self.html)
         for c in simple["chips"]:
             self.assertIn(c["text"], self.html)
@@ -669,6 +673,11 @@ class UnreliableBalanceSuppressesPlainCashTests(unittest.TestCase):
         write_config(self.conn)
         add_bill(self.conn, "Rent", 2000.0, next_due=TODAY.replace(day=1),
                  last_seen=TODAY.replace(day=1))
+        # a paycheck is scheduled: without one the notice is the ask for
+        # it, not a shortfall
+        add_bill(self.conn, "Northwind Payroll", 900.0, income=True,
+                 frequency="WEEKLY", interval=2,
+                 next_due=TODAY + dt.timedelta(days=9))
         add_txn(self.conn, TODAY, 42.50, "SAFEWAY", primary="FOOD_AND_DRINK")
         self.d = report.gather(self.conn, TODAY)
 
@@ -693,6 +702,121 @@ class UnreliableBalanceSuppressesPlainCashTests(unittest.TestCase):
     def test_the_same_shortfall_does_speak_when_the_balance_is_good(self):
         self.assertIn("CASH:", self._plain(False),
                       "the guard must not silence a real shortfall")
+
+
+class NothingToSpendTodayIsOneLineTests(unittest.TestCase):
+    """A bucket with nothing to hand out today and nothing spent today
+    used to render a big "$0", "of $0 today · nothing spent yet" and an
+    empty bar — three lines restating one zero. It folds to one line on
+    every surface, and the flag that decides it is computed once."""
+
+    def setUp(self):
+        self.conn = make_db()
+        add_ledger_history(self.conn, TODAY)
+        write_config(self.conn, today_view="detail")
+        add_txn(self.conn, TODAY, 42.50, "SAFEWAY", primary="FOOD_AND_DRINK")
+        # "other" spent past its month budget YESTERDAY: nothing left to
+        # hand out today, nothing spent today
+        add_txn(self.conn, TODAY - dt.timedelta(days=1), 1180.0,
+                "GADGET BARN", primary="GENERAL_MERCHANDISE")
+        self.d = report.gather(self.conn, TODAY)
+        _, self.plain, self.html = report.build(self.d)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_the_flag_marks_only_the_empty_bucket(self):
+        from oikonome.web import todayview
+        allow, _kids, _tiles = todayview.allowances(self.d)
+        self.assertTrue(allow["other"]["zero_day"])
+        self.assertFalse(allow["food"]["zero_day"])
+
+    def test_html_and_plain_say_it_in_one_line(self):
+        self.assertNotIn("of $0 today", self.html)
+        self.assertNotIn("of $0", self.plain)
+        self.assertRegex(self.html, r"Everything else</b>\s*<span[^>]*> \$0 today")
+        self.assertIn("Everything else $0 today (daily reduced", self.plain)
+        # the bucket that does hold money keeps its full row
+        self.assertIn("of $", self.html[self.html.index("Food"):])
+
+    def test_spend_on_an_empty_day_keeps_the_full_row(self):
+        add_txn(self.conn, TODAY, 5.0, "CORNER SHOP",
+                primary="GENERAL_MERCHANDISE")
+        d = report.gather(self.conn, TODAY)
+        from oikonome.web import todayview
+        allow, _kids, _tiles = todayview.allowances(d)
+        self.assertFalse(allow["other"]["zero_day"])
+        _, plain, _html = report.build(d)
+        self.assertIn("Everything else $0 (over by $5", plain)
+
+
+class ZeroDayReachesTheTodayPayloadTests(unittest.TestCase):
+    """The page and the app fold the row off /api/today/full's own flag —
+    they never re-derive it."""
+
+    def test_the_payload_carries_the_flag(self):
+        import uuid
+
+        from fastapi.testclient import TestClient
+
+        from oikonome.db import tenancy
+
+        from .util import _ensure_db, seed_accounts
+        os.environ["OIKONOME_DEV"] = "1"
+        _ensure_db()
+        import oikonome.web.app as appmod
+        appmod.DEV_MODE = True
+        client = TestClient(appmod.app)
+        r = client.post("/api/signup",
+                        data={"email": f"zd-{uuid.uuid4().hex[:8]}@x.dev",
+                              "password": "correct-horse-battery"})
+        self.assertEqual(r.status_code, 200, r.text)
+        tid = client.get("/api/me").json()["tenant_id"]
+        real = dt.date.today()
+        conn = tenancy.tenant_connect(tid)
+        try:
+            seed_accounts(conn)
+            write_config(conn)
+            # "other" spent past its budget before today (the 1st has no
+            # earlier day this month, so the spend lands on it instead and
+            # the bucket is over, not zero — the flag must then be off)
+            add_txn(conn, real.replace(day=1), 1500.0, "GADGET BARN",
+                    primary="GENERAL_MERCHANDISE")
+        finally:
+            conn.close()
+        other = client.get("/api/today/full").json()["allow"]["other"]
+        self.assertIn("zero_day", other)
+        self.assertEqual(other["zero_day"], real.day != 1)
+
+
+class NoBalanceColumnWithoutABalanceTests(unittest.TestCase):
+    """With no trusted checking balance the forecast is suppressed, and
+    the cash timeline's Balance column was a dot on every row. The column
+    appears only once there is a balance to put in it."""
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn, today_view="detail")
+        add_txn(self.conn, TODAY, 42.50, "SAFEWAY", primary="FOOD_AND_DRINK")
+
+    def tearDown(self):
+        self.conn.close()
+
+    def _html(self):
+        return report.build(report.gather(self.conn, TODAY))[2]
+
+    def test_a_balance_brings_the_column(self):
+        self.assertRegex(self._html(), r"<th[^>]*>(Balance|Autopay stmt)</th>")
+
+    def test_no_balance_no_column(self):
+        from oikonome.sync import base
+        self.conn.execute("DELETE FROM accounts")
+        aid = base.ensure_split_account(self.conn, "mint", "Everyday Checking")
+        add_txn(self.conn, TODAY, 40.0, "KROGER", account=aid)
+        html = self._html()
+        self.assertIn("Cash timeline", html)
+        self.assertNotRegex(html, r"<th[^>]*>(Balance|Autopay stmt|Pay cards now)</th>")
+        self.assertNotIn(">·</td>", html)
 
 
 class OneNameForTheCashQuantityTests(unittest.TestCase):
@@ -778,7 +902,7 @@ class PlanFlowAddsUpTests(unittest.TestCase):
             # the plan flow line renders on the detail face only
             write_config(conn, today_view="detail")
             with budget.config_txn(conn) as cfg:
-                cfg["income_monthly"] = 6000.0
+                cfg["budgeted_income_monthly"] = 6000.0
                 cfg["savings_goals"] = [{"name": "Vacation", "target": 5000,
                                  "monthly_plan": 400.0}]
             d = report.gather(conn, TODAY)

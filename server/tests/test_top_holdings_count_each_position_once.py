@@ -44,8 +44,8 @@ class TopHoldingsCountEachPositionOnce(unittest.TestCase):
                     "'brokerage',120000)", (aid, name))
                 conn.execute(
                     "INSERT INTO holdings (account_id,symbol,name,quantity,"
-                    "price,value) VALUES (%s,'VTSAX','Total Stock',1000,"
-                    "120,120000)", (aid,))
+                    "price,value,as_of) VALUES (%s,'VTSAX','Total Stock',"
+                    "1000,120,120000,now())", (aid,))
             from oikonome.engine import entities
             biz = entities.create_entity(conn, name="Side Studio LLC",
                                          structure="sole_prop")
@@ -56,8 +56,8 @@ class TopHoldingsCountEachPositionOnce(unittest.TestCase):
                 (biz["id"],))
             conn.execute(
                 "INSERT INTO holdings (account_id,symbol,name,quantity,"
-                "price,value) VALUES ('brk-biz','VTIAX','Intl Stock',1000,"
-                "90,90000)")
+                "price,value,as_of) VALUES ('brk-biz','VTIAX','Intl Stock',"
+                "1000,90,90000,now())")
             links.create(conn, ["brk-a", "brk-b"])
             conn.execute("UPDATE accounts SET user_removed_at=now() "
                          "WHERE id='brk-hidden'")

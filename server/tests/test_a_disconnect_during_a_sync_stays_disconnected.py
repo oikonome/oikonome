@@ -177,9 +177,13 @@ class MxDisconnectTests(unittest.TestCase):
         return httpx.MockTransport(handler), asked
 
     def _archived_days_ago(self, days):
+        # noon, local, that many calendar days back: "now minus N days" in
+        # the database's zone lands on the neighbouring local date for an
+        # hour each night whenever a clock change falls inside the span
+        at = dt.datetime.combine(dt.date.today() - dt.timedelta(days=days),
+                                 dt.time(12)).astimezone()
         self.conn.execute(
-            "UPDATE items SET archived_at = now() - make_interval(days => %s) "
-            "WHERE id='mx-MBR-1'", (days,))
+            "UPDATE items SET archived_at = %s WHERE id='mx-MBR-1'", (at,))
 
     def _resync_from(self):
         return self.conn.execute(

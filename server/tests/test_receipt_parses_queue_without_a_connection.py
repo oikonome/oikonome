@@ -83,12 +83,8 @@ class ParseQueueTests(unittest.TestCase):
         self.assertTrue(_wait_for(self._all_slots_free))
 
     def _all_slots_free(self):
-        got = 0
-        while receipts._PARSE_TURNS.acquire(blocking=False):
-            got += 1
-        for _ in range(got):
-            receipts._PARSE_TURNS.release()
-        return got == receipts.PARSE_SLOTS
+        return receipts._PARSE_TURNS.snapshot() == {
+            "free": receipts.PARSE_SLOTS, "held": {}, "waiting": []}
 
     def _claimed_receipt(self):
         txn = add_txn(self.conn, "2026-07-01", 10.0, "STORE")
@@ -97,13 +93,16 @@ class ParseQueueTests(unittest.TestCase):
         return rid
 
     def _hold_every_slot(self):
+        # another household's batch holding every turn: no wait under any
+        # household name gets one before it times out
+        hog = "another household"
         held = 0
-        while receipts._PARSE_TURNS.acquire(blocking=False):
+        while receipts._PARSE_TURNS.acquire(hog, 0):
             held += 1
 
         def _release():
             for _ in range(held):
-                receipts._PARSE_TURNS.release()
+                receipts._PARSE_TURNS.release(hog)
         self.addCleanup(_release)
 
     def _status(self, rid):

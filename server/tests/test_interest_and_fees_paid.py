@@ -143,7 +143,7 @@ class NewChargeNoticeTests(unittest.TestCase):
         _fee(self.conn, TODAY - dt.timedelta(days=9), 20, "WIRE FEE")
         self.assertEqual(self.notices(),
                          ["Fee charged: OVERDRAFT FEE $35 on "
-                          f"{TODAY - dt.timedelta(days=1):%m/%d} (Test Checking)"])
+                          f"{TODAY - dt.timedelta(days=1):%m/%d/%y} (Test Checking)"])
 
     def test_interest_names_the_gap_since_the_card_last_charged_it(self):
         _fee(self.conn, dt.date(2026, 3, 20), 18, "PURCHASE INTEREST CHARGE",
@@ -151,14 +151,26 @@ class NewChargeNoticeTests(unittest.TestCase):
         _fee(self.conn, TODAY, 25.00, "PURCHASE INTEREST CHARGE",
              account="card", detailed="BANK_FEES_INTEREST_CHARGE")
         self.assertEqual(self.notices(),
-                         [f"Interest charged: Test Card $25 on {TODAY:%m/%d}"
+                         [f"Interest charged: Test Card $25 on {TODAY:%m/%d/%y}"
                           " — first since Mar 2026"])
+
+    def test_a_fee_names_the_card_as_the_month_view_does(self):
+        """The notice names the card the way every other page does — its
+        given name and last four — not the aggregator's product name."""
+        self.conn.execute("UPDATE accounts SET name='Invented Rewards Card®',"
+                          " display_name='Test Everyday', mask='0042' "
+                          "WHERE id='card'")
+        _fee(self.conn, TODAY, 12, "FOREIGN TRANSACTION FEE", account="card",
+             detailed="BANK_FEES_FOREIGN_TRANSACTION_FEES")
+        self.assertEqual(self.notices(),
+                         ["Fee charged: FOREIGN TRANSACTION FEE $12 on "
+                          f"{TODAY:%m/%d/%y} (Test Everyday 0042)"])
 
     def test_a_first_ever_interest_charge_says_so(self):
         _fee(self.conn, TODAY, 9.99, "INTEREST CHARGE ON PURCHASES",
              account="card", detailed="BANK_FEES_INTEREST_CHARGE")
         self.assertEqual(self.notices(),
-                         [f"Interest charged: Test Card $9.99 on {TODAY:%m/%d}"
+                         [f"Interest charged: Test Card $9.99 on {TODAY:%m/%d/%y}"
                           " — first ever on this account"])
 
     def test_pennies_are_not_a_notice(self):

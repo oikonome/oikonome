@@ -1,16 +1,31 @@
-// Net worth page math, runnable under plain node (scripts/pure-logic-tests.mjs).
+// Net worth screen helpers, runnable under plain node (scripts/pure-logic-tests.mjs).
+//
+// Every figure the screen prints is the server's (specs/counted-figures.md):
+// the headline's and the tiles' changes, each list's net and the Over-time
+// gain. What is left here is presentation — which of the server's windows
+// to draw.
 
-/** The change from the last month-end to now on a monthly series
- *  ([YYYY-MM, value] pairs, the current month last), or null when the
- *  series has no earlier month — or is absent, as from a server that does
- *  not send it. The hero passes the full series (property included) so the
- *  change is measured on the base of the Total net worth beside it; the
- *  Financial accounts line passes the financial-only `trend`. No fallback
- *  from one to the other: a financial change shown beside the total would
- *  read a mortgage payment as a full loss. */
-export function monthChange(
-  series: [string, number][] | null | undefined,
-): number | null {
-  if (!series || series.length < 2) return null;
-  return series[series.length - 1][1] - series[series.length - 2][1];
+export type OverTimeWindow = {
+  start: number; end: number; gain: number | null; pct: number | null;
+  full: boolean;
+  /** The server's words when a typed-in property entered the series
+   *  inside the window; the gain is then the financial accounts' alone. */
+  note?: string | null;
+  /** The server's words for where the gain is measured from, sent when
+   *  there is no percent to say it ("from −$4,200 in 03/08"). */
+  from_text?: string | null;
+};
+
+/** The Over-time card's window for a timeframe: the server's, from
+ *  `trend_windows`, over `full_trend`. A server too old to send the windows
+ *  draws the whole series and prints no gain — never a gain worked out
+ *  here, which would be a second definition of the same figure. */
+export function overTimeWindow(
+  windows: Record<string, OverTimeWindow> | null | undefined,
+  range: string, points: number,
+): OverTimeWindow {
+  const w = windows?.[range];
+  if (w) return w;
+  return { start: 0, end: Math.max(points - 1, 0), gain: null, pct: null,
+           full: true };
 }

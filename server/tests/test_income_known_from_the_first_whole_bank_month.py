@@ -63,14 +63,19 @@ class IncomeKnownFromTheFirstWholeBankMonthTests(unittest.TestCase):
         self.assertIsNone(cells[3]["net"])
         self.assertIsNotNone(cells[4]["net"])
 
-    def test_the_flow_picture_opens_on_the_first_whole_month(self):
+    def test_the_flow_picture_marks_the_months_before_the_first_whole_one(self):
+        """1y is Oct 2025–Sep 2026 on every Cash Flow tab. The feed opens
+        Mar 20, so October through March are counted and marked
+        incomplete: their spend in full, their (missing) income as it is."""
         _seed(self.conn, dt.date(2026, 3, 20))
         f = reporting.flow_breakdown(self.conn, TODAY, "1y")
-        self.assertEqual(f["from"], "2026-04-01")
-        self.assertTrue(f["income_clipped"])
-        # six whole months of pay against six months of spend
+        self.assertEqual(f["from"], "2025-10-01")
+        self.assertEqual(f["incomplete_months"],
+                         ["2025-10", "2025-11", "2025-12", "2026-01",
+                          "2026-02", "2026-03"])
+        # six whole months of pay, against twelve months of spend
         self.assertEqual(round(f["in"]["total"]), 6 * 5000)
-        self.assertEqual(round(f["out"]["total"]), 6 * 4200)
+        self.assertEqual(round(f["out"]["total"]), 12 * 4200 + 60)
 
     def test_saved_by_month_has_no_loss_for_the_partial_month(self):
         _seed(self.conn, dt.date(2026, 3, 20))

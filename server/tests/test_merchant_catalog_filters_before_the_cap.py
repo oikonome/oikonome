@@ -19,9 +19,18 @@ LIMIT = 4
 
 
 def _looks_unnamed(name: str) -> bool:
-    # the merchant screens' own test, restated
-    return bool(re.search(r"\d{3,}|[*#]", name)) or (
-        bool(re.search(r"[A-Z]{4,}", name)) and name == name.upper())
+    # the merchant screens' own test, restated: a long number or a
+    # terminal's * or #; a shorter number in a line with no lower case;
+    # several words all in capitals. One capitalised word is a brand.
+    return bool(re.search(r"\d{5,}|[*#]", name)) or (
+        bool(re.search(r"\d{3,}", name)) and not re.search(r"[a-z]", name)
+    ) or (bool(re.search(r"[A-Z]{4,}", name)) and " " in name
+          and name == name.upper())
+
+
+def _name(r):
+    # a → z as people read it: case does not order names
+    return (r["display"].lower(), r["display"])
 
 
 class CatalogBeforeTheCapTests(unittest.TestCase):
@@ -63,10 +72,10 @@ class CatalogBeforeTheCapTests(unittest.TestCase):
 
     def test_each_sort_orders_the_whole_catalog_before_the_limit(self):
         cases = {
-            "count": lambda r: (-r["rows"], r["display"]),
-            "alpha": lambda r: r["display"],
-            "spend": lambda r: (-float(r["total"]), r["display"]),
-            "recent": lambda r: (-(r["last"].toordinal()), r["display"]),
+            "count": lambda r: (-r["rows"], _name(r)),
+            "alpha": _name,
+            "spend": lambda r: (-float(r["total"]), _name(r)),
+            "recent": lambda r: (-(r["last"].toordinal()), _name(r)),
         }
         for sort, key in cases.items():
             want = self._expect(self.all, key)
@@ -83,13 +92,13 @@ class CatalogBeforeTheCapTests(unittest.TestCase):
         }
         for flt, keep in cases.items():
             want = self._expect([r for r in self.all if keep(r)],
-                                lambda r: (-r["rows"], r["display"]))
+                                lambda r: (-r["rows"], _name(r)))
             self.assertTrue(want, flt)
             got = self._pages(filter=flt)
             self.assertEqual(got, want, flt)
             # and a filter with a sort: the cut is the sorted filtered set
             spend = self._expect([r for r in self.all if keep(r)],
-                                 lambda r: (-float(r["total"]), r["display"]))
+                                 lambda r: (-float(r["total"]), _name(r)))
             self.assertEqual(self._pages(filter=flt, sort="spend"), spend,
                              flt)
 
@@ -97,7 +106,7 @@ class CatalogBeforeTheCapTests(unittest.TestCase):
         self.assertEqual(
             [r["display"] for r in merchant_dedup.listing(
                 self.conn, limit=LIMIT, order="alpha")],
-            sorted(r["display"] for r in self.all)[:LIMIT])
+            [r["display"] for r in sorted(self.all, key=_name)][:LIMIT])
 
     def test_unknown_values_are_refused(self):
         with self.assertRaises(ValueError):
@@ -112,6 +121,41 @@ class CatalogBeforeTheCapTests(unittest.TestCase):
             [r["display"] for r in self.all[:LIMIT]])
         self.assertEqual(merchant_dedup.listing(
             self.conn, limit=LIMIT, offset=10 ** 30), [])
+
+
+
+class TheListReadsAsPeopleRead(unittest.TestCase):
+    def setUp(self):
+        self.conn = make_db()
+        self.addCleanup(self.conn.close)
+        write_config(self.conn)
+        for name in ("AZ Bakery", "Abbey Diner", "ZEFO", "KRAV",
+                     "412 Kitchenette", "TERMINAL ORCHARD", "POS 48213 KIOSK",
+                     "Shellfuel 57442653", "SQ *LANTERNWAY"):
+            add_txn(self.conn, TODAY - dt.timedelta(days=3), 10.0, name,
+                    merchant=name, account="chk")
+        # an all-capitals name the person gave a merchant themselves
+        mid = self.conn.execute(
+            "INSERT INTO merchants (name, name_source) VALUES "
+            "('HOME RENT POOL', 'manual') RETURNING id").fetchone()["id"]
+        tid = add_txn(self.conn, TODAY - dt.timedelta(days=3), 900.0,
+                      "ACH DEBIT 0099", merchant="ACH DEBIT 0099",
+                      account="chk")
+        self.conn.execute("UPDATE transactions SET merchant_id = %s "
+                          "WHERE id = %s", (mid, tid))
+
+    def _names(self, **kw):
+        return [r["display"] for r in merchant_dedup.listing(
+            self.conn, limit=500, today=TODAY, **kw)]
+
+    def test_a_to_z_ignores_capitals(self):
+        names = self._names(sort="alpha")
+        self.assertLess(names.index("Abbey Diner"), names.index("AZ Bakery"))
+
+    def test_unnamed_lists_bank_strings_and_no_real_name(self):
+        self.assertEqual(sorted(self._names(filter="unnamed")),
+                         sorted(["TERMINAL ORCHARD", "POS 48213 KIOSK",
+                                 "Shellfuel 57442653", "SQ *LANTERNWAY"]))
 
 
 if __name__ == "__main__":

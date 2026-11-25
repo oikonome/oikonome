@@ -29,6 +29,29 @@ export function bankAwaitsConfirm(me: Me | undefined): boolean {
 export const CONFIRM_TO_CONNECT =
   "Confirm your email to connect a bank — the link is in your inbox.";
 
+// The days a new account is left alone about its unconfirmed address:
+// the top banner waits them out, and so does the sentence about freezing.
+// A person who signed up a minute ago and is looking at "check your inbox"
+// has not ignored anything yet.
+const VERIFY_GRACE_MS = 3 * 24 * 60 * 60 * 1000;
+const VERIFY_NEAR_MS = 7 * 24 * 60 * 60 * 1000;
+/** True once the account is past the grace days (or its age is unknown —
+ *  fail toward saying it), and always once the freeze is a week away:
+ *  the deadline is the HOUSEHOLD's, counted from its oldest signup, so a
+ *  member invited yesterday can be days from a freeze they must be told
+ *  about. */
+export function verifyNagDue(createdAt: string | null | undefined,
+                             deadline?: string | null): boolean {
+  if (deadline) {
+    const d = Date.parse(deadline);
+    if (!Number.isNaN(d) && d - Date.now() <= VERIFY_NEAR_MS) return true;
+  }
+  if (!createdAt) return true;
+  const t = Date.parse(createdAt);
+  if (Number.isNaN(t)) return true;
+  return Date.now() - t >= VERIFY_GRACE_MS;
+}
+
 /** The way to ask for the confirmation mail again, at any account age.
  *  The top banner waits out a grace period so a brand-new signup is not
  *  nagged on day one; this card does not, because a link that went to
@@ -57,7 +80,8 @@ export function VerifyEmailCard({ me, inline, children }: {
         {children && <>{children} </>}
         We sent a link to <b>{me.email}</b>. No email? Check spam, or
         resend.
-        {me.verify_deadline && <>
+        {me.verify_deadline
+          && verifyNagDue(me.created_at, me.verify_deadline) && <>
           {" "}Unconfirmed accounts are frozen on{" "}
           {mmdd(me.verify_deadline)} and deleted a week later.</>}
       </p>

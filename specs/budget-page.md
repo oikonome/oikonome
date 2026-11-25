@@ -5,7 +5,7 @@ unallocated · savings). Every tracking surface speaks that same language
 rather than a separate one (Variable spending / Food / Everything else /
 Fixed bills), and the plan has a home.
 
-Decisions:
+The rules:
 
 1. **Budget page = plan + actuals in one**, in the nav right after
    Recurring. Top: the balance planner (the existing shared
@@ -37,11 +37,11 @@ Decisions:
   buckets with actual/expected/month_budget). The Budget page and the
   aligned bars read that same payload — no new engine math.
 - Shared renderer: one `<PlanBars>` component (Today, Budget, Month,
-  Week) so the surfaces cannot drift again.
+  Week) so the surfaces cannot drift apart.
 - Unallocated actual = `other.actual − Σ children.actual` (the existing
   `display_actual`); its budget = `other.month_budget − Σ children
   .month_budget`.
-- Savings bar actual = the goal's 90-day-rate month-to-date
+- Savings bar actual = the goal's 3-month-rate month-to-date
   contributions (`savings.progress`), plan = `monthly_plan`.
 - Email: the bucket lines follow the same order/names; no HTML rework
   beyond the loop source.

@@ -1,12 +1,13 @@
 // Shared ledger row: Today's recent pane and the Transactions page render
 // the identical shape, mirroring the web's shared TxnTable.
-// Sign convention: positive = money out; the display flips (inflows +green).
+// Sign convention: positive = money out; the display is the web's — money
+// out reads negative, money in plain and green, money moved muted.
 import { memo } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { Txn } from "../lib/api";
 import { C, mmddyy, money } from "../lib/theme";
-import { catLabel } from "../lib/pure";
+import { isMovedMoney, rowCategoryLabel } from "../lib/pure";
 import MerchantAvatar from "./merchant-avatar";
 
 function TxnRow({ t, onPress, onLongPress, selected }:
@@ -15,9 +16,7 @@ function TxnRow({ t, onPress, onLongPress, selected }:
   const inflow = t.amount < 0;
   // transfers/card payments are not real spend — mute the amount so the
   // eye skips them, like the web's amount column
-  const tcat = catLabel(t.category || "");
-  const xfer = tcat.includes("TRANSFER")
-    || (tcat.includes("LOAN PAYMENTS") && t.amount < 0);
+  const xfer = isMovedMoney(t.category, t.amount, t.category_detailed);
   // paired payback (↩ reimb) and a still-awaiting flag are different
   // states — one is resolved, the other is money someone still owes
   // you, and the web NAMES both instead of leaving bare glyphs
@@ -39,9 +38,33 @@ function TxnRow({ t, onPress, onLongPress, selected }:
       ? `✂ split ${t.split.length} ways${t.split_source && t.split_source !== "user" ? " by receipt" : ""}`
       : "" },
   ].filter((m) => m.text);
+  // One focus stop, so it speaks the row in words: the marks without
+  // their glyphs (⟳ ✂ 🏢 📎 ✎ read aloud as symbol names), the amount with
+  // its direction, and a "Select" action for what a long press does.
+  const label = [
+    t.payee + (t.check_payee ? `, to ${t.check_payee}` : "")
+      + (t.item_summary ? `, ${t.item_summary}` : ""),
+    inflow ? `+${money(-t.amount)} in` : money(t.amount),
+    t.entity ?? "",
+    mmddyy(t.date), rowCategoryLabel(t),
+    t.override_is_fee && t.override_bill ? `fee of ${t.override_bill}` : "",
+    t.pending ? "pending" : "",
+    ...marks.map((m) => spoken(m.text)),
+    t.note ? `note: ${t.note}` : "",
+  ].filter(Boolean).join(", ");
   return (
     <Pressable onPress={onPress ? () => onPress(t) : undefined}
                onLongPress={onLongPress ? () => onLongPress(t) : undefined}
+               accessibilityRole="button"
+               accessibilityLabel={label}
+               accessibilityState={selected === undefined ? undefined
+                 : { selected }}
+               accessibilityActions={onLongPress
+                 ? [{ name: "longpress", label: selected ? "Deselect" : "Select" }]
+                 : undefined}
+               onAccessibilityAction={(e) => {
+                 if (e.nativeEvent.actionName === "longpress") onLongPress?.(t);
+               }}
                style={({ pressed }) => [s.row,
                  selected ? { backgroundColor: C.hover } : null,
                  pressed && onPress ? { backgroundColor: C.hover } : null]}>
@@ -54,6 +77,8 @@ function TxnRow({ t, onPress, onLongPress, selected }:
       <View style={s.left}>
         <Text style={s.payee} numberOfLines={1}>
           {t.payee}
+          {/* whom a check paid, read off its image (web: the same) */}
+          {t.check_payee ? <Text style={s.mut}> · to {t.check_payee}</Text> : null}
           {t.item_summary ? <Text style={s.mut}> · {t.item_summary}</Text> : null}
         </Text>
         {/* the row IS a business's money (its account belongs to the
@@ -66,7 +91,7 @@ function TxnRow({ t, onPress, onLongPress, selected }:
           </View>
         ) : null}
         <Text style={s.mut} numberOfLines={1}>
-          {mmddyy(t.date)} · {catLabel(t.category)}
+          {mmddyy(t.date)} · {rowCategoryLabel(t)}
           {t.override_is_fee && t.override_bill
             ? ` · fee of ${t.override_bill}` : ""}
           {t.pending ? " · pending" : ""}
@@ -84,10 +109,16 @@ function TxnRow({ t, onPress, onLongPress, selected }:
       </View>
       <Text style={[s.amount, xfer ? { color: C.mut }
                               : inflow ? { color: C.good } : null]}>
-        {inflow ? `+${money(-t.amount)}` : money(t.amount)}
+        {money(-t.amount)}
       </Text>
     </Pressable>
   );
+}
+
+// a mark as it is said: its glyph dropped, the receipt clip named
+function spoken(mark: string): string {
+  if (mark === "📎") return "receipt";
+  return mark.replace(/^(⟳|↩|⚑|🏢|✂)\s*/u, "");
 }
 
 // rows re-render only when their own transaction changes — a list of a

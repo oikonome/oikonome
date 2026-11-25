@@ -9,10 +9,12 @@
 // polyline on every parent render (a refresh flag, a keystroke in the
 // assets editor below) would be visible jank.
 import { memo, useMemo } from "react";
-import Svg, { Circle, Line, Polyline } from "react-native-svg";
+import Svg, { Circle, Line, Polygon, Polyline } from "react-native-svg";
 import { StyleSheet, Text, View } from "react-native";
 
+import { chartSentence, chartTable, type ChartSeries } from "../lib/chart-summary";
 import { C, money } from "../lib/theme";
+import { ShowNumbers } from "./show-numbers";
 
 // a series with more points than the line has pixels draws the same
 // shape at a fraction of the cost — keep every Nth point plus the last,
@@ -30,18 +32,24 @@ export default memo(Sparkline);
 
 function Sparkline({ data: dataIn, second: secondIn, markX: markXIn,
                      markLabel, legend, dashUntil: dashUntilIn,
-                     dashFrom: dashFromIn, events: eventsIn,
-                     width, height = 84 }: {
+                     dashFrom: dashFromIn, events: eventsIn, band: bandIn,
+                     width, height = 84, subject }: {
   data: [string, number][];
+  /** what the line is, for the spoken sentence and the "Show numbers"
+   *  table: "Net worth" */
+  subject: string;
   second?: [string, number][];        // the alternate card-payment scenario
+  /** a shaded band, low and high edge per point (the forecast's own past
+   *  results), named by legend[1] when no second line takes it */
+  band?: { lo: [string, number][]; hi: [string, number][] };
   markX?: number | null;              // index of the first negative point
   markLabel?: string;                 // e.g. "runs out 7/16"
   /** dated events (card autopays) as index+label, the web AreaChart's
    *  `events`: muted lines behind the series. The label is not drawn — a
    *  phone-width chart has no room for rotated captions, so the dates are
    *  named in the row list under the chart, as the web does at desktop */
-  events?: { i: number; label: string }[];
-  legend?: [string, string];          // [primary, second] series names
+  events?: { i: number; label: string; note?: string }[];
+  legend?: string[];                 // [primary, second] series names
   dashUntil?: number;                 // points BEFORE this index are
                                       // estimated/reconstructed → dashed
   dashFrom?: number;                  // points FROM this index are a
@@ -58,6 +66,8 @@ function Sparkline({ data: dataIn, second: secondIn, markX: markXIn,
     const step = Math.ceil(dataIn.length / maxPts);
     const data = downsample(dataIn, maxPts);
     const second = secondIn ? downsample(secondIn, maxPts) : undefined;
+    const bandLo = bandIn ? downsample(bandIn.lo, maxPts) : [];
+    const bandHi = bandIn ? downsample(bandIn.hi, maxPts) : [];
     const idx = (i: number | null | undefined) =>
       i == null ? i : Math.min(Math.round(i / step), data.length - 1);
     const markX = idx(markXIn);
@@ -70,8 +80,9 @@ function Sparkline({ data: dataIn, second: secondIn, markX: markXIn,
     const dashFrom = idx(dashFromIn);
     const values = data.map(([, v]) => v);
     const values2 = (second ?? []).map(([, v]) => v);
-    const lo = Math.min(...values, ...values2, 0);
-    const hi = Math.max(...values, ...values2);
+    const valuesB = [...bandLo, ...bandHi].map(([, v]) => v);
+    const lo = Math.min(...values, ...values2, ...valuesB, 0);
+    const hi = Math.max(...values, ...values2, ...valuesB);
     const span = hi - lo || 1;
     const x = (i: number, n: number) => (i / (n - 1)) * w;
     const y = (v: number) => height - ((v - lo) / span) * (height - 6) - 3;
@@ -96,17 +107,36 @@ function Sparkline({ data: dataIn, second: secondIn, markX: markXIn,
     const pts2 = values2.length >= 2
       ? values2.map((v, i) => `${x(i, values2.length)},${y(v)}`).join(" ")
       : null;
+    const ptsBand = bandLo.length >= 2
+      ? [...bandLo.map(([, v], i) => `${x(i, bandLo.length)},${y(v)}`),
+         ...bandHi.map(([, v], i) => `${x(i, bandHi.length)},${y(v)}`)
+           .reverse()].join(" ")
+      : null;
     const zeroInRange = lo < 0 && hi > 0;
     const mark = markX != null && markX >= 0 && markX < values.length
       ? { cx: x(markX, values.length), cy: y(values[markX]) } : null;
     const evLines = events.map((e) => ({ ...e, cx: x(e.i, values.length) }));
-    return { data, lo, hi, y, pts, ptsDash, pts2, zeroInRange, mark, evLines };
-  }, [dataIn, secondIn, markXIn, dashUntilIn, dashFromIn, eventsIn, w, height]);
+    return { data, lo, hi, y, pts, ptsDash, pts2, ptsBand, zeroInRange, mark,
+             evLines };
+  }, [dataIn, secondIn, markXIn, dashUntilIn, dashFromIn, eventsIn, bandIn,
+      w, height]);
   if (!g) return null;
-  const { data, lo, hi, y, pts, ptsDash, pts2, zeroInRange, mark, evLines } = g;
+  const { data, lo, hi, y, pts, ptsDash, pts2, ptsBand, zeroInRange, mark,
+          evLines } = g;
   const label = (d: string) => d.slice(5, 10).replace("-", "/");
+  // the words read the series as sent, not the thinned drawing
+  const named: ChartSeries[] = [{ name: legend?.[0] ?? subject, points: dataIn }];
+  if (secondIn && secondIn.length >= 2)
+    named.push({ name: legend?.[1] ?? "second line", points: secondIn });
+  else if (bandIn && bandIn.lo.length >= 2) {
+    named.push({ name: `${legend?.[1] ?? "band"} — low edge`, points: bandIn.lo });
+    named.push({ name: `${legend?.[1] ?? "band"} — high edge`, points: bandIn.hi });
+  }
+  const fmt = (v: number) => money(v, false);
   return (
     <View style={{ marginTop: 8 }}>
+    <View accessible accessibilityRole="image"
+          accessibilityLabel={chartSentence(subject, named, fmt, dashFromIn)}>
       <View style={{ height, flexDirection: "row" }}>
         <Svg width={w} height={height}>
           {/* floor line anchors the shape */}
@@ -121,6 +151,10 @@ function Sparkline({ data: dataIn, second: secondIn, markX: markXIn,
                   stroke={C.mut} strokeWidth={1} strokeDasharray="3 3"
                   opacity={0.75} />
           ))}
+          {ptsBand && (
+            <Polygon points={ptsBand} fill={C.accent} fillOpacity={0.14}
+                     stroke="none" />
+          )}
           {pts2 && (
             <Polyline points={pts2} fill="none" stroke={C.mut}
                       strokeWidth={1.5} strokeDasharray="5 3"
@@ -156,16 +190,19 @@ function Sparkline({ data: dataIn, second: secondIn, markX: markXIn,
         ) : null}
         <Text style={s.axis}>{label(data[data.length - 1][0])}</Text>
       </View>
-      {legend && pts2 && (
+      {legend && (pts2 || ptsBand) && (
         <View style={{ flexDirection: "row", gap: 14, marginTop: 4 }}>
           <Text style={s.axis}>
             <Text style={{ color: C.accent }}>━</Text> {legend[0]}
           </Text>
           <Text style={s.axis}>
-            <Text style={{ color: C.mut }}>┅</Text> {legend[1]}
+            <Text style={{ color: pts2 ? C.mut : C.accent }}>
+              {pts2 ? "┅" : "▒"}</Text> {legend[1]}
           </Text>
         </View>
       )}
+    </View>
+    <ShowNumbers table={() => chartTable(named, fmt, { forecastFrom: dashFromIn })} />
     </View>
   );
 }

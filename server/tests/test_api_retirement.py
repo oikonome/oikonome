@@ -101,7 +101,7 @@ class RetirementApiTests(unittest.TestCase):
     def test_age_override_param(self):
         # explicit no-birthdate state (order-independent), then a what-if age
         self.client.post("/api/settings", json={"birthdate": ""})
-        r = self.client.get("/api/retirement?age=70&end=75")
+        r = self.client.get("/api/retirement?age=70&end=75&spend=40000")
         self.assertEqual(r.status_code, 200)
         body = r.json()
         self.assertEqual(body["inputs"]["age"], 70)
@@ -135,7 +135,11 @@ class RetirementApiTests(unittest.TestCase):
         r = self.client.post("/api/settings", json={
             "birthdate": "1970-01-01", "ss_estimates": {"67": 3000}})
         self.assertEqual(r.status_code, 200)
+        # no saved spend and no ledger: nothing is assumed
         r = self.client.get("/api/retirement")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()["inputs"]["spend_source"], "needed")
+        r = self.client.get("/api/retirement?spend=250000")
         self.assertEqual(r.status_code, 200)
         body = r.json()
         for key in ("buckets", "rows", "earliest", "real_return", "spend",
@@ -154,13 +158,14 @@ class RetirementApiTests(unittest.TestCase):
                          retirement.age_from_birthdate("1970-01-01"))
         self.assertEqual(inp["your_ss"], 3000)
         self.assertTrue(inp["has_sched"])
-        self.assertEqual(inp["spend"], 250000)          # the default
+        self.assertEqual(inp["spend"], 250000)          # the what-if
         # card debt nets out of cash: $5,000 − $250
         self.assertEqual(body["buckets"]["cash"], 4750.0)
         row = body["rows"][0]
         self.assertEqual(row["age"], inp["age"])
         self.assertEqual(set(row), {"age", "at_retire", "feasible",
-                                    "fail_age", "max_spend", "hist_pct"})
+                                    "fail_age", "max_spend", "hist_pct",
+                                    "hist_lasts", "meets_target"})
         # historical replay covers every start year of the return series
         self.assertEqual(body["hist"]["n"], len(hist_returns.STOCK))
         for k in ("ok", "pct", "spend90", "spend100", "stock_frac"):
@@ -168,7 +173,7 @@ class RetirementApiTests(unittest.TestCase):
         self.assertEqual(len(body["stress"]), 4)
         for s in body["stress"]:
             self.assertEqual(set(s), {"label", "earliest",
-                                      "max_spend_at_ref"})
+                                      "max_spend_at_ref", "under_target"})
         self.assertTrue(body["growth_path"])            # [["YYYY-06", $], …]
 
     def test_cash_yield_and_birth_year_reach_the_projection(self):
@@ -196,11 +201,12 @@ class RetirementApiTests(unittest.TestCase):
             "ss_estimates": {"67": 3000, "70": 4000}})
         r = self.client.get("/api/retirement?age=70&end=75&ssage=70")
         self.assertEqual(r.json()["inputs"]["your_ss"], 4000)
-        # an ssage with no schedule entry means $0 SS in the sim
+        # an ssage below every schedule entry is the nearest one reduced
+        # for the early claim (24 months at 5/9 % a month)
         r = self.client.get("/api/retirement?age=70&end=75&ssage=65")
         inp = r.json()["inputs"]
         self.assertEqual(inp["ssage"], 65)
-        self.assertEqual(inp["your_ss"], 0)
+        self.assertEqual(inp["your_ss"], 2600)
 
     def test_a_restored_schedule_with_bad_amounts_never_500s(self):
         """Only the Settings save coerces the schedule's amounts; a restored
@@ -224,7 +230,10 @@ class RetirementApiTests(unittest.TestCase):
                 put({"67": bad, "70": 4000})
                 r = self.client.get("/api/retirement?age=60&end=75&ssage=67")
                 self.assertEqual(r.status_code, 200, r.text)
-                self.assertEqual(r.json()["inputs"]["your_ss"], 0)
+                # the bad entry is dropped; 67 is the age-70 estimate
+                # less the 36 months of delayed credit
+                self.assertEqual(r.json()["inputs"]["your_ss"],
+                                 round(4000 / 1.24, 2))
                 r = self.client.get("/api/retirement?age=60&end=75&ssage=70")
                 self.assertEqual(r.json()["inputs"]["your_ss"], 4000)
         for bad in (["not", "a", "dict"], "text"):

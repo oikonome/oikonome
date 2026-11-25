@@ -30,6 +30,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from ..db import tenancy
 from ..engine import reporting
 from .security import limit
+from .schemas import documented
+from .schemas import reports as shapes
 
 router = APIRouter(prefix="/api/reports")
 
@@ -72,6 +74,7 @@ def _household_today(conn) -> dt.date:
 
 
 @router.get("/networth", dependencies=_REPORT_LIMIT)
+@documented(response=shapes.NetWorthReport)
 def networth(user: dict = Depends(_user()), owner: str = ""):
     # an owner lens shows only that owner's live accounts (property +
     # historical trend are household-level and omitted for an owner view).
@@ -88,16 +91,19 @@ def networth(user: dict = Depends(_user()), owner: str = ""):
 
 
 @router.get("/spending", dependencies=_REPORT_LIMIT)
+@documented(response=shapes.SpendingReport)
 def spending(user: dict = Depends(_user())):
     return _report("spending", user)
 
 
 @router.get("/cashflow", dependencies=_REPORT_LIMIT)
+@documented(response=shapes.CashflowReport)
 def cashflow(user: dict = Depends(_user())):
     return _report("cashflow", user)
 
 
 @router.get("/cashflow/flow", dependencies=_REPORT_LIMIT)
+@documented(response=shapes.FlowPeriod)
 def cashflow_flow(range: str = "1y", user: dict = Depends(_user())):
     """One timeframe of the Cash Flow flow picture. Served per range —
     not inside the report — because the fixed split walks month_status
@@ -121,21 +127,29 @@ def _windowed(fn, range_key: str, user: dict) -> dict:
 
 
 @router.get("/spending/window", dependencies=_REPORT_LIMIT)
+@documented(response=shapes.SpendingWindow)
 def spending_window(range: str = "1y", user: dict = Depends(_user())):
-    return _windowed(reporting.spending_window, range, user)
+    data = _windowed(reporting.spending_window, range, user)
+    # this server lists each figure's rows (GET /api/transactions?spend=);
+    # a phone links the figures only when the window says so
+    data["figures_open_rows"] = True
+    return data
 
 
 @router.get("/income/window", dependencies=_REPORT_LIMIT)
+@documented(response=shapes.IncomeWindow)
 def income_window(range: str = "1y", user: dict = Depends(_user())):
     return _windowed(reporting.income_window, range, user)
 
 
 @router.get("/fees", dependencies=_REPORT_LIMIT)
+@documented(response=shapes.FeesReport)
 def fees(user: dict = Depends(_user())):
     return _report("fees", user)
 
 
 @router.get("/cash-costs", dependencies=_REPORT_LIMIT)
+@documented(response=shapes.CashCostsReport)
 def cash_costs(user: dict = Depends(_user())):
     """Interest and fees paid on bank and card accounts, by year."""
     return _report("cash_costs", user)
@@ -154,9 +168,9 @@ def snapshot_tenant(tenant_id: str) -> dict:
         # two doors reach this (the nightly cron and the console's
         # run-job); the single-flight try-lock the nightly sweep itself
         # takes keeps a second entrant from recording the same night twice.
-        locked = conn.execute(
-            "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-            (f"oikonome:snapshot:{tenant_id}",)).fetchone()["ok"]
+        locked = tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (f"oikonome:snapshot:{tenant_id}",))["ok"]
         if not locked:
             return {"snapshot": False, "_status": "already-running"}
         try:

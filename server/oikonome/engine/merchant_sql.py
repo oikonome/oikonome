@@ -46,3 +46,15 @@ MC_JOIN = (f"LEFT JOIN merchant_canonical mc ON mc.raw_merchant = {RAW_KEY} "
 DISPLAY_MERCHANT = f"COALESCE(mm.name, mc.canonical, {RAW_KEY})"
 MERCHANT_LOGO = "mm.logo_url"
 MERCHANT_ID = "mm.id"
+
+
+def shown_payee(row) -> str:
+    """The name a charge PRINTS under on every list, tile, alert line and
+    email: DISPLAY_MERCHANT's answer as a spend row carries it — the
+    merchant row's name or the alias (`display_payee`), else the identity
+    key (`payee`), which is also what the ledger falls back to. The one
+    Python reader of those two columns, so no surface spells its own
+    fallback; the bank's raw descriptor (`name`) is never a fallback here
+    — it is printed only inside an opened transaction."""
+    return ((row.get("display_payee") or "").strip()
+            or (row.get("payee") or "").strip())

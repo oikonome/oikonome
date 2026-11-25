@@ -58,6 +58,8 @@ class EnrichmentSurvives(unittest.TestCase):
                 "SELECT raw FROM transactions WHERE id = ANY(%s)", (ids,)):
             self.assertEqual(r["raw"]["website"], "riverside.example")
             self.assertEqual(r["raw"]["_batch"], second)
+            # the second import's file holds the line too, so it joins
+            # the import that added it as an owner
             self.assertEqual(len(r["raw"]["_batches"]), 2)
 
     def test_a_feed_resending_a_row_keeps_its_enrichment(self):

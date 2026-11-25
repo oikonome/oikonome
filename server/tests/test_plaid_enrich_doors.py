@@ -160,7 +160,8 @@ class TheEnrichCapIsAnOperatorCeilingOnHosted(unittest.TestCase):
         env: OIKONOME_HOSTED also arms the forced-2FA write gate, which
         would 403 the very POST under test on an account that has no
         second factor — a different rule, not this one."""
-        import oikonome.web.api as apimod
+        # the module the enrich-cap ceiling reads the hosted flag in
+        import oikonome.web.api_settings as apimod
         real = apimod.env_flag
         return mock.patch.object(
             apimod, "env_flag",
@@ -224,7 +225,8 @@ class TheEnrichCeilingHoldsAtSpendTimeNotOnlyAtWriteTime(unittest.TestCase):
 
     @staticmethod
     def _as_hosted():
-        import oikonome.web.api as apimod
+        # the module the enrich-cap ceiling reads the hosted flag in
+        import oikonome.web.api_settings as apimod
         real = apimod.env_flag
         return mock.patch.object(
             apimod, "env_flag",

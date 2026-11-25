@@ -143,6 +143,33 @@ class NoAiDetailsByHandTests(unittest.TestCase):
             "/api/receipts/not-a-uuid/details",
             json={"total": 4, "date": TODAY.isoformat()}).status_code, 404)
 
+    def test_a_long_store_already_read_can_be_saved_back(self):
+        # a store stored before the parse kept no more than the door takes
+        # is filled into the form and sent back untouched: it is kept,
+        # never refused for a length the person did not type
+        rid, _ = self._snap()
+        long_store = ("LANTERN HARDWARE " * 6).strip()
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("UPDATE receipts SET status='failed', error='x',"
+                         " parsed=%s WHERE id=%s",
+                         (json.dumps({"merchant": long_store}), rid))
+        finally:
+            conn.close()
+        r = self.owner.post(f"/api/receipts/{rid}/details", json={
+            "total": 4.5, "date": TODAY.isoformat(),
+            "merchant": long_store})
+        self.assertEqual(r.status_code, 200, r.text)
+        row = _db(self.tid, "SELECT parsed FROM receipts WHERE id=%s",
+                  (rid,))
+        self.assertEqual(row["parsed"]["merchant"], long_store)
+        # a different long name is still the person's typing, and refused
+        r = self.owner.post(f"/api/receipts/{rid}/details", json={
+            "total": 4.5, "date": TODAY.isoformat(),
+            "merchant": long_store + " X"})
+        self.assertEqual(r.status_code, 400, r.text)
+        self.owner.delete(f"/api/receipts/{rid}")
+
     def test_a_viewer_may_not_enter_details(self):
         rid, _ = self._snap()
         self.assertEqual(self.viewer.post(
@@ -247,6 +274,15 @@ class AParseNeverOverwritesDetailsTests(unittest.TestCase):
         p = self._parsed()["parsed"]
         self.assertEqual((p["merchant"], p["tax"], p["total"]),
                          ("L4NTERN", 1.1, 27.35))
+
+    def test_a_store_read_off_the_slip_fits_the_details_form(self):
+        # the parse keeps no more of the store than the details door
+        # takes, so the form it fills can be saved as filled
+        long_read = dict(self.MISREAD, merchant="L4NTERN HARDWARE " * 8)
+        receipts.parse_one(self.conn, self.rid, transport=_vision(long_read))
+        got = self._parsed()["parsed"]["merchant"]
+        self.assertLessEqual(len(got), receipts.STORE_MAX)
+        self.assertEqual(receipts.STORE_MAX, 80)
 
 
 class NeedsDetailsIsPureTests(unittest.TestCase):

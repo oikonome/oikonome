@@ -53,6 +53,14 @@ class FlowBreakdownTests(unittest.TestCase):
         # a year-old row sits outside 3m and 6m, inside 1y and wider
         _txn(self.conn, self.bank, dt.date(2025, 10, 1), 999.0, "OLD",
              category_primary="GENERAL_SERVICES")
+        # checking is on file every month from then on: a transfer to
+        # savings (neither spend nor income) marks the months nothing else
+        # posted in, so none of them is a feed hole
+        d = dt.date(2025, 11, 3)
+        while d < dt.date(2026, 8, 1):
+            _txn(self.conn, self.bank, d, 25.0, "TO SAVINGS",
+                 category_primary="TRANSFER_OUT")
+            d = (d + dt.timedelta(days=32)).replace(day=3)
         m = reporting.flow_breakdown(self.conn, today, "3m")
         self.assertEqual(m["in"]["paychecks"], 5000.0)
         self.assertEqual(m["in"]["interest"], 20.0)
@@ -66,13 +74,13 @@ class FlowBreakdownTests(unittest.TestCase):
         six = reporting.flow_breakdown(self.conn, today, "6m")
         self.assertEqual(six["label"], "Mar–Aug 2026")
         self.assertEqual(six["out"]["total"], 1740.0)
-        # the year would open in Sep 2025, but the checking feed's first row
-        # is the OLD one in Oct 2025 and income is unknown before it, so the
-        # picture starts there and says so
+        # the year opens in Sep 2025, as on every other Cash Flow tab; the
+        # checking feed's first row is the OLD one in Oct 2025, so
+        # September's income is unknown — counted, and marked incomplete
         year = reporting.flow_breakdown(self.conn, today, "1y")
-        self.assertEqual(year["from"], "2025-10-01")
-        self.assertEqual(year["label"], "Oct 2025–Aug 2026")
-        self.assertTrue(year["income_clipped"])
+        self.assertEqual(year["from"], "2025-09-01")
+        self.assertEqual(year["label"], "Sep 2025–Aug 2026")
+        self.assertEqual(year["incomplete_months"], ["2025-09"])
         self.assertEqual(year["out"]["total"], 2739.0)   # + the OLD row
         # 'all' opens at the earliest transaction's month
         both = reporting.flow_breakdown(self.conn, today, "all")

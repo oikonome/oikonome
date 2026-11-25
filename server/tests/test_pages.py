@@ -70,6 +70,43 @@ class PagesTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_form_doors_keep_the_json_doors_bounds(self):
+        """The legacy form doors refuse what their JSON siblings refuse: a
+        category name past the stored bound, and an account type outside
+        the vocabulary every aggregate groups by."""
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            tid = conn.execute("SELECT id FROM transactions LIMIT 1"
+                               ).fetchone()
+            if tid is None:
+                conn.execute(
+                    "INSERT INTO transactions (id, account_id, date, amount,"
+                    " name) VALUES ('t-bound','chk','2026-07-01',5,'KIOSK')")
+                tid = {"id": "t-bound"}
+            r = self.client.post("/transactions/recategorize",
+                                 data={"txn_id": tid["id"],
+                                       "category": "x" * 65},
+                                 follow_redirects=False)
+            self.assertEqual(r.status_code, 400)
+            row = conn.execute("SELECT category_override FROM transactions"
+                               " WHERE id=%s", (tid["id"],)).fetchone()
+            self.assertNotEqual(row["category_override"], "x" * 65)
+            for path, form in (
+                    ("/accounts/classify", {"account_id": "chk",
+                                            "kind": "foo/bar"}),
+                    ("/accounts/add", {"name": "Odd Kind", "kind": "foo"})):
+                with self.subTest(door=path):
+                    r = self.client.post(path, data=form,
+                                         follow_redirects=False)
+                    self.assertEqual(r.status_code, 400, r.text[:200])
+            self.assertEqual(conn.execute(
+                "SELECT type FROM accounts WHERE id='chk'").fetchone()["type"],
+                "depository")
+            self.assertIsNone(conn.execute(
+                "SELECT 1 FROM accounts WHERE name='Odd Kind'").fetchone())
+        finally:
+            conn.close()
+
     def test_csv_upload_auto_detects_chase_headers(self):
         r = self.client.post("/import",
                              data={"account_id": "card",

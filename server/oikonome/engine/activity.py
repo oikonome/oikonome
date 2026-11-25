@@ -29,6 +29,7 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import logging
+import re
 
 from ..sync import card_number
 from .compat import jsonb
@@ -75,8 +76,36 @@ def _clip(s, n: int = QUOTE_MAX) -> str:
 
 
 def _cat(stored) -> str:
-    # the SPA's catLabel: the stored key with its underscores opened up
+    # the category as every page names it (the clients' catLabel):
+    # "TRANSPORTATION" reads "Transportation", a typed name is kept
+    from .categories import display_label
+    return display_label(str(stored or ""))
+
+
+def _old_cat(stored) -> str:
+    """How a category read in a sentence written before `_cat` named it as
+    the pages do: the stored key with its underscores opened up."""
     return (str(stored or "")).replace("_", " ") or "uncategorized"
+
+
+# A row with no person behind it and no script token: an operator's
+# maintenance pass. It reads as a script, never as a name that belongs to
+# nobody in the household, and the "Who" filter offers it as one.
+MAINTENANCE = "script:maintenance"
+
+
+def _shown_actor(actor: str | None, user_id) -> str:
+    a = str(actor or "")
+    if (user_id is None and a and "@" not in a and not a.startswith("script")
+            and a != "someone"):
+        return MAINTENANCE
+    return a
+
+
+# where a sentence names a category: after one of these, before the end of
+# a clause — so a merchant label that happens to hold the same word is not
+# touched
+_CAT_AT = r"(→ |from | to |under |\(was |: |, )"
 
 
 def money(v) -> str:
@@ -213,6 +242,11 @@ def sentence(kind: str, action: str, label: str, detail: dict | None) -> str:
             return f"entered a waiting receipt's total{amt} and date by hand"
         if action == "unmatched":
             return f"took a receipt off {label} and put it back to waiting"
+        # a person's answer about two receipts read alike
+        if action == "same_slip":
+            return "said two receipts are the same receipt, counted once"
+        if action == "two_purchases":
+            return "said two receipts are two purchases, each counted"
         return f"attached a {what} to {label}"
     if kind == "reimbursement":
         if action == "flagged":
@@ -241,6 +275,12 @@ def sentence(kind: str, action: str, label: str, detail: dict | None) -> str:
             return f"kept the merchants {label} apart"
         if action == "undone":
             return f"undid a merchant name change ({label})"
+        if action == "paycheck":
+            return f"counted {label} as paychecks"
+        if action == "not_paycheck":
+            return f"stopped counting {label} as paychecks"
+        if action == "paycheck_auto":
+            return f"let the rules decide whether {label} is paychecks"
     if kind == "account":
         if action == "renamed":
             return f"renamed the account {label} to {_clip(after, 48)}"
@@ -248,6 +288,16 @@ def sentence(kind: str, action: str, label: str, detail: dict | None) -> str:
             return f"left the account {label} out of the budget"
         if action == "included":
             return f"put the account {label} back in the budget"
+        # a bank a several-bank Plaid sign-in brought after it had answered
+        # (jobs/plaid_links._note_late), and a pause of such sign-ins
+        if action == "late_connected":
+            return (f"connected {label}, a bank added after the sign-in "
+                    "had answered")
+        if action == "late_refused":
+            return f"did not connect {label}: {_clip(d.get('reason'), 160)}"
+        if action == "several_banks_paused":
+            return ("paused linking several banks in one sign-in for a "
+                    f"day: {_clip(d.get('reason'), 160)}")
     if kind == "settings":
         keys = d.get("keys") or []
         if action == "debt_plan":
@@ -256,6 +306,12 @@ def sentence(kind: str, action: str, label: str, detail: dict | None) -> str:
             return "downloaded the continuity packet"
         if action == "continuity_emailed":
             return f"emailed the continuity packet to {label}"
+        if action == "tax_document_removed":
+            return f"removed the stored {label}"
+        if action == "tax_document_restored":
+            return f"put back the stored {label}"
+        if action == "tax_document_payer_renamed":
+            return f"renamed the payer on the stored {label}"
         shown = ", ".join(_setting_name(k) for k in keys[:6])
         more = f" and {len(keys) - 6} more" if len(keys) > 6 else ""
         return f"changed settings: {shown}{more}"
@@ -343,6 +399,44 @@ _SETTING_NAMES = {
     "timezone": "time zone", "llm_url": "AI backend", "smtp_host": "mail relay",
     "retirement": "retirement plan", "income_scenarios": "income scenarios",
     "debt_plan": "debt payoff plan", "home_page": "home page",
+    "food_monthly": "food budget", "other_monthly": "everything-else budget",
+    "budgeted_income_monthly": "plan income",
+    "dynamic_variable_budget": "budget scaling",
+    "checking_account_id": "primary checking", "birthdate": "birth date",
+    "ss_estimates": "Social Security estimates",
+    "retirement_saving": "retirement saving",
+    "income_biweekly_saving": "paycheck while saving",
+    "income_biweekly_not_saving": "paycheck while not saving",
+    "active_scenario": "active income scenario",
+    "dismissed_hints": "dismissed suggestions",
+    "dismissed_health": "dismissed health checks",
+    "manual_assets": "property and vehicles",
+    "advisory_fees": "advisory fees",
+    "advisory_fee_exempt_masks": "fee-exempt accounts",
+    "investment_basis_override": "investment cost basis",
+    "email_muted": "muted email recipients",
+    "email_schedule": "email schedule",
+    "email_send_hour_utc": "email time", "email_prefs": "email preferences",
+    "merchant_logos": "merchant logos",
+    "plaid_recurring": "bank-detected bills",
+    "plaid_enrich_cap": "merchant lookup limit",
+    "bill_detection_auto": "automatic bill detection",
+    "feedback_enabled": "feedback button",
+    "history_months": "history length", "setup_mode": "setup mode",
+    "today_view": "Today layout", "home_web": "home page (web)",
+    "home_mobile": "home page (phone)", "theme": "theme",
+    "wizard_done": "setup finished", "wizard_steps": "setup steps",
+    "biz_wizard_steps": "business setup steps",
+    "ret_wizard_steps": "retirement setup steps",
+    "ret_wizard_answers": "retirement setup answers",
+    "timezone_adopted": "time zone", "list_versions": "saved lists",
+    "llm_backends": "AI backends", "llm_model": "AI model",
+    "llm_roles": "AI roles", "llm_vision_model": "AI vision model",
+    "llm_extra_body": "AI options", "llm_api_key": "AI key",
+    "taxdocs_allow_remote_llm": "tax documents AI",
+    "smtp_port": "mail relay port", "smtp_user": "mail relay sign-in",
+    "smtp_password": "mail relay password", "smtp_from": "mail sender",
+    "smtp_starttls": "mail relay encryption",
 }
 
 
@@ -539,6 +633,22 @@ def record(conn, user, kind: str, action: str, *, target: str | None = None,
 
 # ---- reading ---------------------------------------------------------------
 
+def _relabel(summary: str, detail: dict | None) -> str:
+    """A sentence written before categories were named as the pages name
+    them reads with those names now."""
+    if not summary or not isinstance(detail, dict):
+        return summary
+    vals = [detail.get("before"), detail.get("after")]
+    vals += [p.get("category") for p in detail.get("parts") or []
+             if isinstance(p, dict)]
+    for v in {str(v) for v in vals if v}:
+        old, new = _old_cat(v), _cat(v)
+        if old != new:
+            summary = re.sub(_CAT_AT + re.escape(old) + r"(?=$|[ ),.])",
+                             lambda m, n=new: m.group(1) + n, summary)
+    return summary
+
+
 def _row(r) -> dict:
     d = dict(r)
     d["id"] = str(d["id"])
@@ -548,6 +658,9 @@ def _row(r) -> dict:
         d["actor_user_id"] = str(d["actor_user_id"])
     from .compat import as_dict
     d["detail"] = as_dict(d.get("detail")) if d.get("detail") else None
+    if d.get("kind") in ("category", "split", "rule"):
+        d["summary"] = _relabel(d.get("summary") or "", d["detail"])
+    d["actor"] = _shown_actor(d.get("actor"), d.get("actor_user_id"))
     return d
 
 
@@ -572,7 +685,13 @@ def list_activity(conn, *, limit: int = PAGE, before: str | None = None,
     if kind:
         where.append("kind = %s")
         args.append(kind)
-    if actor:
+    if actor and actor.strip().lower() == MAINTENANCE:
+        # the rows _shown_actor names a maintenance script
+        where.append("(actor = %s OR (actor_user_id IS NULL"
+                     " AND position('@' in actor) = 0"
+                     " AND actor NOT LIKE %s AND actor <> 'someone'))")
+        args += [MAINTENANCE, "script%"]
+    elif actor:
         where.append("actor = %s")
         args.append(actor.strip().lower())
     if target:
@@ -586,9 +705,11 @@ def list_activity(conn, *, limit: int = PAGE, before: str | None = None,
     rows = conn.execute(sql, args).fetchall()
     more = len(rows) > limit
     rows = [_row(r) for r in rows[:limit]]
-    actors = [r["actor"] for r in conn.execute(
-        "SELECT actor FROM activity_log GROUP BY actor ORDER BY max(at) DESC"
-    ).fetchall()]
+    actors = list(dict.fromkeys(
+        _shown_actor(r["actor"], r["uid"]) for r in conn.execute(
+            "SELECT actor, (array_agg(actor_user_id))[1] AS uid"
+            " FROM activity_log GROUP BY actor ORDER BY max(at) DESC"
+        ).fetchall()))
     return {"rows": rows, "more": more,
             "next": rows[-1]["at"] if more and rows else None,
             "actors": actors, "kinds": list(KINDS)}

@@ -11,12 +11,14 @@ import { Alert, Linking, Platform, Pressable, ScrollView, StyleSheet, Text,
          TextInput, View } from "react-native";
 
 import { Card } from "../components/ui";
+import { FailedLine } from "../components/loaded";
 import MerchantAvatar from "../components/merchant-avatar";
 import { errText, MerchantDetail } from "../lib/api";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
 import { catLabel } from "../lib/pure";
+import { fieldA11y } from "../components/field";
 
 export default function Merchant() {
   const { display } = useLocalSearchParams<{ display: string }>();
@@ -102,7 +104,7 @@ export default function Merchant() {
             <Text style={s.small}>
               {m?.parent ? `outlet of ${m.parent} · ` : ""}
               {m?.kind && m.kind !== "merchant" ? `${catLabel(m.kind)} · ` : ""}
-              {m ? `${m.rows} row${m.rows === 1 ? "" : "s"} · ${money(m.total, false)} · `
+              {m ? `${m.rows.toLocaleString()} row${m.rows === 1 ? "" : "s"} · ${m.total_label !== undefined ? m.total_label ?? "" : money(m.total, false)} · `
                  + `${mmddyy(m.first)} – ${mmddyy(m.last)}` : ""}
             </Text>
           </View>
@@ -114,18 +116,25 @@ export default function Merchant() {
               Rename</Text>
             <Text style={s.action} onPress={() => { setPick(""); setMode("merge"); }}>
               Merge into…</Text>
+            {/* the web's link: this merchant's rows on the ledger */}
+            <Text style={s.action} accessibilityRole="link"
+                  onPress={() => router.push({ pathname: "/(tabs)/transactions",
+                    params: { q: name } } as never)}>
+              open in Transactions →</Text>
           </View>
         )}
         {canEdit && mode === "rename" && (
           <View style={{ marginTop: 10, gap: 8 }}>
-            <TextInput style={s.input} value={draft} onChangeText={setDraft}
+            <TextInput {...fieldA11y("New name")}
+                       style={s.input} value={draft} onChangeText={setDraft}
                        autoFocus autoCapitalize="words" placeholderTextColor={C.mut} />
             <View style={{ flexDirection: "row", gap: 14, alignItems: "center" }}>
-              <Pressable style={[s.doneBtn, (busy || !draft.trim() || draft.trim() === name)
+              <Pressable accessibilityRole="button"
+                         style={[s.doneBtn, (busy || !draft.trim() || draft.trim() === name)
                                    && { opacity: 0.5 }]}
                          disabled={busy || !draft.trim() || draft.trim() === name}
                          onPress={() => rename.mutate(draft.trim())}>
-                <Text style={{ color: "#fff", fontWeight: "700" }}>Save</Text>
+                <Text style={{ color: C.text, fontWeight: "700" }}>Save</Text>
               </Pressable>
               <Text style={s.action} onPress={() => setMode("view")}>Cancel</Text>
             </View>
@@ -133,7 +142,8 @@ export default function Merchant() {
         )}
         {canEdit && mode === "merge" && (
           <View style={{ marginTop: 10, gap: 8 }}>
-            <TextInput style={s.input} value={pick} onChangeText={setPick} autoFocus
+            <TextInput {...fieldA11y("Merge into which merchant?")}
+                       style={s.input} value={pick} onChangeText={setPick} autoFocus
                        placeholder="merge into which merchant?" placeholderTextColor={C.mut}
                        autoCapitalize="none" autoCorrect={false} />
             <Text style={s.small}>
@@ -141,13 +151,16 @@ export default function Merchant() {
             </Text>
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
               {options.map((o) => (
-                <Pressable key={o.display} style={s.chip} disabled={busy}
+                <Pressable accessibilityRole="button" key={o.display} style={s.chip} disabled={busy}
                            onPress={() => rename.mutate(o.display)}>
                   <Text style={{ color: C.accent, fontSize: 12 }}>
                     {o.display}<Text style={{ color: C.mut }}> · {o.rows}</Text></Text>
                 </Pressable>
               ))}
-              {pickQ.length > 0 && !cands.isPending && options.length === 0 && (
+              {/* "no match" only from a search that answered */}
+              {pickQ.length > 0 && cands.isError && (
+                <FailedLine q={cands} what="the merchants" />)}
+              {pickQ.length > 0 && cands.isSuccess && options.length === 0 && (
                 <Text style={s.small}>No merchant matches that.</Text>
               )}
             </View>
@@ -157,10 +170,7 @@ export default function Merchant() {
       </Card>
 
       {d.isPending && <Text style={s.small}>Loading…</Text>}
-      {d.isError && (
-        <Text style={[s.small, { color: C.bad }]} onPress={() => d.refetch()}>
-          Couldn't load: {errText(d.error)} — tap to retry.</Text>
-      )}
+      {d.isError && <FailedLine q={d} what="this merchant" />}
       {m && (
         <Card>
           <Text style={s.h}>About</Text>
@@ -176,8 +186,10 @@ export default function Merchant() {
           <Text style={s.small}>
             Category: <Text style={{ color: C.text }}>
               {m.category ? catLabel(m.category) : "—"}</Text>
-            {m.rule ? ` · ${m.rule.source === "user" ? "your rule" : m.rule.source + " rule"}`
-                       + ` → ${catLabel(m.rule.category_primary)}` : ""}
+            {/* older-server path: stands in for `rule.label` */}
+            {m.rule?.label ? ` · ${m.rule.label}`
+              : m.rule && m.rule.label === undefined ? ` · ${m.rule.source === "user" ? "your rule" : m.rule.source + " rule"}`
+                         + ` → ${catLabel(m.rule.category_primary)}` : ""}
           </Text>
           <Text style={s.small}>Source names: {m.variants.join(" · ")}</Text>
           <Text style={[s.h, { marginTop: 10 }]}>Where</Text>
@@ -191,7 +203,10 @@ export default function Merchant() {
                 {place(l) || "unnamed place"}
                 <Text style={s.small}>  {l.n} visit{l.n === 1 ? "" : "s"} · last {mmddyy(l.last)}</Text>
               </Text>
-              <Text style={s.action} onPress={() => openMap(l)}>Map</Text>
+              {/* only a place the maps can find, as the web's link */}
+              {(l.lat != null || l.address || l.city || l.postal) ? (
+                <Text style={s.action} onPress={() => openMap(l)}>Map</Text>
+              ) : null}
             </View>
           ))}
         </Card>
@@ -208,11 +223,11 @@ const s = StyleSheet.create({
   link: { color: C.accent, fontSize: 12 },
   action: { color: C.accent, fontSize: 13, fontWeight: "600",
             paddingVertical: 6, paddingHorizontal: 4 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 10, color: C.text, fontSize: 15,
            paddingHorizontal: 12, paddingVertical: 9 },
   chip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
           borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
-  doneBtn: { backgroundColor: C.accent, borderRadius: 8,
+  doneBtn: { backgroundColor: C.btn, borderRadius: 8,
              paddingHorizontal: 20, paddingVertical: 9 },
 });

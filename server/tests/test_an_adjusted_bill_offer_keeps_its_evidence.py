@@ -201,7 +201,11 @@ class AdjustedApprovalTests(unittest.TestCase):
                                             "due_day": 28})
         self.assertEqual(r.status_code, 200, r.text)
         bill, raw = self._bill(conn, p["payee"])
-        self.assertEqual(bill["due_on"], p["next_due"])
+        # the offer's date, or — approved after that date has passed — a
+        # later one on the same weekday: the day sent never moves it
+        ahead = (bill["due_on"] - p["next_due"]).days
+        self.assertGreaterEqual(ahead, 0)
+        self.assertEqual(ahead % 7, 0)
         self.assertNotIn("byMonthDay", raw["recurrence"])
 
     def test_a_new_name_another_bill_already_covers_is_refused(self):

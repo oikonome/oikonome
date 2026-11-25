@@ -59,6 +59,21 @@ class OfxRawMinimizationTests(unittest.TestCase):
             raw = dict(row["raw"])
             self.assertEqual(raw.get("acct"), ACCTID.decode()[-4:])
 
+    def test_raw_holds_the_parsed_line_and_the_printed_day_note_only(self):
+        """Every key raw may hold, pinned: a new one rides /export and the
+        archive with every row, so adding it is a decision, not a side
+        effect. `dated` says the row's date is the day its line printed,
+        which a re-import reads to tell this build's rows from an earlier
+        build's."""
+        ofximport.import_ofx(self.conn, "chk", OFX)
+        for row in self.conn.execute(
+                "SELECT raw FROM transactions WHERE id LIKE 'ofx:%'"):
+            raw = dict(row["raw"])
+            self.assertEqual(set(raw) - {"_batch", "_batches"}, {
+                "fitid", "date", "amount", "name", "memo", "type", "acct",
+                "accttype", "cc", "dated"})
+            self.assertEqual(raw["dated"], "printed")
+
     def test_full_number_appears_nowhere_in_stored_raw(self):
         """Belt over the key check: however the dict is shaped, the full
         digit string must be absent from the serialized JSONB."""

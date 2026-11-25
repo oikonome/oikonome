@@ -188,8 +188,13 @@ class HouseholdPushSwitchTests(unittest.TestCase):
                             st.get("email_muted"))
             rows = st.get("email_recipient_status") or []
             self.assertTrue(all(x["email"] == mine for x in rows), rows)
+        # the household's mute list is the owner's to read; a
+        # viewer reads their own mute off their own status row
         st = self.viewer.get("/api/settings").json()
-        self.assertEqual(st["email_muted"], [self.viewer_email])
+        self.assertNotIn("email_muted", st)
+        mine = [x for x in st["email_recipient_status"]
+                if x["email"] == self.viewer_email]
+        self.assertTrue(mine and mine[0]["muted"], st["email_recipient_status"])
 
     def test_the_doors_refuse_a_shapeless_body(self):
         r = self.viewer.post("/api/me/push", json={"muted": "yes"})

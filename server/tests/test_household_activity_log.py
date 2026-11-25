@@ -34,7 +34,7 @@ class SentenceTests(unittest.TestCase):
                               {"before": "GENERAL_MERCHANDISE",
                                "after": "FOOD_AND_DRINK", "scope": "one"})
         self.assertEqual(s, "changed the category of Big Box $80.00 on "
-                            "01/15/26 from GENERAL MERCHANDISE to FOOD AND DRINK")
+                            "01/15/26 from General Merchandise to Food and Drink")
 
     def test_teaching_the_merchant_is_said(self):
         s = activity.sentence("category", "set", "X $1.00 on 01/01/26",
@@ -52,8 +52,8 @@ class SentenceTests(unittest.TestCase):
         s = activity.sentence("split", "set", "T", {"parts": [
             {"category": "FOOD_AND_DRINK", "amount": 30},
             {"category": "GENERAL_MERCHANDISE", "amount": 50}]})
-        self.assertEqual(s, "split T 2 ways: FOOD AND DRINK $30.00, "
-                            "GENERAL MERCHANDISE $50.00")
+        self.assertEqual(s, "split T 2 ways: Food and Drink $30.00, "
+                            "General Merchandise $50.00")
         s = activity.sentence("bill", "edited", "Power", {
             "before": {"amount": 100, "frequency": "MONTHLY", "interval": 1},
             "after": {"amount": 120, "frequency": "MONTHLY", "interval": 1}})
@@ -86,7 +86,7 @@ class SentenceTests(unittest.TestCase):
     def test_settings_entry_names_keys_only(self):
         s = activity.sentence("settings", "changed", "", {"keys": [
             "budget", "smtp_password", "savings_goals"]})
-        self.assertEqual(s, "changed settings: budget, smtp password, "
+        self.assertEqual(s, "changed settings: budget, mail relay password, "
                             "savings goals")
 
     def test_a_long_note_is_clipped(self):
@@ -279,7 +279,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(row["kind"], "category")
         self.assertIn("BIG BOX", row["label"].upper())
         self.assertIn("$80.00", row["summary"])
-        self.assertIn("FOOD AND DRINK", row["summary"])
+        self.assertIn("Food and Drink", row["summary"])
         self.assertEqual(row["detail"]["before"], "GENERAL_MERCHANDISE")
         # and clearing it is a second row that names what it was
         r = self.member.post(f"/api/transactions/{txn}/category",
@@ -287,7 +287,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         rows = self._rows(target=txn)
         self.assertEqual(rows[0]["action"], "cleared")
-        self.assertIn("was FOOD AND DRINK", rows[0]["summary"])
+        self.assertIn("was Food and Drink", rows[0]["summary"])
 
     def test_note_set_edit_clear(self):
         txn = self._txn()
@@ -360,7 +360,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
         rows = self._rows(kind="rule")
         self.assertEqual(rows[0]["action"], "set")
-        self.assertIn("→ TRANSPORTATION", rows[0]["summary"])
+        self.assertIn("→ Transportation", rows[0]["summary"])
         self.assertEqual(rows[0]["detail"]["count"], 3)
 
     def test_settings_save_names_keys_never_values(self):

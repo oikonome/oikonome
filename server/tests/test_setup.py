@@ -305,7 +305,8 @@ class LlmSettingsApiTests(unittest.TestCase):
         self.assertEqual(eff["categorize"],
                          {"source": "tenant",
                           "url": "http://localhost:11434/v1",
-                          "model": "qwen3:4b", "local": True})
+                          "model": "qwen3:4b", "local": True,
+                          "label": "Qwen3 4b"})
         self.assertEqual(eff["categorize"], eff["assistant"])
         self.client.post("/api/settings", json={
             "llm_url": "https://api.openai.com/v1",

@@ -59,7 +59,21 @@ class RestoresAtOnceTests(unittest.TestCase):
 
         restore.restore_zip = held
         self.addCleanup(setattr, restore, "restore_zip", real)
+        # a test leaves no restore holding a slot for the next one
+        self._before = set(threading.enumerate())
+        self.addCleanup(self._wait_for_restores)
         self.addCleanup(self.release.set)
+
+    def _wait_for_restores(self):
+        """Wait for every restore this test started to END. The job row
+        reads 'done' once the merge commits, but the worker still runs the
+        categorize pass after that and gives its slot back only when it
+        returns — on a loaded machine that tail is long enough for the next
+        start to be refused."""
+        for t in set(threading.enumerate()) - self._before:
+            if t.name == "oikonome-restore":
+                t.join(30)
+                self.assertFalse(t.is_alive(), "a restore never finished")
 
     def _settle(self, conn):
         for _ in range(200):
@@ -95,6 +109,7 @@ class RestoresAtOnceTests(unittest.TestCase):
         self.release.set()
         for c in self.conns[:cap]:
             self._settle(c)
+        self._wait_for_restores()
         # the slots come back once the restores finish
         out = restore_job.start(_tid(extra), _zip())
         self.assertTrue(out.get("restore_started"), out)

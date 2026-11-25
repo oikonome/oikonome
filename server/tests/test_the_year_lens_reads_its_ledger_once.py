@@ -122,6 +122,21 @@ class YearLensReadsOnce(unittest.TestCase):
             self.page()
         self.assertLessEqual(calls[0], 2 * n, (calls[0], n))
 
+    def test_closed_months_skip_the_cash_events_nobody_reads(self):
+        """The bonus / investment-funding scan is the live month's alert
+        input; a closed month's report card never shows it, so the page
+        runs it once — for the month in progress — not once per month."""
+        calls = [0]
+        real = budget.cash_events
+
+        def counted(*a, **kw):
+            calls[0] += 1
+            return real(*a, **kw)
+
+        with mock.patch.object(budget, "cash_events", counted):
+            self.page(with_detail=True)
+        self.assertLessEqual(calls[0], 1, calls[0])
+
 
 if __name__ == "__main__":
     unittest.main()

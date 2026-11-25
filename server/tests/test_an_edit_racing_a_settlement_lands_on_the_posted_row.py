@@ -19,7 +19,8 @@ from unittest import mock
 
 from oikonome.db import tenancy
 from oikonome.sync import reanchor
-from oikonome.web import api, data
+from oikonome.web import api, api_ledger, data
+from oikonome.web.fields import Fields
 
 from .util import add_txn, make_db, write_config
 
@@ -60,7 +61,7 @@ class EditRacingSettlement(unittest.TestCase):
         with other.transaction():
             other.execute(data._REIMB_LOCK)
             t = threading.Thread(target=lambda: (api.set_txn_note(
-                "hold-1", user=self.user, body={"note": "tip for Sam"}),
+                "hold-1", user=self.user, body=Fields({"note": "tip for Sam"})),
                 done.set()))
             t.start()
             time.sleep(0.5)
@@ -74,10 +75,10 @@ class EditRacingSettlement(unittest.TestCase):
 
     def test_an_edit_on_a_retired_hold_goes_to_its_posted_row(self):
         self._settle(self.conn)
-        api.set_txn_note("hold-1", user=self.user, body={"note": "n"})
+        api.set_txn_note("hold-1", user=self.user, body=Fields({"note": "n"}))
         self.assertEqual(self._note("post-1"), "n")
         api.set_category("hold-1", user=self.user,
-                         body={"category": "FOOD_AND_DRINK"})
+                         body=Fields({"category": "FOOD_AND_DRINK"}))
         r = self.conn.execute("SELECT category_override FROM transactions "
                               "WHERE id='post-1'").fetchone()
         self.assertEqual(r["category_override"], "FOOD_AND_DRINK")
@@ -89,7 +90,7 @@ class EditRacingSettlement(unittest.TestCase):
         with other.transaction():
             other.execute(data._REIMB_LOCK)
             t = threading.Thread(target=lambda: (api.set_txn_owner_api(
-                "hold-1", user=self.user, body={"owner": "Alex"}),
+                "hold-1", user=self.user, body=Fields({"owner": "Alex"})),
                 done.set()))
             t.start()
             time.sleep(0.5)
@@ -105,11 +106,11 @@ class EditRacingSettlement(unittest.TestCase):
     def test_owner_split_bulk_and_business_on_a_retired_hold_go_to_its_posted_row(self):
         self._settle(self.conn)
         out = api.set_txn_owner_api("hold-1", user=self.user,
-                                    body={"owner": "Alex"})
+                                    body=Fields({"owner": "Alex"}))
         self.assertEqual(out["id"], "post-1")
-        api.set_split_api("hold-1", user=self.user, body={"parts": [
+        api.set_split_api("hold-1", user=self.user, body=Fields({"parts": [
             {"category": "FOOD_AND_DRINK", "amount": 40.00},
-            {"category": "ENTERTAINMENT", "amount": 5.60}]})
+            {"category": "ENTERTAINMENT", "amount": 5.60}]}))
         self.assertTrue(self.conn.execute(
             "SELECT 1 FROM transaction_splits WHERE txn_id='post-1'"
         ).fetchone())
@@ -120,10 +121,10 @@ class EditRacingSettlement(unittest.TestCase):
         api.business_flag("hold-1", user=self.user)
         self.assertTrue(self.conn.execute(
             "SELECT 1 FROM business_flags WHERE txn_id='post-1'").fetchone())
-        with mock.patch.object(api, "_log_bulk"):
-            res = api.transactions_bulk(user=self.user, body={
+        with mock.patch.object(api_ledger, "_log_bulk"):
+            res = api.transactions_bulk(user=self.user, body=Fields({
                 "ids": ["hold-1"], "action": "category",
-                "category": "FOOD_AND_DRINK"})
+                "category": "FOOD_AND_DRINK"}))
         self.assertEqual(res["applied"], 1)
         r = self.conn.execute("SELECT owner_override, category_override "
                               "FROM transactions WHERE id='post-1'").fetchone()

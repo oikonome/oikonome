@@ -5,14 +5,15 @@
 // and by kind; "show older" pages by the last row's timestamp.
 // Mirrors the Activity card on webapp/src/pages/Settings.tsx (Users).
 import { FlashList } from "@shopify/flash-list";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useState } from "react";
 import { Pressable, StyleSheet, Text, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
+import { FailedLine, StaleLine } from "../components/loaded";
 import { HelpLink } from "../components/ui";
-import { errText, type ActivityPage } from "../lib/api";
+import { type ActivityPage } from "../lib/api";
+import { EMPTY_LINES, pagesAfter } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
 
@@ -36,13 +37,15 @@ export function when(iso: string): string {
 // one row of the log; memoised, so "show older" appending a page does
 // not repaint the pages already on screen
 const ActivityRow = memo(function ActivityRow({ at, who, summary, first }:
-    { at: string; who: string; summary: string; first: boolean }) {
+    { at: string; who: string | null; summary: string; first: boolean }) {
   return (
     <View style={[s.row, first && s.rowFirst]}>
       <Text style={s.mut}>{when(at)}</Text>
       <Text style={s.msg}>
-        <Text style={{ fontWeight: "600" }}>{who}</Text>
-        {" "}{summary}
+        {who ? (<>
+          <Text style={{ fontWeight: "600" }}>{who}</Text>
+          {" "}{summary}
+        </>) : summary.charAt(0).toUpperCase() + summary.slice(1)}
       </Text>
     </View>
   );
@@ -52,8 +55,16 @@ export default function Activity() {
   const { client } = useSession();
   const [who, setWho] = useState("");
   const [kind, setKind] = useState("");
-  const [pages, setPages] = useState<ActivityPage[]>([]);
+  const qc = useQueryClient();
   const [cursor, setCursor] = useState<string | null>(null);
+  // the filter the held pages answer; they stay on screen (dimmed) while
+  // another filter loads, and go only when its answer, or its failure,
+  // arrives
+  const filterKey = `${who}|${kind}`;
+  const [held, setHeld] = useState<{ key: string;
+    pages: { cursor: string | null; page: ActivityPage }[] }>(
+    // nothing held answers any filter yet
+    { key: "\u0000", pages: [] });
   const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
                         enabled: !!client });
   const params: Record<string, string> = {};
@@ -66,12 +77,21 @@ export default function Activity() {
     enabled: !!client,
     placeholderData: (prev) => prev,
   });
+  // dataUpdatedAt too: a refetch that answers the same log hands back the
+  // same object, and the pages it answers must still be taken as current
   useEffect(() => {
-    if (!query.data) return;
-    setPages((prev) => cursor ? [...prev, query.data] : [query.data]);
+    if (!query.data || query.isPlaceholderData) return;
+    const page = query.data;
+    setHeld((prev) => pagesAfter(prev, filterKey, cursor, page));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query.data]);
-  const reset = () => { setPages([]); setCursor(null); };
+  }, [query.data, query.dataUpdatedAt, query.isPlaceholderData]);
+  // a new filter starts from its first page; what is held stays up until
+  // that page answers
+  const reset = () => setCursor(null);
+  const current = held.key === filterKey;
+  // another filter's rows go once this one's read has failed
+  const pages = current || !query.isError ? held.pages.map((x) => x.page) : [];
+  const dimmed = !current || query.isPlaceholderData;
   const first = pages[0] ?? query.data;
   const rows = useMemo(() => pages.flatMap((p) => p.rows), [pages]);
   const last = pages[pages.length - 1];
@@ -80,15 +100,22 @@ export default function Activity() {
     : a.startsWith("script:") ? `the ${a.slice(7)} script` : a, [mine]);
   const actors = first?.actors ?? [];
   const kinds = first?.kinds ?? [];
+  // In a household of one every row would open with the same name, so the
+  // name goes (as on the web); a script's rows keep theirs
+  const members = useQuery({ queryKey: ["members"],
+    queryFn: () => client!.members(), enabled: !!client });
+  const solo = members.data?.users.length === 1;
   const renderRow = useCallback(({ item: r, index }:
       { item: ActivityPage["rows"][number]; index: number }) => (
-    <ActivityRow at={r.at} who={nameOf(r.actor)} summary={r.summary}
-                 first={index === 0} />),
-    [nameOf]);
+    <ActivityRow at={r.at}
+                 who={solo && !r.actor.startsWith("script:")
+                   ? null : nameOf(r.actor)}
+                 summary={r.summary} first={index === 0} />),
+    [nameOf, solo]);
 
   const header = (
     <>
-      <StaleBanner query={query} />
+      <StaleLine query={query} />
       <View style={{ paddingHorizontal: 12, paddingTop: 10, gap: 4 }}>
         <Text style={s.mut}>
           Who changed what, and when — categories, splits, notes, bills,
@@ -100,11 +127,12 @@ export default function Activity() {
       {query.isPending && rows.length === 0 && (
         <Text style={s.center}>Loading…</Text>)}
       {query.isError && rows.length === 0 && (
-        <Text style={s.center}>{errText(query.error)}</Text>)}
+        <FailedLine q={query} what="the activity log" />)}
       {actors.length > 1 && (
         <View style={s.filterRow}>
           {["", ...actors].map((a) => (
-            <Pressable key={a || "*"} style={[s.fchip, who === a && s.fchipOn]}
+            <Pressable accessibilityRole="button"
+                       key={a || "*"} style={[s.fchip, who === a && s.fchipOn]}
                        onPress={() => { setWho(a); reset(); }}>
               <Text style={{ color: who === a ? C.text : C.mut, fontSize: 12 }}>
                 {a ? nameOf(a) : "everyone"}</Text>
@@ -115,7 +143,8 @@ export default function Activity() {
       {rows.length > 0 || kind ? (
         <View style={[s.filterRow, { marginTop: 6 }]}>
           {["", ...kinds].map((k) => (
-            <Pressable key={k || "*"} style={[s.fchip, kind === k && s.fchipOn]}
+            <Pressable accessibilityRole="button"
+                       key={k || "*"} style={[s.fchip, kind === k && s.fchipOn]}
                        onPress={() => { setKind(k); reset(); }}>
               <Text style={{ color: kind === k ? C.text : C.mut, fontSize: 12 }}>
                 {k ? (KIND_LABEL[k] ?? k) : "everything"}</Text>
@@ -123,10 +152,14 @@ export default function Activity() {
           ))}
         </View>
       ) : null}
-      {!query.isPending && !query.isError && rows.length === 0 && (
+      {/* empty only from this filter's own answer; a filtered log that
+          answered empty says so, not that the log is */}
+      {current && !query.isPlaceholderData && !query.isError
+        && rows.length === 0 && (
         <Text style={s.center}>
-          Nothing yet — the first category you correct, note you leave or
-          bill you edit lands here, with your name on it.
+          {who || kind ? EMPTY_LINES.filtered
+            : "Nothing yet — the first category you correct, note you "
+              + "leave or bill you edit lands here, with your name on it."}
         </Text>
       )}
     </>
@@ -134,7 +167,7 @@ export default function Activity() {
   const footer = rows.length > 0 ? (
     <View style={s.rowLast}>
       {last?.more && last.next ? (
-        <Pressable style={s.more} disabled={query.isFetching}
+        <Pressable accessibilityRole="button" style={s.more} disabled={query.isFetching}
                    onPress={() => setCursor(last.next)}>
           <Text style={{ color: C.accent, fontSize: 13 }}>
             {query.isFetching ? "loading…" : "show older"}</Text>
@@ -147,18 +180,19 @@ export default function Activity() {
   // hundreds of lines, and only the visible ones are mounted
   return (
     <FlashList
-      style={s.wrap}
       data={rows}
       keyExtractor={(r) => r.id}
       renderItem={renderRow}
       extraData={mine}
+      style={dimmed && rows.length > 0 ? { ...s.wrap, opacity: 0.55 } : s.wrap}
       ListHeaderComponent={header}
       ListFooterComponent={footer}
       contentContainerStyle={{ paddingBottom: 24 }}
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                    progressBackgroundColor={C.card}
                                    onRefresh={() => { reset();
-                                                      query.refetch(); }} />}
+                                     return qc.invalidateQueries(
+                                       { queryKey: ["activity"] }); }} />}
     />
   );
 }

@@ -114,7 +114,57 @@ ACCOUNT_REFS = (
     # through the move's record, and to none once that record cannot say
     # which of two cards it meant
     ("account_sources", "account_id"),
+    # what the cash forecast said each night names the checking account it
+    # walked: a night left on the old id is graded against an account that
+    # no longer exists (specs/forecast-grading.md, "An account that moves").
+    # Its card shares are keyed by account id inside `pace`, carried by
+    # _carry_forecast_nights beside this list
+    ("forecast_nights", "checking_id"),
 )
+
+# Columns whose name says "account" but that do not hold accounts.id, and
+# why — the account-reference coverage test reads this beside ACCOUNT_REFS,
+# so a new column that does hold one cannot be left out by forgetting it.
+NOT_ACCOUNT_REFS = {
+    ("account_adoptions", "old_account_id"):
+        "the id the account stood under BEFORE a move: the record of the "
+        "move itself, which rewriting would erase",
+    ("amazon_orders", "account"):
+        "the store login the order was collected under, not an account row",
+    ("costco_receipts", "account"):
+        "the store membership the receipt was collected under, not an "
+        "account row",
+    ("forecast_nights", "start_checking"): "a balance, not an id",
+    ("plaid_link_sessions", "manage_accounts"): "a flag, not an id",
+}
+
+
+def _carry_forecast_nights(conn, old_id: str, new_id: str) -> None:
+    """Rename `old_id` inside the kept forecast nights' JSON. The one place a
+    night holds an account id there is `pace.shares`, the pace's spending
+    share per walked card keyed by card id ("checking" is a bucket, not an
+    id); the walks are per scenario and the inputs name a card by its name.
+    A share already on `new_id` (a merge of two copies of the same card) is
+    added to, so the shares still sum to one. Idempotent: a second run finds
+    no `old_id` key. `checking_id` itself is in ACCOUNT_REFS."""
+    conn.execute(
+        """UPDATE forecast_nights
+              SET pace = jsonb_set(pace, '{shares}',
+                    ((pace->'shares') - %(old)s::text) || jsonb_build_object(
+                      %(new)s::text,
+                      CASE WHEN jsonb_typeof(pace->'shares'->%(new)s::text)
+                                = 'number'
+                            AND jsonb_typeof(pace->'shares'->%(old)s::text)
+                                = 'number'
+                           THEN to_jsonb(
+                                  (pace->'shares'->>%(new)s::text)::numeric
+                                  + (pace->'shares'->>%(old)s::text)::numeric)
+                           ELSE COALESCE(pace->'shares'->%(new)s::text,
+                                         pace->'shares'->%(old)s::text)
+                      END))
+            WHERE jsonb_typeof(pace->'shares') = 'object'
+              AND pace->'shares' ? %(old)s::text""",
+        {"old": old_id, "new": new_id})
 
 
 def account_id_without_comma(aid: str) -> str:
@@ -520,6 +570,7 @@ def _rewrite_account_id(conn, old_id: str, new_id: str,
             conn.execute(
                 f"UPDATE {table} SET {col} = %s WHERE {col} = %s",
                 (new_id, old_id))
+        _carry_forecast_nights(conn, old_id, new_id)
         # a file row's note that a feed set its copy aside names the feed
         # account by id inside raw, where no foreign key reaches
         from .base import carry_stood_in_accounts
@@ -2124,6 +2175,7 @@ def _move_account_children(conn, old_id: str, new_id: str) -> None:
     for table, col in ACCOUNT_REFS:
         conn.execute(f"UPDATE {table} SET {col} = %s WHERE {col} = %s",
                      (new_id, old_id))
+    _carry_forecast_nights(conn, old_id, new_id)
     from .base import carry_stood_in_accounts
     carry_stood_in_accounts(conn, old_id, new_id)
 

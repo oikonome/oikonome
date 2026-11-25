@@ -339,3 +339,45 @@ class TextDaysLeftIsTheRatesSpanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlanVersusNowDecidedInCentsTests(unittest.TestCase):
+    """The plan-vs-now note decides its direction in cents and prints both
+    figures floored. September 2026 has 30 days; a $500 budget is a
+    $16.67/day plan, which prints as $16 — never rounded to $17."""
+
+    def _food(self, today, before, spent_today=0.0):
+        rows = []
+        if before:
+            rows.append({"date": today.replace(day=1), "amount": before})
+        if spent_today:
+            rows.append({"date": today, "amount": spent_today})
+        d = {"verdict": "ON BUDGET", "variance": 0, "reasons": [],
+             "today": today, "days_in_month": 30,
+             "buckets": {
+                 "food": {"month_budget": 500.0,
+                          "actual": before + spent_today, "rows": rows},
+                 "other": {"month_budget": 900.0, "actual": 0.0,
+                           "rows": []}}}
+        return dict(todayview.allowances(d)[2])["Food"]
+
+    def test_an_on_plan_first_day_carries_no_note(self):
+        food = self._food(dt.date(2026, 9, 1), 0.0)
+        self.assertAlmostEqual(food["rate"], 500.0 / 30, 3)
+        self.assertIsNone(food["daily_note"])
+        self.assertIsNone(food["daily_note_tone"])
+        self.assertIsNone(food["recover_note"])
+
+    def test_slightly_under_pace_is_raised_not_reduced(self):
+        # day 11: $140 through yesterday (pace says $166.67) leaves $360
+        # over 20 days = $18/day against a $16.67 plan
+        food = self._food(dt.date(2026, 9, 11), 140.0)
+        self.assertEqual(food["daily_note"], "daily raised from $16 to $18")
+        self.assertEqual(food["daily_note_tone"], "pos")
+
+    def test_the_recovery_sentence_says_the_floored_plan(self):
+        # day 11: $300 through yesterday leaves $200 over 20 days = $10
+        food = self._food(dt.date(2026, 9, 11), 300.0)
+        self.assertEqual(food["daily_note"], "daily reduced from $16 to $10")
+        self.assertIn("$16", food["recover_note"])
+        self.assertNotIn("$17", food["recover_note"])

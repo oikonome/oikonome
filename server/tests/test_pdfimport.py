@@ -885,10 +885,16 @@ class ExpansionLimitTests(unittest.TestCase):
         import re as re_
         pyproject = (pathlib.Path(__file__).resolve().parents[1]
                      / "pyproject.toml").read_text()
-        m = re_.search(r'"pypdf>=([0-9.]+)"', pyproject)
+        m = re_.search(r'"pypdf>=([0-9.]+),<([0-9]+)"', pyproject)
         self.assertIsNotNone(m)
         floor = tuple(int(x) for x in m.group(1).split("."))
         self.assertGreaterEqual(floor + (0,) * (3 - len(floor)), (6, 11, 0))
+        # and a ceiling: a later major line renamed a limit the sandbox
+        # lowers at import (reading the old name raises), so an image built
+        # the day it was released could read no PDF at all. The ceiling
+        # moves only together with the names in pdf_sandbox.DECODER_LIMITS.
+        import pypdf
+        self.assertLess(int(pypdf.__version__.split(".")[0]), int(m.group(2)))
 
 
 # ---- end-to-end import (DB) -------------------------------------------------
@@ -1152,7 +1158,8 @@ class ImportPdfTests(unittest.TestCase):
             "SELECT COUNT(*) AS n FROM transactions WHERE id LIKE 'pdf:%'"
         ).fetchone()["n"]
         self.assertEqual(n, 5)
-        self.assertEqual(r2["imported"], 5)      # upsert, not duplicates
+        # the second import added nothing: every line was stored
+        self.assertEqual((r2["imported"], r2["matched"]), (0, 5))
 
     def test_card_import_flow_categories(self):
         r = pdfimport.import_pdf(self.conn, "card", make_pdf(CARD_TEXT),

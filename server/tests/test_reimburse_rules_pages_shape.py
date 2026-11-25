@@ -33,14 +33,17 @@ class ReimburseShapeTests(unittest.TestCase):
     def test_each_charge_says_how_long_it_has_waited(self):
         """The fact that turns a list into a to-do — derivable from the date
         column, and useless until it is stated."""
-        self.assertIn("function waited(", self.src)
-        self.assertIn("waitedLabel(t.date)", self.src)
+        # stated in the server's words, counted in the household's days
+        # (data.waited_label), not from the browser's clock
+        self.assertIn("{t.waited_label}", self.src)
+        self.assertNotIn("Date.now()", self.src)
 
     def test_the_title_is_not_repeated_as_a_card_heading(self):
         self.assertNotIn("Awaiting reimbursement", self.src,
                          "the h1 and the card h2 must not say the same thing")
         self.assertIn("<h1>Reimbursements</h1>", self.src)
-        self.assertEqual(1, self.src.count("<h1>"))
+        # once on the page, once on the page that failed to load
+        self.assertEqual(2, self.src.count("<h1>"))
 
     def test_partial_is_progress_not_permanent_form_controls(self):
         self.assertIn("got {money(got)} of {money(expect)}", self.src)
@@ -66,9 +69,11 @@ class ReimburseShapeTests(unittest.TestCase):
         """A partial expectation (the insurer's share) is what is owed, as
         the Today strip and the email say; summing the charges' face value
         overstated it and then dropped straight to zero when the expected
-        amount arrived and cleared the flag."""
-        self.assertIn("const owed = reimbOwed(pending)", self.src)
+        amount arrived and cleared the flag. The page prints the server's
+        figure (alerts.reimb_owed), the one the strip and the email state."""
+        self.assertIn("const owed = q.data.owed", self.src)
         self.assertNotIn("a + Math.abs(t.amount)", self.src)
+        self.assertNotIn("reimbOwed", self.src)
 
     def test_a_failed_link_keeps_the_matcher_open(self):
         """A failed link must not close the matcher and throw away the
@@ -88,8 +93,11 @@ class RulesShapeTests(unittest.TestCase):
             self.skipTest("webapp/ not present")
 
     def test_the_hero_states_the_count_and_its_provenance_split(self):
-        self.assertIn("rule{total === 1", self.src)
-        self.assertIn("yours ·", self.src)
+        self.assertIn("rule${total === 1", self.src)
+        # an unread count is the unknown mark, never "0 rules"
+        self.assertIn("`${UNKNOWN_FIGURE} rules`", self.src)
+        # the provenance split is the server's phrase (counts_text)
+        self.assertIn("userQ.data.counts_text", self.src)
         self.assertIn("built-in", self.src)
 
     def test_search_sits_above_the_groups_it_filters(self):
@@ -111,7 +119,7 @@ class RulesShapeTests(unittest.TestCase):
         self.assertIn("{r.disabled ? \"—\" : r.count}", self.src)
 
     def test_each_group_carries_its_own_explanation(self):
-        self.assertIn("inferred by the local model; correcting one makes it yours",
+        self.assertIn("classified by an AI endpoint; correcting one makes it yours",
                       self.src)
         self.assertIn("shipped starting points", self.src)
 
@@ -153,12 +161,17 @@ class ReimburseMatcherHonestyTests(unittest.TestCase):
     def test_the_running_total_counts_ticks_the_filter_hides(self):
         """A filter change swaps the visible rows but not the selection; a
         total summed from the visible rows left a hidden tick out of
-        "selected $X" while the button still linked it."""
-        self.assertIn("useState<Map<string, number>>", self.src)
-        self.assertIn("[...picked.values()].reduce(", self.src)
+        "selected $X" while the button still linked it. The line is the
+        server's, asked of every ticked id — the ones Pair sends — once
+        the ticking pauses."""
+        self.assertIn("useState<Set<string>>", self.src)
+        self.assertIn("setPickedSettled(picked)", self.src)
+        self.assertIn("const pickedIds = [...settled].sort()", self.src)
+        self.assertIn("api.reimbSelection(anchor.id, pickedIds, partial)",
+                      self.src)
         self.assertNotIn("filter((c) => picked.has(c.id))", self.src)
         self.assertIn("hidden by the filter", self.src)
-        self.assertIn("ids: [...picked.keys()]", self.src)
+        self.assertIn("ids: [...picked], partial", self.src)
 
     def test_each_candidate_names_its_account_and_pending_state(self):
         """Candidates span every checking and savings account plus the

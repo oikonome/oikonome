@@ -222,6 +222,9 @@ class SimplefinRedactionTests(unittest.TestCase):
         _ensure_db()
         from .util import make_db
         conn = make_db()
+        # a pooled checkout: left open it starves whichever test next
+        # drains the tenant pool
+        self.addCleanup(conn.close)
         from oikonome.sync import base
         base.upsert_item(conn, "sf-item", "simplefin-org", "SimpleFIN", "tok")
         base.log_sync(conn, "sf-item", 0,

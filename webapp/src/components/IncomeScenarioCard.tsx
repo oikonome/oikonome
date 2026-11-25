@@ -1,9 +1,11 @@
+import { Link } from "react-router";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { api, errText, money, type Settings as SettingsData } from "../api/client";
 import { SETTINGS_SAVES, saveSettings } from "../api/cache";
-import { mergeIncomeScenarios, takeHomeOf, type ScenarioDraft }
+import { mergeIncomeScenarios, type ScenarioDraft }
   from "../incomescenarios";
+import Note from "./Note";
 
 // Named take-home scenarios. The active one caps the paycheck the cash
 // forecast walks in; converted to a monthly figure it is the plan's income
@@ -23,6 +25,9 @@ export default function IncomeScenarioCard({ data, onSaved }: {
   // the copy this card was seeded from: the merge base at save time
   const baseline = useRef(data.income_scenarios ?? []);
   const baseActive = useRef(data.active_scenario ?? "");
+  // what is saved now: the one "Active now" speaks for
+  const [saved, setSaved] = useState({
+    list: data.income_scenarios ?? [], active: data.active_scenario ?? "" });
   const qc = useQueryClient();
   const save = useMutation({
     scope: SETTINGS_SAVES,
@@ -39,7 +44,7 @@ export default function IncomeScenarioCard({ data, onSaved }: {
       // the server keeps whichever one is live now
       if (active !== baseActive.current) body.active_scenario = active;
       // seeds ["settings"] with the returned view as the response lands
-      return saveSettings(qc, body);
+      return saveSettings(qc, body, cur);
     },
     onSuccess: (v) => {
       // the saved view is the new merge base, and the card shows what was
@@ -47,6 +52,7 @@ export default function IncomeScenarioCard({ data, onSaved }: {
       const scen = v.income_scenarios ?? [];
       baseline.current = scen;
       baseActive.current = v.active_scenario ?? "";
+      setSaved({ list: scen, active: v.active_scenario ?? "" });
       setRows(scen.map((x) => ({
         name: x.name, take_home: String(x.take_home), cadence: x.cadence })));
       setActive(v.active_scenario ?? "");
@@ -57,39 +63,41 @@ export default function IncomeScenarioCard({ data, onSaved }: {
   const upd = (i: number, patch: Partial<Row>) =>
     setRows(rows.map(
       (r, j) => (j === i ? { ...r, ...patch, touched: true } : r)));
-  const activeRow = rows.find((r) => r.name === active) ?? rows[0];
-  const monthly = activeRow
-    ? takeHomeOf(activeRow.take_home) *
-      ({ weekly: 4, biweekly: 2, semimonthly: 2, monthly: 1 }[
-        activeRow.cadence] ?? 2)
-    : null;
+  // "Active now" is the SAVED active scenario's month, as the server
+  // converts it for the plan (each scenario's `monthly`); an unsaved edit
+  // changes nothing until it is saved, and a server without the figure
+  // gets no line rather than a second conversion worked out here
+  const live = saved.list.find((x) => x.name === saved.active);
   return (
     <div className="card">
       <h2>Income scenarios{" "}
         <span className="mut" style={{ fontSize: 13, fontWeight: 400 }}>
           — take-home per paycheck; the active one drives the cash forecast</span></h2>
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+      {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
       {rows.length > 0 && (
         <table style={{ marginBottom: ".5rem" }}>
           <thead><tr><th style={{ width: "1%" }}>Active</th><th>Name</th>
-            <th>Take-home</th><th>Cadence</th><th /></tr></thead>
+            <th>Take-home</th><th>Cadence</th>
+              <th><span className="sr-only">Actions</span></th></tr></thead>
           <tbody>
             {rows.map((r, i) => (
               <tr key={i}>
                 <td style={{ textAlign: "center" }}>
-                  <input type="radio" name="active-scenario"
+                  <input aria-label={`Active: ${r.name || "unnamed scenario"}`}
+                         type="radio" name="active-scenario"
                          checked={active === r.name}
                          onChange={() => setActive(r.name)} /></td>
-                <td><input value={r.name} placeholder="full salary"
+                <td><input aria-label="Scenario name" value={r.name} placeholder="full salary"
                            onChange={(e) => {
                              if (active === r.name) setActive(e.target.value);
                              upd(i, { name: e.target.value });
                            }} /></td>
-                <td><input inputMode="decimal" value={r.take_home}
+                <td><input aria-label={`${r.name || "Scenario"} take-home`}
+                           inputMode="decimal" value={r.take_home}
                            style={{ width: "6.5rem" }}
                            onChange={(e) => upd(i, { take_home: e.target.value })} /></td>
                 <td>
-                  <select value={r.cadence}
+                  <select aria-label={`${r.name || "Scenario"} cadence`} value={r.cadence}
                           onChange={(e) => upd(i, { cadence: e.target.value })}>
                     <option value="weekly">weekly</option>
                     <option value="biweekly">biweekly</option>
@@ -109,14 +117,12 @@ export default function IncomeScenarioCard({ data, onSaved }: {
                   touched: true }])}>
         Add scenario</button>
       <p className="mut" style={{ fontSize: 13 }}>
-        {monthly && Number.isFinite(monthly)
-          ? <>Active now: <b>{money(monthly)}/mo</b> ({activeRow!.name}). </>
+        {live?.monthly != null
+          ? <>Active now: <b>{money(live.monthly)}/mo</b> ({live.name}). </>
           : null}
-        Applies to the cash forecast and daily email: the paycheck it
-        describes is walked in at no more than its take-home. It sets the
-        plan's income only until a paycheck is tracked on Bills — from
-        then the plan counts this month's own checks. No scenarios →
-        the plan's own income figure is used.</p>
+        The active scenario caps that paycheck in the cash forecast and
+        daily email.{" "}
+        <Link to="/help?topic=budget">How this works</Link></p>
       <button className="pri" disabled={save.isPending}
               onClick={() => save.mutate()}>
         {save.isPending ? "saving…" : "Save income scenarios"}</button>

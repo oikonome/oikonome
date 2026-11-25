@@ -39,8 +39,15 @@ DATA_MAP = {
     "crypto_holdings": "crypto positions",
     "networth_recorded": "net-worth history (recorded points)",
     "networth_snapshot": "net-worth history (nightly snapshots)",
+    "forecast_nights": "the cash forecast as it stood each night — the "
+                       "balances it predicted 7 to 60 days ahead — so the "
+                       "app can show how close it landed",
     "income_annual": "yearly income summary",
     "income_documents": "income documents metadata (W-2s and the like)",
+    "income_uploads": "each stored tax or income document (kind, file "
+                      "name, when; one removed in the last 30 days)",
+    "income_upload_values": "the yearly figures each stored tax document "
+                            "wrote",
     "merchant_canonical": "merchant-name spelling variants → one name",
     "merchant_renames": "your merchant rename/merge history (the undo "
                         "journal behind the Merchants screen)",
@@ -373,6 +380,14 @@ def build_zip(conn, out=None, *,
                                 r["config"] = _scrub_snapshot(r.get("config"))
                             elif tbl in _RAW_ID_TABLES:
                                 r["raw"] = _plaid_scrub(r.get("raw"))
+                            elif tbl == "income_uploads":
+                                # a name stored whole by an older build
+                                # leaves with its SSN or EIN cut to the
+                                # last four, as every reader shows it
+                                from ..engine.taxdocs import _clean_filename
+                                if r.get("filename"):
+                                    r["filename"] = _clean_filename(
+                                        r["filename"])
                             if w is None:
                                 cols = [c for c in r.keys()
                                         if c not in drop]

@@ -1,17 +1,17 @@
 """The ledger row is ONE shape across server, web and mobile.
 
-specs/ledger-row.schema.json is the contract; scripts/gen-ledger-row-types.py
-writes the Txn type for both clients from it. Here: the generated files
-are current (a schema edit without a regenerate fails), and the API emits
-EXACTLY the schema's keys — a server field no client knows, or a client
-field the server never sends, is a failure. A field can otherwise escape
-both Txn types indefinitely without anything noticing."""
+The server's Txn model (web/schemas/ledger.py) is the contract; both
+clients' Txn type is generated from it with every other shape
+(scripts/gen-api-types.py), and the conformance hook checks each row a
+test receives. Here: both clients take Txn from the generated file and
+hand-write none, and the API emits EXACTLY the model's keys on every ledger
+surface — a server field no client knows, or a client field the server
+never sends, is a failure. The hook alone would let a key the model makes
+optional quietly go missing; this pins the full key set.
+"""
 
 import datetime as dt
-import json
 import pathlib
-import subprocess
-import sys
 import unittest
 import uuid
 
@@ -21,20 +21,20 @@ from oikonome.db import tenancy
 
 from .util import _ensure_db, add_txn, seed_accounts, write_config
 
+from oikonome.web.schemas.ledger import Txn
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-SCHEMA = json.loads((ROOT / "specs" / "ledger-row.schema.json").read_text())
+FIELDS = set(Txn.model_fields)
+REQUIRED = {n for n, f in Txn.model_fields.items() if f.is_required()
+            and f.annotation is not None
+            and "None" not in str(f.annotation)}
 
 
-class GeneratedTypesTests(unittest.TestCase):
-    def test_generated_ts_is_current(self):
-        r = subprocess.run([sys.executable, str(ROOT / "scripts" / "gen-ledger-row-types.py"),
-                            "--check"], capture_output=True, text=True)
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-
-    def test_both_clients_import_the_generated_type(self):
+class ClientsTakeTheGeneratedTxn(unittest.TestCase):
+    def test_both_clients_alias_the_generated_type(self):
         for f in ("webapp/src/api/client.ts", "mobile/src/lib/api.ts"):
             src = (ROOT / f).read_text(encoding="utf-8")
-            self.assertIn('from "./ledger-row.generated"', src, f)
+            self.assertIn('export type Txn = S["Txn"];', src, f)
             self.assertNotIn("export interface Txn {", src,
                              f"{f} must not hand-write Txn — it is generated")
 
@@ -63,13 +63,13 @@ class ApiShapeTests(unittest.TestCase):
             conn.close()
 
     def _check(self, row: dict, where: str, extras: set | None = None):
-        want = set(SCHEMA["properties"])
+        want = FIELDS
         got = set(row) - (extras or set())
         self.assertEqual(got - want, set(),
                          f"{where}: server sends fields the contract lacks")
         self.assertEqual(want - got, set(),
                          f"{where}: contract fields the server never sent")
-        for k in SCHEMA["required"]:
+        for k in REQUIRED:
             self.assertIsNotNone(row.get(k), f"{where}: {k} is required, got null")
 
     def test_month_search_and_today_rows_match_the_contract(self):

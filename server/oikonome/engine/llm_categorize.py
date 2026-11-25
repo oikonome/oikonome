@@ -201,6 +201,7 @@ ANTHROPIC_VERSION = "2023-06-01"
 # is only a ceiling, so it is lifted to leave the thinking room.
 ANTHROPIC_MIN_MAX_TOKENS = 4096
 
+from ..db import tenancy
 from .compat import jsonb as _jsonb
 from .categories import (
     FLOW_SQL as _FLOW_SQL,
@@ -540,6 +541,13 @@ def _backend(conn=None, role: str = "categorize") -> dict:
             # pass through decrypt unchanged)
             "extra_body": crypto.decrypt(conn, eb) if eb else "",
             "vision_model": "", "source": "tenant"})
+    from ..envnum import env_flag
+    if env_flag("OIKONOME_HOSTED"):
+        # the env endpoint is the operator's, answering with the operator's
+        # model; a household's stored vision model (which no hosted client
+        # shows) is not sent to it. Self-hosted, it still pairs with the
+        # bundled endpoint
+        return out
     return _with_cfg_vision(out)
 
 
@@ -1297,7 +1305,8 @@ def apply(conn, canon: str | None = None,
 
 
 def categorize_check_payee(conn, txn_id: str, payee: str, memo: str = "",
-                           transport=None) -> str | None:
+                           transport=None, *, classify: bool = True
+                           ) -> str | None:
     """Check-image parse → the transaction's category. A written check's
     ledger row is bank mechanics ("CHECK #1234" — skip_llm territory, no
     merchant to classify), but the payee read off the check's face IS the
@@ -1306,11 +1315,32 @@ def categorize_check_payee(conn, txn_id: str, payee: str, memo: str = "",
     resolution, unanimity gate) wins outright; otherwise one LLM
     classification is cached under the payee so the next check to the same
     payee is free. The write respects everything apply() respects — never
-    category_override, never flow rows, only generic aggregator buckets."""
+    category_override, never flow rows, only generic aggregator buckets —
+    except the one flow label a check carries before check_classify files
+    it (_CHECK_TRANSFER_SQL): an answer that lands just after a re-sync
+    re-stamped the row must still file it.
+
+    `classify=False` asks the rule cache only: check_classify re-derives
+    every stored answer on each pass, and a payee no model could place
+    must not be billed again every pass."""
     from . import merchant_seed
     payee = (payee or "").strip()
-    if (not payee or merchant_seed.flow_match(payee)
-            or merchant_seed.skip_llm(payee)):
+    flow = merchant_seed.flow_match(payee) if payee else None
+    if flow:
+        # an answer naming money moving (a transfer, a card or loan
+        # payment) takes the check out of spending, as a flow row no pass
+        # files under Checks again
+        cur = conn.execute(
+            f"""UPDATE transactions SET category_primary = %s,
+                       category_detailed = %s, category_source = 'flow'
+                 WHERE id = %s AND removed = 0
+                   AND (category_source IN ('check', 'check_own')
+                        OR {_CHECK_TRANSFER_SQL})""",
+            (flow[0], flow[1], txn_id))
+        # the reply names what the answer made of the check (so the toast
+        # says "a transfer", not "saved as a note") — only when it did
+        return flow[0] if cur.rowcount else None
+    if not payee or merchant_seed.skip_llm(payee):
         return None                       # flow strings stay flow_classify's
     txn = conn.execute(
         "SELECT amount FROM transactions WHERE id=%s AND removed=0",
@@ -1327,7 +1357,7 @@ def categorize_check_payee(conn, txn_id: str, payee: str, memo: str = "",
             HAVING COUNT(DISTINCT m.category_primary) = 1""",
         (canon,)).fetchone()
     cat = r["cat"] if r else None
-    if cat is None and configured(conn):
+    if cat is None and classify and configured(conn):
         try:
             # tenant CHAT backend (not the vision override the check parse
             # itself ran under) — this is a text classification
@@ -1354,10 +1384,16 @@ def categorize_check_payee(conn, txn_id: str, payee: str, memo: str = "",
     cur = conn.execute(f"""
         UPDATE transactions SET category_primary = %s, category_source = 'rule_llm'
         WHERE id = %s AND removed = 0 AND category_override IS NULL
-          AND COALESCE(raw #>> '{{personal_finance_category,primary}}',
-                       'OTHER') IN {_GENERIC_SQL}
-          -- FLOW-GUARD: an importer-assigned flow row stays a flow row
-          AND COALESCE(category_primary, '') NOT IN {_FLOW_SQL}""",
+          AND ((COALESCE(raw #>> '{{personal_finance_category,primary}}',
+                         'OTHER') IN {_GENERIC_SQL}
+                -- a check check_classify filed under Checks: its payee is
+                -- the one thing that can say more
+                OR category_source IN ('check', 'check_own'))
+               -- FLOW-GUARD: an importer-assigned flow row stays a flow row
+               AND COALESCE(category_primary, '') NOT IN {_FLOW_SQL}
+               -- ...save a check the aggregator re-stamped as a transfer
+               -- out, which check_classify would file under Checks anyway
+               OR {_CHECK_TRANSFER_SQL})""",
         (cat, txn_id))
     return cat if cur.rowcount else None
 
@@ -1572,6 +1608,167 @@ def mcc_classify(conn, stats: dict | None = None) -> int:
                 (m[0], m[1], r["id"], m[0])).rowcount
     if stats is not None:
         stats["mcc_classified"] = stats.get("mcc_classified", 0) + n
+    return n
+
+
+# The category a written check with nothing else to go on is filed under:
+# real spending, to someone the ledger does not know yet
+CHECKS = "Checks"
+
+# A written check whose working category is still the aggregator's own
+# word: money out, no person's word on it, and a transfer label (or none)
+# stamped by the feed or an importer. check_classify files exactly these
+# under CHECKS; categorize_check_payee may file them under a payee.
+_CHECK_TRANSFER_SQL = """(check_number IS NOT NULL AND amount > 0
+    AND category_override IS NULL AND override_source IS NULL
+    AND (COALESCE(category_primary, '') = ''
+         OR (category_primary = 'TRANSFER_OUT'
+             AND COALESCE(category_source, '') IN ('plaid', 'import', ''))))"""
+
+# A written check whose money landed in another of the household's own
+# accounts: a deposit of the same size there within CHECK_PAIR_DAYS either
+# side that the bank read as a transfer in (or, in an investment account, a
+# cash row with no category at all). Such a check funds the household's own
+# IRA or savings — a transfer, not spending. The deposit must be unclaimed:
+# no OTHER same-size outflow from another account sits in its window (an
+# online transfer to savings already pairs with its own transfer out, and
+# two same-size checks cannot both claim one deposit). Over `t`, the check.
+CHECK_PAIR_DAYS = 10
+_OWN_ACCOUNT_DEPOSIT_SQL = f"""EXISTS (
+    SELECT 1 FROM transactions o JOIN accounts oa ON oa.id = o.account_id
+     WHERE o.removed = 0 AND o.account_id <> t.account_id
+       AND o.amount = -t.amount
+       AND o.date BETWEEN t.date - {CHECK_PAIR_DAYS} AND t.date + {CHECK_PAIR_DAYS}
+       AND (COALESCE(o.category_override, o.category_primary, '') = 'TRANSFER_IN'
+            OR (oa.type = 'investment' AND o.category_override IS NULL
+                AND COALESCE(o.category_primary, '') = ''))
+       AND NOT EXISTS (
+           SELECT 1 FROM transactions x
+            WHERE x.removed = 0 AND x.id <> t.id
+              AND x.account_id <> o.account_id
+              AND x.amount = t.amount
+              AND x.date BETWEEN o.date - {CHECK_PAIR_DAYS}
+                             AND o.date + {CHECK_PAIR_DAYS}))"""
+
+# A check someone has answered ("paid to …") or whose image named a payee
+# is never re-read as a transfer: the person's word decides it.
+_CHECK_ANSWERED_SQL = """(EXISTS (SELECT 1 FROM transaction_notes tn
+                    WHERE tn.txn_id = t.id AND tn.note ~* '^paid to[[:space:]]+[^[:space:]]')
+     OR EXISTS (SELECT 1 FROM receipts rc
+                 WHERE rc.txn_id = t.id AND rc.kind = 'check'
+                   AND rc.status = 'parsed'
+                   AND NULLIF(rc.parsed->>'payee', '') IS NOT NULL))"""
+
+# A check's answer as the check-payee door writes it: the note's first
+# line, "paid to <payee>". The SQL twin is what needs_payee reads.
+_ANSWER_RE = re.compile(r"paid to\s+(\S.*)", re.IGNORECASE)
+ANSWER_NOTE_SQL = "^paid to[[:space:]]+[^[:space:]]"
+
+
+def answer_note(payee: str) -> str:
+    """The note line that records whom a check paid."""
+    return f"paid to {payee.strip()}"
+
+
+def with_answer(note: str | None, payee: str) -> str:
+    """`note` with `payee` as its answer line: a first line the door
+    itself wrote (exactly answer_note of the payee it names) is replaced,
+    so a wrong answer can be corrected; anything else — a person's own
+    "Paid to …" line included — is kept whole under the new answer."""
+    note = (note or "").strip()
+    first, _, rest = note.partition("\n")
+    old = answered_payee(first)
+    if old is None or first.strip() != answer_note(old):
+        rest = note
+    return "\n".join(x for x in (answer_note(payee), rest.strip()) if x)
+
+
+def answered_payee(note: str | None) -> str | None:
+    """Whom a check paid, read back from its note; None when the note is
+    not an answer."""
+    first = (note or "").strip().split("\n", 1)[0]
+    m = _ANSWER_RE.fullmatch(first.strip())
+    return m.group(1).strip() if m else None
+
+
+def check_classify(conn) -> int:
+    """A paper check the aggregator filed as a transfer out is spending.
+
+    A bank often reports a written check as TRANSFER_OUT at low confidence:
+    the money left, but nothing says to whom, so it counted nowhere and
+    the month read cheaper than it was. A check with money out, no
+    person's word on it (no override, no cleared override), whose working
+    category is still the aggregator's own TRANSFER_OUT (source plaid or
+    import) or none at all, is filed under CHECKS with category_source
+    'check' — spending by every predicate unchanged. A row any of our
+    rules moved (a flow rule, an own-transfer match, a merchant rule) is
+    left as it is; the aggregator's label stays in category_plaid. A check
+    into one of the household's own accounts (_OWN_ACCOUNT_DEPOSIT_SQL) is
+    a transfer instead — filed or not, it becomes a flow row. Runs
+    on every categorization pass, so a re-synced or restored row that
+    carries the transfer label again is filed again.
+
+    The category a check's answer gave is derived, not stored: a re-sync
+    re-stamps the row as a transfer, and a re-anchor carries the note but
+    not the category. So a check under Checks that has an answer — a
+    "paid to …" note, or a payee read off its image — is run through
+    categorize_check_payee again (rule cache only; no model call per pass).
+    specs/ledger-figures.md."""
+    # a check this pass read as a transfer into the household's own account
+    # ('check_own') goes back under Checks once that no longer holds — the
+    # deposit was claimed or removed, or someone answered the check
+    conn.execute(
+        f"""UPDATE transactions t
+              SET category_primary = %s, category_source = 'check'
+            WHERE t.removed = 0 AND t.category_source = 'check_own'
+              AND t.category_override IS NULL
+              AND (NOT {_OWN_ACCOUNT_DEPOSIT_SQL} OR {_CHECK_ANSWERED_SQL})""",
+        (CHECKS,))
+    # a check into the household's own account is a transfer — filed under
+    # Checks or not yet, it leaves spending, marked 'check_own' so the line
+    # above can undo it
+    conn.execute(
+        f"""UPDATE transactions t
+              SET category_primary = 'TRANSFER_OUT', category_detailed = NULL,
+                  category_source = 'check_own'
+            WHERE t.removed = 0
+              AND ({_CHECK_TRANSFER_SQL}
+                   OR (t.category_source = 'check'
+                       AND t.category_override IS NULL))
+              AND NOT {_CHECK_ANSWERED_SQL}
+              AND {_OWN_ACCOUNT_DEPOSIT_SQL}""")
+    n = conn.execute(
+        f"""UPDATE transactions
+              SET category_primary = %s, category_source = 'check'
+            WHERE removed = 0 AND {_CHECK_TRANSFER_SQL}""",
+        (CHECKS,)).rowcount
+    rows = conn.execute(
+        """SELECT t.id, tn.note,
+                  (SELECT NULLIF(rc.parsed->>'payee', '') FROM receipts rc
+                    WHERE rc.txn_id = t.id AND rc.kind = 'check'
+                      AND rc.status = 'parsed'
+                    ORDER BY rc.parsed_at DESC NULLS LAST LIMIT 1) AS image,
+                  (SELECT rc.parsed->>'memo' FROM receipts rc
+                    WHERE rc.txn_id = t.id AND rc.kind = 'check'
+                      AND rc.status = 'parsed'
+                    ORDER BY rc.parsed_at DESC NULLS LAST LIMIT 1) AS memo
+             FROM transactions t
+             LEFT JOIN transaction_notes tn ON tn.txn_id = t.id
+            WHERE t.removed = 0 AND t.category_source = 'check'
+              AND t.category_override IS NULL
+              AND (tn.note ~* %s
+                   OR EXISTS (SELECT 1 FROM receipts rc
+                               WHERE rc.txn_id = t.id AND rc.kind = 'check'
+                                 AND rc.status = 'parsed'
+                                 AND NULLIF(rc.parsed->>'payee', '')
+                                     IS NOT NULL))""",
+        (ANSWER_NOTE_SQL,)).fetchall()
+    for r in rows:
+        # the person's word first, then the image's reading
+        payee = answered_payee(r["note"]) or r["image"]
+        if payee:
+            categorize_check_payee(conn, r["id"], payee,
+                                   memo=r["memo"] or "", classify=False)
     return n
 
 
@@ -2322,6 +2519,7 @@ def categorize_new(conn, *, limit: int | None = SYNC_MERCHANT_LIMIT,
              "own_transfers": 0,
              "rows_updated": 0, "configured": bool(backend["url"])}
     flow_classify(conn, stats)                  # bank mechanics → flow
+    check_classify(conn)                        # a written check → spending
     own_transfer_classify(conn, stats)          # own-institution → transfer
     mcc_classify(conn, stats)                   # the merchant's own MCC next
     apply_seed(conn, stats)                     # deterministic rules next
@@ -2383,7 +2581,10 @@ def _match_guarded(conn, run_match, store: str) -> None:
         log.warning("sync-time %s match failed", store, exc_info=True)
 
 
-_AMAZON_LOCK = "hashtext('oikonome:amazon:' || current_setting('app.tenant_id'))"
+# each lock's key as text (what tenancy.release_lock takes) and as the
+# hash the lock is held under
+_AMAZON_KEY = "'oikonome:amazon:' || current_setting('app.tenant_id')"
+_AMAZON_LOCK = f"hashtext({_AMAZON_KEY})"
 
 # How long a waiting door (the nightly sweep) waits for a per-household LLM
 # lock before giving that household up for the night. The holder is usually
@@ -2402,16 +2603,20 @@ class LockBusy(RuntimeError):
     never run the guarded work without the lock."""
 
 
-def _take_lock(conn, key_sql: str, wait: bool) -> bool:
-    """Try the session advisory lock once, or, with `wait`, keep trying for
-    up to LOCK_WAIT_SECONDS and raise LockBusy if it never frees."""
+def _take_lock(conn, key_sql: str, wait: bool) -> str | None:
+    """Try the session advisory lock on the text key `key_sql` evaluates to
+    once, or, with `wait`, keep trying for up to LOCK_WAIT_SECONDS and
+    raise LockBusy if it never frees. Returns the key when held (computed
+    here, while the session can still answer: the release may run in a
+    transaction that has already failed), else None."""
     import time
     deadline = time.monotonic() + LOCK_WAIT_SECONDS
     while True:
-        got = conn.execute(
-            f"SELECT pg_try_advisory_lock({key_sql}) AS ok").fetchone()["ok"]
-        if got or not wait:
-            return bool(got)
+        r = tenancy.take_lock(
+            conn, f"SELECT k, pg_try_advisory_lock(hashtext(k)) AS ok"
+            f" FROM (SELECT {key_sql} AS k) s")
+        if r["ok"] or not wait:
+            return r["k"] if r["ok"] else None
         if time.monotonic() >= deadline:
             raise LockBusy(f"lock still held after {LOCK_WAIT_SECONDS:g}s")
         time.sleep(_LOCK_POLL_SECONDS)
@@ -2434,16 +2639,17 @@ def amazon_chain_lock(conn, *, wait: bool = False):
     reconciliation pass and must not silently skip), but only for
     LOCK_WAIT_SECONDS, then raises LockBusy. Session-level, so the
     finally-unlock matters on pooled connections."""
-    got = _take_lock(conn, _AMAZON_LOCK, wait)
+    key = _take_lock(conn, _AMAZON_KEY, wait)
     try:
-        yield got
+        yield key is not None
     finally:
-        if got:
-            conn.execute(f"SELECT pg_advisory_unlock({_AMAZON_LOCK})")
+        if key is not None:
+            # a failed unlock drops the connection, never pools it locked
+            tenancy.release_lock(conn, key)
 
 
-_MERCHANT_LOCK = \
-    "hashtext('oikonome:llmclassify:' || current_setting('app.tenant_id'))"
+_MERCHANT_KEY = "'oikonome:llmclassify:' || current_setting('app.tenant_id')"
+_MERCHANT_LOCK = f"hashtext({_MERCHANT_KEY})"
 
 
 @contextmanager
@@ -2463,12 +2669,12 @@ def merchant_classify_lock(conn, *, wait: bool = False):
     mop-up pass and must not silently skip), but only for
     LOCK_WAIT_SECONDS, then raises LockBusy. Session-level, so the
     finally-unlock matters on pooled connections."""
-    got = _take_lock(conn, _MERCHANT_LOCK, wait)
+    key = _take_lock(conn, _MERCHANT_KEY, wait)
     try:
-        yield got
+        yield key is not None
     finally:
-        if got:
-            conn.execute(f"SELECT pg_advisory_unlock({_MERCHANT_LOCK})")
+        if key is not None:
+            tenancy.release_lock(conn, key)
 
 
 def run(conn, *, limit: int | None = None, batch_size: int = BATCH_SIZE,
@@ -2490,6 +2696,7 @@ def run(conn, *, limit: int | None = None, batch_size: int = BATCH_SIZE,
              "configured": bool(backend["url"])}
     if not dry_run:
         flow_classify(conn, stats)              # bank mechanics → flow
+        check_classify(conn)                    # a written check → spending
         own_transfer_classify(conn, stats)      # own-institution → transfer
         mcc_classify(conn, stats)               # the merchant's own MCC next
         apply_seed(conn, stats)                 # deterministic rules next

@@ -160,8 +160,7 @@
   <div>
     <span class="sub" style="float:right;margin-left:.65rem;">
       <b class="{{ 'neg' if remaining < 0 else '' }}" style="{{ '' if remaining < 0 else 'color:var(--ink)' }};font-weight:600;">{{ money(remaining|abs) }}</b>
-      {{ 'over the' if remaining < 0 else 'of' }} {{ money(hero_budget) }}{{ '' if remaining < 0 else ' left' }}
-      · {{ day.days_left }} day{{ '' if day.days_left == 1 else 's' }}</span>
+      {{ day.month_words }}</span>
     <span class="{{ 'neg' if over else 'pos' }}" style="font-size:21px;font-weight:800;letter-spacing:-.01em;">
       {{ 'Over budget' if over else ('Under budget' if under else 'On budget') }}</span>
     {# pace carries the same good/bad color as the verdict word — it is
@@ -171,7 +170,7 @@
   <div style="clear:both;"></div>
   {# LEFT TO SPEND TODAY — the star: the only number that changes what
      you do today. Meter = today's allowance, table cells for mail. #}
-  <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin:1rem 0 .45rem;">Left to spend today</div>
+  <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin:1rem 0 .45rem;">{{ day.left_label }}</div>
   {# stacked full-width tiles: mail tables don't reflow, and three-across
      is exactly the phone squeeze test_grid_cards_stack_single_column
      exists to prevent #}
@@ -195,6 +194,17 @@
   {% else %}
   {% for label, a in day.allow_tiles %}
   {% set overT = a.left_today < -0.5 %}
+  {% if a.zero_day and not overT %}
+  {# nothing to hand out and nothing spent: ONE line — label, "$0 today"
+     and the notes — not a big zero over an empty bar. MIRRORS the folded
+     row on Today.tsx and the app. #}
+  <div style="margin-top:.7rem;font-size:13px;">
+    {% if a.to and (not email or app_base) %}<a href="{{ (app_base ~ '/app' ~ a.to) if email else ('/app' ~ a.to) }}" style="color:inherit;text-decoration:none;"><b>{{ label }}</b></a>{% else %}<b>{{ label }}</b>{% endif %}
+    <span class="sub"> $0 today</span>
+    {%- if a.daily_note %}<span class="sub"> · </span><span class="sub{{ ' ' + a.daily_note_tone if a.daily_note_tone else '' }}">{{ a.daily_note }}</span>{% endif %}
+    {%- if a.recover_note %}<span class="sub"> · {{ a.recover_note }}</span>{% endif %}
+  </div>
+  {% else %}
   {% set dfrac = (1 if a.spent_today > 0.005 else 0) if a.today_allowance <= 0 else [1, a.spent_today / a.today_allowance] | min %}
   {# map-style ROW; number stacks UNDER the label, left — the pane keeps
      one left-aligned anatomy, matching the simple face #}
@@ -203,11 +213,10 @@
     {% if a.to and (not email or app_base) %}<a href="{{ (app_base ~ '/app' ~ a.to) if email else ('/app' ~ a.to) }}" style="color:inherit;text-decoration:none;"><b>{{ label }}</b></a>{% else %}<b>{{ label }}</b>{% endif %}
     {# the number keeps the tiles' weight — the row layout is the map's,
        the number's prominence is the tiles' #}
-    <div class="{{ 'neg' if overT else '' }}" style="font-size:22px;font-weight:750;letter-spacing:-.015em;line-height:1.15;">{{ money([0, a.left_today] | max) }}</div>
-    <div class="sub" style="font-size:12px;">
-      {% if overT %}over today by <b class="neg">{{ money(-a.left_today) }}</b> · spent {{ money(a.spent_today) }} of {{ money(a.today_allowance) }}
-      {% elif a.spent_today > 0.005 %}of {{ money(a.today_allowance) }} today · spent {{ money(a.spent_today) }}
-      {% else %}of {{ money(a.today_allowance) }} today · nothing spent yet{% endif %}</div>
+    <div class="{{ 'neg' if overT else '' }}" style="font-size:22px;font-weight:750;letter-spacing:-.015em;line-height:1.15;">{{ money(a.left_dollars) }}</div>
+    {# the line under the figure, composed once (allowances: day_line) —
+       the page at every width and the app print the same words #}
+    <div class="sub{{ ' neg' if overT else '' }}" style="font-size:12px;">{{ a.day_line }}</div>
     {{ meter6((dfrac * 100) | round, none, overT, h=14, r=7) }}
     {% if a.daily_note %}
     {# tone class last so its color wins over .sub's mute. MIRRORS the
@@ -220,13 +229,14 @@
     <div class="sub" style="font-size:12px;margin-top:.1rem;">{{ a.recover_note }}</div>
     {% endif %}
   </div>
+  {% endif %}
   {% endfor %}
   {% endif %}
   {# PINNED BILLS — bills flagged "pin to Today" in their settings. MIRRORS
      the Pinned bills tiles on Today.tsx; sentences come composed from
      build_context (bill_cards), so the two surfaces cannot drift. #}
   {% if day.bill_cards %}
-  <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin:1rem 0 .45rem;">Pinned bills</div>
+  <div class="sub" style="letter-spacing:.08em;text-transform:uppercase;font-size:11.5px;margin:1rem 0 .45rem;">Pinned</div>
   {% for c in day.bill_cards %}
   {# map-style row; number under the label, left — the pane's one
      anatomy #}
@@ -261,15 +271,25 @@
     {% if email %}Link your checking account on the Accounts page to see cash ahead.
     {% else %}<a href="/accounts">Link your checking account on Accounts</a> to see cash ahead.{% endif %}
   </div>
+  {% elif cash and cash.state == 'ask' %}
+  <div class="sub" style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;">
+    {% if email %}{{ cash.text }}{% else %}<a href="/bills">{{ cash.text }}</a>{% endif %}
+  </div>
   {% elif cash and cash.state == 'critical' %}
+  {# the sentence is composed once (todayview.cash_sentence): the page,
+     the app and the plain text print the same words #}
   <div style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;color:var(--red);">
-    {% if cash.kind == 'today' %}Short <b>{{ money(cash.short) }}</b> today — checking doesn't cover cards &amp; bills before the next paycheck{% if cash.next_paycheck %} ({{ cash.next_paycheck|d }}){% endif %}. Cover it from savings{% if cash.slow_to is not none %}, or slow spending to <b>{{ money(cash.slow_to) }}/day</b>{% endif %}.
-    {% else %}Short <b>{{ money(cash.short) }}</b> by <b>{{ cash.by|d if cash.by else 'now' }}</b> — cover it from savings{% if cash.slow_to is not none %}, or slow spending to <b>{{ money(cash.slow_to) }}/day</b>{% endif %}.{% endif %}
+    {{ cash_notice.text }}
   </div>
   {% elif cash %}
   <div class="sub" style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;">
-    {% if cash.kind == 'forecast' %}Cash gets tight around {{ cash.low_date|d }} (low {{ money(cash.low) }}).
-    {% else %}Cash is tight — {{ money(cash.headroom) }} left after cards &amp; bills before the next paycheck{% if cash.next_paycheck %} ({{ cash.next_paycheck|d }}){% endif %}.{% endif %}
+    {{ cash_notice.text }}
+  </div>
+  {% elif cash_band %}
+  {# the heavier-month warning: quiet, only when the usual walk stays
+     above $0 and a heavier month does not (todayview.cash_band) #}
+  <div class="sub" style="margin-top:.6rem;border-top:1px solid var(--line);padding-top:.5rem;font-size:.85rem;">
+    {{ cash_band.text }}
   </div>
   {% endif %}
   {# the WHY, over-budget only — a good day is QUIET: merchant chips,
@@ -301,24 +321,29 @@
   {% endif %}
   {# "This month's plan" demoted to ONE flow line — monthly facts, not
      daily news; the Budget page owns the detail #}
-  {% if st.plan_surplus is not none and view == 'detail' %}
+  {% if st.plan_line and view == 'detail' %}
+  {# the terms in the whole dollars budget.plan_line rounded to the
+     printed excess, so the line adds up as printed #}
+  {% set pl = st.plan_line %}
   <div style="margin-top:.9rem;padding-top:.7rem;border-top:1px solid var(--line);font-size:13px;{% if not email %}display:flex;gap:.55rem;flex-wrap:wrap;align-items:baseline;{% endif %}">
     <span class="sub">Plan:</span>
-    <span class="sub"><b style="color:var(--ink);">{{ money(st.income) }}</b> in</span>
+    <span class="sub"><b style="color:var(--ink);">{{ money(pl.income) }}</b> in</span>
     <span style="color:var(--line);">&#8594;</span>
-    {# the bills the month is SCHEDULED to owe — the figure the variable
-       scale subtracted, so in → bills due → to spend balances. The fixed
-       bar keeps the cash basis (an early autopay of next month's bill is
-       cash gone here, but not this month's plan). #}
-    <span class="sub"><b style="color:var(--ink);">{{ money(st.scheduled_month if st.scheduled_month is defined else st.buckets.fixed.month_budget) }}</b> bills due</span>
+    {# the plan's own figures, every one on the basis the excess is
+       computed from — bills evened over the year, the budgets as set — so
+       in → bills → to spend → saved → excess adds up in every month. What
+       THIS month is scheduled to owe is the Bills bar's figure below. #}
+    <span class="sub"><b style="color:var(--ink);">{{ money(pl.bills) }}</b> {{ day.plan_bills_label }}</span>{% if day.bills_weight %} <span class="sub">({{ day.bills_weight }})</span>{% endif %}
     <span style="color:var(--line);">&#8594;</span>
-    <span class="sub"><b style="color:var(--ink);">{{ money(var_budget) }}</b> to spend</span>
+    <span class="sub"><b style="color:var(--ink);">{{ money(pl.to_spend) }}</b> to spend</span>
     <span style="color:var(--line);">&#8594;</span>
-    {% if st.savings_plan and st.savings_plan > 0.005 %}
-    <span class="sub"><b style="color:var(--ink);">{{ money(st.savings_plan) }}</b> saved</span>
+    {% if pl.saved is not none %}
+    <span class="sub"><b style="color:var(--ink);">{{ money(pl.saved) }}</b> saved</span>
     <span style="color:var(--line);">&#8594;</span>
     {% endif %}
-    <span class="sub"><b class="{{ 'pos' if st.plan_surplus >= 0 else 'neg' }}">{{ money(st.plan_surplus) }}</b> excess</span>
+    {# the excess in the Budget summary's words and tone (plan_excess_words) #}
+    {% set exw = day.plan_excess_words %}
+    <span class="sub"><b class="{{ exw.tone if exw else ('pos' if pl.excess >= 0 else 'neg') }}">{{ money(pl.excess) }}</b> {{ exw.text if exw else 'excess' }}</span>
     {# sweep goals sit beside the chain, not inside it — the sentence is
        composed once in build_context so no surface can drift #}
     {% if day.sweep_line %}<span class="sub">· {{ day.sweep_line }}</span>{% endif %}
@@ -350,16 +375,17 @@
       <span class="mut" style="font-size:13px;">plan {{ money(g.monthly_plan) }}/mo</span>
       <span class="mut" style="font-size:13px;margin-left:auto;">{% if g.needs_account %}match words need an account — pick one on the Budget page{% else %}plan only — set a destination account on the Budget page to track progress{% endif %}</span>
       {% else %}
-      {# open-ended goal (no target): "$X saved" + the measured rate —
-         never "of $0" (mirrors Today.tsx) #}
+      {# open-ended goal (no target): "$X saved" + what the last 3 months
+         saved — never "of $0" (mirrors Today.tsx) #}
       <span class="mut" style="font-size:13px;">{{ money(g.saved or 0) }}{% if g.target %} of {{ money(g.target) }}{% else %} saved{% endif %}{% if g.pct is not none %} ({{ g.pct }}%){% endif %}</span>
       <span class="mut" style="font-size:13px;margin-left:auto;">
-        {%- if not g.target %}{% if (g.rate_90d or 0) > 0 %}saving {{ money(g.rate_90d) }}/mo{% else %}no contributions in 90 days{% endif %}
+        {%- if not g.target %}{% if (g.saved_90d or 0) > 0 %}{{ money(g.saved_90d) }} in the last 3 months{% elif g.contributed_90d %}no net saving in the last 3 months{% else %}no contributions in 3 months{% endif %}
         {%- elif g.pct is not none and g.pct >= 100 %}funded ✓
         {%- elif g.on_pace is false %}<b class="neg">off pace for {{ g.target_date|d }}</b>
         {%- elif g.on_pace %}on pace for {{ g.target_date|d }}
         {%- elif g.eta %}~{{ g.eta|d }} at the current rate
-        {%- else %}no contributions in 90 days{% endif %}</span>
+        {%- elif g.contributed_90d %}no net saving in the last 3 months
+        {%- else %}no contributions in 3 months{% endif %}</span>
       {% endif %}
     </div>
     {% if not g.plan_only and g.target %}
@@ -410,9 +436,11 @@
   {% set gone = (st.overdue_unpaid or []) | selectattr(3) | list %}
   {% if map.folded or st.irregular_bills or st.overdue_unpaid %}
   <div class="sub" style="font-size:12px;margin-top:.5rem;">
+    {#- the page's two lines: the folded plan rows, then the
+        non-monthly bills (MoneyMap's footer, then Today's footnote) #}
     {%- if map.folded %}Also this month: {{ map.folded | join(' · ') }}{% endif %}
-    {%- if map.folded and st.irregular_bills %} · {% endif %}
-    {%- if st.irregular_bills %}non-monthly bills: {% for i in st.irregular_bills[:4] %}{{ i.payee }} <b>{{ money(i.amount) }}</b> ({{ i.label }}){{ ' · ' if not loop.last }}{% endfor %}{% endif %}
+    {%- if map.folded and st.irregular_bills %}<br>{% endif %}
+    {%- if st.irregular_bills %}Non-monthly bills this month: {% for i in st.irregular_bills[:4] %}{{ i.payee }} <b>{{ money(i.amount) }}</b> ({{ i.label }}){{ ' · ' if not loop.last }}{% endfor %}{% endif %}
     {%- if (map.folded or st.irregular_bills) and late %}<br>{% endif %}
     {%- if late %}Scheduled but not yet posted: {% for o in late[:4] %}{{ o[0] }} {{ money(o[1]) }} (due {{ o[2]|d }}){{ ', ' if not loop.last }}{% endfor %}{% endif %}
     {%- if (map.folded or st.irregular_bills or late) and gone %}<br>{% endif %}
@@ -432,7 +460,7 @@
   <h2 style="margin-top:0;">Cash timeline
     <span class="sub" style="font-weight:400;">
       {%- if fc %} recent activity &amp; next {{ fc.days }} days
-      {%- else %} ({{ st.yesterday|d }} – {{ st.today|d }} · variable spending {{ money(day.recent_var|map(attribute='amount')|sum) }}){% endif %}</span></h2>
+      {%- else %} ({{ st.yesterday|d }} – {{ st.today|d }} · variable spending {{ money(day.recent_var_total) }}){% endif %}</span></h2>
   {% if fc %}
   {# inline-block KPI tiles, not a flex row: Gmail strips flex-wrap and
      squeezes four tiles into unreadable slivers #}
@@ -441,101 +469,99 @@
       <div class="kpi sm {{ 'neg' if fc.checking < 0 else '' }}">{{ money(fc.checking) }}</div></div>
     <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">card debt</span>
       <div class="kpi sm">{{ money(fc.card_debt) }}</div></div>
-    {% if rw and rw.checking is not none and st.bills_remaining_month is not none %}
-    {# the month-end figure counts the paychecks still due as well as the
-       bills still due — bills alone reads as if the product forgot the
-       household's pay. Without an income series the tile says why (the
-       gathered `income_due_note`): nothing set up, income budgeted rather
-       than scheduled, or switched off — the figure stays cash. #}
+    {# paychecks still due, then the month-end balance: the same day the
+       timeline's month-end row ends the month on (todayview.month_end_left)
+       — after the bills and paychecks still due, the card autopays and
+       spending at today's pace. Without an income series the note says
+       why no paycheck is counted. #}
     {% if st.income_due_total is not none %}
     <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub" title="paychecks still due this month">paychecks still due</span>
       <div class="kpi sm pos">+{{ money(st.income_due_total) }}</div>
       {% if st.income_due_dates %}<div class="sub" style="font-size:11px;">{% for x in st.income_due_dates[:3] %}{{ x|d }}{{ ", " if not loop.last }}{% endfor %}</div>{% endif %}</div>
-    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub" title="checking − card debt − bills still due this month + paychecks still due this month">after cards, bills &amp; paychecks</span>
-      <div class="kpi sm {{ 'pos' if rw.checking - rw.card_debt - st.bills_remaining_month + st.income_due_total >= 0 else 'neg' }}">{{ money(rw.checking - rw.card_debt - st.bills_remaining_month + st.income_due_total) }}</div></div>
-    {% else %}
-    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub" title="checking − card debt − bills still due this month">after cards &amp; bills</span>
-      <div class="kpi sm {{ 'pos' if rw.checking - rw.card_debt - st.bills_remaining_month >= 0 else 'neg' }}">{{ money(rw.checking - rw.card_debt - st.bills_remaining_month) }}</div>
-      <div class="sub" style="font-size:11px;">{{ no_paycheck_note(st) }}</div></div>
     {% endif %}
+    {% if month_end %}
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">{{ month_end_label }}</span>
+      <div class="kpi sm {{ 'pos' if month_end.balance >= 0 else 'neg' }}">{{ money(month_end.balance) }}</div>
+      <div class="sub" style="font-size:11px;">{{ month_end_note }}</div>
+      {% if month_end_cards_note %}<div class="sub" style="font-size:11px;">{{ month_end_cards_note }}</div>{% endif %}</div>
     {% endif %}
-    {% if fc_lows_converged %}
-    {% set l0 = fc_lows[0] %}
-    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">low point</span>
-      <div class="kpi sm {{ 'neg' if l0.min < 0 else '' }}">{{ money(l0.min) }} <span class="sub">{{ l0.min_date|d }}</span></div>
-      {% set negs = fc_lows | selectattr('negative_date') | list %}
-      {% if negs %}
-      {% set negdates = negs | map(attribute='negative_date') | unique | list %}
-      <div class="sub" style="font-size:11px;">
-        {%- if negdates | length == 1 %}negative from {{ negdates[0]|d }}
-        {%- else %}negative from:
-        {% for l in negs %}{{ l.short }} {{ l.negative_date|d }}{{ " · " if not loop.last }}{% endfor %}
-        {%- endif %}</div>
-      {% endif %}
-    </div>
-    {% else %}
+    {# each card scenario's low point, side by side in the server's words
+       (todayview.low_words): your usual, pay all cards now, pay on the
+       due date #}
     {% for l in fc_lows %}
-    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">low — {{ l.label }}</span>
-      <div class="kpi sm {{ 'neg' if l.min < 0 else '' }}">{{ money(l.min) }} <span class="sub">{{ l.min_date|d }}</span></div>
-      {% if l.negative_date %}
-      <div class="sub" style="font-size:11px;">negative from {{ l.negative_date|d }}</div>
-      {% endif %}
+    <div style="display:inline-block;vertical-align:top;margin:0 1.4rem .5rem 0;"><span class="sub">low — {{ l.label|lower }}</span>
+      <div class="kpi sm {{ 'neg' if l.min < 0 else '' }}" style="font-size:14px;">{{ l.words }}</div>
+      {% if l.cards_note %}<div class="sub" style="font-size:11px;">{{ l.cards_note }}</div>{% endif %}
     </div>
     {% endfor %}
-    {% endif %}
   </div>
   {# the SVG chart is web-only — mail clients strip SVG. The email carries
      the same chart as a PNG (emailchart.render), inline in the message. #}
   {% if not email %}{{ fc_chart | safe }}
-  {% elif fc_email_chart %}<img src="{{ fc_email_chart }}" width="616" alt="Cash forecast chart: autopay statement balance and pay all cards now, next {{ fc.days }} days" style="display:block;width:100%;max-width:616px;height:auto;border:0;margin:10px 0 6px;">
+  {% elif fc_email_chart %}<img src="{{ fc_email_chart }}" width="616" alt="Cash forecast chart: your usual card payments and a heavier month, next {{ fc.days }} days" style="display:block;width:100%;max-width:616px;height:auto;border:0;margin:10px 0 6px;">
   {% endif %}
+  {# the one-offs the forecast's daily pace leaves out — the same
+     sentence the page and the app print under their charts #}
+  {% if pace_note %}<div class="sub" style="font-size:12px;margin-top:.3rem;">{{ pace_note }}</div>{% endif %}
+  {# the forecast's track record (todayview.score_sentences); the
+     "checks itself" note is the page's and the app's only #}
+  {% if forecast_score and forecast_score.text %}<div class="sub" style="font-size:12px;margin-top:.3rem;">{{ forecast_score.text }}</div>{% endif %}
+  {% if forecast_score and forecast_score.bias_text %}<div class="sub" style="font-size:12px;margin-top:.3rem;">{{ forecast_score.bias_text }}</div>{% endif %}
+  {% if card_timing_note %}<div class="sub" style="font-size:12px;margin-top:.3rem;">{{ card_timing_note }}</div>{% endif %}
+  {# own-account transfers the forecast leaves out (todayview.transfers_note) #}
+  {# a paycheck the forecast leaves out because it stopped arriving #}
+  {% if stopped_paychecks_note %}<div class="sub" style="font-size:12px;margin-top:.3rem;">{{ stopped_paychecks_note }}</div>{% endif %}
+  {% if transfers_note %}<div class="sub" style="font-size:12px;margin-top:.3rem;">{{ transfers_note }}</div>{% endif %}
+  {% if scenarios and scenarios[0].cards_note %}<div class="sub" style="font-size:12px;margin-top:.3rem;">{{ scenarios[0].cards_note }}</div>{% endif %}
   {% endif %}
   {# one chronological table: paid ✓ rows + recent transactions, the TODAY
      divider, then the scheduled events. transaction-table convention:
      amounts statement-signed — spending negative, money in
      positive+green; cents on transaction rows only. #}
-  {% set balcols = 1 if (fc_lows_converged or not fc) else 2 %}
+  {# no forecast = no balance to show: a Balance column of dots on every
+     row says nothing the set-your-balance prompt above does not, so it
+     appears only once there is a balance (MIRRORS Today.tsx) #}
+  {# one balance column: the usual walk's (the page and the app switch
+     scenarios; a mail cannot) #}
+  {% set balcols = 0 if not fc else 1 %}
   <table class="stack-m" style="margin-top:.6rem;"><thead><tr><th>Date</th><th>Event</th><th class="num">Amount</th>
     {% if balcols == 1 %}<th class="num">Balance</th>
-    {% else %}<th class="num hide-m">Pay cards now</th><th class="num">Autopay stmt</th>{% endif %}</tr></thead><tbody>
-  {% for d0, a, pyee, bn, bs in tl_past %}
+    {% endif %}</tr></thead><tbody>
+  {% for d0, a, pyee, bn, bs, card in tl_past %}
   <tr><td class="mut r2l" style="white-space:nowrap;width:1%;">{{ d0|d }}</td>
       <td class="mut r1l" style="{% if not email %}overflow:hidden;text-overflow:ellipsis;white-space:nowrap{% else %}word-break:break-word{% endif %};">{{ pyee }}</td>
       <td class="num r1r mut" style="white-space:nowrap;">{{ money(a) }}</td>
-      <td class="num r2r mut" style="white-space:nowrap;">·</td>
-      {% if balcols == 2 %}<td class="num mut hide-m" style="white-space:nowrap;">·</td>{% endif %}</tr>
+      {% if balcols %}<td class="num r2r mut" style="white-space:nowrap;">·</td>{% endif %}
+</tr>
   {% endfor %}
   {% for r in day.recent_var %}
   <tr><td class="mut r2l" style="white-space:nowrap;width:1%;">{{ r.date|d }}</td>
-      <td class="r1l" style="{% if not email %}overflow:hidden;text-overflow:ellipsis;white-space:nowrap{% else %}word-break:break-word{% endif %};">{% set s = day.summaries.get(r.txn_id) %}{% if s %}{{ r.payee }} — <i>{{ s }}</i>{% else %}{{ r.payee }}{% endif %}{% if r.pending %} <span class="pill m">pend</span>{% endif %} <span class="sub">· {{ r.category }}</span></td>
+      <td class="r1l" style="{% if not email %}overflow:hidden;text-overflow:ellipsis;white-space:nowrap{% else %}word-break:break-word{% endif %};">{% set s = day.summaries.get(r.txn_id) %}{% if s %}{{ r.payee }} — <i>{{ s }}</i>{% else %}{{ r.payee }}{% endif %}{% if r.pending %} <span class="pill m">pend</span>{% endif %} <span class="sub">· {{ r.category|cat }}</span></td>
       <td class="num r1r {{ 'pos' if r.amount < 0 else '' }}" style="white-space:nowrap;">{{ moneyc(-r.amount) }}</td>
-      <td class="num r2r mut" style="white-space:nowrap;">·</td>
-      {% if balcols == 2 %}<td class="num mut hide-m" style="white-space:nowrap;">·</td>{% endif %}</tr>
+      {% if balcols %}<td class="num r2r mut" style="white-space:nowrap;">·</td>{% endif %}
+</tr>
   {% endfor %}
   {% if fc %}
   <tr><td colspan="{{ 3 + balcols }}" style="border-bottom:1px solid var(--blue);padding:.3rem .55rem;">
       <b style="font-size:12px;color:var(--blue);">TODAY</b>
-      <span class="sub"> · checking {{ money(fc.checking) }} · recent variable spending {{ money(day.recent_var|map(attribute='amount')|sum) }}</span></td></tr>
-  {% for d0, a, pyee, bn, bs in tl_pre %}
+      <span class="sub"> · checking {{ money(fc.checking) }} · recent variable spending {{ money(day.recent_var_total) }}</span></td></tr>
+  {% for d0, a, pyee, bn, bs, card in tl_pre %}
   <tr><td class="mut r2l" style="white-space:nowrap;width:1%;">{{ d0|d }}</td>
       {# email: let a long payee WRAP. text-overflow:ellipsis needs a width
          a mail client won't compute, so nowrap pushes the row off the
          card on a phone. #}
-      <td class="r1l {{ 'mut' if bn is none else '' }}" style="{% if not email %}overflow:hidden;text-overflow:ellipsis;white-space:nowrap{% else %}word-break:break-word{% endif %};">{{ pyee }}</td>
-      <td class="num r1r {{ 'mut' if bn is none else ('pos' if a>0 else '') }}" style="white-space:nowrap;">{{ money(a) }}</td>
-      {% if balcols == 1 %}
-      <td class="num r2r {{ 'neg' if bs is not none and bs < 0 else 'mut' }}" style="white-space:nowrap;">{{ money(bs) if bs is not none else '·' }}</td>
-      {% else %}
-      <td class="num hide-m {{ 'neg' if bn is not none and bn < 0 else 'mut' }}" style="white-space:nowrap;">{{ money(bn) if bn is not none else '·' }}</td>
-      <td class="num r2r {{ 'neg' if bs is not none and bs < 0 else 'mut' }}" style="white-space:nowrap;">{{ money(bs) if bs is not none else '·' }}</td>
-      {% endif %}</tr>
+      <td class="r1l {{ 'mut' if bs is none or card else '' }}" style="{% if not email %}overflow:hidden;text-overflow:ellipsis;white-space:nowrap{% else %}word-break:break-word{% endif %};">{{ pyee }}</td>
+      {# the month-end row is a balance with no amount (todayview.month_end_left) #}
+      <td class="num r1r {{ 'mut' if bs is none or a is none or card else ('pos' if a>0 else '') }}" style="white-space:nowrap;">{{ money(a) if a is not none else '' }}</td>
+      <td class="num r2r {{ 'neg' if bs is not none and bs < 0 else 'mut' }}" style="white-space:nowrap;">{{ money(bs) if bs is not none else '·' }}</td></tr>
   {% endfor %}
   {% endif %}
   </tbody></table>
   {% if fc and tl_rest > 0 %}
   <div class="sub" style="font-size:12px;margin-top:.45rem;">
-    {%- if email %}+ {{ tl_rest }} more scheduled event{{ '' if tl_rest == 1 else 's' }} after the low point — open Oikonome for the full timeline
-    {%- else %}+ {{ tl_rest }} more scheduled event{{ '' if tl_rest == 1 else 's' }} after the low point{% endif %}</div>
+    {#- the count in the server's words (todayview.email_timeline) #}
+    {%- if email %}{{ tl_rest_words }} — open Oikonome for the full timeline
+    {%- else %}{{ tl_rest_words }}{% endif %}</div>
   {% endif %}
 </div>
 {% endif %}

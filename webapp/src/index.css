@@ -3,8 +3,21 @@
    shared with the Jinja shell (templates/base.html); SPA-only components
    (calendar, onboarding, matcher) are styled from the same tokens. */
 :root{--ink:#dbe3ea;--mut:#8b98a3;--line:#2a323d;--bg:#0f141a;--card:#1a212b;
-      --hover:#232c38;--green:#5cb56b;--amber:#f0b429;--red:#e0695d;--blue:#4f9bd6;
+      --hover:#1f2833;--green:#5cb56b;--amber:#f0b429;--red:#e0695d;--blue:#4f9bd6;
       --entity:#b79af0;
+      /* a field's edge: 3:1 against the card, the page and a hovered row
+         (WCAG 1.4.11), where --line is a divider and need not be */
+      --field-line:#6b7682;
+      /* status-pill text, one shade lighter than its hue, so it reads at
+         4.5:1 on the pill's own 16 % tint */
+      --pill-m:#9aa5af;--pill-b:#69aadc;--pill-r:#ec8277;
+      /* the amber notice's text (the light theme redefines it) */
+      --note-ink:#e6c874;
+      /* a destructive button's fill under a white label */
+      --danger:#b64438;
+      /* the fill under a white label (primary button, active nav item):
+         deeper than --blue, which white text cannot sit on legibly */
+      --btn:#1f66a8;
       --r:12px;--rs:8px;--header-bg:rgba(26,33,43,.86);
       --shadow:0 1px 2px rgba(0,0,0,.28),0 10px 28px -14px rgba(0,0,0,.55);
       /* without this the browser paints NATIVE controls light — select
@@ -16,16 +29,18 @@
    user hasn't pinned dark. The two blocks are intentionally identical. */
 :root[data-theme=light]{
       --ink:#1f2933;--mut:#5b6875;--line:#d8dfe6;--bg:#f2f5f7;--card:#ffffff;
-      --hover:#e7edf2;--green:#2f8f46;--amber:#a97b0d;--red:#c44b3e;--blue:#2673b8;
-      --entity:#6f47c4;
+      --hover:#e7edf2;--green:#287a3c;--amber:#89640b;--red:#b64438;--blue:#246eb1;
+      --entity:#6f47c4;--field-line:#7d8894;
+      --pill-m:var(--mut);--pill-b:var(--blue);--pill-r:var(--red);--note-ink:var(--amber);
       --header-bg:rgba(255,255,255,.86);
       --shadow:0 1px 2px rgba(15,23,32,.08),0 10px 28px -14px rgba(15,23,32,.25);
       color-scheme:light}
 @media (prefers-color-scheme: light){
   :root:not([data-theme=dark]){
       --ink:#1f2933;--mut:#5b6875;--line:#d8dfe6;--bg:#f2f5f7;--card:#ffffff;
-      --hover:#e7edf2;--green:#2f8f46;--amber:#a97b0d;--red:#c44b3e;--blue:#2673b8;
-      --entity:#6f47c4;
+      --hover:#e7edf2;--green:#287a3c;--amber:#89640b;--red:#b64438;--blue:#246eb1;
+      --entity:#6f47c4;--field-line:#7d8894;
+      --pill-m:var(--mut);--pill-b:var(--blue);--pill-r:var(--red);--note-ink:var(--amber);
       --header-bg:rgba(255,255,255,.86);
       --shadow:0 1px 2px rgba(15,23,32,.08),0 10px 28px -14px rgba(15,23,32,.25);
       color-scheme:light}
@@ -83,9 +98,24 @@ nav{display:flex;align-items:center;gap:.1rem;flex-wrap:wrap}
 nav a{color:var(--ink);text-decoration:none;padding:.38rem .68rem;border-radius:var(--rs);
       font-size:14px;white-space:nowrap;transition:background .15s}
 nav a:hover{background:var(--hover);text-decoration:none}
-nav a.on{background:var(--blue);color:#fff}
+nav a.on{background:var(--btn);color:#fff}
 .navsep{width:1px;height:1.05rem;background:var(--line);margin:0 .4rem;flex:0 0 auto}
-.rt{margin-left:auto;display:flex;gap:.4rem;align-items:center}
+.rt{margin-left:auto;display:flex;gap:.75rem;align-items:center}
+/* the header's round icon buttons (feedback, alerts, help, the account
+   initial) draw at 28px but answer a 40px tap: an invisible halo. The
+   cluster's gap is the halos' combined overhang (2 × 6px), so neighbouring
+   targets meet without overlapping. */
+.hdr-ic{position:relative}
+.hdr-ic::after{content:"";position:absolute;inset:-6px;border-radius:50%}
+/* the round ones are sized by min-width/min-height and centre their glyph
+   with flex, not a fixed 28px line height: wider text spacing or a larger
+   font grows the circle instead of clipping what is in it */
+.hdr-round{display:inline-flex;align-items:center;justify-content:center;
+  align-self:center;min-width:28px;min-height:28px;border-radius:50%;
+  border:1px solid var(--line);text-decoration:none;color:var(--blue)}
+/* the user menu's copies of Feedback and Help show only where the header
+   folds its icons away (the phone-width block below) */
+.usermenu-panel .um-fold{display:none}
 /* The drawer's chrome exists only below the breakpoint — above it the rail
    opens on hover and there is nothing to press or to close. Declared here
    rather than as a `display:none` inside the desktop query so the default
@@ -139,6 +169,23 @@ nav a.on{background:var(--blue);color:#fff}
                   padding:.24rem .6rem;border-radius:var(--rs);max-width:15ch;
                   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .usermenu>summary::-webkit-details-marker{display:none}
+/* phone width: the status, three round buttons and the name do not all
+   fit; the name gives way (the full address is the menu's first line) */
+@media (max-width:480px){
+  /* seven characters of an address read as a typo: at this width the
+     name is its initial in a round button, like its neighbours */
+  .usermenu>summary{max-width:none;min-width:28px;min-height:28px;padding:0;
+    display:flex;align-items:center;justify-content:center;border-radius:50%;
+    border:1px solid var(--line);font-size:13px;text-transform:uppercase}
+  .usermenu>summary .um-rest{display:none}
+  /* and the row still has to fit 320 px (400 % zoom of a 1280 px window)
+     without scrolling sideways: Feedback and Help fold into the user
+     menu, and the sync status may break over two short lines */
+  .hdr-fold{display:none}
+  .usermenu-panel .um-fold{display:block}
+  .topline .rt{flex:0 1 auto}
+  .rt>.syncchip{flex:0 1 auto;min-width:0;white-space:normal;line-height:1.15}
+}
 .usermenu>summary:hover{background:var(--hover);color:var(--ink)}
 .usermenu[open]>summary{background:var(--hover);color:var(--ink)}
 .usermenu-panel{position:absolute;right:0;top:calc(100% + .3rem);z-index:20;
@@ -166,10 +213,6 @@ h1{font-size:1.42rem;margin:.2rem 0 1rem;letter-spacing:-.015em}
 .lensctl{margin-left:auto;display:flex;gap:.4rem;align-items:center;flex-wrap:wrap}
 .lensctl>button{padding:.3rem .6rem;font-weight:700}
 .lensctl select{padding:.28rem .4rem;font-size:13px}
-.lenspick{display:inline-flex;border:1px solid var(--line);border-radius:var(--rs);overflow:hidden}
-.lenspick button{border:none;border-radius:0;padding:.34rem .72rem;font-size:13px;background:var(--card)}
-.lenspick button+button{border-left:1px solid var(--line)}
-.lenspick button.on{background:var(--blue);color:#fff}
 
 /* ==== year lens: 12-cell verdict grid ==== */
 .ygrid{display:grid;grid-template-columns:repeat(4,1fr);gap:.7rem;margin-top:1rem}
@@ -260,13 +303,18 @@ table select{padding:.15rem .3rem;font-size:12.5px}
 table .pill{font-size:11px;padding:.08rem .42rem;white-space:nowrap}
 
 .pill{display:inline-block;padding:.13rem .55rem;border-radius:999px;font-size:11.5px;font-weight:600;line-height:1.5}
-.pill.g{background:rgba(92,181,107,.16);color:var(--green)} .pill.a{background:rgba(240,180,41,.16);color:var(--amber)}
-.pill.r{background:rgba(224,105,93,.16);color:var(--red)} .pill.m{background:rgba(139,152,163,.16);color:var(--mut)}
-.pill.b{background:rgba(79,155,214,.16);color:var(--blue)}
+/* a pill's tint is laid over the card colour, not over whatever is under
+   it, so it reads the same on a card, on the page and on a hovered row
+   (each text shade is set at 4.5:1 on its tint over the card) */
+.pill.g{background:linear-gradient(rgba(92,181,107,.16),rgba(92,181,107,.16)),var(--card);color:var(--green)}
+.pill.a{background:linear-gradient(rgba(240,180,41,.16),rgba(240,180,41,.16)),var(--card);color:var(--amber)}
+.pill.r{background:linear-gradient(rgba(224,105,93,.16),rgba(224,105,93,.16)),var(--card);color:var(--pill-r)}
+.pill.m{background:linear-gradient(rgba(139,152,163,.16),rgba(139,152,163,.16)),var(--card);color:var(--pill-m)}
+.pill.b{background:linear-gradient(rgba(79,155,214,.16),rgba(79,155,214,.16)),var(--card);color:var(--pill-b)}
 /* a business ENTITY's own money (its account, or an assigned equity
    movement) — named after the business, in a hue no other pill uses,
    so it never reads as the blue Schedule C `biz` tag on a household row */
-.pill.e{background:rgba(160,120,220,.18);color:var(--entity)}
+.pill.e{background:linear-gradient(rgba(160,120,220,.18),rgba(160,120,220,.18)),var(--card);color:var(--entity)}
 /* the row detail (under ⋯): the aggregator's facts + the category's why */
 .txn-detail{padding:.2rem .1rem .55rem;font-size:12.5px}
 .txn-facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));gap:.3rem 1.2rem}
@@ -291,35 +339,97 @@ button,.btn{font:inherit;border:1px solid var(--line);background:var(--card);bor
      padding:.42rem .8rem;cursor:pointer;color:var(--ink);text-decoration:none;
      display:inline-block;
      transition:background .15s,border-color .15s,transform .06s}
-button:hover,.btn:hover{background:var(--hover);border-color:#3a4552;text-decoration:none}
-button:active,.btn:active{transform:translateY(1px)}
-button.pri,.btn.pri{background:var(--blue);color:#fff;border-color:var(--blue)}
-button.pri:hover,.btn.pri:hover{background:#5ea8e0;border-color:#5ea8e0}
-button:disabled{opacity:.55;cursor:default}
-input,select{font:inherit;border:1px solid var(--line);border-radius:var(--rs);padding:.4rem .6rem;
+/* :where() keeps these at the specificity of a bare button:hover, so a
+   component's own hover (.row-menu:hover, .linkish:hover) still wins — and
+   a disabled button no longer lights up under the pointer as if it would
+   do something */
+button:where(:not(:disabled)):hover,.btn:hover{background:var(--hover);border-color:#3a4552;text-decoration:none}
+button:where(:not(:disabled)):active,.btn:active{transform:translateY(1px)}
+/* Button hierarchy: .pri is a card's ONE main constructive action (save,
+   add, search, connect). A choice between options is a SegmentedControl,
+   never a row of .pri/plain buttons — the chosen option used to wear
+   exactly the fill of the action beside it. */
+button.pri,.btn.pri{background:var(--btn);color:#fff;border-color:var(--btn)}
+button.pri:where(:not(:disabled)):hover,.btn.pri:hover{background:#5ea8e0;border-color:#5ea8e0}
+button:disabled{opacity:.5;cursor:not-allowed}
+/* a disabled primary stops looking primary: a dimmed blue fill still read
+   as "press me", only fainter. Outlined, dashed and muted, it reads as
+   "not yet" in either theme. */
+button.pri:disabled{background:transparent;color:var(--mut);
+  border-color:var(--line);border-style:dashed;opacity:1}
+
+/* an on/off filter button: when on it wears the chosen-segment look
+   below, not the primary fill — it is a state, not an action */
+button.tgl[aria-pressed="true"]{background:var(--hover);color:var(--ink);
+  font-weight:650;border-color:color-mix(in srgb,var(--blue) 60%,var(--line))}
+
+/* ==== SegmentedControl (components/SegmentedControl.tsx) — the one
+   "pick one" control: timeframes, page tabs, views, methods. A sunken
+   track; the chosen segment is raised and outlined — deliberately NOT the
+   primary fill, so a choice never looks like the action next to it. One
+   row on a wide screen; at phone width it wraps (below). ==== */
+.segctl{display:inline-flex;flex-wrap:nowrap;gap:2px;padding:2px;
+  max-width:100%;min-width:0;overflow-x:auto;overscroll-behavior-x:contain;
+  scrollbar-width:none;vertical-align:middle;
+  border:1px solid var(--line);border-radius:999px;background:var(--bg)}
+.segctl::-webkit-scrollbar{display:none}
+/* options scrolled past an edge: that edge fades (SegmentedControl) */
+.segctl.more-r{-webkit-mask-image:linear-gradient(to right,#000 calc(100% - 2.2rem),transparent);
+  mask-image:linear-gradient(to right,#000 calc(100% - 2.2rem),transparent)}
+.segctl.more-l{-webkit-mask-image:linear-gradient(to left,#000 calc(100% - 2.2rem),transparent);
+  mask-image:linear-gradient(to left,#000 calc(100% - 2.2rem),transparent)}
+.segctl.more-l.more-r{-webkit-mask-image:linear-gradient(to right,transparent,#000 2.2rem,#000 calc(100% - 2.2rem),transparent);
+  mask-image:linear-gradient(to right,transparent,#000 2.2rem,#000 calc(100% - 2.2rem),transparent)}
+.segctl>button{flex:0 0 auto;white-space:nowrap;line-height:1.35;
+  min-height:0;min-width:0;padding:.3rem .85rem;font-size:13px;
+  border:1px solid transparent;border-radius:999px;background:none;
+  color:var(--mut)}
+.segctl>button:where(:not(:disabled)):hover{background:var(--hover);
+  color:var(--ink);border-color:transparent}
+.segctl>button.on,.segctl>button.on:hover{background:var(--card);
+  color:var(--ink);font-weight:650;
+  border-color:color-mix(in srgb,var(--blue) 60%,var(--line));
+  box-shadow:0 1px 2px rgba(0,0,0,.22)}
+.segctl>button:active{transform:none}
+/* a window longer than the data (it would equal All) */
+.segctl>button:disabled{opacity:.38;background:none}
+.segctl.sm>button{padding:.2rem .65rem;font-size:12.5px}
+input,select{font:inherit;border:1px solid var(--field-line);border-radius:var(--rs);padding:.4rem .6rem;
      background:var(--card);color:var(--ink);transition:border-color .15s,box-shadow .15s}
-input:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(79,155,214,.18);outline:none}
+/* a focused field draws a 2px outline beside its blue edge: the faint
+   ring alone measured under 3:1, so the colour change carried it all */
+input:focus,select:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(79,155,214,.18);
+  outline:2px solid var(--blue);outline-offset:1px}
 /* Chromium drops its color-scheme-dark popup rendering whenever the select
    itself carries an author background — even `transparent` (the table
    category dropdown) — and paints the options on white. Style the options
    explicitly so every popup follows the theme regardless of select styling. */
 select option,select optgroup{background:var(--card);color:var(--ink)}
-textarea{width:100%;font:13px ui-monospace,Menlo,monospace;border:1px solid var(--line);
+textarea{width:100%;font:13px ui-monospace,Menlo,monospace;border:1px solid var(--field-line);
      border-radius:var(--rs);padding:.7rem;background:var(--card);color:var(--ink)}
-textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(79,155,214,.18);outline:none}
+textarea:focus{border-color:var(--blue);box-shadow:0 0 0 3px rgba(79,155,214,.18);
+  outline:2px solid var(--blue);outline-offset:1px}
 input[type="file"]::file-selector-button{font:inherit;font-size:13px;border:1px solid var(--line);
      background:var(--hover);color:var(--ink);border-radius:var(--rs);
      padding:.25rem .7rem;margin-right:.6rem;cursor:pointer}
 
-.note{background:rgba(240,180,41,.10);border:1px solid rgba(240,180,41,.28);color:#e6c874;
+.note{background:rgba(240,180,41,.10);border:1px solid rgba(240,180,41,.28);color:var(--note-ink);
       border-radius:10px;padding:.55rem .75rem;font-size:13px;margin:.5rem 0;
       display:flex;gap:.5rem;align-items:baseline}
 .note.bad{border-color:rgba(224,105,93,.4);background:rgba(224,105,93,.1);color:var(--red)}
 .note.info{border-color:var(--line);background:var(--card);color:var(--mut)}
+.note.warn{border-color:rgba(240,180,41,.4);background:rgba(240,180,41,.1);color:var(--amber)}
 .note.good{border-color:rgba(92,181,107,.35);background:rgba(92,181,107,.1);color:var(--green)}
 .note .dismiss{background:none;border:none;color:inherit;cursor:pointer;
                font-size:1rem;padding:0 .2rem;opacity:.6}
 .note .dismiss:hover{opacity:1;background:none}
+/* the keyboard's way to close a banner or a card that closes on a click
+   anywhere on it (Note, the toast): out of sight and out of the layout
+   until it has focus, so a mouse user sees it exactly as before */
+.note-x{background:none;border:none;color:inherit;cursor:pointer;
+        font-size:1rem;padding:0 .2rem;margin-left:auto}
+.note-x:not(:focus){position:absolute;width:1px;height:1px;padding:0;
+        overflow:hidden;clip-path:inset(50%);white-space:nowrap}
 
 /* App-wide banners (demo countdown, operator broadcast, reboot countdown,
    bounced email, verify-your-address): siblings of <main> inside .shell,
@@ -329,6 +439,9 @@ input[type="file"]::file-selector-button{font:inherit;font-size:13px;border:1px 
 
 /* ==== charts (donut / ranked bars / axis) ==== */
 .ax{color:var(--mut);font-size:11px}
+/* a share bar squeezed between a category and three figures is a sliver
+   at a phone width; the percentage beside it says the same */
+@media (max-width:560px){td.c-sharebar{display:none}}
 .cgrid{stroke:var(--line)}
 .donut{display:flex;gap:1rem;align-items:center;flex-wrap:wrap}
 .dc-t{font-size:15px;font-weight:700;fill:var(--ink)} .dc-s{font-size:10px;fill:var(--mut)}
@@ -370,6 +483,8 @@ input[type="file"]::file-selector-button{font:inherit;font-size:13px;border:1px 
 .field-grid label{display:block;font-size:14px}
 .field-grid label input:not([type="checkbox"]),.field-grid label select{display:block;width:100%;margin-top:.25rem}
 .field-grid .check{display:flex;gap:.5rem;align-items:baseline}
+label.check>input[type="checkbox"]{margin-right:.4rem}
+.field-grid label.check>input[type="checkbox"]{margin-right:0}
 
 /* reimburse matcher */
 .matcher{padding:.4rem 0 .6rem}
@@ -381,13 +496,37 @@ input[type="file"]::file-selector-button{font:inherit;font-size:13px;border:1px 
           text-transform:uppercase;letter-spacing:.055em;font-weight:600}
 .cal-cell{min-height:4.2rem;background:var(--bg);border:1px solid var(--line);border-radius:6px;
           padding:.25rem .35rem;display:flex;flex-direction:column;gap:1px;overflow:hidden}
-.cal-cell.past{opacity:.35}
+/* a past day recedes by losing its fill and edge, not by fading its
+   number: at opacity .35 the date measured under 2:1 */
+.cal-cell.past{background:transparent;border-color:transparent}
 .cal-cell.today{outline:1px solid var(--blue)}
 .cal-day{font-size:11px;color:var(--mut)}
-.cal-amt{font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
+.cal-amt{white-space:nowrap;font-size:13px;font-weight:700;font-variant-numeric:tabular-nums}
 .cal-amt.out{color:var(--red)}
+/* a five-figure day still has to fit a seventh of a phone's width */
+@media (max-width:480px){.cal-amt{font-size:11px;letter-spacing:-.02em}}
 .cal-amt.in{color:var(--green)}
 .cal-label{font-size:10.5px;color:var(--mut);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* what an event's figure is ("full balance"): a line of its own under
+   the name, so the name's ellipsis never cuts it */
+.cal-note{display:block;font-size:10.5px;color:var(--mut);opacity:.85;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* phone: a seventh of the screen is four letters of a payee, which named
+   nothing (two lines broken anywhere read as fragments). The cells keep
+   the day's total only, and the short agenda under the grid names what
+   is due in the next two weeks. Desktop never shows the agenda. */
+.cal-agenda{display:none}
+@media (max-width:480px){
+  .cal-label{display:none}
+  .cal-cell{min-height:3rem}
+  .cal-agenda{display:block}
+  .cal-ag-day{display:grid;grid-template-columns:3.6rem minmax(0,1fr);
+    gap:.5rem;padding:.4rem 0;border-top:1px solid var(--line);font-size:13.5px}
+  .cal-ag-date{color:var(--mut);font-size:12.5px;white-space:nowrap}
+  .cal-ag-ev{display:flex;justify-content:space-between;gap:.6rem}
+  .cal-ag-name{min-width:0;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap}
+}
 
 /* onboarding checklist */
 .onboard-step{display:flex;gap:.8rem;align-items:flex-start;padding:.55rem 0;border-top:1px solid var(--line)}
@@ -397,6 +536,18 @@ input[type="file"]::file-selector-button{font:inherit;font-size:13px;border:1px 
 .onboard-mark.done{background:rgba(92,181,107,.18);color:var(--green)}
 .btn-link{align-self:center;white-space:nowrap;color:var(--blue);text-decoration:none}
 .btn-link:hover{text-decoration:underline}
+/* phone width: the step's link drops under its text instead of squeezing
+   the text into a column a few words wide */
+@media (max-width:600px){
+  .onboard-step{flex-wrap:wrap}
+  .onboard-step>.btn-link{flex-basis:100%;align-self:flex-start;
+    margin-left:2.4rem}
+  .wiz-pill{max-width:100%;overflow:hidden;text-overflow:ellipsis;
+    white-space:nowrap}
+  /* a table wider than its card scrolls inside it; the last cell keeps
+     a margin so it does not sit on the card's edge */
+  .card>table td:last-child,.card>table th:last-child{padding-right:.5rem}
+}
 
 /* ==== responsive ==== */
 @media(max-width:1100px){.hide-t{display:none!important}}
@@ -494,7 +645,20 @@ input[type="file"]::file-selector-button{font:inherit;font-size:13px;border:1px 
   th,td{padding:.42rem .45rem}
   /* touch targets + no iOS focus-zoom (16px inputs) */
   input,select{font-size:16px;padding:.55rem .6rem;min-height:2.6rem}
+  /* a tick box is not a text field: given a field's height it draws its
+     box at the top of a tall invisible area and its label lands a line
+     below it. The label around it is the touch target. */
+  input[type="checkbox"],input[type="radio"]{min-height:0;padding:0}
   button,.btn{padding:.55rem .8rem;min-height:2.6rem;min-width:2.6rem;font-size:15px}
+  /* segments: a fingertip each way (the touch-target rule below). The
+     eight timeframes and the alert filters are wider than a phone card:
+     scrolled, 5y / All and Dismissed sat past the edge with a sliver to
+     show for them, so at this width the track wraps and every option is
+     in view */
+  .segctl>button,.segctl.sm>button{padding:.3rem .6rem;font-size:13.5px}
+  .segctl,.segctl.more-l,.segctl.more-r,.segctl.more-l.more-r{
+    flex-wrap:wrap;overflow-x:visible;border-radius:15px;
+    -webkit-mask-image:none;mask-image:none}
   /* icon-only chrome that would otherwise measure under 32px */
   .note .dismiss{padding:0 .55rem;min-width:2.2rem;min-height:2.2rem}
   .lensctl>button{min-width:2.6rem}
@@ -526,8 +690,12 @@ input[type="file"]::file-selector-button{font:inherit;font-size:13px;border:1px 
      inputs are wider than a phone card — let them shrink instead of
      poking past the card's right edge */
   .daterange label{display:flex;align-items:center;gap:.3rem;
-      flex:1 1 0;min-width:0}
+      flex:1 1 40%;min-width:8.5rem}
   .daterange input[type=date]{width:100%;min-width:0}
+  /* the range buttons take a row of their own and wrap there: scrolled
+     inside the panel, 5y and All sat past its edge with no sign of them,
+     and the date boxes beside them collapsed to slivers */
+  .daterange .segctl{flex:1 1 100%;flex-wrap:wrap;border-radius:12px}
   /* budget planner category rows: the size=16 name input can't shrink, so
      the row's min-content width pushed the whole Money-out panel past the
      phone viewport (amount inputs painted off-screen). Let the name flex. */
@@ -575,6 +743,7 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
 /* a second section only exists in search results, where it needs the air */
 .sgrp + .sgrp h2.ssec{margin-top:1.8rem}
 .sgrp > div > .card{margin-top:1rem}
+.setnav-chev{display:none}
 
 @media(max-width:760px){
   /* two panes become two screens — see Settings.tsx, which renders one or
@@ -585,6 +754,9 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
     border-radius:0}
   .setnav a:last-child{border-bottom:0}
   .setnav-l{font-size:15px}
+  .setnav a{position:relative;padding-right:1.8rem}
+  .setnav-chev{display:block;position:absolute;right:.6rem;top:50%;
+    transform:translateY(-50%);color:var(--mut);font-size:18px;line-height:1}
 }
 
 /* ==== connect hub: the linked-bank rows (setup step 1 + Accounts) ==== */
@@ -592,16 +764,19 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
 .linked-hdr{display:flex;align-items:baseline;gap:.6rem;margin-bottom:.4rem}
 .linked-hdr b{font-size:14px}
 .linked-rows{border:1px solid var(--line);border-radius:var(--rs);overflow:hidden}
-.linked-row{display:flex;align-items:center;gap:.8rem;padding:.55rem .8rem;
-  border-top:1px solid var(--line);background:var(--card)}
+/* the row wraps and its buttons never break mid-word: at a phone width
+   "Disconnect" otherwise folds to three letters a line beside the name */
+.linked-row{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem .8rem;
+  padding:.55rem .8rem;border-top:1px solid var(--line);background:var(--card)}
 .linked-row:first-child{border-top:0}
 .linked-dot{width:9px;height:9px;border-radius:50%;background:var(--green);flex:none;
   box-shadow:0 0 0 3px color-mix(in srgb,var(--green) 18%,transparent)}
 .linked-dot.bad{background:var(--red);box-shadow:0 0 0 3px color-mix(in srgb,var(--red) 18%,transparent)}
-.linked-name{font-weight:600;flex:1 1 auto;min-width:0}
+.linked-name{font-weight:600;flex:1 1 11rem;min-width:0}
 .linked-name small{display:block;font-weight:400;color:var(--mut);font-size:12.5px}
 .linked-x{background:transparent;border:1px solid var(--line);color:var(--mut);
-  border-radius:var(--rs);padding:.25rem .6rem;font-size:12px;cursor:pointer}
+  border-radius:var(--rs);padding:.25rem .6rem;font-size:12px;cursor:pointer;
+  white-space:nowrap;flex:none}
 .linked-x:hover{color:var(--ink);border-color:var(--mut)}
 
 /* ==== setup wizard step 2: the history-import bar. Determinate fill (how
@@ -628,12 +803,16 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   border-radius:3px;background:var(--blue);
   animation:rcpt-slide 1.2s ease-in-out infinite}
 @keyframes rcpt-slide{0%{left:-35%}100%{left:100%}}
+/* reduced motion: the bar stays, full and still, so it still says "working" */
+@media (prefers-reduced-motion:reduce){
+  .rcpt-progress span{animation:none;left:0;width:100%;opacity:.5}}
 
 /* ==== ledger row chrome ==================================
    The category select reads as an editable chip rather than plain muted
    text: a dotted underline and a caret say "you can change this" without a
    hover tooltip, which a touch device never shows. Still a native select. */
-.cat-chip{font-size:12px;padding:0 .9rem 0 0;background:transparent;
+.cat-chip{font-size:12px;padding:0 1.1rem 0 0;background:transparent;
+  text-overflow:ellipsis;
   border:none;color:var(--mut);max-width:11rem;cursor:pointer;
   border-bottom:1px dotted var(--mut);border-radius:0;
   -webkit-appearance:none;appearance:none;
@@ -662,43 +841,61 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   /* headers are redundant once rows are cards: date/amount/merchant are
      self-evident, the category select shows its value, 📎 is iconic */
   .txn-table thead{display:none}
+  /* One stacked row, ~64px: line 1 = merchant (+its pills) · amount;
+     line 2 = the date (only where no day header above already says it)
+     and the category as a compact chip. The checkbox and ⋯ span both
+     lines at the edges. It used to be 100–130px: a repeated date, then a
+     full-width 40px category select on a line of its own. */
   .txn-table tr{
     display:grid;
-    /* line 1: date · merchant+pills (the ONE flexible track — minmax(0,1fr)
-       lets long merchant names wrap instead of blowing the grid) · amount
-       line 2: category chip (spans left)
-       ⋯ spans both rows on the right: one target for the whole row) */
-    grid-template-columns:max-content minmax(0,1fr) max-content max-content;
+    grid-template-columns:max-content max-content minmax(0,1fr) max-content max-content;
     grid-template-areas:
-      "date merch amt  clip"
-      "cat  cat   cat  clip";
+      "pick merch merch amt clip"
+      "pick date  cat   cat clip";
     align-items:baseline;
     column-gap:.55rem;row-gap:.2rem;
-    padding:.55rem .1rem;
+    padding:.4rem .1rem;
     /* the row separator moves from the tds to the card */
     border-bottom:1px solid var(--line);
   }
+  /* a day-grouped ledger already names the day in the band above */
+  .txn-table.dayg .c-date{display:none}
+  .txn-table.dayg tr{grid-template-areas:
+      "pick merch merch amt clip"
+      "pick cat   cat   cat clip"}
   .txn-table tbody tr:last-child{border-bottom:none}
   .txn-table td{border-bottom:none;padding:0}
-  .txn-table .c-date{grid-area:date;font-size:12px}
-  .txn-table .c-merch{grid-area:merch}
+  .txn-table .c-date{grid-area:date;font-size:12px;width:auto!important}
+  .txn-table .c-merch{grid-area:merch;min-width:0}
+  /* an order summary ("— shampoo, milk, …") takes at most two short
+     lines under the name instead of wrapping the whole row tall */
+  .txn-table .txn-sum{display:-webkit-box;-webkit-line-clamp:2;
+      -webkit-box-orient:vertical;overflow:hidden;font-size:12.5px}
   .txn-table .c-amt{grid-area:amt;font-weight:600}
   /* !important beats the td's inline whiteSpace:nowrap (harmless for the
      owner select, needed so the viewer's plain-text category can wrap) */
-  .txn-table .c-cat{grid-area:cat;white-space:normal!important;align-self:center}
+  .txn-table .c-cat{grid-area:cat;white-space:normal!important;min-width:0;
+      align-self:center}
   /* !important beats the cells' inline width:1% — as a grid item that
      resolves to a ~4px box and the 40px target spills PAST the row's right
      edge as clipped crescent slivers */
   .txn-table .c-clip{grid-area:clip;justify-self:end;align-self:center;
       width:auto!important}
   .txn-table .row-menu{min-height:2.75rem;min-width:2.75rem}
-  .txn-table .c-date{width:auto!important}
   /* account column is hide-m (display:none) at this width — grid-area kept
      only so the showAccount=true shape stays declared, not auto-placed */
   .txn-table .c-acct{grid-area:cat}
-  /* the recategorize select owns line 2: full width (its inline
-     maxWidth:11rem needs !important) + a real 40px touch target */
-  .txn-table .c-cat select{width:100%;max-width:none!important;min-height:2.5rem}
+  /* the recategorize select is a compact chip that sizes to its label,
+     not a full-width row of its own: a filled pill so it reads as
+     tappable without the dotted underline a finger cannot hover */
+  .txn-table .c-cat select.cat-chip,
+  .rules-table .c-cat select.cat-chip{min-height:1.85rem;min-width:0;
+      max-width:100%!important;padding:.2rem 1.35rem .2rem .65rem;
+      border:none;border-radius:999px;background-color:var(--hover);
+      color:var(--ink);font-size:12.5px;
+      background-position:calc(100% - 13px) center,calc(100% - 9px) center}
+  .txn-table .c-cat .chip-x{min-height:1.85rem;min-width:1.85rem;
+      vertical-align:middle}
   .txn-table .clip-btn{min-height:2.5rem;min-width:2.5rem}
   /* biz toggle stays visually pill-sized (a 40px pill would double the
      merchant line) — an invisible ::after halo supplies the touch target */
@@ -710,6 +907,16 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   .txn-table tr.tr-expand td{display:block;padding:.55rem .1rem}
 }
 
+
+/* a ledger row's state pills render twice in TxnTable — after the name
+   and after the category — and exactly one placement shows: the phone
+   restack puts them on the chip's line (display:none hides the other from
+   screen readers too) */
+.txn-pills-narrow{display:none}
+@media(max-width:620px){
+  .txn-table .txn-pills-wide{display:none}
+  .txn-table .txn-pills-narrow{display:inline}
+}
 
 /* ==== day dividers on the ledger (TxnTable dayGroups) — a band before
    each day carrying the day's spend. Styled as the table's own column
@@ -761,6 +968,10 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
     border-bottom:1px solid var(--line);
   }
   .cash-tl tbody tr:last-child{border-bottom:none}
+  /* the category takes its own line under the name; inline, its
+     separator ended the line above whenever the name filled it */
+  .cash-tl .tl-cat{display:block}
+  .cash-tl .tl-dot{display:none}
   .cash-tl td{border-bottom:none;padding:0}
   /* !important beats the tds' inline width:1% / nowrap-ellipsis */
   .cash-tl .c-date{grid-area:date;font-size:12px;width:auto!important}
@@ -768,6 +979,8 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
       overflow:visible!important;text-overflow:clip!important}
   .cash-tl .c-amt{grid-area:amt;font-weight:600}
   .cash-tl .c-bal{grid-area:bal;font-size:12px}
+  /* a row with no balance to show has no second line, not a lone dot */
+  .cash-tl .c-bal.c-none{display:none}
   /* the TODAY divider row (colSpan): opt out of the card grid entirely
      so the spanning cell keeps working */
   .cash-tl tr.tr-today{display:block;padding:0;border-bottom:none}
@@ -829,9 +1042,12 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   /* State and Health share one cell, and the row-level disable
      button lives in the ✎ expander, so the second line is
      due · status with ✎ spanning both rows as the row's one target. */
+  /* the first column keeps room for a due date: a long status (count
+     received, last and next dates) wraps in its own cell instead of
+     squeezing the column until the date printed over it */
   .bills-table tr.billrow{display:grid;align-items:center;
     gap:.15rem .55rem;padding:.5rem .1rem;
-    grid-template-columns:minmax(0,1fr) auto auto;
+    grid-template-columns:minmax(6.5rem,1fr) auto auto;
     grid-template-areas:"name amt act" "due state act"}
   /* envelopes swap the due date for the pool bar */
   .bills-table tr.billrow.env{
@@ -846,8 +1062,8 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   /* the cycle bar is a desktop glance; stacked rows already say "in N days" */
   .bills-table td.c-cycle{display:none}
   .bills-table .c-chgs{grid-area:chgs}
-  .bills-table .c-state{grid-area:state;justify-self:start;
-    /* inline nowrap+hidden clips pills once they're grid items */
+  .bills-table .c-state{grid-area:state;justify-self:start;min-width:0;
+    /* never clipped: a pill or a long status wraps in its cell */
     white-space:normal!important;overflow:visible!important}
   .bills-table .c-act{grid-area:act;justify-self:end;
     white-space:normal!important}
@@ -896,6 +1112,101 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   .bills-table .editrow select{min-height:2.5rem}
 }
 
+/* ==== Rules and matched reimbursements (<=620px): stacked rows ========
+   Squeezed into columns a phone could not hold, names broke mid-word
+   and every row ran three or four lines. */
+.rules-table td.c-merch{overflow-wrap:anywhere;min-width:7.5rem}
+@media(max-width:620px){
+  .rules-table thead,.pairs-table thead{display:none}
+  .rules-table tr:not(.tr-expand),.pairs-table tr{display:grid;
+    align-items:center;column-gap:.6rem;row-gap:.15rem;padding:.5rem 0;
+    border-bottom:1px solid var(--line)}
+  .rules-table tbody tr:last-child,.pairs-table tbody tr:last-child{
+    border-bottom:none}
+  .rules-table td,.pairs-table td{border:0;padding:0;min-width:0}
+  /* rules: merchant on its own full line, its category chip under it,
+     ⋯ at the right of both */
+  .rules-table tr:not(.tr-expand){grid-template-columns:minmax(0,1fr) max-content;
+    grid-template-areas:"merch act" "cat act"}
+  .rules-table td.c-merch{grid-area:merch;min-width:0;
+    overflow-wrap:break-word}
+  .rules-table td.c-cat{grid-area:cat}
+  .rules-table td.c-act{grid-area:act}
+  .rules-table tr.tr-expand{display:block}
+  .rules-table tr.tr-expand td{display:block}
+  /* matched pairs: charge · amount, then date and who paid it back;
+     the undo button at the right of both lines */
+  .pairs-table tr{grid-template-columns:max-content minmax(0,1fr) max-content max-content;
+    grid-template-areas:"chg chg amt act" "date dep dep act"}
+  .pairs-table td.c-chg{grid-area:chg;font-weight:600}
+  .pairs-table td.c-amt{grid-area:amt;display:block!important}
+  .pairs-table td.c-date{grid-area:date;font-size:12.5px}
+  .pairs-table td.c-dep{grid-area:dep;font-size:12.5px;color:var(--mut)}
+  .pairs-table td.c-dep::before{content:"paid back by "}
+  .pairs-table td.c-act{grid-area:act}
+  .pairs-table td[colspan]{grid-column:1 / -1}
+}
+
+/* ==== Net Worth P/L tables (<=620px): account · value, then P/L ·
+   return under the value. Four squeezed columns wrapped every account
+   name over two or three lines and broke "Value now" in its header. ==== */
+@media(max-width:620px){
+  .pl-table thead{display:none}
+  .pl-table tr{display:grid;align-items:baseline;column-gap:.6rem;
+    grid-template-columns:minmax(0,1fr) max-content max-content;
+    grid-template-areas:"name val val" "name pl ret";
+    padding:.45rem 0;border-bottom:1px solid var(--line)}
+  .pl-table tbody tr:last-child{border-bottom:none}
+  /* !important beats the cells' inline group/indent padding */
+  .pl-table td{border:0;padding:0!important;min-width:0}
+  .pl-table td:first-child{grid-area:name}
+  .pl-table td.c-sub{padding-left:.9rem!important}
+  .pl-table td.c-val{grid-area:val}
+  .pl-table td.c-pl{grid-area:pl;font-size:12.5px}
+  .pl-table td.c-ret{grid-area:ret;font-size:12.5px}
+  /* a spend change keeps its dollars on one line; the percentage steps
+     aside in a phone-width table (Spending, Cash Flow) */
+  td .dl-pct{display:none}
+}
+
+/* ==== Debt payoff order (<=620px): one small grid per debt ============
+   Eight columns with two inputs were wider than a phone card, so the APR
+   box sat half outside it behind a sideways scroll. Stacked: # · name ·
+   balance, then the two editable figures side by side, then the outcome. */
+@media(max-width:620px){
+  .debt-table thead{display:none}
+  .debt-table tr{display:grid;align-items:baseline;gap:.35rem .7rem;
+    grid-template-columns:1.1rem minmax(0,1fr) max-content;
+    grid-template-areas:"ord name bal" ". apr min" ". off int" ". skip skip";
+    padding:.65rem 0;border-bottom:1px solid var(--line)}
+  .debt-table tbody tr:last-child{border-bottom:none}
+  .debt-table td{border:0;padding:0;min-width:0}
+  .debt-table .c-ord{grid-area:ord}
+  /* !important beats the cell's inline min-width, which is the desktop
+     table's readable-name floor */
+  .debt-table .c-name{grid-area:name;min-width:0!important}
+  .debt-table .c-bal{grid-area:bal;font-weight:600}
+  .debt-table .c-apr{grid-area:apr;text-align:left}
+  .debt-table .c-min{grid-area:min}
+  .debt-table .c-off{grid-area:off}
+  .debt-table .c-int{grid-area:int}
+  .debt-table .c-skip{grid-area:skip;display:flex;align-items:center;gap:.45rem}
+  /* the headers are gone — each figure carries its own small label */
+  .debt-table .c-apr::before,.debt-table .c-min::before,
+  .debt-table .c-off::before,.debt-table .c-int::before{display:block;
+    color:var(--mut);font-size:11px;font-weight:600;letter-spacing:.04em;
+    text-transform:uppercase;margin-bottom:.15rem}
+  .debt-table .c-apr::before{content:"APR %"}
+  .debt-table .c-min::before{content:"Min $/mo"}
+  .debt-table .c-off::before{content:"Paid off"}
+  .debt-table .c-int::before{content:"Interest"}
+  .debt-table .c-skip:has(input)::before{content:"Leave out of the plan";
+    color:var(--mut);font-size:12.5px;order:2}
+  /* a viewer has no box to tick; "left out" already shows under Paid off */
+  .debt-table .c-skip:not(:has(input)){display:none}
+  .debt-table input:not([type="checkbox"]){min-height:2.5rem;font-size:15px}
+}
+
 /* ==== Accounts page (mobile restack) ==== */
 /* desktop hook only: AcctRow's child-account indent moved from an inline
    style to this class so the phone layout can shrink it */
@@ -915,6 +1226,10 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   .accts-table td.c-bal{grid-column:2;white-space:nowrap}
   .accts-table td.c-pad{display:none}
   .accts-table td.c-acct.indent{padding-left:1.6rem}
+  /* the account's name wraps beside its sync button like any text; as an
+     inline-block (the touch-area rule for table links) a long name drops
+     whole to the line under the button */
+  .accts-table td.c-acct a:not(.acct-edit){display:inline}
   /* pills/badges (primary, Plaid, fix ↗, run…) become the row's second
      line instead of wrapping mid-name; empty wrapper adds no height */
   .accts-table .acct-pills{display:block;margin-top:.3rem}
@@ -922,9 +1237,9 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   /* the fixed 3.4em dot+sync box is too tight for a touch-size ↻ */
   .accts-table .acct-left{width:auto !important;margin-right:.25rem}
   /* touch targets ≥40px for in-row chrome (sync/run/copy/fix/reconnect) */
-  .accts-table td button{min-height:2.5rem;min-width:2.5rem}
+  .accts-table td button:not(.as-link){min-height:2.5rem;min-width:2.5rem}
   /* ✎ rename: invisible hit-area bump, same trick as the 760px td a rule */
-  .accts-table a.acct-edit{display:inline-block;padding:.5rem .55rem;
+  .accts-table .acct-edit{display:inline-block;padding:.5rem .55rem;
     margin:-.4rem -.3rem}
   /* colSpan rows (✎ edit form) span the whole grid and keep 40px inputs */
   .accts-table tr.editrow td{grid-column:1 / -1}
@@ -1193,11 +1508,10 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
 .txn-table .c-pick{width:1%}
 .txn-table .c-pick input{min-width:1.15rem;min-height:1.15rem}
 @media(max-width:620px){
-  /* the checkbox joins the first line, ahead of the date */
-  .txn-table tr{grid-template-columns:max-content max-content minmax(0,1fr) max-content max-content;
-    grid-template-areas:"pick date merch amt  clip" "pick cat  cat   cat  clip"}
+  /* the checkbox spans both lines at the row's left edge (the row grid is
+     declared with the TxnTable restack above) */
   .txn-table .c-pick{grid-area:pick;align-self:center}
-  .txn-table .c-pick input{min-width:1.4rem;min-height:1.4rem}
+  .txn-table .c-pick input{min-width:1.3rem;min-height:1.3rem}
 }
 
 /* ==== Alerts ============================================
@@ -1211,6 +1525,11 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
 .alertrow.warn{border-color:rgba(240,180,41,.45)}
 .alertrow .ico{line-height:1.5}
 .alertrow .meta{font-size:11.5px;color:var(--mut);margin-top:.15rem}
+/* the Alerts history: one subject a line, its words the full width */
+.hist-line{padding:.55rem 0;border-top:1px solid var(--line);overflow-wrap:anywhere}
+.hist-line:first-child{border-top:0}
+.hist-line .meta{font-size:11.5px;color:var(--mut);margin-top:.2rem;
+  display:flex;flex-wrap:wrap;align-items:center;gap:.3rem}
 .chip{border-radius:999px;padding:.2rem .7rem;font-size:12.5px;cursor:pointer;
   background:var(--hover);color:var(--ink);border:1px solid var(--line)}
 .chip.on{background:rgba(79,155,214,.16);border-color:var(--blue);
@@ -1256,7 +1575,8 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
 .chat-compose{border-top:1px solid var(--line);padding:.7rem .9rem;background:var(--card)}
 .chat-compose .box{display:flex;gap:.5rem;align-items:flex-end;border:1px solid var(--line);
   border-radius:var(--r);background:var(--bg);padding:.4rem .4rem .4rem .8rem}
-.chat-compose .box:focus-within{border-color:var(--blue);box-shadow:0 0 0 3px rgba(79,155,214,.18)}
+.chat-compose .box:focus-within{border-color:var(--blue);box-shadow:0 0 0 3px rgba(79,155,214,.18);
+  outline:2px solid var(--blue);outline-offset:1px}
 .chat-compose textarea{flex:1;border:0;background:transparent;color:var(--ink);font:inherit;
   resize:none;outline:0;min-height:1.6rem;max-height:10rem;padding:.2rem 0;border-radius:0}
 .chat-compose .hint{display:flex;justify-content:space-between;font-size:11.5px;color:var(--mut);
@@ -1265,6 +1585,7 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
 .chat-typing i{width:6px;height:6px;border-radius:50%;background:var(--mut);animation:chatblink 1.2s infinite}
 .chat-typing i:nth-child(2){animation-delay:.2s}.chat-typing i:nth-child(3){animation-delay:.4s}
 @keyframes chatblink{0%,80%,100%{opacity:.25}40%{opacity:1}}
+@media (prefers-reduced-motion:reduce){.chat-typing i{animation:none;opacity:.6}}
 .chat-empty{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
   gap:.6rem;padding:2rem 1rem;text-align:center}
 .chat-empty h2{margin:0;font-size:20px}
@@ -1283,12 +1604,31 @@ h2.ssec{margin:0 0 .2rem;padding-left:.55rem;border-left:3px solid var(--blue);
   background:var(--hover);overflow:hidden;vertical-align:middle}
 .minibar>i{display:block;height:100%;background:var(--blue)}
 
-/* a provenance group's header — its own explanation lives here, because the
-   promotion rule is only interesting where it applies */
-.grouphead{display:flex;gap:.6rem;align-items:baseline;padding:.6rem 0 .3rem;
-  border-bottom:1px solid var(--line);cursor:pointer;width:100%;
-  background:none;text-align:left;color:var(--ink);font:inherit}
-.grouphead:hover{color:var(--blue)}
+/* ==== Disclosure (components/Disclosure.tsx) — the one collapsible
+   section. Caret on the LEFT, title inside the border with air around it.
+   `.card.disclosure` is a page-level section (the card supplies border and
+   padding); a bare `.disclosure` is a bordered box inside a card. ==== */
+.disclosure>summary{list-style:none;cursor:pointer;display:flex;
+  align-items:baseline;flex-wrap:wrap;gap:.25rem .6rem}
+.disclosure>summary::-webkit-details-marker{display:none}
+/* a CSS triangle, not a glyph: ▸/▾ render at different sizes per font and
+   jumped the title sideways on every toggle; a rotation cannot */
+.disclosure>summary::before{content:"";flex:none;align-self:center;
+  width:0;height:0;margin:0 .1rem 0 .05rem;
+  border-left:6px solid var(--mut);border-top:4.5px solid transparent;
+  border-bottom:4.5px solid transparent;transition:transform .15s}
+.disclosure[open]>summary::before{transform:rotate(90deg)}
+.disclosure>summary:hover{color:var(--blue)}
+.disclosure>summary:hover::before{border-left-color:var(--blue)}
+.disclosure:not(.card){border:1px solid var(--line);border-radius:var(--rs);
+  padding:0 .8rem}
+.disclosure:not(.card)>summary{padding:.65rem 0}
+.disclosure:not(.card)[open]{padding-bottom:.7rem}
+.disclosure:not(.card)[open]>summary{border-bottom:1px solid var(--line);
+  margin-bottom:.4rem}
+.disclosure:not(.card)+.disclosure:not(.card){margin-top:.6rem}
+.card.disclosure[open]>summary{margin-bottom:.6rem}
+@media (prefers-reduced-motion:reduce){.disclosure>summary::before{transition:none}}
 
 /* a section that has a PROBLEM says so in the list, so it is findable from
    any other section without a banner floating over all of them */
@@ -1512,10 +1852,6 @@ a.catlink:hover,.catlink:hover{background:var(--hover);color:var(--blue);text-de
 .linkish{background:none;border:none;padding:0;color:var(--blue);cursor:pointer;
   font-size:inherit;text-decoration:underline;text-decoration-color:var(--mut)}
 .linkish:hover{background:none}
-.card.fold summary{cursor:pointer;list-style:none;display:flex;align-items:center}
-.card.fold summary::-webkit-details-marker{display:none}
-.card.fold summary::before{content:"▸";color:var(--mut);margin-right:.5rem;font-size:11px}
-.card.fold[open] summary::before{content:"▾"}
 .side-panel{position:fixed;top:0;right:0;bottom:0;width:min(36rem,100%);
   background:var(--card);border-left:1px solid var(--line);
   box-shadow:-12px 0 32px rgba(0,0,0,.35);z-index:40;overflow:auto;
@@ -1524,3 +1860,142 @@ a.catlink:hover,.catlink:hover{background:var(--hover);color:var(--blue);text-de
   line-height:1;cursor:pointer;padding:.2rem .5rem}
 .side-panel .close:hover{color:var(--ink);background:var(--hover)}
 @media(max-width:700px){.merchants-head.pinned{position:static}}
+
+/* ==== loading placeholders (components/PageSkeleton) ==== */
+.sk{background:var(--hover);border-radius:.4rem;
+    animation:skpulse 1.4s ease-in-out infinite}
+@keyframes skpulse{0%,100%{opacity:1}50%{opacity:.55}}
+@media (prefers-reduced-motion:reduce){.sk{animation:none}}
+/* left:0 — out of flow at its static place, a hidden label inside a
+   sideways-scrolling table (an "Actions" header) still widened the page
+   at 320 px; pinned to its containing block's left edge it cannot */
+.sr-only{position:absolute;left:0;width:1px;height:1px;overflow:hidden;
+         clip-path:inset(50%);white-space:nowrap}
+/* the skip link: out of sight until it has keyboard focus, then a small
+   chip over the header's corner */
+.skip-link{position:absolute;left:.5rem;top:.5rem;z-index:2000;
+  background:var(--card);color:var(--ink);border:1px solid var(--line);
+  border-radius:var(--rs);padding:.4rem .8rem;text-decoration:none}
+.skip-link:not(:focus){width:1px;height:1px;padding:0;border:0;
+  overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+/* main takes focus only from the skip link; the page is the indicator */
+main:focus{outline:none}
+
+/* ==== touch targets ====
+   At phone width a control is at least a fingertip in each direction.
+   Buttons written as words inside a sentence (.linkish) stay text. */
+@media (max-width:760px){
+  button:not(.linkish):not(.as-link),.btn,select{min-height:2.75rem;min-width:2.75rem}
+  /* a segment keeps the fingertip height, but a short label ("1y") at
+     that height and width drew the chosen one as a tall circle: a
+     rounded box instead, inside a track rounded to match */
+  .segctl>button:not(.linkish):not(.as-link){border-radius:12px}
+  .note .dismiss,.pill .chip-x{min-height:2.75rem;min-width:2.75rem}
+  input[type=checkbox],input[type=radio]{min-width:1.4rem;min-height:1.4rem}
+}
+
+/* ==== an empty list (components/EmptyState) ==== */
+.empty{text-align:center;padding:1.6rem 1rem}
+.empty p{margin:.3rem auto .9rem;max-width:34rem}
+/* the title on its own line, and a gap before an action that follows it
+   directly (no text between): side by side they butted at desktop width */
+.empty>b{display:block}
+.empty>b+.btn,.empty>b+button{margin-top:.7rem}
+
+/* ==== an alert on Today ====
+   The message, then what to do about it as a button, then dismiss. The
+   edge carries how serious it is, so a broken connection and a bill to
+   review no longer look alike. */
+.alertrow{display:flex;align-items:center;flex-wrap:wrap;gap:.5rem .8rem;
+  background:var(--card);border:1px solid var(--line);
+  border-left:4px solid var(--amber);border-radius:var(--rs);
+  padding:.6rem .8rem;margin:1rem 0 0}
+.alertrow.bad{border-left-color:var(--red)}
+.alertrow.info{border-left-color:var(--blue)}
+.alertrow.good{border-left-color:var(--green)}
+.alertrow-msg{flex:1 1 9rem;min-width:0}
+.alertrow .btn{text-decoration:none}
+
+/* ==== what needs you, on Today ====
+   ONE line above the day: how many alerts wait and the most serious one,
+   opening the Alerts page (where each is fixed or dismissed), and the
+   setup steps left in the same slim anatomy. A bar per alert pushed the
+   day's number ~600px down a phone. */
+.needsrow{display:flex;align-items:center;gap:.6rem;min-height:44px;
+  box-sizing:border-box;background:var(--card);border:1px solid var(--line);
+  border-left:4px solid var(--amber);border-radius:var(--rs);
+  padding:.35rem .8rem;margin:1rem 0 0;color:var(--ink);
+  text-decoration:none;font-size:14px}
+.needsrow + .needsrow{margin-top:.5rem}
+.needsrow.bad{border-left-color:var(--red)}
+.needsrow.info{border-left-color:var(--blue)}
+.needsrow.good{border-left-color:var(--green)}
+.needsrow.setup{border-left-color:var(--blue)}
+.needsrow-msg{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap;color:var(--mut)}
+.needsrow-go{flex-shrink:0;color:var(--blue);font-size:16px}
+/* at phone width the message wraps to two lines: one line cut the amount
+   and the ask ("… verify you recognize it") off the end */
+@media(max-width:760px){
+  .needsrow-msg{white-space:normal;display:-webkit-box;-webkit-box-orient:vertical;
+    -webkit-line-clamp:2;line-clamp:2}
+}
+
+/* a page's key figures as tiles: two across at phone width, not a stack */
+@media(max-width:800px){
+  .herotiles{grid-template-columns:1fr 1fr}
+  /* an odd tile out takes the full row instead of half of it */
+  .herotiles>:last-child:nth-child(odd){grid-column:1 / -1}
+}
+
+/* ==== Today's budget rows at phone width ====
+   One line a budget (its name, what is left today) over its bar, so six
+   budgets fit a screen where six stacked tiles took two. The lines under
+   each figure are the same as on desktop and in the app. */
+.only-m{display:none}
+@media(max-width:760px){
+  .only-m{display:inline}
+  .drow{display:grid;grid-template-columns:minmax(0,1fr) auto;
+    column-gap:.6rem;align-items:baseline}
+  .drow>*{grid-column:1 / -1}
+  .drow>.drow-l{grid-column:1}
+  .drow>.drow-n{grid-column:2;grid-row:1;font-size:1.05rem;text-align:right}
+}
+
+/* ==== unsaved changes ====
+   A form's Save and Discard, kept on screen while anything in it is
+   unsaved. Fixed to the viewport: a card is its own scroll box, so a
+   sticky bar inside one would stay with the card, not the screen. */
+.savebar{position:fixed;left:50%;transform:translateX(-50%);z-index:6;
+  bottom:max(1rem,env(safe-area-inset-bottom));
+  width:min(34rem,calc(100% - 2rem));display:flex;align-items:center;
+  gap:.6rem;background:var(--hover);border:1px solid var(--blue);
+  border-radius:var(--r);padding:.5rem .7rem;box-shadow:var(--shadow)}
+
+/* ==== column headings that stay put ====
+   On a long table the headings scroll away and the columns lose their
+   names. A card marked stickyhead pins its table's heading row under the
+   top bar. Desktop only: a card scrolls sideways at phone width, and a
+   box that scrolls cannot pin anything to the screen. */
+@media(min-width:761px){
+  .card.stickyhead{overflow:visible}
+  .card.stickyhead thead th{position:sticky;top:var(--bar-h,0px);z-index:2;
+    background:var(--card);box-shadow:0 1px 0 var(--line)}
+}
+
+/* ==== show more: a long list opens short (components/ShowMore.tsx) ==== */
+.show-more{display:block;margin-top:.6rem;background:none;border:0;padding:.35rem 0;
+  color:var(--blue);font-size:13.5px;cursor:pointer;min-height:0}
+.show-more:hover{text-decoration:underline}
+
+/* A control that was an <a> with no href (or href="#") is a real button
+   now, so the keyboard reaches it and a screen reader calls it a button;
+   it keeps the anchor's look. :where() leaves it at a bare button's
+   specificity, so a class beside it (.mut, .sub) still sets its colour. */
+button:where(.as-link){font:inherit;background:none;border:none;padding:0;
+  border-radius:0;color:var(--ink);text-align:inherit;display:inline;
+  text-decoration:underline;text-decoration-color:var(--mut);
+  text-underline-offset:2px;transition:text-decoration-color .15s}
+button:where(.as-link):where(:not(:disabled)):hover{background:none;
+  text-decoration-color:var(--ink)}
+button:where(.as-link):where(:not(:disabled)):active{transform:none}

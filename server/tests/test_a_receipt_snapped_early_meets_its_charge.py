@@ -226,6 +226,20 @@ class ATieWaitsTests(unittest.TestCase):
         self.assertTrue(receipt_match.match_by_hand(self.conn, rid, "c2"))
         self.assertEqual(_attached(self.conn, rid), ("c2", "manual"))
 
+    def test_an_old_tie_says_only_that_several_charges_fit(self):
+        # a receipt with several charges that fit has charges; "no charge
+        # has matched in 30 days" beside "more than one charge fits" says
+        # two things of one receipt, and only the second is the news
+        rid = _snap(self.conn, total=6.25, merchant="Harbor Coffee")
+        _sync(self.conn, _txn("c1", 6.25, "HARBOR COFFEE"),
+              _txn("c2", 6.25, "HARBOR COFFEE",
+                   date=DAY + dt.timedelta(days=1)))
+        self.assertEqual(_attached(self.conn, rid), (None, None))
+        w = receipt_match.waiting(
+            self.conn, today=DAY + dt.timedelta(days=45))["waiting"][0]
+        self.assertTrue(w["tie"])
+        self.assertFalse(w["stale"])
+
     def test_a_charge_with_a_receipt_is_not_offered_to_another(self):
         first = _snap(self.conn, total=6.25, merchant="Harbor Coffee")
         _post(self.conn, "c1", 6.25, "HARBOR COFFEE")

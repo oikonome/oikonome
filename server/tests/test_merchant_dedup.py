@@ -12,12 +12,13 @@ from .util import add_txn, make_db
 class CanonicalMerchantTests(unittest.TestCase):
     """Pure-function layer 1 — the documented cleaning rules."""
 
-    def test_mint_volatile_clause_stripped(self):
-        # the '~…~ Tran:' clause embeds the dollar amount — one payee
-        # exploded into dozens of strings without this
+    def test_tilde_clause_stripped(self):
+        # everything from a tilde on is a volatile clause that can carry
+        # an amount or a reference: one payee would split into a string
+        # per payment without the cut
         self.assertEqual(
             merchant_dedup.canonical_merchant(
-                "THE BRIARWOOD LOFTS ONLINE payment~ Future Amount: 1620 ~ Tran:"),
+                "THE BRIARWOOD LOFTS ONLINE payment~ Sched 0417 Amt 935.00 ~ Seq 22"),
             "Briarwood Lofts")
         self.assertEqual(
             merchant_dedup.canonical_merchant("THE BRIARWOOD LOFTS ONLINE PMT~"),

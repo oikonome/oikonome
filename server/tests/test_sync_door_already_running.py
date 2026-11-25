@@ -117,6 +117,72 @@ class BackgroundSyncDoorHonesty(unittest.TestCase):
             holder.close()
 
 
+class BackgroundSyncSettlesOnlyItsOwnRun(unittest.TestCase):
+    """The /jobs/sync/start thread settles the row after sync_tenant has let
+    go of the lock. A newer run can claim the row in that gap; the late
+    settle must leave the newer run's live row alone, or its poll reads
+    'done' with the old run's counts while it is still pulling."""
+
+    def test_a_late_settle_does_not_stamp_a_newer_run(self):
+        import os
+        import threading
+        import time
+        import uuid
+
+        from fastapi.testclient import TestClient
+
+        from oikonome.db import tenancy
+        from oikonome.jobs import worker
+
+        from .util import _ensure_db
+        os.environ["OIKONOME_DEV"] = "1"
+        _ensure_db()
+        import oikonome.web.app as appmod
+        appmod.DEV_MODE = True
+        client = TestClient(appmod.app)
+        client.post("/api/signup", data={
+            "email": f"syncsettle-{uuid.uuid4().hex[:8]}@example.dev",
+            "password": "correct-horse-battery"})
+        tid = client.get("/api/me").json()["tenant_id"]
+        finished = threading.Event()
+
+        def fake_sync(t, progress=None):
+            c = tenancy.tenant_connect(t)
+            try:
+                worker._progress_mark(c, "running", {"done": 0, "total": 1},
+                                      reset=True)
+                progress("item", {"id": "i1", "name": "Sample Bank",
+                                  "status": "ok", "transactions": 0})
+                worker._progress_mark(c, "done", None)
+                # the lock is gone; a second device's run claims the row
+                c.execute(
+                    "UPDATE job_progress SET state='running', "
+                    "progress='{}'::jsonb, updated_at=now(), "
+                    "started_at=now() + interval '1 second' WHERE id='sync'")
+            finally:
+                c.close()
+                finished.set()
+            return {"i1": "ok"}
+
+        with mock.patch("oikonome.jobs.worker.sync_tenant", new=fake_sync):
+            r = client.post("/api/jobs/sync/start")
+            self.assertTrue(r.json()["started"], r.text)
+            self.assertTrue(finished.wait(15))
+            deadline = time.time() + 15
+            while time.time() < deadline and any(
+                    th.name.startswith("wizard-sync-")
+                    for th in threading.enumerate()):
+                time.sleep(0.05)
+        conn = tenancy.tenant_connect(tid)
+        try:
+            row = conn.execute("SELECT state, progress FROM job_progress "
+                               "WHERE id='sync'").fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(row["state"], "running",
+                         "the newer run's live row was stamped done")
+
+
 class ManualSyncCategorizes(unittest.TestCase):
     """The ↻ button is a sync door like the hourly sweep and the webhook,
     and like them it runs the sync-time categorize pass after the pull;

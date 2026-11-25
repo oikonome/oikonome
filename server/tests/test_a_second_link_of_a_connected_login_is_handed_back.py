@@ -200,7 +200,11 @@ class SecondLinkTests(unittest.TestCase):
                          plaid.REPEAT_LEDGER_REASON)
         self.assertEqual(sync_base.released_count(self.conn), 0)
 
-    def test_a_fourth_repeat_in_a_day_is_not_exchanged(self):
+    def test_a_fourth_repeat_in_a_day_is_handed_back_and_holds_a_place(self):
+        """Past the limit a repeat is still exchanged — an Item whose token
+        was never exchanged could never be removed — and handed back, but
+        ledgered as an ordinary refusal, so it holds a place under the cap
+        and a client stuck relinking runs into the cap."""
         self._held_item()
         with self._platform_keys():
             for _ in range(plaid.REPEAT_LIMIT):
@@ -213,14 +217,18 @@ class SecondLinkTests(unittest.TestCase):
             with self.assertRaises(ValueError) as cm:
                 self._link()
         self.assertEqual(str(cm.exception), plaid.TOO_MANY_REPEATS)
-        self.assertEqual(len(self.exchanged), plaid.REPEAT_LIMIT)
-        self.assertFalse(self._ledgered())
-        self.assertEqual(sync_base.released_count(self.conn), 0)
+        self.assertEqual(len(self.exchanged), plaid.REPEAT_LIMIT + 1)
+        self.assertFalse(self._has(self.new_item))
+        self.assertEqual(self.removed[-1], "access-new")
+        row = self._ledger_row()
+        self.assertIsNotNone(row)
+        self.assertNotEqual(row["removed_reason"], plaid.REPEAT_LEDGER_REASON)
+        self.assertEqual(sync_base.released_count(self.conn), 1)
 
-    def test_a_different_bank_after_the_repeat_limit_is_not_called_a_repeat(self):
-        """Past the limit no token is exchanged, so nothing knows whether
-        the next bank is a repeat: it is told the limit, never that the
-        bank is already connected."""
+    def test_a_different_bank_after_the_repeat_limit_is_kept(self):
+        """The limit applies to a token found to be a repeat: a bank that
+        brings accounts not held here is kept, however many repeats came
+        before it."""
         self._held_item()
         with self._platform_keys():
             for _ in range(plaid.REPEAT_LIMIT):
@@ -230,11 +238,9 @@ class SecondLinkTests(unittest.TestCase):
                     self._link()
             self.new_item = f"pl-new-{uuid.uuid4().hex[:8]}"
             self.accounts["access-new"] = [_acct("9999")]
-            with self.assertRaises(ValueError) as cm:
-                self._link()
-        self.assertEqual(str(cm.exception), plaid.TOO_MANY_REPEATS)
-        self.assertNotEqual(str(cm.exception), plaid.ALREADY_LINKED)
-        self.assertEqual(len(self.exchanged), plaid.REPEAT_LIMIT)
+            self.assertEqual(self._link(), self.new_item)
+        self.assertTrue(self._has(self.new_item))
+        self.assertEqual(len(self.exchanged), plaid.REPEAT_LIMIT + 1)
 
     def test_a_repeat_before_the_first_sync_landed_is_handed_back(self):
         self._held_item(with_rows=False)

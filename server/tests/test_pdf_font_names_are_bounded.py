@@ -15,6 +15,7 @@ from unittest import mock
 from oikonome.sync import pdf_sandbox, pdfimport
 
 from .test_pdfimport import _layout_statement, assemble_pdf
+from .test_restore_bounds_each_archive_row import cpu_seconds
 
 # one bfrange line mapping every two-byte code, starting at 'a'
 _FULL_RANGE_MAP = b"beginbfrange <%s> <%s> <%s> endbfrange" % (
@@ -108,14 +109,16 @@ class FontNamesAreBoundedTests(unittest.TestCase):
                 self._bounded_once(fn, pdf, seconds, peak_mb)
 
     def _bounded_once(self, fn, pdf, seconds, peak_mb):
+        # CPU, the child's included once it is reaped: the work the file
+        # costs, whatever else the host is running
         tracemalloc.start()
-        started = time.monotonic()
+        started = cpu_seconds()
         try:
             try:
                 fn(pdf)
             except ValueError as e:
                 self.assertIn("size limit", str(e))
-            spent = time.monotonic() - started
+            spent = cpu_seconds() - started
             peak = tracemalloc.get_traced_memory()[1] / 1e6
         finally:
             tracemalloc.stop()

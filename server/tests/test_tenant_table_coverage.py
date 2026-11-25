@@ -16,6 +16,10 @@ RESTORED = {
     "reimbursements", "reimburse_flags", "business_flags", "liabilities",
     "holdings", "crypto_holdings", "networth_recorded", "networth_snapshot",
     "income_annual", "income_documents", "merchant_canonical", "merchants",
+    # each stored tax document and the yearly figures it wrote: without
+    # them a restored household's figures could not be taken back one
+    # document at a time (specs/tax-documents.md, "Stored documents")
+    "income_uploads", "income_upload_values",
     "merchant_renames", "merchant_categories", "amazon_orders", "amazon_matches",
     "amazon_summaries", "costco_receipts", "costco_matches",
     # the merge offers AND the decisions on them: a rejected pair is only
@@ -33,6 +37,8 @@ RESTORED = {
     "entity_membership", "equity_movement", "business_txn_class",
     "compliance_obligation", "mileage_log", "vendor_1099", "transaction_notes",
     "transaction_splits", "budget_snapshots",
+    # what the cash forecast said each night: nothing else can rebuild it
+    "forecast_nights",
     # the household's own record of who changed what: nothing regenerates
     # it, so a round trip that dropped it would lose the answer to "who
     # changed this bill" for good
@@ -61,6 +67,8 @@ RESTORED = {
 # say why it doesn't belong in a user's data export/restore.
 SKIP = {
     "import_staging": "import scratch",
+    "ledger_writes": "cache bookkeeping — transaction ids, rebuilt by "
+                     "the next write",
     "bulk_import_jobs": "import scratch and job bookkeeping",
     "bulk_import_files": "import scratch and job bookkeeping",
     "job_progress": "job bookkeeping",
@@ -82,6 +90,12 @@ SKIP = {
                        "figures in it are the ledger's, which travels",
     "category_undo": "a category write's held undo — a week of scratch "
                      "whose reference only this instance issued",
+    "forecast_learned": "the cash forecast's learned facts per day — "
+                        "derived from the ledger (round-tripped) and "
+                        "recomputed by the first build after a restore",
+    "plaid_users": "an id at Plaid tied to this instance's client keys — "
+                   "never valid under another instance's; a restored "
+                   "household gets a new one when it next links a bank",
     "txn_id_keys": "the secret file-row ids hashed over a full number are "
                    "keyed under — SECRET, must never export; a restore "
                    "keys an older archive's rows under its own",

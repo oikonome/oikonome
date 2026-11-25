@@ -364,7 +364,8 @@ class ABusyHasherSpendsNoOneTimeFactorTests(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
         with self._control() as conn:
-            login_unlock.follow(conn, login_unlock.create(conn, uid))
+            return login_unlock.follow(
+                conn, login_unlock.create(conn, uid))["proof"]
 
     def _still_unlocked(self, email):
         from oikonome.auth import login_unlock
@@ -373,9 +374,9 @@ class ABusyHasherSpendsNoOneTimeFactorTests(unittest.TestCase):
 
     def test_a_busy_app_sign_in_leaves_the_emailed_unlock_unspent(self):
         uid, email = self._user()
-        self._unlocked(uid, email)
+        proof = self._unlocked(uid, email)
         c = TestClient(self.appmod.app, raise_server_exceptions=False)
-        form = {"email": email, "password": self.PW}
+        form = {"email": email, "password": self.PW, "unlock_proof": proof}
         with mock.patch.object(passwords, "_gated",
                                side_effect=passwords.HasherBusy("full")):
             r = c.post("/api/login", data=form)
@@ -387,9 +388,9 @@ class ABusyHasherSpendsNoOneTimeFactorTests(unittest.TestCase):
 
     def test_a_busy_form_sign_in_leaves_the_emailed_unlock_unspent(self):
         uid, email = self._user()
-        self._unlocked(uid, email)
+        proof = self._unlocked(uid, email)
         c = TestClient(self.appmod.app, raise_server_exceptions=False)
-        form = {"email": email, "password": self.PW}
+        form = {"email": email, "password": self.PW, "unlock_proof": proof}
         with mock.patch.object(passwords, "_gated",
                                side_effect=passwords.HasherBusy("full")):
             r = c.post("/login", data=form, follow_redirects=False)
@@ -406,10 +407,10 @@ class ABusyHasherSpendsNoOneTimeFactorTests(unittest.TestCase):
         from oikonome.auth import login_unlock
         from oikonome.web import turnstile
         uid, email = self._user()
-        self._unlocked(uid, email)
+        proof = self._unlocked(uid, email)
         with self._control() as conn:
             # spent by an earlier attempt that got as far as a wrong password
-            self.assertTrue(login_unlock.consume(conn, email))
+            self.assertTrue(login_unlock.consume(conn, email, proof))
             conn.execute("UPDATE login_unlocks SET consumed_at = consumed_at"
                          " - interval '5 seconds' WHERE user_id=%s", (uid,))
         c = TestClient(self.appmod.app, raise_server_exceptions=False)

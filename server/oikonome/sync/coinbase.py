@@ -5,10 +5,11 @@ Read-only. Every Coinbase account is stored budget-excluded like any other
 brokerage: type='investment', subtype='crypto', and every transaction is
 mapped to TRANSFER_IN/OUT so it never touches spend math. Net worth comes
 from the crypto_holdings table (positions × spot price), NOT from summing
-transaction amounts — crypto txn signs are informational only, so the
-source amounts are preserved verbatim (native_amount as-is; the rows are
-spend-excluded by category, and reporting._coinbase_pl reads `raw`, not the
-amount column). P/L stays anchored to FIAT flows in raw (buy/sell/
+transaction amounts. A row's amount is its native_amount in the LEDGER's
+sign (positive = money out of the account — Coinbase's own sign is the
+wallet's, + for value arriving, so it is negated: coinbase_push.
+ledger_amount); the rows are spend-excluded by category, and
+reporting._coinbase_pl reads `raw`, not the amount column. P/L stays anchored to FIAT flows in raw (buy/sell/
 fiat_deposit/fiat_withdrawal) — pro_/exchange_ transfers are the user's own
 money moving between venues, never new cost basis; counting them as basis
 understates the return by an order of magnitude (see
@@ -55,6 +56,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import decode_dss_signature
 
 from ..engine.compat import as_date, jsonb
+from .coinbase_push import ledger_amount, transfer_label
 from .base import (MERCHANT_NAME_ON_CONFLICT, get_access_token, log_sync,
                    upsert_item)
 
@@ -329,12 +331,13 @@ def _holding_raw(wallets: list) -> dict:
 
 
 def _upsert_txn(conn, aid: str, t: dict) -> None:
-    nat = t.get("native_amount") or {}
-    amount = float(nat.get("amount") or 0)   # Coinbase sign: + = value into wallet
+    # the ledger's sign, not the wallet's (coinbase_push.ledger_amount):
+    # value arriving in the account is money in, a negative amount
+    amount = ledger_amount(t) or 0.0
     code = (t.get("amount") or {}).get("currency")
     ttype = (t.get("type") or "unknown")
     # Both TRANSFER_IN/OUT are spend-excluded; sign only drives which label.
-    cat = "TRANSFER_OUT" if amount > 0 else "TRANSFER_IN"
+    cat = transfer_label(amount)
     date = as_date((t.get("created_at") or "")[:10] or None)
     pending = 0 if t.get("status") == "completed" else 1
     name = f"Coinbase {ttype}" + (f" {code}" if code else "")

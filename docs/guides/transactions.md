@@ -19,14 +19,15 @@ here.
 
 By default you browse one calendar month with the **‹ › arrows** (the
 **today** button jumps back to the current month; you can't page past
-it). The headline states the month's cash flow — **in · out · net** —
+it). The headline states the month's cash flow in four tiles — **In**,
+**Out**, **Net** and **A day** —
 by the same definitions the Cash Flow page uses: income in, household
 spending out. Transfers between your own accounts and credit-card
 payments are money *moved*, not made or spent (the card's swipes
-already counted), so they appear in the list but move none of the three
-figures. In the current month, **in** is what has landed so far, with
-the paychecks still due before month end shown beside it as "expected"
-— the Budget page's plan counts the two together. Beside them, **/day** is the month's spending per day: out
+already counted), so they appear in the list but move none of the
+figures. In the current month, **In** is what has landed so far, with
+the paychecks still due before month end shown under it as "+$X
+expected" — the Budget page's plan counts the two together. **A day** is the month's spending per day: out
 divided by the days so far in the current month, or by every day of a
 closed month. A category opened for a month, a budget label (Food,
 Everything else) or a from/to date range shows the same per-day figure
@@ -37,8 +38,13 @@ immediately; the search box filters **as you type** (a beat after the
 last keystroke, two characters minimum — press Enter to search a single
 character). Universal search covers
 every account, the whole history, newest first, **100 rows per page**,
-with a summary line — result count, scope, date range, and the signed
-total over the entire result set, not just the visible page.
+with a summary line — result count, scope, date range, and **out · in ·
+net** over the entire result set, not just the visible page. Those three
+use the same rules as the month tiles and Cash Flow: card payments and
+transfers between your own accounts are in neither, so a date range
+alone reads exactly what Cash Flow reads for the same days. On a
+desktop the table's column headings stay pinned at the top of the
+screen as you scroll down a long list.
 
 Text search matches the merchant name — the one the page shows, so a
 merchant you renamed is findable under its new name as well as the
@@ -46,15 +52,21 @@ bank's original spelling — the category (with or without
 underscores), and **line items** — searching "shampoo" finds the store
 run whose attached receipt lists it, and the same goes for the items in
 an imported store order or receipt (Amazon orders, Costco receipts). A
-query that looks like a number also matches transaction amounts. It
+query that looks like a number also matches transaction amounts, and a
+written check whose image was read is found by its payee. It
 also matches **account
 names**, by either name an account has — the name you gave it or the
-bank's own — and returns that account's transactions; the summary line
-then says so ("includes Groceries Card"), naming the bank's own name
-when that is what matched, so a result that shows neither word explains
-itself. **clear** returns to the monthly view.
+bank's own. When no transaction's own text matches, the term names an
+account and you get that account's transactions; the summary line then
+says so ("includes Groceries Card"), naming the bank's own name when
+that is what matched. When transactions do match (searching a store
+that a card is also named after), the result is those transactions only,
+and the card is offered as its own link — "also: rows on …" — so the
+card's other purchases never fold into the store's figures. **clear**
+returns to the monthly view.
 
-More lenses sit behind **more ▾** in the toolbar:
+More lenses sit behind **more ▾** in the toolbar (it reads "more (2) ▾"
+when two of them are on):
 
 - **reimb** — only reimbursement activity: matched pairs and
   awaiting-reimbursement flags. Works in both month view and search.
@@ -65,6 +77,16 @@ More lenses sit behind **more ▾** in the toolbar:
 - A payment-channel dropdown — **any channel**, **in store**, **online**,
   **other** — narrows to how the bank says a purchase was paid.
 - **checks only** keeps just the transactions the bank reports as checks.
+  A written check the bank filed as a transfer counts as spending under
+  **Checks**, and its row asks once **who was this to?** — the answer is
+  saved as the check's note and, where a rule or the assistant's model
+  knows the payee, files the check under that payee's category. The
+  answer is up to 120 characters; answering again replaces it (a "Paid
+  to …" line you wrote yourself is kept), and it survives the bank
+  re-sending the row. A check whose money lands in another of your own
+  accounts — the same amount, within ten days, such as a check that
+  funds your IRA or savings — is a transfer, not spending, and does not
+  ask; so does a check whose answer says the money only moved.
 
 The channel and check filters run as searches, so they cover the whole
 ledger like an account or category pick does.
@@ -72,7 +94,7 @@ ledger like an account or category pick does.
 The **awaiting reimbursement** button carries a live count and opens the
 Reimburse page; it's a shortcut, not a filter. The count of business
 rows lives on the Business tab; the headline's own "*N* business (not in
-the totals)" note explains why the three figures look the way they do.
+the totals)" note explains why the figures look the way they do.
 
 ## Downloading what you see
 
@@ -98,13 +120,13 @@ page but is not offered the file.
 
 Beside the from/to boxes sit the same eight range buttons every other
 over-time surface uses — **This month · 1m · 3m · 6m · 1y · 3y · 5y ·
-All**. They are a shortcut into the same from/to filter, cut on calendar
-months: **3m** in September means "from July 1", the month in progress
-included, because the ledger shows what is there to edit (Cash Flow's
-3m holds complete months only — June through August); **This month** is
-from the 1st; **1m** is the last complete month, closed on its last day
-(in September, August 1–31).
-**All** clears both dates. Type a from/to by hand and none of the eight
+All**. They are a shortcut into the same from/to filter, and they cover
+exactly the windows Cash Flow's buttons cover: every range but This month
+holds complete months — **3m** in September is June 1 through August 31,
+**1y** the twelve months that have closed — so the figures above the list
+match Cash Flow's for the same button. **This month** runs from the 1st
+to today; **1m** is the last complete month. Hover a button to see its
+dates. **All** clears both dates. Type a from/to by hand and none of the eight
 lights up — the boxes are still the precise control, the buttons are the
 quick one.
 
@@ -113,7 +135,9 @@ its **Date range** section, with **from** and **to** opening a calendar
 rather than asking you to type a date. **Account** and **Category** there
 are searchable drop-downs (closed accounts grouped under *Archived /
 closed*) instead of long strips of chips, and the sheet's top line keeps
-score as you go — "September 2026 · 128 transactions · $412.00 listed".
+score as you go — "September 2026 · 128 transactions", with "· $412.00
+spent" once a filter narrows the month (a search reads "42 results · out
+$X · in $Y").
 A listing opened from a plan label (a Today tile, a money-map row, a Why
 line) says what it is in a chip — "Food · Sep 2026", or "Food · 2026"
 from the year lens — and, when the raw sum of the listed rows is not the
@@ -123,23 +147,25 @@ envelope, while the list shows whole rows.
 
 Back on the list, every filter in force shows as a chip under the search
 box: tap one to drop that filter, or **clear all** to drop them together,
-and a subhead reports what is left — "24 listed · $612.40 total for this
-filter".
+and a subhead reports what is left — "24 listed · $612.40 spent", the
+spending among the listed rows.
 
 ## Reading a row
 
 - **Date** — MM/DD/YY.
 - **Amount** — the display flips the stored sign: charges show
-  negative, deposits positive (and highlighted). Cents always show
-  here. Transfers render dimmed, as does the incoming (credit) side of
-  a loan or credit-card payment — money moving, not spend; the
-  outgoing payment row itself is not dimmed (see the concepts guide).
+  negative, deposits positive (and highlighted), on the web and the
+  phone alike. Cents always show here. Transfers render dimmed, and so
+  does a credit-card payment on both sides — the checking row that pays
+  the card as well as the card row it lands on — which reads **Card
+  payment** rather than "Loan Payments", the name it shares with a
+  mortgage that is spending (see the concepts guide).
 - **Merchant** — the merchant's logo (when your bank connection
   supplies one — Plaid does for most national merchants; otherwise a
   two-letter mark in a colour that stays the same for that merchant),
-  then its name, linking to the merchant's history page (the last 24
-  months of charges, lifetime and monthly totals, the add-as-bill
-  form). Logos can be switched off in Settings → Merchants ("Show
+  then its name, linking to the merchant's history page (every charge, over
+  the This month … All picker, All by default; lifetime and monthly
+  totals; the add-as-bill form). Logos can be switched off in Settings → Merchants ("Show
   merchant logos") for a plainer ledger; the choice applies to the
   merchants, spending and accounts pages too (the daily email never
   carries images).
@@ -167,13 +193,14 @@ filter".
   for reference, never counted in the page's household totals; the
   **more ▾** filters can hide or isolate these rows.
 - **⟳ recurring** — a blue pill meaning an active bill's matcher counts
-  this row: the bill's merchant tokens all appear in the row's text and
-  the amount is within tolerance (the larger of $30 or 25% of the bill
-  amount; envelope bills take any spend row on their merchant). It
-  links to that bill's history. Unmatched spend rows instead show a
-  faint **+⟳** shortcut — the merchant's history page with a bill /
-  envelope form prefilled (nothing saves until you confirm; see the
-  Bills guide).
+  this row: the row is one of the bill's merchants (a bill with no
+  merchants matches by words in the row's text) and the amount is
+  within tolerance — a quarter of the bill, at least $30 but never more
+  than half the bill ($15 → $7.50, $60 → $30, $200 → $50); envelope
+  bills take any spend row on their merchant. It links to that bill's
+  history. An unmatched spending row offers **⟳ make recurring** in its
+  ⋯ menu instead — the merchant's history page with a bill / envelope
+  form (nothing saves until you confirm; see the Bills guide).
 
 ## The row's detail (⋯)
 
@@ -334,7 +361,7 @@ rest under **more…** with a search box.
 ## View-only logins
 
 A view-only login gets the same table read-only: the category is
-plain text, the biz toggle becomes a pill, the +⟳ shortcut is hidden,
+plain text, the biz toggle becomes a pill, the ⟳ make recurring shortcut is hidden,
 and the clip appears only when a receipt is already attached (view
 only). The server enforces it too — the writes are rejected, not just
 hidden. A **member** login edits this page exactly as the owner does;
@@ -344,7 +371,7 @@ see the security guide for what each role can change.
 
 Every hand edit on a row — a category correction, a split, a note, a
 receipt, a flag — is recorded with the person and the time in the
-household's activity log: **Settings → Users → Activity** on the web,
+household's activity log: **Settings → Household → Activity** on the web,
 **More → Activity** in the app. See [Account security → Activity](security.md).
 
 ## Gotchas
@@ -355,7 +382,8 @@ household's activity log: **Settings → Users → Activity** on the web,
 - "Reset to source" only deletes the per-transaction override — an
   existing merchant rule reasserts itself on the next sweep. To truly
   detach, delete or disable the rule from the merchant page.
-- The search-mode total sums the **whole** result set across pages;
-  refunds and deposits in the results offset the charges.
+- The search-mode out · in · net covers the **whole** result set across
+  pages; a refund on a card is money in, a card payment or a transfer is
+  neither.
 - If a fetch fails mid-browse, the page keeps the last loaded rows and
   says so — a stale banner with a Retry button, not silently old data.

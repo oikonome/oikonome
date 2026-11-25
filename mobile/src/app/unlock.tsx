@@ -36,11 +36,12 @@ export default function Unlock() {
     <View style={s.wrap}>
       <Text style={s.h1}>Oikonome</Text>
       <Text style={s.mut}>Locked</Text>
-      <Pressable style={[s.btn, busy && { opacity: 0.5 }]} disabled={busy}
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, busy && { opacity: 0.5 }]} disabled={busy}
                  onPress={tryUnlock}>
         <Text style={s.btnText}>Unlock</Text>
       </Pressable>
-      <Pressable onPress={startOver} style={{ marginTop: 24 }}>
+      <Pressable accessibilityRole="button" onPress={startOver} style={{ marginTop: 24 }}>
         <Text style={s.link}>Can't unlock? Sign in again</Text>
       </Pressable>
     </View>
@@ -52,7 +53,7 @@ const s = StyleSheet.create({
           justifyContent: "center", gap: 12 },
   h1: { color: C.text, fontSize: 32, fontWeight: "700" },
   mut: { color: C.mut, fontSize: 15 },
-  btn: { backgroundColor: C.accent, borderRadius: 10, marginTop: 16,
+  btn: { backgroundColor: C.btn, borderRadius: 10, marginTop: 16,
          paddingHorizontal: 32, paddingVertical: 14 },
   btnText: { color: C.text, fontSize: 16, fontWeight: "600" },
   link: { color: C.mut, fontSize: 13, textDecorationLine: "underline" },

@@ -79,7 +79,8 @@ class CsvImportTests(unittest.TestCase):
             "SELECT COUNT(*) AS n FROM transactions WHERE id LIKE 'csv:%'"
         ).fetchone()["n"]
         self.assertEqual(n, 4)          # two identical Safeway rows kept, once
-        self.assertEqual(r2["imported"], 4)   # upsert, not duplicate
+        # the second import added nothing: all four lines were stored
+        self.assertEqual((r2["imported"], r2["matched"]), (0, 4))
 
     def test_cross_source_dedup_is_one_to_one(self):
         """ONE aggregator row at the same amount within ±3 days claims ONE

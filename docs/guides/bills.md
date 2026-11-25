@@ -4,25 +4,32 @@ The Bills page manages the bills the plan spends against. Bills are
 **ledger-driven**: detection reads your transaction history and proposes
 them; you approve. Nothing invents a bill you didn't have.
 
-The headline sums the schedule as evened-out monthly figures — what
-bills cost per month (a weekly or every-2-weeks bill at its exact rate
-over an average year, so a year with a 27th payday or a 53rd week does
-not inflate it), what income brings in, and the difference: what's
-left for variable spending and savings. Income is read from what
-actually landed: each income series' deposits (a deposit two series
-could both claim counts once, for the closer match) over the last twelve
-complete months, divided by the months the series has been paying, at
-most twelve (down to three while it is young — hover the figure to see
-which). Each check counts for the month it pays, so one moved a day or
-two early off a weekend is not counted twice in a month, and a paycheck
-that stopped for a while and started again counts from its restart. A
-deposit from the same payer that pays no scheduled check (a bonus, back
-pay) adds its dollars. A paycheck changes
-through the year as withholding caps out or a raise lands, so the
-current check annualised would over- or understate a year of it; a
-series with less than three months of deposits counts its scheduled
-rate until it has them. The bill load uses the same math as the Budget
-page's flow line, so the pages can't disagree about the same schedule.
+The page is titled **Bills & Income**. Its headline is the month's plan —
+the same figures the Budget page and Today's plan line print, sent by the
+server and added up nowhere on the page — in the plan line's order:
+
+- **Income** — the plan's income, with where it comes from: "this
+  month's money in" (every deposit that landed — paychecks, interest,
+  refunds — plus the paychecks still due, named with their amount when
+  there are any: "incl. $1,200 of paychecks still due"), "your income
+  scenario", or "the monthly income set on Budget".
+- **Bills** — "a month, evened out": the schedule as an average month (a
+  weekly or every-2-weeks bill at its exact rate over an average year, so
+  a year with a 27th payday or a 53rd week does not inflate it). The bill
+  load uses the same math as the Budget page's flow line, so the pages
+  can't disagree about the same schedule.
+- **Left after bills** (**Left after bills and savings** when the plan
+  saves) — the plan's to-spend plus its excess, and the note says so
+  ("to spend $2,000 + excess $1,500").
+- **Still due** — the bills not yet paid this month, the one figure
+  Today counts, under the name the Bills row on Today gives it. With a
+  bill still unpaid from an earlier month, its note gives the two parts
+  ("$380 of bills due this month + $45 late from Aug 2026").
+
+With no income in the plan, the headline shows Bills and Still due
+only.
+Under it, **Next 7 days** says what the week ahead holds ("$165 across 2
+bills").
 
 ## Detection and proposals
 
@@ -44,11 +51,39 @@ either side still counts as that payday. To change the days, pick another
 cadence; the days come back when the ledger shows them again. A paycheck
 already set up as every 2 weeks (or monthly) that the deposits show is
 really paid on two days of the month, three months running, gets a
-cadence-change proposal to twice a month.
+cadence-change proposal to twice a month — also when the two checks differ
+in size (deductions taken from one of them); its amount is then the average
+check, so the month adds up to what lands. Deposits of unrelated sizes on a
+second day of the month, such as bonuses, are not offered as a second
+payday.
 
 Everything detection wants to change arrives as a **proposal** — new
 bill, cadence change, a price change on the due date, "this bill seems
 gone" — and sits pending until you approve or dismiss it. The one exception is **amount drift**.
+
+Each offer reads the same on the web and the phone: what approving it
+does ("new bill", "new income", "new envelope", "stop tracking", "fee",
+"add merchant", "amount change"), its cadence ("every 2 weeks"; "varies
+month to month" for an envelope), the next date — never a day already
+past — an advisory tag in words ("looks like a subscription"), and the
+evidence ("4 charges about every 14 days"). Only offers you can act on
+are listed:
+
+- a credit-card payment is never offered as a bill (approving it would
+  count the card's spending twice — the card already reserves its
+  payment);
+- an offer to change, remove or join a bill that is no longer active,
+  or one an active bill already covers, is not listed;
+- several offers to add one merchant at different amounts show as one
+  row, the one due next; turning it down turns down the others;
+- an unanswered offer to add a bill lapses once its expected date is a
+  full cycle past. Detection gives a standing offer its series' new date
+  each night the series still charges, so only one that stopped lapses.
+
+**Approve all N** approves exactly the N offers on your screen — an offer
+that a detection run filed after the page loaded waits for you to see it.
+An offer withdrawn because a bill already tracks it is reported as
+withdrawn, not as one that stayed pending.
 
 **Adjust before approving.** In the setup wizard each new-bill or
 paycheck proposal has an **Adjust** button beside Dismiss and Approve.
@@ -59,6 +94,8 @@ exactly as an unadjusted approval would be, so the charges and merchants
 that proved it stay attached. A changed amount counts as your own edit,
 so drift leaves it alone for 60 days (see below). A new name that
 another bill already uses is refused and the proposal stays pending.
+A bill approved after the due date its offer predicted moves on to its
+next occurrence at once, so it does not open as late.
 
 Bank connections that know their own recurring streams (Plaid does) are
 cross-checked nightly: a stream Plaid sees that no bill covers arrives
@@ -161,7 +198,9 @@ whether the change came from drift, a proposal or your own edit.
 
 Envelope bills have no due dates — the amount is a spending **cap**
 (monthly, or an annual calendar-year pool for lumpy costs — see the
-Budget guide). Detection can propose monthly envelopes for
+Budget guide). On Today, Budget and the lenses they are the
+**Envelopes** row under Bills, not part of the Bills row, and the
+"Still due" figure here notes what is set aside in them to month end. Detection can propose monthly envelopes for
 grocery-style refill spending; **annual envelopes are always created
 manually** (pick "envelope (annual pool)" as the cadence).
 
@@ -226,11 +265,19 @@ fixed bill only shows a card in months it's actually scheduled.
 
 ## Managing bills
 
+Beside each bill, what is paid this month is said in words: "paid
+05/03", "paid 05/03 · next 06/03" when the next due date is already
+next month's ("paid 05/03 · next 05/03/27" for a yearly bill, whose next
+date is in another year), "1 of 2 paid" for a bill due twice, "received 05/15" for
+income. A used-up envelope pool reads "used up" ("used up this year" for
+an annual one).
+
 The **Cycle** column is a bar for where you are in the bill's billing
 cycle, with the answer written beside it: "in 12 days", "due today",
 "3 days late". Green while there is time, amber inside three days of the
 due date, red once it is late; the mobile app colours the same words under
-each bill the same way.
+each bill the same way. A next due date of today or tomorrow reads **due today** or
+**due tomorrow** (**today** / **tomorrow** for income).
 
 Each bill row edits inline: rename, amount, cadence (the standard cycles,
 or **Custom interval…** for every N months or years, up to about twenty
@@ -239,15 +286,21 @@ a custom interval keeps it listed in the picker, so editing something
 else never loses it), next due date, an occurrence cap (at most N per
 month), disable, archive, or delete. The enable/disable button sets the
 state it shows, so if someone else in the household changed the bill a
-moment earlier, clicking it does not flip it back.
-Health pills flag problems — a bill that stopped appearing ("stale"), one
+moment earlier, clicking it does not flip it back. A renamed bill is
+still the same bill: past months, the Year and a restored backup all
+count it under its new name, and an unpaid month before the rename is
+not read as a second, missing bill.
+Health pills flag problems — a bill that stopped appearing ("stale"; an
+envelope is stale once a whole period of its own — a month, or a year
+for a yearly pool — passed with nothing charged to it), one
 whose due-date anchor sits more than a couple of days off the real charge
 phase ("misdated"), and "mismatch": the merchant is charging you, but
 never near the amount the bill is set to. A mismatch says what it did see
 ("ledger $42.00 on 03/18/26"), which is usually enough to tell a price
 rise from a wrong bill. A bill whose merchant has never appeared in the
 ledger at all — a cash or hand-tracked bill, usually — carries
-"off-ledger" instead.
+"off-ledger" instead (a category envelope is on the ledger once its
+category's charges fill it).
 
 Bills that need attention also collect in a short queue at the top of the
 page (and of the Bills tab on the phone): one line per bill, a severity
@@ -271,7 +324,7 @@ Transactions page) over the usual This month · 1m · 3m · 6m · 1y · 3y ·
 5y · All picker —
 All by default, so the list agrees with the lifetime total — monthly
 totals, the lifetime total, and
-**Avg / mo (active)** — the average over months that actually had
+**avg / mo (active)** — the average over months that actually had
 activity, so sparse merchants aren't understated by empty months. That
 lookup reads the whole ledger, so it is budgeted like the reports are —
 60 payees a minute, far above reading and well under a loop. If a panel
@@ -289,9 +342,10 @@ of its rows first. The owner and members see the card; a view-only
 login does not.
 
 You can also create a bill or envelope straight from the Transactions
-page: any row already matched to a bill shows an indicator, and
-unmatched merchants offer "add as bill / envelope" with a suggested
-cadence prefilled from that merchant's history (you confirm; nothing
+page: a row already matched to a bill carries a "⟳ recurring" pill,
+and an unmatched charge's ⋯ menu offers "⟳ make recurring", which opens
+that merchant's history with an add form — press "✨ suggest from
+history" to fill it from the merchant's charges (you confirm; nothing
 auto-saves).
 
 ## Past months
@@ -306,6 +360,15 @@ read from the snapshot taken when it closed — the settings and bill
 schedule it was judged under — so a bill archived, repriced or disabled
 since still reads the way it did that month (an archived one keeps its
 row). A month with no snapshot is read under the live schedule. The
+headline shows that month's own figures too: Bills is the load frozen
+with the month ("a month, evened out, as frozen when the month closed"),
+Income is what landed, and Left after bills is that month's to-spend plus
+excess. A past month lists no offers and no week ahead — those are
+today's — and its calendar is that month's own: each bill on the day it
+was paid, each paycheck on the day it landed (one due on the 1st that
+landed on the 30th before sits on the 1st, "— landed 04/30", because it is
+the month's it pays), and a bill the month left unpaid on its due day,
+"— not paid". The
 next dates and health flags are always the live ones: a bill added since
 shows with nothing due in a month it did not exist for, and an edit made
 while looking at a past month changes the live bill. **This month**
@@ -316,11 +379,27 @@ brings you back.
 At the bottom of the page (web and mobile), **Next five weeks** shows a
 Monday-anchored grid of every scheduled bill and income event over the
 coming five weeks, with today highlighted and past days dimmed. Each day
-with an event shows its net total and up to two event labels, plus a
-"+N more" count when a day is busier; on the web, hovering a day lists
+with an event shows its money in and out apart, each signed ("+$2,400",
+"−$15"), so a bill never hides behind a paycheck on the same day, and up
+to two event labels, plus a "+N more" count when a day is busier (the
+phone's opened day reads "+$2,400 in · $15 out"). A card's payments are
+the ones the Today page's cash timeline shows by default ("your usual"),
+on the same dates and for the same amounts, labelled with the card and
+how it is paid ("Harbor card — paid after payday", "Summit card —
+statement due"); a bill a card pays says so ("… — on Harbor card"), sits
+on the day the card is charged — the same day the Today timeline lists
+it — and is not counted in that day's out: the card payment that pays it
+is the money leaving checking, so checking money is counted once. On
+the web, hovering a day lists
 every event with its amount, and on the phone tapping a day opens that
-day's events under the grid (tap again to close). The grid is the whole
-agenda — nothing repeats below it, so the **Archived** table follows it
+day's events under the grid (tap again to close). In a phone-width
+browser the cells carry only the day's figures, and **The next two weeks**
+under the grid lists what is due. A bill that is due
+today, or is late and still unpaid, a paycheck due today and a card
+payment its issuer dates today sit in today's cell — a bill a card pays
+included, still marked as on the card (a card with no due
+date sits on tomorrow, as the forecast assumes). Otherwise the grid is the
+whole agenda — nothing repeats below it, so the **Archived** table follows it
 directly.
 
 Archiving a bill yourself is a decision, not a deletion: the bill keeps

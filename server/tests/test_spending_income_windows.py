@@ -56,7 +56,7 @@ class WindowedTabsTests(unittest.TestCase):
         self.assertEqual(w["label"], "Jun–Aug 2026")
         self.assertEqual(w["total"], 390.0)
         self.assertEqual(w["prev_total"], 100.0)
-        self.assertEqual(w["categories"][0][:2], ["FOOD AND DRINK", 300.0])
+        self.assertEqual(w["categories"][0][:2], ["FOOD_AND_DRINK", 300.0])
         self.assertEqual(w["categories"][0][2], 100.0)   # the prev figure
         self.assertEqual(w["categories"][1][:3], ["ENTERTAINMENT", 90.0, 0.0])
         payees = {m[0]: m for m in w["merchants"]}
@@ -101,7 +101,7 @@ class WindowedTabsTests(unittest.TestCase):
         _txn(self.conn, self.bank, dt.date(2026, 4, 9), 6000.0, "AIRLINE",
              category_primary="TRAVEL")
         w = reporting.spending_window(self.conn, self.today, "3m")
-        self.assertEqual(w["categories"], [["FOOD AND DRINK", 240.0, 100.0],
+        self.assertEqual(w["categories"], [["FOOD_AND_DRINK", 240.0, 100.0],
                                            ["TRAVEL", 0.0, 6000.0]])
         self.assertEqual(w["total"], 240.0)
         self.assertEqual(

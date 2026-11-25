@@ -160,7 +160,7 @@ class PlaidReplaceKeysTests(_Base):
             conn.close()
 
     def _replace(self, cid, env="production"):
-        with mock.patch("oikonome.web.api.plaid_validate",
+        with mock.patch("oikonome.web.api_accounts.plaid_validate",
                         return_value={"env": env}):
             return self.client.post("/api/accounts/plaid/keys", json={
                 "password": "correct-horse-battery",
@@ -196,7 +196,7 @@ class PlaidEnvKeyItemsTests(_Base):
 
     def _replace(self, cid, env="production"):
         with mock.patch.dict(os.environ, self.ENV), \
-                mock.patch("oikonome.web.api.plaid_validate",
+                mock.patch("oikonome.web.api_accounts.plaid_validate",
                            return_value={"env": env}):
             return self.client.post("/api/accounts/plaid/keys", json={
                 "password": "correct-horse-battery",

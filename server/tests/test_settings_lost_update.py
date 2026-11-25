@@ -38,6 +38,23 @@ class TaxdocRowCapTests(unittest.TestCase):
         pop.assert_not_called()
 
 
+def _unlock(conn, tid) -> None:
+    conn.execute("SELECT pg_advisory_unlock(hashtext(%s))",
+                 (f"oikonome:email:{tid}",))
+
+
+def _try_and_release(conn, tid) -> bool:
+    """Could a sweep take the email lock now? Asked by taking it and,
+    when that worked, letting go at once: the probe is a pooled
+    connection, and one that kept the lock would hand it to the next
+    test that borrows the backend."""
+    got = conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+                       (f"oikonome:email:{tid}",)).fetchone()["ok"]
+    if got:
+        _unlock(conn, tid)
+    return got
+
+
 class EmailSweepOverlapTests(unittest.TestCase):
     """The due-check and the heartbeat that suppresses it
     are separate statements, so two overlapping sweeps could both send."""
@@ -61,6 +78,9 @@ class EmailSweepOverlapTests(unittest.TestCase):
         got = holder.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
                              (f"oikonome:email:{self.tid}",)).fetchone()["ok"]
         self.assertTrue(got)
+        # the holder is pooled: it lets go before it goes back, or the next
+        # test to borrow the backend inherits a sweep's lock
+        self.addCleanup(_unlock, holder, self.tid)
         with mock.patch.object(worker, "emails_due") as due:
             worker._email_if_due(self.tid)
         due.assert_not_called(
@@ -77,8 +97,7 @@ class EmailSweepOverlapTests(unittest.TestCase):
         probe = tenancy.tenant_connect(self.tid)
         self.addCleanup(probe.close)
         self.assertTrue(
-            probe.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-                          (f"oikonome:email:{self.tid}",)).fetchone()["ok"],
+            _try_and_release(probe, self.tid),
             "a guard that never unlocks would silence the cadence forever")
 
     def test_a_send_that_raises_still_releases_the_lock(self):
@@ -91,8 +110,7 @@ class EmailSweepOverlapTests(unittest.TestCase):
         probe = tenancy.tenant_connect(self.tid)
         self.addCleanup(probe.close)
         self.assertTrue(
-            probe.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-                          (f"oikonome:email:{self.tid}",)).fetchone()["ok"],
+            _try_and_release(probe, self.tid),
             "one failed send must not wedge the cadence permanently")
 
 

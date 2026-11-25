@@ -249,8 +249,10 @@ class AtomicRestoreTests(unittest.TestCase):
             w.writeheader()
             w.writerow({"id": "zt1", "account_id": "chk",
                         "date": "2026-07-01", "amount": "10", "name": "ok"})
+            # a non-finite amount refuses the whole archive (an unreadable
+            # date only refuses its row), so the first row must roll back
             w.writerow({"id": "zt2", "account_id": "chk",
-                        "date": "not-a-date", "amount": "5", "name": "bad"})
+                        "date": "2026-07-01", "amount": "nan", "name": "bad"})
             z.writestr("transactions.csv", s.getvalue())
         with self.assertRaises(Exception):
             restore.restore_zip(self.conn, buf.getvalue())

@@ -26,17 +26,18 @@ import PullRefresh from "../components/pull-refresh";
 import { CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "../components/verify-email-card";
 
-import StaleBanner from "../components/stale-banner";
-import { Card, Pill, SharedLock } from "../components/ui";
+import { StaleLine } from "../components/loaded";
+import { Card, Pill, SharedLock, Note } from "../components/ui";
 import { AppearancePane } from "../components/wizard-appearance";
 import { BillsQuestion, ManualBills, ProposalsInline, type SetupMode }
   from "../components/wizard-bills";
 import { ManualBudgets } from "../components/wizard-budgets";
-import { EmailPane, recipientCount } from "../components/wizard-email";
-import { accountsSummary, billsContinue, billsSummary, budgetsSummary,
-         checklistSummary, connectDoneHint, deliverySummary, historyRowNote,
+import { EmailPane } from "../components/wizard-email";
+import { accountsSummary, billsContinue, billsSummary, budgetsStepKept,
+         budgetsSummary, planSaved,
+         checklistSummary, connectDoneHint, historyRowNote,
          windowNarrower,
-         finishBlurb, type HistoryMonths, historyMonthsOf,
+         finishBlurb, reachLine, type HistoryMonths, historyMonthsOf,
          THEME_LABEL, type ThemeChoice, WIZARD_STEPS, type WizardStep,
          backfillFailsOpen, wizardThemeChoice }
   from "../components/wizard-logic";
@@ -45,9 +46,10 @@ import { PrimaryCheckingPick } from "../components/wizard-primary-checking";
 import { TAP, ws } from "../components/wizard-ui";
 import type { Onboarding, SettingsView } from "../lib/api";
 import { patchQuery, removeFromList, SETTINGS_SAVES, saveSettings } from "../lib/cache";
-import { bankAwaitsConfirm, deliveryOf, institutionAllowance,
+import { bankAwaitsConfirm, institutionAllowance,
          FIRST_SYNC_RUNNING, scanAlreadyRunning,
-         SCAN_RUNNING_RETRY_MS } from "../lib/pure";
+         SCAN_RUNNING_RETRY_MS, saveWaits, failLine, UNKNOWN_FIGURE }
+  from "../lib/pure";
 import { ext } from "../ext";
 import { useSession } from "../lib/session";
 import { C, setThemeMode, themeRestartPending } from "../lib/theme";
@@ -55,11 +57,12 @@ import { useSharedLock } from "../lib/viewer";
 import { markLeftWizard } from "../lib/storage";
 import { type PlaidLinkOutcome, startPlaidLink,
          useRelinkingItems } from "../lib/plaid";
-import { PendingLinkRows } from "../components/pending-links";
+import { BankLinkLine, PendingLinkRows } from "../components/pending-links";
 import { usePlaidLinkResume } from "./connect-hub";
 import { ago } from "../lib/dates";
 import { Planner } from "./budget";
 import { errText } from "../lib/api";
+import { useReduceMotion } from "../lib/a11y";
 
 type StepKey = WizardStep;
 
@@ -75,8 +78,11 @@ export default function Welcome() {
   const ob = useQuery({ queryKey: ["onboarding"],
     queryFn: () => client!.onboarding(), enabled: !!client,
     refetchInterval: 5000 });
+  // asked again while the bank door waits on the emailed link, which is
+  // opened in the mail app or on another device (connect-hub does the same)
   const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
-                        enabled: !!client });
+                        enabled: !!client,
+    refetchInterval: (q) => bankAwaitsConfirm(q.state.data) ? 5000 : false });
   // The left-the-wizard flag is keyed by TENANT, because that is how
   // Today reads it (index.tsx), so wait for the id rather than fall back
   // to a key Today never looks at.
@@ -138,8 +144,9 @@ export default function Welcome() {
   const backfillReady = backfillFailsOpen(backfill)
     || !!(backfill.data && backfill.data.all_ready && (reveal || !finished));
   // the poll is read-only; kicking a quiet backfill is an owner-only
-  // POST — once when the wizard opens and then every 30 s while the
-  // wait lasts (the web's rule: a new bank's first pull is queued on the
+  // POST — only while history is still owed, at once and then every 30 s
+  // while the wait lasts (a wizard opened on a complete import only
+  // reads, the web's rule) (the web's rule: a new bank's first pull is queued on the
   // worker, not made at link time, and a queued first sync counts as
   // syncing, so the nudge only asks the worker and never starts a second
   // pull beside it; without a webhook nothing else would pull again, and
@@ -147,9 +154,8 @@ export default function Welcome() {
   // repeat is free while history is flowing). A viewer's 403 is ignored.
   const backfillWaiting = !!backfill.data && !backfill.data.all_ready;
   useEffect(() => {
-    if (!client) return;
+    if (!client || !backfillWaiting) return;
     client.onboardingBackfillNudge().catch(() => {});
-    if (!backfillWaiting) return;
     const t = setInterval(() => {
       client.onboardingBackfillNudge().catch(() => {});
     }, 30_000);
@@ -195,8 +201,13 @@ export default function Welcome() {
   const [modeOv, setModeOv] = useState<SetupMode | null>(null);
   const [modeErr, setModeErr] = useState<string | null>(null);
   const storedMode = sv?.setup_mode ?? d?.setup_mode;
-  const setupMode: SetupMode = modeOv
-    ?? (storedMode === "manual" ? "manual" : "auto");
+  // the stored answer, or null while neither read has answered: a guess
+  // here would be written by Continue — "auto" over a household's
+  // "manual" turns the nightly finder back on
+  const setupMode: SetupMode | null = modeOv
+    ?? (storedMode == null ? null : storedMode === "manual" ? "manual" : "auto");
+  const modeWaits = saveWaits(setupMode !== null,
+                              settings.isError && ob.isError);
   // manual also stops the finder scanning on its own; choosing the
   // finder turns it back on — the answer is the person's either way.
   // One save in flight at a time, the last tap winning: two sent together
@@ -218,6 +229,10 @@ export default function Welcome() {
   // a save made in this wizard makes the re-seeded planner show what was
   // saved, not the live suggestion again
   const [plannerSaved, setPlannerSaved] = useState(false);
+  // the planner holds figures it has not saved: Continue would keep the
+  // stored plan and Done would report a figure the step did not show last
+  // (the web's rule), so the step waits for a save or a discard
+  const [budgetDirty, setBudgetDirty] = useState(false);
   // resume at the first step with no done/skipped mark — the web's rule,
   // and why a wizard started in a browser continues correctly here
   // …and not from a stale settings snapshot: a remount right after a
@@ -258,6 +273,7 @@ export default function Welcome() {
   const advance = (state: "done" | "skipped") => {
     setTouched(true);
     mark.mutate({ key: keys[idx], state });
+    setBudgetDirty(false);
     setI(Math.min(idx + 1, keys.length - 1));
   };
 
@@ -282,7 +298,8 @@ export default function Welcome() {
     setLinkMsg(r.kind === "add" ? null
       : r.kind === "exited" || r.kind === "cancelled"
         ? "No bank was linked — the sign-in window was closed."
-        : String(r.error ?? "link failed"));
+        // several banks, none kept: the server says which and why
+        : String(r.summary ?? r.error ?? "link failed"));
     if (r.kind === "add") {
       qc.invalidateQueries({ queryKey: ["connections"] });
       qc.invalidateQueries({ queryKey: ["onboarding"] });
@@ -336,13 +353,10 @@ export default function Welcome() {
     },
     onError: (e) => setLinkMsg(errText(e)),
   });
-  // Step 2 runs the finder itself once the history is in — the web's
-  // autoDetect. Without it the step says "the finder already scanned"
-  // over a Bills tab that has never scanned, and the person has to find
-  // the button. Once per visit, and only after the bills
-  // data has loaded so the refetch that follows is not folded into a
-  // still-in-flight first load.
-  const detectRan = useRef(false);
+  // The finder runs when the person asks for it: Continue on "find them
+  // for me" (the web's rule), or "Scan again" in the pane — never because
+  // the pane opened, so a re-run or a resume only reads the offers the
+  // last scan left (the nightly finder keeps them current).
   const detect = useMutation({
     mutationFn: () => client!.billsDetect(),
     onSuccess: async () => {
@@ -370,8 +384,9 @@ export default function Welcome() {
   // not mark the step done for the moment before the refetch corrects it
   const onBudgetsSaved = async (set: boolean = true) => {
     setPlannerSaved(set);
-    patchQuery<{ budgets_set: boolean }>(qc, ["onboarding"],
-      { budgets_set: set });
+    setBudgetDirty(false);
+    patchQuery<{ budgets_set: boolean; budgets_saved_by_user: boolean }>(
+      qc, ["onboarding"], { budgets_set: set, budgets_saved_by_user: true });
     await qc.invalidateQueries({ queryKey: ["settings"] });
     qc.invalidateQueries({ queryKey: ["onboarding"] });
     setPlannerGen((g) => g + 1);
@@ -434,9 +449,15 @@ export default function Welcome() {
       go: hosted ? null
         : { label: connected ? "Connect another account" : "Connect an account",
             to: "/connect-hub" },
+      // "connect at least one source" only from a setup state that
+      // answered: unread, nothing is known about what is connected
       primary: { label: "Done connecting →",
-                 disabled: !connected || !!askChecking,
-                 hint: !connected ? "connect at least one source, or skip"
+                 disabled: d === undefined || !connected || !!askChecking,
+                 hint: d === undefined
+                   ? (ob.isError
+                      ? failLine(ob.error, "the setup progress", "phone").text
+                      : "Loading…")
+                   : !connected ? "connect at least one source, or skip"
                    : askChecking },
       skippable: true },
     { key: "bills", label: "Bills & budgets", title: billsTitle,
@@ -447,9 +468,14 @@ export default function Welcome() {
       go: null,
       primary: !backfillReady ? null
         : billsPane === "question"
-          ? { label: "Continue →", onPress: () => {
+          ? { label: "Continue →", disabled: setupMode === null,
+              hint: modeWaits ?? undefined, onPress: () => {
+                if (setupMode === null) return;
                 // continuing on the pre-selected answer is an answer too
                 if (owner && storedMode !== setupMode) saveMode(setupMode);
+                // "find them for me" is the ask to scan; "I'll enter them
+                // myself" means nothing is detected behind their back
+                if (setupMode === "auto" && client && !viewer) detect.mutate();
                 setBillsPane(setupMode);
               } }
           // the auto pane leaves done, or skipped with proposals still
@@ -475,8 +501,10 @@ export default function Welcome() {
       // the planner is inline (the web's step), not a detour to the
       // Budget page — same Planner the page uses
       go: null,
-      primary: { label: "Continue →", disabled: !d?.budgets_set,
-                 hint: d?.budgets_set ? undefined : "save budgets first" },
+      primary: { label: "Continue →",
+                 disabled: !d || !budgetsStepKept(d) || budgetDirty,
+                 hint: !d || !budgetsStepKept(d) ? "save budgets first"
+                   : budgetDirty ? BUDGET_UNSAVED : undefined },
       skippable: true },
     { key: "email", label: "Email & push", title: "Email & push",
       blurb: "One message a day with your verdict, and alerts when "
@@ -484,9 +512,9 @@ export default function Welcome() {
         + "else in the household gets it.",
       primary: { label: "Continue →" }, skippable: true },
     { key: "finish", label: "Done", title: "Done",
-      // the first-email promise only when email is what was chosen
-      blurb: finishBlurb(deliveryOf(daily?.on ?? true, !!daily?.push),
-                         daily?.hour ?? 7),
+      // the first-message promise only when the server says it reaches
+      // someone (email_reach), as on the web
+      blurb: finishBlurb(sv?.email_reach?.daily, daily?.hour ?? 7),
       primary: null, skippable: false },
   ];
   const step = steps[idx];
@@ -497,21 +525,6 @@ export default function Welcome() {
     if (step.key === "bills") backfill.refetch();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step.key]);
-  // the finder runs only on the path that asked for it: "I'll enter them
-  // myself" means nothing is detected behind the person's back
-  // a gate that closes again (a bank linked since) means more history is
-  // coming: the next opening detects again, over the whole ledger
-  useEffect(() => {
-    if (!backfillReady) detectRan.current = false;
-  }, [backfillReady]);
-  useEffect(() => {
-    if (step.key === "bills" && billsPane === "auto" && backfillReady
-        && !detectRan.current && client && !viewer) {
-      detectRan.current = true;
-      detect.mutate();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [step.key, billsPane, backfillReady, client]);
 
   // leaving Appearance by Continue saves what is selected, the
   // pre-selected Auto included: a household that never chose has no
@@ -526,7 +539,7 @@ export default function Welcome() {
   };
   const onBack = () => {
     if (step.back) { step.back(); return; }
-    setTouched(true); setI(idx - 1);
+    setTouched(true); setBudgetDirty(false); setI(idx - 1);
   };
 
   // the wizard is nothing but writes, so a viewer gets the same note the
@@ -549,7 +562,7 @@ export default function Welcome() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => ob.refetch()} />}>
-      <StaleBanner query={ob} />
+      <StaleLine query={ob} />
       <Card>
         <Text style={s.mut}>Step {idx + 1} of {steps.length} ·{" "}
           <Text style={{ color: C.text, fontWeight: "700" }}>{step.label}</Text>
@@ -588,7 +601,7 @@ export default function Welcome() {
             <SharedLock note={credentialLock}>
             {/* the link's token is minted from the stored history
                 window, so it waits for a window save still in flight */}
-            <Pressable style={[s.btn, (link.isPending || instFull
+            <Pressable accessibilityRole="button" style={[s.btn, (link.isPending || instFull
                                        || confirmFirst || historyBusy)
                                       && { opacity: 0.5 }]}
                        disabled={link.isPending || instFull || confirmFirst
@@ -608,7 +621,8 @@ export default function Welcome() {
             <Text style={s.mut}>Opens your bank's sign-in (Plaid). When
               you finish, the connection appears below so you can link
               another or continue.</Text>
-            {linkMsg && <Text style={[s.mut, { color: C.warn }]}>{linkMsg}</Text>}
+            <BankLinkLine />
+            {linkMsg && <Note style={[s.mut, { color: C.warn }]}>{linkMsg}</Note>}
             {(conns.data?.connections ?? []).length > 0 && (
               <LinkedBanks conns={conns.data!.connections}
                            locked={!!credentialLock}
@@ -640,10 +654,19 @@ export default function Welcome() {
             Scanning your history for paychecks and recurring bills…</Text>
         )}
         {step.key === "bills" && backfillReady && billsPane === "auto"
-          && !detect.isPending && <ProposalsInline />}
+          && !detect.isPending && (<>
+            <ProposalsInline />
+            {!viewer && (
+              <Text style={[s.mut, { color: C.accent, marginTop: 6 }]}
+                    accessibilityRole="button"
+                    onPress={() => detect.mutate()}>Scan again</Text>)}
+          </>)}
         {step.key === "bills" && backfillReady && billsPane === "manual"
           && <ManualBills />}
 
+        {step.key === "budgets" && modeWaits && (
+          <Text style={s.mut}>{modeWaits}</Text>
+        )}
         {step.key === "budgets" && setupMode === "manual" && (
           <ManualBudgets viewer={viewer} onSaved={onBudgetsSaved} />
         )}
@@ -651,13 +674,20 @@ export default function Welcome() {
           && ob.data && (
           <Planner key={`wiz-p${plannerGen}`} s0={settings.data}
                    viewer={viewer}
-                   wizard={{ saved: plannerSaved
-                     || ob.data.wizard_steps?.budgets === "done" }}
+                   wizard={{ saved: plannerSaved || planSaved(ob.data) }}
+                   onDirty={setBudgetDirty}
                    onSaved={onBudgetsSaved} />
+        )}
+        {step.key === "budgets" && budgetDirty && (
+          <Text style={[s.mut, { color: C.accent, marginTop: 6 }]}
+                accessibilityRole="button"
+                onPress={() => { setBudgetDirty(false);
+                                 setPlannerGen((g) => g + 1); }}>
+            Discard changes</Text>
         )}
 
         {step.go && (
-          <Pressable style={s.btn}
+          <Pressable accessibilityRole="button" style={s.btn}
                      onPress={() => router.push(step.go!.to as never)}>
             <Text style={s.btnText}>{step.go.label}</Text>
           </Pressable>
@@ -690,18 +720,18 @@ export default function Welcome() {
         <View style={{ flexDirection: "row", alignItems: "center",
                        gap: 12, marginTop: 16, flexWrap: "wrap" }}>
           {step.skippable && (
-            <Pressable style={s.tap} onPress={() => advance("skipped")}>
+            <Pressable accessibilityRole="button" style={s.tap} onPress={() => advance("skipped")}>
               <Text style={s.link}>Skip this step</Text>
             </Pressable>
           )}
           <View style={{ flex: 1 }} />
           {(idx > 0 || !!step.back) && (
-            <Pressable style={s.tap} onPress={onBack}>
+            <Pressable accessibilityRole="button" style={s.tap} onPress={onBack}>
               <Text style={s.link}>← Back</Text>
             </Pressable>
           )}
           {step.primary && (
-            <Pressable
+            <Pressable accessibilityRole="button"
               style={[s.btn, { marginTop: 0 },
                       step.primary.disabled && { opacity: 0.5 }]}
               disabled={step.primary.disabled}
@@ -710,7 +740,7 @@ export default function Welcome() {
             </Pressable>
           )}
           {last && (
-            <Pressable style={[s.btn, { marginTop: 0 },
+            <Pressable accessibilityRole="button" style={[s.btn, { marginTop: 0 },
                                finish.isPending && { opacity: 0.5 }]}
                        disabled={finish.isPending}
                        onPress={() => finish.mutate()}>
@@ -719,9 +749,11 @@ export default function Welcome() {
           )}
         </View>
 
+        {/* the last step has one way out: "Go to Today" is both doors */}
+        {!last && (
         <View style={{ flexDirection: "row", justifyContent: "flex-end",
                        gap: 14, marginTop: 4, flexWrap: "wrap" }}>
-          <Pressable style={s.tap} onPress={async () => {
+          <Pressable accessibilityRole="button" style={s.tap} onPress={async () => {
                        // records the decision so Today stops redirecting
                        // back into the wizard — the web keeps the same flag
                        await markLeftWizard(await tenantId());
@@ -729,11 +761,12 @@ export default function Welcome() {
                      }}>
             <Text style={s.link}>save &amp; finish later</Text>
           </Pressable>
-          <Pressable style={s.tap} disabled={finish.isPending}
+          <Pressable accessibilityRole="button" style={s.tap} disabled={finish.isPending}
                      onPress={() => finish.mutate()}>
             <Text style={s.link}>don't show this again</Text>
           </Pressable>
         </View>
+        )}
       </Card>
     </ScrollView>
   );
@@ -809,7 +842,7 @@ function LinkedBanks({ conns, onDisconnect, busyId, locked, household,
               )}
               {!bad && onRelink && windowNarrower(c.history_months, household)
                 && !relinking.has(c.id) && (
-                <Pressable disabled={relinkBusy || locked}
+                <Pressable accessibilityRole="button" disabled={relinkBusy || locked}
                            onPress={() => onRelink(c.id)}
                            style={{ borderWidth: StyleSheet.hairlineWidth,
                                     borderColor: C.border, borderRadius: 8,
@@ -819,7 +852,7 @@ function LinkedBanks({ conns, onDisconnect, busyId, locked, household,
                     pull more history ↗</Text>
                 </Pressable>
               )}
-              <Pressable disabled={busyId === c.id || locked}
+              <Pressable accessibilityRole="button" disabled={busyId === c.id || locked}
                          onPress={() => Alert.alert(
                            `Disconnect ${c.institution_name || c.id}?`,
                            "It stops syncing — history is kept.",
@@ -844,18 +877,23 @@ function LinkedBanks({ conns, onDisconnect, busyId, locked, household,
  *  window has landed) with a sweep running over it while the bank is
  *  still sending, so an unmoving fill still reads as working, not hung.
  *  Full and still only once the bank says the window is complete. */
-function BackfillBar({ frac, live, tall, muted }: {
-  frac: number; live: boolean; tall?: boolean; muted?: boolean }) {
+function BackfillBar({ frac, live, tall, muted, label }: {
+  frac: number; live: boolean; tall?: boolean; muted?: boolean;
+  /** the bar's accessible name, the web's: what is being imported */
+  label: string }) {
   const pct = Math.max(0, Math.min(1, frac));
   const sweep = useRef(new Animated.Value(0)).current;
+  // the sweep is decoration: under reduce motion the fill alone says
+  // how far the import has got
+  const still = useReduceMotion();
   useEffect(() => {
-    if (!live) return;
+    if (!live || still) return;
     const loop = Animated.loop(Animated.timing(sweep, {
       toValue: 1, duration: 1600, easing: Easing.inOut(Easing.ease),
       useNativeDriver: true }));
     loop.start();
     return () => loop.stop();
-  }, [live, sweep]);
+  }, [live, still, sweep]);
   const [w, setW] = useState(0);
   const tx = sweep.interpolate({ inputRange: [0, 1],
                                  outputRange: [-w, w] });
@@ -863,14 +901,14 @@ function BackfillBar({ frac, live, tall, muted }: {
     <View style={{ height: tall ? 10 : 6, borderRadius: tall ? 5 : 3,
                    backgroundColor: C.hover, overflow: "hidden",
                    marginTop: tall ? 8 : 4, marginBottom: tall ? 4 : 0 }}
-          accessibilityRole="progressbar"
+          accessibilityRole="progressbar" accessibilityLabel={label}
           accessibilityValue={{ min: 0, max: 100, now: Math.round(pct * 100) }}>
       <View onLayout={(e) => setW(e.nativeEvent.layout.width)}
             style={{ height: "100%", width: `${pct * 100}%`,
                      borderRadius: tall ? 5 : 3, overflow: "hidden",
                      backgroundColor: muted ? C.warn : C.accent,
                      opacity: muted ? 0.6 : 1 }}>
-        {live && (
+        {live && !still && (
           <Animated.View style={{ position: "absolute", top: 0, bottom: 0,
                                   left: 0, right: 0,
                                   backgroundColor: "rgba(255,255,255,0.35)",
@@ -908,7 +946,8 @@ function BackfillGate({ items }: { items: {
         {items.length === 1 ? "connection" : "connections"} complete
       </Text>
       <BackfillBar frac={overall}
-                   live={items.some((it) => !it.ready && !it.stalled)} tall />
+                   live={items.some((it) => !it.ready && !it.stalled)} tall
+                   label="Transaction history imported" />
       <Text style={s.mut}>
         Your bank sends up to two years of transactions after it connects,
         and this step waits for all of it. That history is how Oikonome
@@ -938,7 +977,8 @@ function BackfillGate({ items }: { items: {
             </Text>
           </Text>
           <BackfillBar frac={it.stalled ? 1 : it.progress}
-                       live={!it.ready && !it.stalled} muted={it.stalled} />
+                       live={!it.ready && !it.stalled} muted={it.stalled}
+                       label={`${it.institution || "bank"} history imported`} />
         </View>
       ))}
       <Text style={s.mut}>
@@ -950,7 +990,7 @@ function BackfillGate({ items }: { items: {
 
 /** The Done step's recap, one line per step — what the household chose,
  *  read back from /api/onboarding and the settings, the web's rows. */
-function FinishSummary({ d, sv, theme, ownerEmail, history }: {
+function FinishSummary({ d, sv, theme, history }: {
   d?: Onboarding; sv?: SettingsView; theme: ThemeChoice;
   ownerEmail?: string; history: HistoryMonths;
 }) {
@@ -960,20 +1000,23 @@ function FinishSummary({ d, sv, theme, ownerEmail, history }: {
   // tracked = not disabled, the web's count
   const list = (bills.data?.bills ?? []).filter((b) => !b.disabled);
   const income = list.filter((b) => b.income).length;
-  const daily = (sv?.email_schedule as { daily?: { on?: boolean;
-    push?: boolean; hour?: number } } | null | undefined)?.daily;
+  // a line whose read has not answered prints the unknown mark, never a
+  // count or a default ("0 bills", "at 7 AM · 1 recipient"), as on the web
   const rows: [string, string][] = [
     ["Appearance", THEME_LABEL[theme]],
-    ["Accounts", accountsSummary(d?.connections ?? 0, d?.accounts ?? 0,
-                                 history)],
-    ["Bills & income", billsSummary(list.length - income, income)],
-    ["Budgets", budgetsSummary(!!d?.budgets_set, sv?.food_monthly,
-                               sv?.other_monthly)],
-    ["Email & push", deliverySummary(
-      deliveryOf(daily?.on ?? true, !!daily?.push), daily?.hour ?? 7,
-      recipientCount(sv, ownerEmail))],
+    ["Accounts", d ? accountsSummary(d.connections ?? 0, d.accounts ?? 0,
+                                     history) : UNKNOWN_FIGURE],
+    ["Bills & income", bills.data
+      ? billsSummary(list.length - income, income) : UNKNOWN_FIGURE],
+    ["Budgets", d && (!budgetsStepKept(d) || sv)
+      ? budgetsSummary(budgetsStepKept(d), sv?.food_monthly,
+                       sv?.other_monthly)
+      : UNKNOWN_FIGURE],
+    // who it reaches is the server's answer (email_reach), as on the web:
+    // a schedule that is on says nothing about whether anyone gets it
+    ["Email & push", reachLine(sv?.email_reach?.daily) ?? UNKNOWN_FIGURE],
     // what the Today screen's checklist will say — the same list it reads
-    ["Today checklist", d ? checklistSummary(d) : "…"],
+    ["Today checklist", d ? checklistSummary(d) : UNKNOWN_FIGURE],
   ];
   return (
     <View style={ws.body}>
@@ -990,6 +1033,10 @@ function FinishSummary({ d, sv, theme, ownerEmail, history }: {
   );
 }
 
+// why Continue waits on the budgets step while the planner holds edits
+// (the web's words)
+const BUDGET_UNSAVED = "save or discard the changes first";
+
 const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   h1: { color: C.text, fontSize: 17, fontWeight: "700", marginTop: 2 },
@@ -999,7 +1046,7 @@ const s = StyleSheet.create({
   input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8, marginTop: 6 },
-  btn: { backgroundColor: C.accent, borderRadius: 8, minHeight: TAP,
+  btn: { backgroundColor: C.btn, borderRadius: 8, minHeight: TAP,
          paddingHorizontal: 14, paddingVertical: 8, marginTop: 8,
          alignSelf: "flex-start", justifyContent: "center" },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

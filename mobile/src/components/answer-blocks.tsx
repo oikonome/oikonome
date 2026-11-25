@@ -5,14 +5,16 @@
 // webapp/src/components/AssistantBlocks.tsx with the same palette and
 // anatomy. Every chart's figures fold out as a table under it, and a
 // lone series has no legend (the title names it); two or more always do.
-import { useState } from "react";
-import { Pressable, StyleSheet, Text, View } from "react-native";
+import { StyleSheet, Text, View } from "react-native";
 import Svg, { Circle, Line, Polyline, Rect, Text as SvgText } from "react-native-svg";
 
-import { type AnswerBlock, type SeriesSpec, barLayout, cellText, chartRows,
-         lineLayout, PALETTE, ringLayout } from "../lib/answer-pure";
+import { type AnswerBlock, type RingShown, type SeriesSpec, barLayout, cellText,
+         chartRows, lineLayout, PALETTE, ringLayout, ringLegend }
+  from "../lib/answer-pure";
+import { chartSentence } from "../lib/chart-summary";
 import { itemLabel, parseRich } from "../lib/richtext";
 import { C, money } from "../lib/theme";
+import { DataTable, ShowNumbers } from "./show-numbers";
 
 /** model prose drawn: **bold** bold, "- " lines a list, the rest
  *  paragraphs (lib/richtext.ts; the web twin is AssistantBlocks'
@@ -46,11 +48,22 @@ export function AnswerBlocks({ blocks, width }: { blocks: AnswerBlock[]; width: 
               <DataTable columns={b.columns} rows={b.rows.map((r) => r.map(cellText))} />
             </Figure>
           );
+        // the picture in one sentence, picks from the drawn values
+        // (lib/chart-summary.ts); the table under it holds every figure
+        const said = chartSentence(b.title || b.series[0]?.name || "Chart",
+          b.series.map((sr) => ({ name: sr.name,
+                                  points: b.labels.map((l, k) => [l, sr.values[k]] as const) })),
+          (v) => money(v));
         return (
           <Figure key={i} title={b.title}>
-            {b.kind === "bar" && <Bars labels={b.labels} series={b.series} width={width} />}
-            {b.kind === "line" && <Lines labels={b.labels} series={b.series} width={width} />}
-            {b.kind === "pie" && <Ring labels={b.labels} values={b.series[0].values} />}
+            {b.kind === "bar" && <View accessible accessibilityRole="image"
+                                       accessibilityLabel={said}>
+              <Bars labels={b.labels} series={b.series} width={width} /></View>}
+            {b.kind === "line" && <View accessible accessibilityRole="image"
+                                        accessibilityLabel={said}>
+              <Lines labels={b.labels} series={b.series} width={width} /></View>}
+            {b.kind === "pie" && <Ring labels={b.labels} values={b.series[0].values}
+                                      shown={b.shown} />}
             {b.kind !== "pie" && b.series.length > 1 && <Legend series={b.series} />}
             <Numbers labels={b.labels} series={b.series} />
           </Figure>
@@ -83,33 +96,7 @@ function Legend({ series }: { series: SeriesSpec[] }) {
 }
 
 function Numbers({ labels, series }: { labels: string[]; series: SeriesSpec[] }) {
-  const [open, setOpen] = useState(false);
-  const t = chartRows(labels, series);
-  return (
-    <View style={{ marginTop: 6 }}>
-      <Pressable onPress={() => setOpen((o) => !o)} hitSlop={8}>
-        <Text style={s.toggle}>{open ? "hide numbers" : "show numbers"}</Text>
-      </Pressable>
-      {open && <DataTable columns={t.columns} rows={t.rows} />}
-    </View>
-  );
-}
-
-function DataTable({ columns, rows }: { columns: string[]; rows: string[][] }) {
-  return (
-    <View style={{ marginTop: 6 }}>
-      <View style={s.tr}>
-        {columns.map((c, i) => (
-          <Text key={i} style={[s.th, i > 0 && s.num]} numberOfLines={1}>{c}</Text>))}
-      </View>
-      {rows.map((r, ri) => (
-        <View key={ri} style={s.tr}>
-          {r.map((c, ci) => (
-            <Text key={ci} style={[s.td, ci > 0 && s.num]} numberOfLines={1}>{c}</Text>))}
-        </View>
-      ))}
-    </View>
-  );
+  return <ShowNumbers table={() => chartRows(labels, series)} />;
 }
 
 function Axis({ ticks, width }: { ticks: { y: number; text: string }[]; width: number }) {
@@ -172,11 +159,17 @@ function Lines({ labels, series, width }: { labels: string[]; series: SeriesSpec
   );
 }
 
-function Ring({ labels, values }: { labels: string[]; values: number[] }) {
+function Ring({ labels, values, shown }: { labels: string[]; values: number[];
+                                          shown?: RingShown | null }) {
   const size = 150, r = size / 2 - 12, cx = size / 2, sw = 22;
   const R = ringLayout(labels, values, r);
   return (
     <View style={s.ringRow}>
+      {/* the legend reads every part; the ring's own figure, the centre
+          total, is its spoken name */}
+      <View accessible={!!shown} accessibilityRole="image"
+            accessibilityLabel={shown ? `Total ${money(shown.total)}` : undefined}
+            importantForAccessibility={shown ? "yes" : "no-hide-descendants"}>
       <Svg width={size} height={size}>
         {R.segs.map((g) => (
           <Circle key={g.si} cx={cx} cy={cx} r={r} fill="none"
@@ -184,17 +177,21 @@ function Ring({ labels, values }: { labels: string[]; values: number[] }) {
                   strokeDasharray={`${g.dash} ${R.circ - g.dash}`}
                   strokeDashoffset={-g.offset} rotation={-90} origin={`${cx}, ${cx}`} />
         ))}
-        <SvgText x={cx} y={cx - 1} textAnchor="middle" fontSize={15} fontWeight="600"
-                 fill={C.text}>{money(R.total)}</SvgText>
-        <SvgText x={cx} y={cx + 14} textAnchor="middle" fontSize={10} fill={C.mut}>total</SvgText>
+        {/* the centre is the server's total; an older server sends none */}
+        {shown && <>
+          <SvgText x={cx} y={cx - 1} textAnchor="middle" fontSize={15} fontWeight="600"
+                   fill={C.text}>{money(shown.total)}</SvgText>
+          <SvgText x={cx} y={cx + 14} textAnchor="middle" fontSize={10} fill={C.mut}>total</SvgText>
+        </>}
       </Svg>
+      </View>
       <View style={{ flex: 1, gap: 3 }}>
-        {R.segs.map((g) => (
+        {ringLegend(R.segs, shown).map((g) => (
           <View key={g.si} style={s.lg}>
             <View style={[s.sw, { backgroundColor: PALETTE[g.si % PALETTE.length] }]} />
-            <Text style={s.lgText} numberOfLines={1}>
-              {g.label} <Text style={{ fontWeight: "600" }}>{money(g.value)}</Text>
-              <Text style={{ color: C.mut }}> {Math.round(g.share * 100)}%</Text>
+            <Text style={s.lgText}>
+              {g.label} <Text style={{ fontWeight: "600" }}>{money(g.dollars)}</Text>
+              {g.share !== null && <Text style={{ color: C.mut }}> {g.share}%</Text>}
             </Text>
           </View>
         ))}
@@ -213,11 +210,5 @@ const s = StyleSheet.create({
   lg: { flexDirection: "row", alignItems: "center", gap: 6 },
   sw: { width: 9, height: 9, borderRadius: 2 },
   lgText: { color: C.text, fontSize: 12, flexShrink: 1 },
-  toggle: { color: C.mut, fontSize: 12 },
   ringRow: { flexDirection: "row", alignItems: "center", gap: 12, marginTop: 6 },
-  tr: { flexDirection: "row", borderBottomWidth: 1, borderBottomColor: C.border,
-        paddingVertical: 4, gap: 6 },
-  th: { flex: 1, color: C.mut, fontSize: 11, fontWeight: "600" },
-  td: { flex: 1, color: C.text, fontSize: 12 },
-  num: { textAlign: "right", fontVariant: ["tabular-nums"] },
 });

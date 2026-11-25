@@ -70,3 +70,16 @@ class EnvNumberTests(unittest.TestCase):
             self.assertEqual(env_num("OIKONOME_TMP_KNOB", "7"), "7")
         finally:
             os.environ.pop("OIKONOME_TMP_KNOB", None)
+
+
+class SmtpPortKnobTests(unittest.TestCase):
+    def test_a_mistyped_smtp_port_keeps_the_default(self):
+        """A hand-edited OIKONOME_SMTP_PORT that is not a number must not
+        raise on every mail path (the mail-health probe among them): it
+        reads as the default, and an out-of-range one is held in range."""
+        from unittest import mock
+        from oikonome.web import report
+        for raw, want in (("587/tcp", 587), ("2525s", 587), ("smtp", 587),
+                          ("2525", 2525), ("0", 1), ("70000", 65535)):
+            with mock.patch.dict(os.environ, {"OIKONOME_SMTP_PORT": raw}):
+                self.assertEqual(report._env_smtp()["port"], want, raw)

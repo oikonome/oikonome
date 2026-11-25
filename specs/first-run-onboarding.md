@@ -30,9 +30,15 @@ links a bank.
   swaps the alarm for a "set today's checking balance on Accounts" nudge,
   and the shared email context suppresses headroom the same way
   (todayview.py). A live source reporting a real $0 is still believed.
-- **The recurring step scans on entry**, so the step opens with proposals
-  to confirm rather than a button to hunt for. Coincidental-cadence false
-  positives are exactly what the approve/reject gate is for.
+- **The recurring step scans when it is asked to**: Continue on "find
+  them for me" is the ask, so the pane opens on a fresh scan with
+  proposals to confirm rather than a button to hunt for, and "Scan again"
+  in the pane asks once more. Opening a step never writes by itself: a
+  pane reopened by Back or a resume only reads the offers the last scan
+  left (the nightly finder keeps them current), and the import gate's
+  backfill nudge is sent only while a bank still owes history — never on
+  a complete import. Coincidental-cadence false positives are exactly
+  what the approve/reject gate is for.
 - **The budgets step pre-fills income** from the just-approved paycheck.
 - **Resume is real**: per-step skip links, an exit-and-resume pill, and a
   resume point that lands on the first incomplete step.

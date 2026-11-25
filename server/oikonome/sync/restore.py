@@ -47,13 +47,14 @@ import re
 import uuid
 import zipfile
 from collections import defaultdict
+from decimal import ROUND_HALF_UP, Decimal
 
 from . import account_sources as _account_sources
 from . import base as _sync_base
 from . import archive_upgrades as _upgrades
 from . import card_number
-from ..engine.entities import _hold_household_mark
-from ..engine.compat import MAX_AMOUNT, as_date, strip_nul
+from . import upload_zip as _upload_zip
+from ..engine.compat import MAX_AMOUNT, as_date, asset_day, strip_nul
 from ..engine.compat import jsonb as _compat_jsonb
 from ..engine import bills as _bills
 from ..engine import budget as _budget
@@ -121,9 +122,17 @@ MAX_RECORD_COMMAS = 1_000_000
 MAX_ROW_OVERFLOW = 50
 
 
-def _not_an_export(name: str, why: str) -> ValueError:
-    return ValueError(f"{name}: {why} — this doesn't look like a genuine "
-                      "Oikonome export")
+class _ArchiveRefused(ValueError):
+    """The whole archive is refused: nothing in it lands (the restore is
+    one transaction). Raised only by a rule that judges the archive, never
+    by a reader meeting one odd cell, so a row's reader can let this
+    through while it costs a cell it cannot read only its row. A
+    ValueError, so every door reports the sentence to the person."""
+
+
+def _not_an_export(name: str, why: str) -> _ArchiveRefused:
+    return _ArchiveRefused(f"{name}: {why} — this doesn't look like a "
+                           "genuine Oikonome export")
 
 
 class _MemberLines:
@@ -213,6 +222,9 @@ def _rows(z: zipfile.ZipFile, name: str):
     moved_txns = _MOVED_TXNS.get()
     id_cells = (("id", "pending_transaction_id") + _TXN_ID_CELLS
                 if name == "transactions.csv" else _TXN_ID_CELLS)
+    list_cells = _TXN_ID_LIST_CELLS.get(name, ())
+    nul_cells = _NUL_KEY_CELLS.get()
+    nul_sample = _NUL_KEY_SAMPLE.get()
     with fh:
         # newline="": csv does its own line handling, and a universal-
         # newline read would turn a CR inside a quoted cell into a line feed
@@ -225,7 +237,7 @@ def _rows(z: zipfile.ZipFile, name: str):
             i = -1
             for i, row in enumerate(reader):
                 if i >= MAX_ROWS_PER_MEMBER:
-                    raise ValueError(
+                    raise _ArchiveRefused(
                         f"{name}: too many rows (limit "
                         f"{MAX_ROWS_PER_MEMBER:,}) — this doesn't look like "
                         "a genuine Oikonome export")
@@ -235,27 +247,127 @@ def _rows(z: zipfile.ZipFile, name: str):
                 # any cell; a jsonb cell's escaped one is dropped on write
                 out = {strip_nul(k): _unescape(strip_nul(v))
                        for k, v in row.items()}
+                if nul_cells is not None:
+                    # a JSON cell can spell a NUL as an escape, in a key;
+                    # _j drops such a value and names its file and column.
+                    # Only the row being landed is kept, per member: the
+                    # map is the size of one row, never of the archive.
+                    nul_cells[name] = {
+                        v: col for col, v in out.items()
+                        if isinstance(v, str) and _NUL_ESCAPE in v}
+                    if nul_sample is not None:
+                        # a lander that reads its member whole before it
+                        # lands a row still gets the first few named
+                        for v, col in nul_cells[name].items():
+                            if len(nul_sample) >= _NUL_SAMPLE_MAX:
+                                break
+                            if len(v) <= _NUL_SAMPLE_TEXT_MAX:
+                                nul_sample.setdefault(v, (name, col))
                 if moved_txns:
                     for cell in id_cells:
                         v = out.get(cell)
                         if v and v in moved_txns:
                             out[cell] = moved_txns[v]
+                    for cell in list_cells:
+                        if out.get(cell):
+                            out[cell] = _carry_id_list(out[cell], moved_txns)
                 yield out
             _tick(name, i + 1, done=True)
         except csv.Error as e:
             # an over-wide cell (or a torn CSV) is a bad file, not a crash
-            raise ValueError(f"{name}: {e} — this doesn't look like a "
+            raise _ArchiveRefused(f"{name}: {e} — this doesn't look like a "
                              "genuine Oikonome export")
+        except UnicodeDecodeError:
+            # the export writes UTF-8: bytes that are not are a bad file,
+            # said in words, not the codec's account of the byte
+            raise _not_an_export(name, "it is not UTF-8 text") from None
+
+
+# Per member, the cells of the row last read from it whose text spells a
+# NUL escape, by text: column, so a value _j drops can be named. A lander
+# lands each row before the next is read, so the row _j is handed is the
+# one recorded. Set per restore (_restore); None elsewhere, where _j still
+# drops such a value.
+_NUL_KEY_CELLS: contextvars.ContextVar = contextvars.ContextVar(
+    "oikonome_restore_nul_cells", default=None)
+# and, for a lander that reads a member whole before landing it, the first
+# _NUL_SAMPLE_MAX such cells of the restore (each at most
+# _NUL_SAMPLE_TEXT_MAX characters), by text: (member, column)
+_NUL_KEY_SAMPLE: contextvars.ContextVar = contextvars.ContextVar(
+    "oikonome_restore_nul_sample", default=None)
+_NUL_SAMPLE_MAX = 64
+_NUL_SAMPLE_TEXT_MAX = 64 * 1024
+# the (member, column) of each value _j dropped for a NUL in a key
+_NUL_KEY_DROPS: contextvars.ContextVar = contextvars.ContextVar(
+    "oikonome_restore_nul_drops", default=None)
+_NUL_ESCAPE = "\\u0000"
+
+
+def _nul_in_a_key(v) -> bool:
+    """Whether a key anywhere in the parsed document holds U+0000."""
+    stack = [v]
+    while stack:
+        x = stack.pop()
+        if isinstance(x, dict):
+            for k, y in x.items():
+                if isinstance(k, str) and "\x00" in k:
+                    return True
+                stack.append(y)
+        elif isinstance(x, list):
+            stack.extend(x)
+    return False
 
 
 def _j(v):
     if not v:
         return None
     try:
-        return json.loads(v)
+        got = json.loads(v)
     except (ValueError, RecursionError):
         # a cell the reader cannot walk is malformed, never fatal
         return None
+    if isinstance(v, str) and _NUL_ESCAPE in v and _nul_in_a_key(got):
+        # A key holding a NUL is never rewritten (compat.strip_nul: a key
+        # check must not see one spelling and the store keep another), and
+        # no genuine export writes one. The value is malformed: it lands as
+        # an empty cell would, and the rest of the archive with it; the
+        # summary names its file and column.
+        drops = _NUL_KEY_DROPS.get()
+        if drops is not None:
+            where = ("an archive file", "a JSON cell")
+            for member, cells in (_NUL_KEY_CELLS.get() or {}).items():
+                if v in cells:
+                    where = (member, cells[v])
+                    break
+            else:
+                where = (_NUL_KEY_SAMPLE.get() or {}).get(v, where)
+            drops.add(where)
+        return None
+    if isinstance(v, str) and _LONE_SURROGATE_ESCAPE.search(v):
+        # JSON may spell half of a surrogate pair on its own ("\ud800"),
+        # which no UTF-8 text holds: PostgreSQL refuses it in jsonb and
+        # psycopg cannot send it as text, so one such cell would end the
+        # whole restore. It reads as the replacement character.
+        try:
+            got = _no_lone_surrogates(got)
+        except RecursionError:
+            return None
+    return got
+
+
+_LONE_SURROGATE_ESCAPE = re.compile(r"\\u[dD][89a-fA-F][0-9a-fA-F]{2}")
+_SURROGATE = re.compile("[\ud800-\udfff]")
+
+
+def _no_lone_surrogates(v):
+    if isinstance(v, str):
+        return _SURROGATE.sub("\ufffd", v)
+    if isinstance(v, dict):
+        return {_no_lone_surrogates(k): _no_lone_surrogates(x)
+                for k, x in v.items()}
+    if isinstance(v, list):
+        return [_no_lone_surrogates(x) for x in v]
+    return v
 
 
 def jsonb(v):
@@ -292,6 +404,33 @@ def _finite_walk(v):
     return v
 
 
+# The longest figure, count or day cell a restore reads. The export writes
+# none longer than a few dozen characters (a float's repr is at most 24, a
+# moment with its zone 32), and a cell may be megabytes: every reader of a
+# figure or a day refuses a longer cell by its length BEFORE any pattern or
+# parser sees it. The restore runs in the web process and a regular
+# expression holds the interpreter lock, so one pattern that backtracks on
+# a long cell stalls every household the process serves; the length cap is
+# the guard that does not depend on each pattern being written right.
+MAX_FIGURE_CELL = 64
+
+
+def _too_long(v) -> bool:
+    return isinstance(v, str) and len(v) > MAX_FIGURE_CELL
+
+
+# A figure as the export writes it: ASCII digits, a point, an exponent.
+# float() also reads "1_000" and other scripts' digits, which no export
+# holds; the words for a non-finite number are let through to float() so
+# they refuse the archive below. Each run of digits has one way to match
+# (the point is not optional between two runs), so a failing match is
+# linear in the cell.
+_FIGURE = re.compile(r"\s*[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)"
+                     r"(?:[eE][+-]?[0-9]+)?\s*", re.ASCII)
+_NON_FINITE = re.compile(r"\s*[+-]?(?:nan|inf|infinity)\s*",
+                         re.ASCII | re.IGNORECASE)
+
+
 def _f(v):
     """CSV cell → float or None ('' travels for NULL).
 
@@ -303,15 +442,45 @@ def _f(v):
     transaction, so nothing lands."""
     if v in (None, ""):
         return None
-    f = float(v)
+    if _too_long(v):
+        raise _NotANumber(v[:20], over="a value that is not a number")
+    if isinstance(v, str) and not (_FIGURE.fullmatch(v)
+                                   or _NON_FINITE.fullmatch(v)):
+        raise _NotANumber(str(v)[:20], over="a value that is not a number")
+    try:
+        f = float(v)
+    except (TypeError, ValueError) as e:
+        # text where a number belongs: that one row's cell, never the
+        # archive (the reader refuses the row as malformed)
+        raise _NotANumber(str(v)[:20], over="a value that is not a number"
+                          ) from e
     if not math.isfinite(f):
-        raise ValueError(f"a number in this archive is not finite ({str(v)[:20]!r}) "
+        raise _ArchiveRefused(f"a number in this archive is not finite ({str(v)[:20]!r}) "
                          "— this doesn't look like a genuine Oikonome export")
     return f
 
 
-class _AmountOutOfRange(ValueError):
-    """One row's amount is larger than any real sum (see `_money`)."""
+class _BadValue(ValueError):
+    """One row's cell the column cannot take; `over` says what was wrong
+    with it, for the summary."""
+
+    def __init__(self, cell: str, over: str = ""):
+        super().__init__(cell)
+        self.over = over
+
+
+class _AmountOutOfRange(_BadValue):
+    """One row's value is past what its column holds: an amount larger
+    than any real sum (see `_money`), or past a bounded column (see
+    `_numeric`), whose bound `over` names for the summary."""
+
+
+class _NotANumber(_BadValue):
+    """One row's figure is text, not a number (see `_numeric`)."""
+
+
+class HouseholdBeingDeleted(_ArchiveRefused):
+    """The household's erasure has begun: a restore writes nothing."""
 
 
 def _money(v):
@@ -347,6 +516,114 @@ def _out_of_range_note(n: int) -> str:
             f"{'were' if n != 1 else 'was'} left out")
 
 
+def _numeric(v, what: str, precision: int, scale: int):
+    """A cell bound for a NUMERIC(precision, scale) column: `_f`, and no
+    more whole digits than the column holds once rounded to its scale.
+    Such a value is finite, so `_f` passes it, but the column refuses it
+    and the refusal rolls back the whole restore; it raises
+    _AmountOutOfRange instead, naming `what` and the column's bound, and
+    the reader refuses that one row or leaves the value empty."""
+    try:
+        f = _f(v)
+    except ValueError as e:
+        if isinstance(v, str) and _is_non_finite(v):
+            raise              # the archive-wide rule in `_f`
+        raise _NotANumber(str(v)[:20], over=f"{what} that is not a number"
+                          ) from e
+    if f is None:
+        return f
+    if not _fits_numeric(f, precision, scale):
+        bound = Decimal(10) ** (precision - scale) - Decimal(1).scaleb(-scale)
+        raise _AmountOutOfRange(str(v)[:20],
+                                over=f"{what} over {bound:,.{scale}f}")
+    return f
+
+
+def _fits_numeric(v, precision: int, scale: int) -> bool:
+    """Whether a NUMERIC(precision, scale) column takes `v` (a float or a
+    Decimal) as psycopg sends it: a float8 the server reads at 15
+    significant digits, a Decimal exactly; either rounded half away from
+    zero to the column's scale."""
+    limit = Decimal(10) ** (precision - scale)
+    if isinstance(v, float):
+        if not math.isfinite(v) or abs(v) >= limit:
+            return False
+        v = Decimal(f"{v:.15g}")
+    elif not v.is_finite() or abs(v) >= limit:
+        return False
+    d = v.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP)
+    return abs(d) < limit
+
+
+def _is_non_finite(v: str) -> bool:
+    try:
+        return not math.isfinite(float(v))
+    except ValueError:
+        return False
+
+
+def _bounded_notes(over: dict, *, left: str) -> list[str]:
+    return [f"{n} row{'s' if n != 1 else ''} with {what} "
+            f"{'were' if n != 1 else 'was'} {left}"
+            for what, n in sorted(over.items())]
+
+
+class _Unreadable(ValueError):
+    """One row's required cell does not read as its type: that row is
+    refused as malformed, never the archive."""
+
+
+# A day as the export writes it, alone or leading a moment
+_DAY = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", re.ASCII)
+
+
+def _as_exported(v) -> str | None:
+    """The cell's text when it spells a day or a moment the way the export
+    writes one, else None. A day read from its first ten characters took
+    an impossible hour (a "T25:00" after the day) or trailing text as
+    that day, and the compact eight-digit form, which no export writes, as
+    it too."""
+    if not isinstance(v, str) or _too_long(v):
+        return None
+    t = v.strip()
+    if not _DAY.match(t):
+        return None
+    if len(t) > 10:
+        try:
+            _dt.datetime.fromisoformat(t)
+        except ValueError:
+            return None
+    return t
+
+
+def _opt_date(v):
+    """An optional date cell, or None when it is blank or unreadable: the
+    row keeps everything else it says."""
+    if v in (None, ""):
+        return None
+    if isinstance(v, str):
+        v = _as_exported(v)
+        if v is None:
+            return None
+    try:
+        return as_date(v)
+    except (ValueError, TypeError):
+        return None
+
+
+def _req_date(v):
+    """A required date cell; _Unreadable when it is blank or unreadable,
+    so the reader refuses that row as malformed and the rest lands."""
+    d = _opt_date(v)
+    if d is None:
+        raise _Unreadable(str(v)[:20])
+    return d
+
+
+# the migration that gave each wage figure a record of what the W-2s wrote
+_W2_FIGURE_MARKS = "226_a_w2_figure_remembers_what_it_wrote.sql"
+
+
 def _i(v, default=None):
     """CSV cell → int (accepts '1.0'-style floats) or default. A non-finite
     cell refuses the archive the way _f does ('inf' would otherwise escape
@@ -366,6 +643,10 @@ def _ts(v):
     text (which won't coerce to timestamptz) — so parse here."""
     if not v:
         return None
+    if isinstance(v, str):
+        v = _as_exported(v)
+        if v is None:
+            return None
     try:
         return _dt.datetime.fromisoformat(str(v))
     except ValueError:
@@ -587,7 +868,7 @@ def _live_credentials(conn, fingerprint: str) -> frozenset:
         return frozenset()
 
 
-class StarterSignedOut(ValueError):
+class StarterSignedOut(_ArchiveRefused):
     """The credential that started this restore was gone before the restore
     began. A ValueError, so the job reports the sentence to the person."""
 
@@ -658,12 +939,18 @@ def pause_if_starter_signed_out(before: dict, after: dict, conn) -> None:
         "smtp": smtp, "recipients": sorted(added), "llm": llm}
 
 
+# credentials under a name no substring rule reads: a relay can take its
+# API token as the login (Postmark does)
+_SECRET_NAMES = frozenset({"smtp_user"})
+
+
 def _secret_key(k) -> bool:
     """Is this config key credential-shaped? The one carve-out is the exact
     key `tokens` — savings-goal entries carry merchant match WORDS under it
     (user data living in list-of-dict config), and no credential store in
     this config uses that name."""
-    return k != "tokens" and any(s in k for s in _SECRET_SUBSTR)
+    return k in _SECRET_NAMES or (
+        k != "tokens" and any(s in k for s in _SECRET_SUBSTR))
 
 
 def _scrub_list(items: list) -> list:
@@ -750,6 +1037,197 @@ def _settle_masked_urls(cfg: dict, dest: dict) -> None:
                 b["url"] = "" if kept is None else kept
 
 
+# Every key the AI route is read from (ai_route); a document pair that
+# differs in none of them has the same route, and nothing is decrypted.
+_AI_ROUTE_KEYS = ("llm_url", "llm_model", "llm_vision_model", "llm_api_key",
+                  "llm_extra_body", "llm_backends", "llm_roles",
+                  "outbound_paused")
+
+
+def _credential_digest(conn, stored) -> str:
+    """A digest of one stored AI credential's plaintext, held only for the
+    comparison and never logged or kept. Decrypted because a save or a
+    restore can re-encrypt the same key (a fresh ciphertext is not a new
+    credential); a value that cannot be decrypted here is compared as
+    stored."""
+    import hashlib
+    if not stored:
+        return ""
+    from ..db import crypto
+    try:
+        plain = crypto.decrypt(conn, stored) or ""
+    except Exception:                                    # noqa: BLE001
+        plain = str(stored)
+    return hashlib.sha256(plain.encode()).hexdigest()
+
+
+def ai_route(conn, cfg: dict) -> tuple:
+    """Where each AI task's text goes: the endpoint, the model, and the
+    credential it is sent with (on a router service the key decides whose
+    account receives and logs the prompts). Read through the same resolver
+    the tasks use, so a document that only respells the route — the legacy
+    endpoint folded into the backend list, a masked URL echoed back, the
+    same list re-posted, the same key re-encrypted — has the same route."""
+    from ..engine.llm_categorize import ROLES, resolve_role
+    out = []
+    for role in ROLES:
+        layer, b = resolve_role(cfg, role)
+        if layer == "backend":
+            model = ((b.get("vision_model") or b.get("model"))
+                     if role == "vision" else b.get("model"))
+            url, key, extra = b.get("url"), b.get("api_key"), \
+                b.get("extra_body")
+        elif layer == "legacy":
+            model = ((cfg.get("llm_vision_model") or cfg.get("llm_model"))
+                     if role == "vision" else cfg.get("llm_model"))
+            url, key, extra = cfg.get("llm_url"), cfg.get("llm_api_key"), \
+                cfg.get("llm_extra_body")
+        else:
+            # the operator's backend; only a household-chosen vision model
+            # rides on it
+            model = cfg.get("llm_vision_model") if role == "vision" else ""
+            url = key = extra = ""
+        out.append((role, str(url or "").strip(), str(model or "").strip(),
+                    _credential_digest(conn, key),
+                    _credential_digest(conn, extra)))
+    return tuple(out)
+
+
+def ai_route_moved(conn, before: dict, after: dict) -> bool:
+    """Does `after` send any AI task's text somewhere `before` did not?"""
+    before, after = before or {}, after or {}
+    if all(before.get(k) == after.get(k) for k in _AI_ROUTE_KEYS):
+        return False
+    return ai_route(conn, before) != ai_route(conn, after)
+
+
+def _tell_the_owner_the_ai_route_moved(conn) -> None:
+    """The settings save's notice, worded for the act that happened (the
+    owner reading it touched no Settings page), in the household owner's
+    name: a restore runs as a job with no request, and only an owner may
+    start one. Never raises — the restore it reports on has committed."""
+    try:
+        row = conn.execute("SELECT current_setting('app.tenant_id', true)"
+                           " AS tid").fetchone()
+        tid = row["tid"] if row else None
+        if not tid:
+            return
+        from ..web import mailguard
+        from ..web.app import _notify_security_change
+        for email in sorted(mailguard.owner_addresses(tid)):
+            _notify_security_change({"email": email, "tenant_id": tid},
+                                    "ai_route_restored")
+    except Exception:                                    # noqa: BLE001
+        log.exception("restore: the AI route notice could not be sent")
+
+
+# Which setting names the destination each stored credential is sent to.
+# A restore carries a credential back only onto the destination it was
+# saved for: an archive is a file anyone holding it can edit, and one
+# naming another endpoint or relay host under the same entry would
+# otherwise hand the stored key to it. `url` is a backend entry's own
+# field (inside llm_backends); the rest are top-level keys. smtp_user is
+# here because a relay can take its API token as the login.
+_DESTINATION_OF = {
+    "api_key": "url", "extra_body": "url",
+    "llm_api_key": "llm_url", "llm_extra_body": "llm_url",
+    "smtp_password": "smtp_host", "smtp_user": "smtp_host",
+}
+
+
+_DEFAULT_PORTS = {"https": 443, "http": 80}
+
+
+def _destination(v) -> tuple:
+    """A destination as compared: an endpoint URL by scheme, host, port
+    (the scheme's default written out or left off alike) and path, the host
+    case-blind; a bare relay host case-blind, as written. The relay's port
+    is its own setting and not part of where the password goes."""
+    from urllib.parse import urlsplit
+    s = str(v or "").strip()
+    try:
+        parts = urlsplit(s)
+        if parts.scheme and parts.netloc:
+            scheme = parts.scheme.lower()
+            # the scheme's own port written out is the same address
+            port = parts.port
+            if port == _DEFAULT_PORTS.get(scheme):
+                port = None
+            return (scheme, (parts.hostname or "").lower(), port,
+                    parts.username or "", parts.path.rstrip("/"),
+                    parts.query)
+    except ValueError:
+        pass
+    return ("", s.lower())
+
+
+def _same_destination(dest: dict, incoming: dict, secret: str) -> bool:
+    """May the stored `secret` of `dest` ride onto `incoming`? Yes when
+    nothing names where it goes, or when `incoming` names the same place
+    `dest` does (or does not name one, leaving the stored one standing)."""
+    field = _DESTINATION_OF.get(secret)
+    if field is None or field not in incoming:
+        return True
+    return _destination(dest.get(field)) == _destination(incoming.get(field))
+
+
+# What a person is told was not carried, in this order, each at most once:
+# the clients word the message from these names.
+_DROPPED_KIND = {"api_key": "ai_key", "extra_body": "ai_key",
+                 "llm_api_key": "ai_key", "llm_extra_body": "ai_key",
+                 "smtp_password": "mail_password",
+                 "smtp_user": "mail_password"}
+_DROPPED_ORDER = ("ai_key", "mail_password")
+
+
+def dropped_kinds(secrets) -> list[str]:
+    """The fixed names for these left-behind credentials, in order."""
+    kinds = {_DROPPED_KIND[s] for s in secrets if s in _DROPPED_KIND}
+    return [k for k in _DROPPED_ORDER if k in kinds]
+
+
+def _drop_moved_credentials(dest: dict, archive: dict,
+                            merged: dict) -> list[str]:
+    """The top-level half of the same rule: the merge keeps a stored flat
+    credential the archive does not carry (an export never does), so one
+    whose destination the archive moved is taken out here. Answers the
+    secrets it took out."""
+    dropped = []
+    for secret, field in _DESTINATION_OF.items():
+        if field == "url" or secret in archive or secret not in merged:
+            continue
+        if not _same_destination(dest, archive, secret):
+            merged.pop(secret)
+            dropped.append(secret)
+    return dropped
+
+
+def _backend_credentials_left_behind(dest: dict, merged: dict) -> list[str]:
+    """The stored backend secrets `carry_forward_secrets` did not carry onto
+    an entry of the same id because the entry's URL moved."""
+    prior = {b.get("id"): b for b in dest.get("llm_backends") or []
+             if isinstance(b, dict) and b.get("id") is not None}
+    left = []
+    for b in merged.get("llm_backends") or []:
+        was = prior.get(b.get("id")) if isinstance(b, dict) else None
+        if not was:
+            continue
+        left += [k for k in ("api_key", "extra_body")
+                 if was.get(k) and not b.get(k)
+                 and not _same_destination(was, b, k)]
+    return left
+
+
+class RestoreCounts(dict):
+    """A restore's counts (rows written per table, `_notes`), carrying
+    beside them the credentials it did not carry back, by their fixed
+    names (`dropped_kinds`). Kept off the dict's keys because every key
+    there reads as a table's row count."""
+    credentials_dropped: list[str] = []
+    # the rows no reader could read, per table (`skipped_rows`)
+    skipped: list[dict] = []
+
+
 def carry_forward_secrets(dest, incoming):
     """Put the destination's credential-shaped values back into an incoming
     config value the export scrubbed them out of.
@@ -766,13 +1244,16 @@ def carry_forward_secrets(dest, incoming):
     So match the two sides up — dicts by key, lists of objects by `id` — and
     restore the destination's secrets onto the entries that still exist.
     Everything non-secret stays the ZIP's to define: renames, new URLs and
-    removed entries all still land.
+    removed entries all still land — but a secret is carried only onto the
+    destination it was saved for (_same_destination): an entry the ZIP
+    moved to another URL lands without it.
     """
     if isinstance(dest, dict) and isinstance(incoming, dict):
         out = dict(incoming)
         for k, v in dest.items():
             if _secret_key(k):
-                out.setdefault(k, v)
+                if k not in out and _same_destination(dest, incoming, k):
+                    out[k] = v
             elif k in out:
                 out[k] = carry_forward_secrets(v, out[k])
         return out
@@ -793,9 +1274,10 @@ def carry_forward_secrets(dest, incoming):
 # read for its dismissed rows only (the mute is the household's own; the
 # rest the next Today build rebuilds). The export's README names which files come
 # back and which are kept for the person's records only, from this set.
-# `bills` is read under a variable (older archives call it recurring.csv),
+# `bills` is read under a variable (older archives call it recurring.csv,
+# and their bill offers recurring_proposals.csv),
 # so a source test that only scans literal `_rows(z, "…")` calls misses it.
-RESTORED_MEMBERS: frozenset[str] = frozenset(['account_adoptions', 'alerts_log', 'account_links', 'account_sources', 'accounts', 'amazon_matches', 'amazon_orders', 'amazon_summaries', 'bill_proposals', 'bills', 'budget_snapshots', 'business_entity', 'business_flags', 'business_txn_class', 'compliance_obligation', 'costco_matches', 'costco_receipts', 'crypto_holdings', 'entity_membership', 'equity_movement', 'holdings', 'import_batches', 'income_annual', 'income_documents', 'items', 'liabilities', 'manual_categories', 'merchant_canonical', 'merchant_categories', 'merchant_merge_proposals', 'merchant_renames', 'merchants', 'mileage_log', 'networth_recorded', 'networth_snapshot', 'receipt_items', 'receipts', 'recipient_invites', 'recurring', 'reimburse_flags', 'reimbursements', 'tenant_settings', 'transaction_notes', 'transaction_splits', 'transactions', 'vendor_1099', 'activity_log'])
+RESTORED_MEMBERS: frozenset[str] = frozenset(['account_adoptions', 'alerts_log', 'account_links', 'account_sources', 'accounts', 'amazon_matches', 'amazon_orders', 'amazon_summaries', 'bill_proposals', 'bills', 'budget_snapshots', 'business_entity', 'business_flags', 'business_txn_class', 'compliance_obligation', 'costco_matches', 'costco_receipts', 'crypto_holdings', 'entity_membership', 'equity_movement', 'forecast_nights', 'holdings', 'import_batches', 'income_annual', 'income_documents', 'income_upload_values', 'income_uploads', 'items', 'liabilities', 'manual_categories', 'merchant_canonical', 'merchant_categories', 'merchant_merge_proposals', 'merchant_renames', 'merchants', 'mileage_log', 'networth_recorded', 'networth_snapshot', 'receipt_items', 'receipts', 'recipient_invites', 'recurring', 'recurring_proposals', 'reimburse_flags', 'reimbursements', 'tenant_settings', 'transaction_notes', 'transaction_splits', 'transactions', 'vendor_1099', 'activity_log'])
 
 
 # A restored activity-log row is held to the size of one the app writes. The
@@ -884,7 +1366,8 @@ def _check_config(cfg: dict) -> list[str]:
                 f"this instance: " + ", ".join(sorted(dropped)))
     if "llm_roles" in cfg:
         if not isinstance(cfg["llm_roles"], dict):
-            raise ValueError("the AI role routing in this export is malformed")
+            raise _ArchiveRefused(
+                "the AI role routing in this export is malformed")
         # a role left pointing at a backend that did not survive would
         # route nowhere. Unset it, which is how this instance's own default
         # takes over — pinning it to "bundled" instead would silently
@@ -975,11 +1458,23 @@ def _raw_dict(v) -> dict:
     a ZIP that carries a list, string or number there would land as-is
     and crash the first reader. The list-shaped keys one level down get the
     same treatment: a value that is not a list is dropped, and every reader
-    already treats an absent key as "the source never said"."""
+    already treats an absent key as "the source never said". The one
+    exception is the list of import batches that own a row: there an absent
+    key means "owned by its latest batch" (rows from before owner lists),
+    so a value that is not a list lands as an EMPTY list, owned by nobody,
+    and no import's undo can then take the row."""
+    # a document nested past what the jsonb write can walk is written as
+    # null, which no `raw` column takes: it is malformed as a whole
+    v = _finite_only(v)
     if not isinstance(v, dict):
         return {}
     bad = [k for k in _ARRAY_RAW_KEYS if k in v and not isinstance(v[k], list)]
-    return {k: x for k, x in v.items() if k not in bad} if bad else v
+    if not bad:
+        return v
+    out = {k: x for k, x in v.items() if k not in bad}
+    if "_batches" in bad:
+        out["_batches"] = []
+    return out
 
 
 # A full account, loan or routing number never belongs in a plaintext
@@ -1139,17 +1634,75 @@ def clean_budget_amounts(cfg: dict) -> list[str]:
                          "left out")
         else:
             bad = 0
-            for e in buckets:
-                if isinstance(e, dict) and "monthly" in e:
-                    n = _amount_or_none(e["monthly"])
-                    if n is None and e["monthly"] not in (None, ""):
-                        bad += 1
-                    e["monthly"] = max(0.0, n or 0.0)
+            kept = []
+            for e in buckets[:_BUCKET_CAP]:
+                e = _bucket(e, {k["name"].lower() for k in kept})
+                if e is None:
+                    continue
+                if e.pop("_bad_amount", False):
+                    bad += 1
+                kept.append(e)
             if bad:
                 notes.append(f"{bad} budget categor"
                              f"{'ies' if bad != 1 else 'y'} had an amount "
                              "that was not usable and now budget $0")
+            dropped = len(buckets) - len(kept)
+            if dropped:
+                notes.append(f"{dropped} budget categor"
+                             f"{'ies' if dropped != 1 else 'y'} could not "
+                             "be used and were left out")
+            if kept:
+                cfg["custom_buckets"] = kept
+            else:
+                cfg.pop("custom_buckets")
     return notes
+
+
+# the settings door's bucket caps: 40 categories, each with at most 40
+# category and 60 merchant matchers of at most 120 characters
+_BUCKET_CAP, _BUCKET_NAME_MAX = 40, 40
+_BUCKET_CATS, _BUCKET_MERCH, _BUCKET_MATCHER_MAX = 40, 60, 120
+
+
+def _bucket(e, seen: set) -> dict | None:
+    """One budget category as the settings door stores it, or None when
+    the door would refuse it. An amount that is no amount budgets $0 (and
+    is marked so the caller can say so); everything else the door refuses
+    drops the category, since the Budget page matches every spend row
+    against every matcher."""
+    from ..engine.budget import RESERVED_BUCKET_NAMES
+    if not isinstance(e, dict):
+        return None
+    name = e.get("name")
+    name = name.strip() if isinstance(name, str) else ""
+    if (not name or len(name) > _BUCKET_NAME_MAX
+            or name.lower() in RESERVED_BUCKET_NAMES
+            or name.lower() in seen
+            or e.get("parent") not in ("food", "other")):
+        return None
+    lists = []
+    for key, cap in (("categories", _BUCKET_CATS),
+                     ("merchants", _BUCKET_MERCH)):
+        raw = e.get(key) or []
+        if not isinstance(raw, list) or len(raw) > cap:
+            return None
+        # the door keeps a number typed as a matcher as its text; a
+        # matcher that is neither, or longer than the door takes, is
+        # dropped on its own
+        words = (str(s).strip() for s in raw
+                 if isinstance(s, (str, int, float))
+                 and not isinstance(s, bool)
+                 and (not isinstance(s, str) or len(s) <= _BUCKET_MATCHER_MAX))
+        lists.append([w for w in words if w and len(w) <= _BUCKET_MATCHER_MAX])
+    out = {"name": name, "parent": e["parent"], "monthly": 0.0,
+           "categories": lists[0], "merchants": lists[1]}
+    if e.get("monthly") not in (None, ""):
+        n = _amount_or_none(e["monthly"])
+        if n is None:
+            out["_bad_amount"] = True
+        else:
+            out["monthly"] = max(0.0, n)
+    return out
 
 
 # The list caps the settings door applies; a restored list is cut to the
@@ -1206,8 +1759,12 @@ def clean_income_scenarios(cfg: dict) -> list[str]:
                              "was left out")
             else:
                 cfg[k] = round(n, 2)
-    if "active_scenario" in cfg and not isinstance(
-            cfg["active_scenario"], (str, type(None))):
+    # the active name is one of the scenario names, which the door cuts
+    # at 60 characters
+    if "active_scenario" in cfg and not (
+            cfg["active_scenario"] is None
+            or isinstance(cfg["active_scenario"], str)
+            and len(cfg["active_scenario"]) <= 60):
         cfg.pop("active_scenario")
     if "income_scenarios" not in cfg:
         return notes
@@ -1274,6 +1831,8 @@ def clean_savings_goals(cfg: dict) -> list[str]:
         tokens = g.get("tokens") or []
         td = str(g.get("target_date") or "").strip()
         try:
+            if _too_long(td):
+                raise ValueError(td[:20])
             td = _dt.date.fromisoformat(td).isoformat() if td else None
             date_ok = True
         except ValueError:
@@ -1328,12 +1887,20 @@ def clean_manual_assets(cfg: dict) -> list[str]:
         name = str(a.get("name") or "").strip()[:60]
         value = _stated_amount(a, "value")
         try:
-            as_of = as_date(a["as_of"]) if a.get("as_of") else None
+            as_of = asset_day(a["as_of"]) if a.get("as_of") else None
             date_ok = True
         except (TypeError, ValueError):
             date_ok = False
         if not name or value is None or not date_ok:
             continue
+        # the day it entered the household: as archived when that is a
+        # date, else its as-of (migration 228's rule for a row stored
+        # before the field existed)
+        try:
+            acquired = (asset_day(a["acquired_on"]) if a.get("acquired_on")
+                        else as_of)
+        except (TypeError, ValueError):
+            acquired = as_of
         # only what the settings door stores: any other key, of any size
         # or value (a NaN aborts the settings write), would ride in unread
         entry = {"name": name,
@@ -1341,6 +1908,8 @@ def clean_manual_assets(cfg: dict) -> list[str]:
                  "value": round(value, 2)}
         if as_of is not None:
             entry["as_of"] = as_of.isoformat()
+        if acquired is not None:
+            entry["acquired_on"] = acquired.isoformat()
         kept.append(entry)
     dropped = len(assets_in) - len(kept)
     if dropped:
@@ -1377,6 +1946,121 @@ _WIZARD_STEPS = {
 }
 
 
+# What the retirement wizard saves beside its step marks: the number typed
+# at each step. Each answer is held to the range the retirement projection
+# takes it in (web/api.py retirement_projection clamps to these; the rate
+# bounds are the ones its _rate reads from here), so any answer the page
+# would compute with can be saved, and the settings door and the restore
+# hold an answer to this one rule. Never a bool: JSON true would otherwise
+# pass as 1.
+RET_RATE_MIN, RET_RATE_MAX = -20.0, 30.0
+RET_WIZARD_RANGES = {
+    "age": (18, 90),
+    "end": (19, 110),
+    "spend": (0, 100_000_000),
+    "employer_mo": (0, 10_000_000),
+    # saving into Roth accounts (employer_mo is the tax-deferred figure);
+    # a client sends it as the top-level `ret_wizard_roth_mo`, as the
+    # claim age rides (specs/retirement-figures.md)
+    "roth_mo": (0, 10_000_000),
+    "taxable_mo": (0, 10_000_000),
+    "ret": (RET_RATE_MIN, RET_RATE_MAX),
+    "infl": (RET_RATE_MIN, RET_RATE_MAX),
+    # the Social Security claim age the plan was last run at (the page's
+    # own claim-age range); saved so every device opens on the same one
+    "ssage": (62, 70),
+}
+RET_WIZARD_ANSWERS = tuple(RET_WIZARD_RANGES)
+
+
+# Each answer as the wizard labels its field, for the refusal a person
+# reads word for word (the restore drops a bad answer and says nothing).
+RET_WIZARD_LABELS = {
+    "age": "Current age",
+    "end": "Plan to age",
+    "spend": "Target spend $/year",
+    "employer_mo": "Employer retirement $/mo",
+    "roth_mo": "Roth retirement $/mo",
+    "taxable_mo": "Taxable saving $/mo",
+    "ret": "Expected return",
+    "infl": "Inflation",
+    "ssage": "Social Security claim age",
+}
+
+
+def ret_wizard_refusal(key: str) -> str:
+    """The sentence a refused answer is answered with: the field's label
+    and the range it takes, in the units the field is typed in."""
+    lo, hi = RET_WIZARD_RANGES[key]
+
+    def num(v):
+        text = f"{int(v):,}" if float(v).is_integer() else f"{v:,}"
+        return text.replace("-", "\u2212")
+    if key in RET_WHOLE_ANSWERS:
+        return (f"{RET_WIZARD_LABELS[key]} must be a whole number from "
+                f"{num(lo)} to {num(hi)}.")
+    if key in ("ret", "infl"):
+        lo_s, hi_s = f"{num(lo)}%", f"{num(hi)}%"
+    elif key in ("age", "end", "ssage"):
+        lo_s, hi_s = num(lo), num(hi)
+    else:
+        lo_s, hi_s = f"${num(lo)}", f"${num(hi)}"
+    return (f"{RET_WIZARD_LABELS[key]} must be between {lo_s} "
+            f"and {hi_s}.")
+
+
+# answers that are ages in whole years: the claim age is a choice among
+# 62..70, so 66.5 is refused, not truncated
+RET_WHOLE_ANSWERS = ("ssage",)
+
+
+def ret_wizard_answer(key: str, v):
+    """The answer to `key` as stored, or None when it is not one."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    lo, hi = RET_WIZARD_RANGES[key]
+    # every float() of `v` sits inside the try: an int too large for a
+    # float raises there, and JSON hands one over as readily as any number
+    try:
+        if key in RET_WHOLE_ANSWERS and not float(v).is_integer():
+            return None
+        if not math.isfinite(v) or not lo <= v <= hi:
+            return None
+    except OverflowError:                 # an int too large for a float
+        return None
+    return v
+
+
+# Which saved answers a current client wrote (it sends `answers_v: 2`
+# with them): only these are inputs to the projection. Older wizards saved
+# every prefilled box — an assumed spend, an untouched $0 saving — so an
+# answer outside this list still prefills the walkthrough but is never
+# read as the household's own. Kept inside the answers object, so a
+# restore carries it with them.
+RET_ANSWERS_MARK = "answers_v2"
+
+
+def ret_marked_answers(v) -> list[str]:
+    """The answer keys a marked save wrote, from a stored answers object."""
+    m = v.get(RET_ANSWERS_MARK) if isinstance(v, dict) else None
+    return sorted({k for k in m if isinstance(k, str)
+                   and k in RET_WIZARD_RANGES}) if isinstance(m, list) else []
+
+
+def _ret_answers(v):
+    if not isinstance(v, dict):
+        return _DROP, 0
+    kept = {k: x for k, x in v.items()
+            if k in RET_WIZARD_RANGES and ret_wizard_answer(k, x) is not None}
+    dropped = len(v) - len(kept)
+    marked = [k for k in ret_marked_answers(v) if k in kept]
+    if RET_ANSWERS_MARK in v:
+        dropped -= 1
+        if marked:
+            kept[RET_ANSWERS_MARK] = marked
+    return kept, dropped
+
+
 def _payee_map(entry):
     """A dict keyed by bill payee whose values pass `entry` (which answers
     the kept value or _DROP)."""
@@ -1397,6 +2081,8 @@ def _occurrence_cap(x):
     if isinstance(x, bool) or not isinstance(x, (str, int)):
         return _DROP
     try:
+        if _too_long(str(x)):
+            return _DROP
         n = int(str(x).strip())
     except ValueError:
         return _DROP
@@ -1427,7 +2113,8 @@ def _flag(v):
 
 def _past_date(v):
     try:
-        d = _dt.date.fromisoformat(v) if isinstance(v, str) else None
+        d = (_dt.date.fromisoformat(v)
+             if isinstance(v, str) and not _too_long(v) else None)
     except ValueError:
         d = None
     if d is None or d >= _dt.date.today():
@@ -1454,17 +2141,302 @@ def _hint_dismissal(x):
     return x
 
 
+def _paycheck_words(v):
+    """The household's paycheck word per payer as the income-payer door
+    writes it: {payer key: bool}."""
+    from ..engine import paychecks
+    if not isinstance(v, dict):
+        return _DROP, 0
+    kept = {k: x for k, x in v.items()
+            if paychecks.valid_key(k) and isinstance(x, bool)}
+    return kept, len(v) - len(kept)
+
+
+# The longest text any of the plain string settings below can hold. The
+# settings door caps the body, not each box, so this is a ceiling no real
+# value comes near (a zone name, a model name, a host, an address, an
+# account id), and a megabyte of text under one of them is no setting.
+_SETTING_TEXT_MAX = 2048
+# the settings door's caps for the investment maps (api_settings
+# _INVEST_MAX_ROWS) and its removed-member memory (_REMOVED_CAP)
+_INVEST_ROWS, _REMOVED_ROWS = 50, 50
+
+
+def _finite_number(x, lo: float, hi: float):
+    """`x` as a float when it is a real number (never a bool) inside
+    [lo, hi], else None. An int too large for a float is no amount."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        n = float(x)
+    except OverflowError:
+        return None
+    return n if math.isfinite(n) and lo <= n <= hi else None
+
+
+def _text(max_len: int = _SETTING_TEXT_MAX, allowed=None, check=None, *,
+          strip: bool = True):
+    """A non-blank string as the door stores it: stripped (unless it is an
+    id compared exactly), no longer than `max_len`, one of `allowed` when
+    given, passing `check` when given."""
+    def coerce(v):
+        if not isinstance(v, str) or len(v) > max_len:
+            return _DROP, 0
+        s = v.strip() if strip else v
+        if not s.strip() or (allowed is not None and s not in allowed) or (
+                check is not None and not check(s)):
+            return _DROP, 0
+        return s, 0
+    return coerce
+
+
+def _whole_in(choices):
+    """A whole number (never a bool) from `choices`."""
+    def coerce(v):
+        if isinstance(v, bool) or not isinstance(v, int) or v not in choices:
+            return _DROP, 0
+        return v, 0
+    return coerce
+
+
+def _account_mask(x):
+    """An account mask as the settings door stores one (api_settings
+    _invest_mask): 2 to 8 ASCII letters or digits, upper-cased."""
+    if isinstance(x, bool) or not isinstance(x, (str, int)):
+        return None
+    if isinstance(x, int) and not 0 <= x < 10 ** 8:
+        return None                  # longer than any mask (or negative)
+    if isinstance(x, str) and len(x) > 64:
+        return None
+    m = str(x).strip().upper()
+    return m if m.isascii() and m.isalnum() and 2 <= len(m) <= 8 else None
+
+
+def _ss_estimates(v):
+    """{claim age 62..70: monthly dollars}, as the settings door writes it:
+    the age a string key, the amount a finite number from 0 to the money
+    ceiling. The Retirement page multiplies these out over decades, so an
+    amount near the float ceiling there is an infinity on every load."""
+    if not isinstance(v, dict):
+        return _DROP, 0
+    kept = {}
+    for k, x in list(v.items())[:_SHAPE_ENTRY_CAP]:
+        try:
+            age = int(k) if isinstance(k, str) and len(k) <= 3 else None
+        except ValueError:
+            age = None
+        amt = _finite_number(x, 0.0, MAX_AMOUNT)
+        if age is not None and 62 <= age <= 70 and amt is not None:
+            kept[str(age)] = amt
+    return (kept, len(v) - len(kept)) if kept else (_DROP, 0)
+
+
+def _basis_override(v):
+    """{account mask: dollars put in}: a mask the door would take, an
+    amount from 0 to the money ceiling, at most the door's row cap."""
+    if not isinstance(v, dict):
+        return _DROP, 0
+    kept = {}
+    for k, x in list(v.items())[:_INVEST_ROWS]:
+        m, amt = _account_mask(k), _finite_number(x, 0.0, MAX_AMOUNT)
+        if m is not None and amt is not None:
+            kept[m] = round(amt, 2)
+    return (kept, len(v) - len(kept)) if kept else (_DROP, 0)
+
+
+def _advisory_fees(v):
+    """{institution fragment: yearly rate}: a lower-cased fragment of 1 to
+    60 characters (a blank one would match every institution) and a rate
+    that is a fraction from 0 to 1, at most the door's row cap."""
+    if not isinstance(v, dict):
+        return _DROP, 0
+    kept = {}
+    for k, x in list(v.items())[:_INVEST_ROWS]:
+        frag = k.strip().lower() if isinstance(k, str) else ""
+        rate = _finite_number(x, 0.0, 1.0)
+        if frag and len(frag) <= 60 and rate is not None:
+            kept[frag] = rate
+    return (kept, len(v) - len(kept)) if kept else (_DROP, 0)
+
+
+def _exempt_masks(v):
+    """The self-directed accounts' masks: a list of masks, no repeats."""
+    if not isinstance(v, list):
+        return _DROP, 0
+    kept = list(dict.fromkeys(
+        m for m in (_account_mask(x) for x in v[:_INVEST_ROWS])
+        if m is not None))
+    return (kept, len(v) - len(kept)) if kept else (_DROP, 0)
+
+
+def _id_list(v):
+    """A list of ids the app compares exactly (the dismissed link
+    prompts): non-blank strings no longer than any id, no repeats."""
+    if not isinstance(v, list):
+        return _DROP, 0
+    kept = list(dict.fromkeys(
+        x for x in v[:_SHAPE_ENTRY_CAP]
+        if isinstance(x, str) and x.strip() and len(x) <= 255))
+    return kept, len(v) - len(kept)
+
+
+def _removed_digests(v):
+    """The removed members' address digests: hex SHA-256 strings."""
+    if not isinstance(v, list):
+        return _DROP, 0
+    kept = [x for x in v[-_REMOVED_ROWS:] if isinstance(x, str)
+            and re.fullmatch(r"[0-9a-f]{64}", x)]
+    return (kept, len(v) - len(kept)) if kept else (_DROP, 0)
+
+
+def _email_prefs(v):
+    """{kind: [addresses that turned it off]}, the kinds the mail knows,
+    each list of addresses bounded as the mute list is."""
+    from ..notify.email_prefs import KINDS
+    if not isinstance(v, dict):
+        return _DROP, 0
+    kept, lost = {}, 0
+    for kind, addrs in v.items():
+        if kind not in KINDS or not isinstance(addrs, list):
+            lost += 1
+            continue
+        good = sorted({a.strip().lower() for a in addrs[:_SHAPE_ENTRY_CAP]
+                       if isinstance(a, str) and a.strip()
+                       and len(a) <= 320})
+        lost += len(addrs) - len(good)
+        if good:
+            kept[kind] = good
+    return (kept, lost) if kept else (_DROP, 0)
+
+
+def _debt_plan(v):
+    """The debt plan, through the one normalizer its save door uses."""
+    from ..engine.debt import normalize_plan
+    try:
+        return normalize_plan(v), 0
+    except (ValueError, TypeError, OverflowError, RecursionError):
+        return _DROP, 0
+
+
+def _goal_state(v):
+    """The nightly savings pass's own record per goal: an object whose
+    milestone is a whole percent, whose verdict is true, false or none and
+    whose plan is an object or none. The pass reads each straight into
+    int() and dict lookups."""
+    if not isinstance(v, dict):
+        return _DROP, 0
+    kept = {}
+    for name, e in list(v.items())[:_SHAPE_ENTRY_CAP]:
+        if not isinstance(e, dict):
+            continue
+        ms = e.get("milestone", 0)
+        if (isinstance(ms, bool) or not isinstance(ms, int)
+                or not 0 <= ms <= 100
+                or e.get("on_pace") not in (True, False, None)
+                or not isinstance(e.get("plan"), (dict, type(None)))):
+            continue
+        kept[name] = e
+    return kept, len(v) - len(kept)
+
+
+def _smtp_port(v):
+    if isinstance(v, str) and v.strip().isdigit() and len(v) <= 5:
+        v = int(v)
+    if isinstance(v, bool) or not isinstance(v, int) or not 1 <= v <= 65535:
+        return _DROP, 0
+    return v, 0
+
+
+def _valid_zone(s: str) -> bool:
+    from .. import localtime
+    return localtime.valid_zone(s)
+
+
+def _int_in(lo: int, hi: int):
+    def coerce(v):
+        if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
+            return _DROP, 0
+        return v, 0
+    return coerce
+
+
+# Keys another pass of this module holds to their door's shape (each named
+# beside it), so the table below need not name them twice. With the
+# table, the policy keys, the credential companions and the
+# credential-shaped names, this is every settings key the app reads or
+# writes; the shape test walks the code for the keys and fails on one
+# that none of them hold.
+HELD_BY_OTHER_CLEANERS = {
+    **dict.fromkeys(("email_schedule", "email_send_hour_utc",
+                     "email_recipients", "email_muted"),
+                    "normalize_notify_shapes"),
+    "excluded_accounts": "clean_excluded_accounts",
+    **dict.fromkeys(("food_monthly", "other_monthly",
+                     "budgeted_income_monthly", "custom_buckets"),
+                    "clean_budget_amounts"),
+    **dict.fromkeys(("income_scenarios", "active_scenario",
+                     "income_biweekly_saving", "income_biweekly_not_saving"),
+                    "clean_income_scenarios"),
+    "savings_goals": "clean_savings_goals",
+    "manual_assets": "clean_manual_assets",
+    **dict.fromkeys(("home_web", "home_mobile", "llm_backends", "llm_roles"),
+                    "_check_config"),
+    "plaid_enrich_cap": "_settle_settings",
+}
+
+
 _CONFIG_SHAPES = {
     "occurrence_caps": _payee_map(_occurrence_cap),
+    "paycheck_payers": _paycheck_words,
     "disabled_bills": _payee_list,
     "dismissed_hints": _payee_map(_hint_dismissal),
     "dismissed_health": _payee_map(lambda x: x if isinstance(x, dict)
                                    else _DROP),
     **{k: _steps(names) for k, names in _WIZARD_STEPS.items()},
+    "ret_wizard_answers": _ret_answers,
     "wizard_done": _flag,
+    "budgets_saved_by_user": _flag,
     "retirement_saving": _flag,
     "dynamic_variable_budget": _flag,
     "birthdate": _past_date,
+    # the Retirement page and the Net worth report
+    "ss_estimates": _ss_estimates,
+    "investment_basis_override": _basis_override,
+    "advisory_fees": _advisory_fees,
+    "advisory_fee_exempt_masks": _exempt_masks,
+    "debt_plan": _debt_plan,
+    # which account the forecast reads, and the ledger's window
+    "checking_account_id": _text(255, strip=False),
+    "history_months": _whole_in(_sync_base.HISTORY_MONTHS),
+    "combine_entities": _flag,
+    # the bank-link prompts the household waved away
+    "link_dismissed": _id_list,
+    "link_card_dismissed": _flag,
+    # the nightly savings pass's record
+    "savings_goal_state": _goal_state,
+    # the look and the bill finder
+    "theme": _text(16, allowed=("auto", "light", "dark")),
+    "today_view": _text(16, allowed=("summary", "detail")),
+    "setup_mode": _text(16, allowed=("auto", "manual")),
+    "bill_detection_auto": _flag,
+    "merchant_logos": _flag,
+    "plaid_recurring": _flag,
+    "feedback_enabled": _flag,
+    "timezone": _text(64, check=_valid_zone),
+    # mail: who asked for what, who left, and the relay (its user and
+    # password never ride an archive)
+    "email_prefs": _email_prefs,
+    "email_removed_members": _removed_digests,
+    "smtp_host": _text(253),
+    "smtp_port": _smtp_port,
+    "smtp_from": _text(320),
+    # the AI endpoint (the backends list is held by _check_config)
+    "llm_url": _text(),
+    "llm_model": _text(200),
+    "llm_vision_model": _text(200),
+    # the demonstration household's generator inputs
+    "demo_seed": _int_in(-(2 ** 63), 2 ** 63 - 1),
+    "demo_years": _int_in(1, 100),
 }
 
 
@@ -1683,9 +2655,30 @@ _MOVED_TXNS: contextvars.ContextVar = contextvars.ContextVar(
     "oikonome_restore_moved_txns", default=None)
 # the cells of each member that name a transaction by its id
 _TXN_ID_CELLS = ("txn_id", "transaction_id", "expense_id", "reimburse_id")
+# the cells holding a JSON LIST of transaction ids, by member: each id
+# follows the carried map like a scalar cell, first-seen order kept and
+# repeats folded (base.carry_unmatch_memory moves them the same way)
+_TXN_ID_LIST_CELLS = {"receipts.csv": ("unmatched_txn_ids",)}
+
+
+def _carry_id_list(v: str, moved: dict) -> str:
+    """A JSON list cell of transaction ids with each id moved to the one it
+    lands under here; a cell that is not a JSON list is left as written
+    (its own pass judges it)."""
+    try:
+        ids = json.loads(v)
+    except (ValueError, RecursionError):
+        return v
+    if not isinstance(ids, list):
+        return v
+    out = list(dict.fromkeys(
+        moved.get(x, x) for x in ids if isinstance(x, str)))
+    return json.dumps(out)
 
 
 def _txn_key(date, amount) -> tuple | None:
+    if _too_long(amount):
+        return None
     try:
         day = (date if isinstance(date, _dt.date)
                else _dt.date.fromisoformat(str(date)[:10]))
@@ -1754,7 +2747,7 @@ def _plan_moved_txns(conn, z) -> dict[str, str]:
     for tid, _dest, _r in _moved_rows(z, moved):
         n += 1
         if n > cap:
-            raise ValueError(
+            raise _ArchiveRefused(
                 f"transactions.csv: too many rows on a moved account (limit "
                 f"{cap:,}) — this doesn't look like a genuine Oikonome "
                 "export")
@@ -2042,7 +3035,8 @@ def _plan_foreign_keyed_txns(conn, z, carried: dict) -> dict[str, str]:
 
     for r in _rows(z, "transactions.csv"):
         tid = r.get("id")
-        if not tid or not keyed_re.match(tid):
+        if (not tid or not keyed_re.match(tid)
+                or _too_long(r.get("amount")) or _too_long(r.get("date"))):
             continue
         aid = _account_id(r.get("account_id"))
         shape = _sync_base.line_shape(r.get("date"), r.get("amount"),
@@ -2171,12 +3165,34 @@ def clean_bill_raw(v) -> dict:
     list. The normal write path validates these; a restore bypassed it,
     and one malformed anchor crashed every Today load for the household."""
     raw = dict(_raw_dict(v))
+    # scheduled_since dropped here is supplied again by the nightly fill
+    # (bills.fill_scheduled_since)
+    for key in ("lastDueOn", "dueOn", "scheduled_since"):
+        if key in raw:
+            try:
+                if not isinstance(raw[key], str):
+                    raise ValueError
+                as_date(raw[key])
+            except (TypeError, ValueError, OverflowError):
+                raw.pop(key, None)
     rec = raw.get("recurrence")
     if rec is not None and not isinstance(rec, dict):
         raw.pop("recurrence", None)
         rec = None
     if isinstance(rec, dict):
         rec = dict(rec)
+        # a date that does not read as one (an impossible day, a year
+        # outside the range the writers accept) is dropped here, so no
+        # later reader meets it: the readers treat a missing end as no end,
+        # a missing floor as no floor, and a database cast would not
+        for key in ("endOn", "dueOn"):
+            if key in rec:
+                try:
+                    if not isinstance(rec[key], str):
+                        raise ValueError
+                    as_date(rec[key])
+                except (TypeError, ValueError, OverflowError):
+                    rec.pop(key, None)
         for key in ("byMonthDay", "byMonth", "bySetPos"):
             if key in rec:
                 vals = rec[key] if isinstance(rec[key], (list, tuple)) else []
@@ -2411,6 +3427,10 @@ def zip_size_problem(infos) -> str | None:
     """Why a restore would refuse an archive with these members, or None.
     The one rule both sides read: the restore refuses on it, and the export
     checks what it just wrote against it."""
+    infos = list(infos)
+    if len(infos) > _upload_zip.MAX_ARCHIVE_MEMBERS:
+        return (f"this ZIP holds {len(infos):,} files — more than the "
+                f"{_upload_zip.MAX_ARCHIVE_MEMBERS:,} a restore opens")
     total = 0
     for info in infos:
         if info.filename in BLOB_MEMBERS:
@@ -2436,7 +3456,7 @@ def zip_size_problem(infos) -> str | None:
 def _check_zip_sizes(z: zipfile.ZipFile) -> None:
     problem = zip_size_problem(z.infolist())
     if problem:
-        raise ValueError(problem)
+        raise _ArchiveRefused(problem)
 
 
 def _txn_exists(conn, txn_id) -> bool:
@@ -2456,9 +3476,9 @@ def _txn_exists(conn, txn_id) -> bool:
                         (txn_id,)).fetchone() is not None
 
 
-#: Why an archived row did not land as a row of its own. Every row a pass
-#: reads ends in exactly one place: written (counted under its table), or
-#: under one of these. Each is the whole truth of what its counter holds.
+# Why an archived row did not land as a row of its own. Every row a pass
+# reads ends in exactly one place: written (counted under its table), or
+# under one of these. Each is the whole truth of what its counter holds.
 REFUSALS: dict[str, str] = {
     "present": "the destination already holds the row, or one that takes "
                "its place: the same key, the same income document, the one "
@@ -2473,27 +3493,249 @@ REFUSALS: dict[str, str] = {
                  "does not decode, a split that does not add up to its charge",
     "over_cap": "past a ceiling every household is held to: a receipt image "
                 "over the upload size or the household's file storage, an "
-                "account's lineage past its bound",
+                "account's lineage past its bound, a partial reimbursement "
+                "with nothing of its charge left to repay",
     "merged": "the same thing the destination holds under an id of its own, "
               "so the archive's pointers now name that one instead",
     "rebuilt": "left for the destination to derive again: a store receipt's "
                "split parts, which the store match rebuilds from the "
-               "restored receipts, and an alert nobody dismissed, which the "
-               "next Today build raises again if it still holds",
+               "restored receipts, an alert nobody dismissed, which the "
+               "next Today build raises again if it still holds, and a "
+               "merchant nothing here names, which the merchant pass "
+               "removes and makes again when a row names it, and a forecast "
+               "night dated the household's today or later, which the "
+               "instance keeps itself",
 }
 
-#: Written rows that were changed on the way in. Each is a subset of its
-#: table's written count, never a refusal.
+# Written rows that were changed on the way in. Each is a subset of its
+# table's written count, never a refusal.
 REPAIRS: dict[str, str] = {
     "amount_repaired": "transactions the archive gave no amount, restored at "
                        "0 so their receipts, notes and splits keep a charge "
                        "to hang on",
+    "value_emptied": "an optional figure past what its column holds (a "
+                     "business's tax rate, a member's share), left empty so "
+                     "the row and what hangs on it land",
+    "payback_trimmed": "a partial reimbursement that, with the other "
+                       "paybacks, repaid more than its charge cost or "
+                       "claimed more than its deposit brought in, cut to "
+                       "it (the newest first)",
 }
 
 # the result key a table or refusal is reported under, where it is not its
 # own name: the names the import hub has always shown
 _RESULT_KEY = {"present": "already_present", "manual_categories": "overrides",
                "tenant_settings": "settings"}
+
+
+def _write_rows(conn, sql: str, rows: list) -> list:
+    if len(rows) == 1:
+        return [conn.execute(sql, rows[0]).fetchone()]
+    cur = conn.cursor()
+    # returning=True keeps executemany pipelined and hands back one
+    # result per tuple, in order: which rows landed, not how many
+    cur.executemany(sql, rows, returning=True)
+    return [cur.fetchone() for _ in cur.results()]
+
+
+# ---- what a column takes ------------------------------------------------
+#
+# The restore is ONE transaction, so a cell the database refuses (text in
+# a uuid column, a whole number past an INTEGER, a name past its varchar)
+# would roll back every other row of the archive. Each row is judged in
+# Python, before its write, against the columns its INSERT names, as the
+# catalogue declares them: a cell a REQUIRED (NOT NULL) column cannot take
+# refuses its row, and one an optional column cannot take is left empty.
+# No savepoint: a restore holding thousands of them overflows the
+# subtransaction cache every snapshot on the server then pays for. A
+# database error that still happens ends the restore, as it always did.
+
+_SHAPES: dict[str, tuple | None] = {}
+_COLUMNS: contextvars.ContextVar = contextvars.ContextVar(
+    "restore_columns", default=None)
+_INSERT_HEAD = re.compile(
+    r"\s*INSERT\s+INTO\s+(\w+)\s*\(([^)]*)\)\s*(VALUES\s*\(|SELECT\s)",
+    re.I | re.S)
+_DIRECT = re.compile(r"%s(::[\w\[\]]+)?")
+_DEFAULTED = re.compile(r"COALESCE\(\s*%s\s*,.*\)", re.I | re.S)
+_SELECT_END = re.compile(r"\s(WHERE|FROM|ON)\b", re.I)
+
+
+def _insert_shape(sql: str):
+    """(table, per parameter: (column, defaulted) or None) for an INSERT
+    whose value list names its columns one placeholder each; None when the
+    statement is not one (then nothing is judged before it runs)."""
+    if sql in _SHAPES:
+        return _SHAPES[sql]
+    shape = None
+    m = _INSERT_HEAD.match(sql)
+    if m:
+        cols = [c.strip() for c in m.group(2).split(",")]
+        values = m.group(3).upper().startswith("VALUES")
+        rest, exprs, cur, depth, quoted = sql[m.end():], [], "", 0, False
+        for i, ch in enumerate(rest):
+            if ch == "'":
+                quoted = not quoted
+            elif not quoted:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    if depth == 0:
+                        exprs.append(cur)
+                        break
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    exprs.append(cur)
+                    cur = ""
+                    continue
+                elif (not values and depth == 0
+                      and _SELECT_END.match(rest, i)):
+                    exprs.append(cur)
+                    break
+            cur += ch
+        if len(exprs) == len(cols):
+            params: list = []
+            for col, e in zip(cols, exprs):
+                e = e.strip()
+                if _DIRECT.fullmatch(e):
+                    params.append((col, False))
+                elif e.count("%s") == 1 and _DEFAULTED.fullmatch(e):
+                    params.append((col, True))
+                else:
+                    params.extend([None] * e.count("%s"))
+            total = sql.count("%s")
+            if len(params) <= total:
+                params.extend([None] * (total - len(params)))
+                shape = (m.group(1), params)
+    _SHAPES[sql] = shape
+    return shape
+
+
+def _table_columns(conn, table: str) -> dict:
+    """The table's columns as the catalogue declares them, read once per
+    restore."""
+    cache = _COLUMNS.get()
+    if cache is None:
+        cache = {}
+    if table not in cache:
+        cache[table] = {r["column_name"]: r for r in conn.execute(
+            """SELECT column_name, udt_name, is_nullable = 'YES' AS nullable,
+                      character_maximum_length AS chars,
+                      numeric_precision AS precision, numeric_scale AS scale
+                 FROM information_schema.columns
+                WHERE table_schema = current_schema() AND table_name = %s""",
+            (table,)).fetchall()}
+    return cache[table]
+
+
+_INT_RANGE = {"int2": 2**15, "int4": 2**31, "int8": 2**63}
+_TYPE_NAMES = {"int2": "smallint", "int4": "integer", "int8": "bigint",
+               "uuid": "uuid", "date": "date", "timestamptz": "timestamp",
+               "timestamp": "timestamp", "bool": "boolean", "text": "text"}
+
+
+def _type_name(col: dict) -> str:
+    udt = col["udt_name"]
+    if udt == "numeric" and col["precision"] is not None:
+        return f"numeric({col['precision']},{col['scale']})"
+    if udt in ("varchar", "bpchar") and col["chars"] is not None:
+        return f"text of at most {col['chars']} characters"
+    return _TYPE_NAMES.get(udt, udt)
+
+
+def _takes(col: dict, v) -> bool:
+    """Whether the column takes `v` as psycopg sends it."""
+    udt = col["udt_name"]
+    if isinstance(v, str) and "\x00" in v:
+        return False
+    if _too_long(v) and (udt in _INT_RANGE or udt in (
+            "numeric", "uuid", "date", "timestamptz", "timestamp")):
+        return False       # no figure, id or day is this long (see _f)
+    if udt in _INT_RANGE:
+        if isinstance(v, bool):
+            return True
+        if isinstance(v, str):
+            try:
+                v = int(v.strip())
+            except ValueError:
+                return False
+        if isinstance(v, (int, float, Decimal)):
+            try:
+                n = round(v)
+            except (ValueError, OverflowError):
+                return False
+            return -_INT_RANGE[udt] <= n < _INT_RANGE[udt]
+        return True
+    if udt == "numeric" and col["precision"] is not None:
+        if isinstance(v, bool) or not isinstance(v, (int, float, Decimal,
+                                                     str)):
+            return True
+        try:
+            d = (v if isinstance(v, (float, Decimal))
+                 else Decimal(str(v).strip()))
+            return _fits_numeric(d, col["precision"], col["scale"])
+        except (ArithmeticError, ValueError):
+            return False
+    if udt == "uuid" and isinstance(v, str):
+        try:
+            uuid.UUID(v)
+            return True
+        except ValueError:
+            return False
+    if (udt in ("varchar", "bpchar") and col["chars"] is not None
+            and isinstance(v, str)):
+        # Postgres trims trailing spaces past the bound instead of refusing
+        return len(v.rstrip(" ")) <= col["chars"]
+    if udt == "date" and isinstance(v, str):
+        try:
+            _dt.date.fromisoformat(v.strip()[:10])
+            return True
+        except ValueError:
+            return False
+    if udt in ("timestamptz", "timestamp") and isinstance(v, str):
+        try:
+            _dt.datetime.fromisoformat(v.strip())
+            return True
+        except ValueError:
+            try:
+                _dt.date.fromisoformat(v.strip()[:10])
+                return True
+            except ValueError:
+                return False
+    return True
+
+
+def _fit_row(conn, sql: str, row: tuple):
+    """(the row as it lands, the labels of optional cells left empty, the
+    label that refuses the row or None). See the section note above."""
+    shape = _insert_shape(sql)
+    if shape is None or len(shape[1]) != len(row):
+        return row, [], None
+    table, params = shape
+    cols = _table_columns(conn, table)
+    out, emptied = list(row), []
+    for i, p in enumerate(params):
+        if p is None or p[0] not in cols:
+            continue
+        name, defaulted = p
+        col, v = cols[name], row[i]
+        if v is None:
+            if not col["nullable"] and not defaulted:
+                return row, [], f"no {name}"
+            continue
+        if _takes(col, v):
+            continue
+        label = f"a {name} that is not a valid {_type_name(col)}"
+        if col["nullable"] or defaulted:
+            out[i] = None
+            emptied.append(label)
+        else:
+            return row, [], label
+    return tuple(out), emptied, None
+
+
+# how many of a table's skipped rows the summary names
+_SKIP_SAMPLE = 5
 
 
 class _Outcomes:
@@ -2506,42 +3748,113 @@ class _Outcomes:
         self.written: dict[str, int] = {}
         self.refused: dict[tuple[str, str], int] = {}
         self.repaired: dict[tuple[str, str], int] = {}
+        # out_of_range refusals and emptied values past a bounded column,
+        # by the bound each names (see `_numeric`); the rest of
+        # out_of_range is amounts past any real sum
+        self.over_bound: dict[str, int] = {}
+        self.emptied_bound: dict[str, int] = {}
+        # malformed rows a column could not take, by what it was
+        self.misfits: dict[str, int] = {}
+        # rows whose reading failed in a way no check anticipated, by
+        # table: [how many, the first few of them by id or place]
+        self.skipped: dict[str, list] = {}
+        # what the row being read has counted so far (see begin_row)
+        self._row: list | None = None
 
     def land(self, conn, table: str, sql: str, rows: list,
              *, as_one: bool = False) -> list:
         """Run `sql` once per parameter tuple in `rows` and return, per
         row and in order, the first column its RETURNING clause gave back,
-        or None for a row the database did not write. `sql` must end in
-        RETURNING. A row not written is one the destination already held:
-        a pass checks every other reason before it gets here.
+        or None for a row not written. `sql` must end in RETURNING. Each
+        row is first judged against the columns it writes (`_fit_row`): a
+        row a required column cannot take is refused as malformed, and an
+        optional cell the column cannot take is left empty. Any other row
+        not written is one the destination already held: a pass checks
+        every other reason before it gets here.
 
         `as_one`: the tuples are spellings of ONE archived row (an alias
         written under its cut and its full key): it counts once, written
         if any spelling was."""
+        # per row, in order, the label `_fit_row` refused it under (None
+        # for a row it let through), for a hook that must tell a row the
+        # destination held from one the column refused
+        self.last_misfits: list = []
         if not rows:
             return []
-        if len(rows) == 1:
-            got = [conn.execute(sql, rows[0]).fetchone()]
-        else:
-            cur = conn.cursor()
-            # returning=True keeps executemany pipelined and hands back one
-            # result per tuple, in order: which rows landed, not how many
-            cur.executemany(sql, rows, returning=True)
-            got = [cur.fetchone() for _ in cur.results()]
-        if len(got) != len(rows):           # pragma: no cover — psycopg
+        fitted, refused, emptied = [], [], []
+        for row in rows:
+            fit, empty, why = _fit_row(conn, sql, row)
+            fitted.append(fit)
+            refused.append(why)
+            emptied.append(empty)
+        self.last_misfits = list(refused)
+        live = [i for i, why in enumerate(refused) if why is None]
+        written = _write_rows(conn, sql, [fitted[i] for i in live])
+        if len(written) != len(live):       # pragma: no cover — psycopg
             raise RuntimeError("restore: a write lost track of its rows")
+        got: list = [None] * len(rows)
+        for i, g in zip(live, written):
+            got[i] = g
         # counted by the row coming back, never by its key's value
         n = sum(1 for g in got if g is not None)
         out = [None if g is None else next(iter(g.values())) for g in got]
         if as_one:
             self.wrote(table, 1 if n else 0)
-            if not n:
+            if n:
+                for label in next(e for g, e in zip(got, emptied)
+                                  if g is not None):
+                    self.emptied(table, label)
+            elif live:
                 self._add(self.refused, table, "present", 1)
-        else:
-            self.wrote(table, n)
-            if len(out) - n:
-                self._add(self.refused, table, "present", len(out) - n)
+            else:
+                self._misfit(table, refused[0])
+            return out
+        self.wrote(table, n)
+        for g, why, empty in zip(got, refused, emptied):
+            if why is not None:
+                self._misfit(table, why)
+            elif g is not None:
+                for label in empty:
+                    self.emptied(table, label)
+        present = sum(1 for g, why in zip(got, refused)
+                      if g is None and why is None)
+        if present:
+            self._add(self.refused, table, "present", present)
         return out
+
+    def _misfit(self, table: str, label: str) -> None:
+        self.refuse(table, "malformed")
+        self._count(self.misfits, label, 1)
+
+    def begin_row(self) -> None:
+        """Start recording what one row's reading counts, so a skip can
+        take it back (`skip`)."""
+        self._row = []
+
+    def end_row(self) -> None:
+        self._row = None
+
+    def skip(self, table: str, ident: str, n: int = 1) -> None:
+        """A row of `table` its reading failed on in a way no check
+        anticipated, standing for `n` archived rows: whatever its reading
+        counted is taken back, then it is refused as malformed and named in
+        the summary by `ident` (its id or its place, never what its cells
+        hold)."""
+        for into, key, k in reversed(self._row or ()):
+            into[key] -= k
+            if not into[key]:
+                del into[key]
+        self._row = None
+        self.refuse(table, "malformed", n)
+        got = self.skipped.setdefault(table, [0, []])
+        got[0] += n
+        if len(got[1]) < _SKIP_SAMPLE:
+            got[1].append(ident)
+
+    def _count(self, into: dict, key, n: int) -> None:
+        into[key] = into.get(key, 0) + n
+        if self._row is not None:
+            self._row.append((into, key, n))
 
     def wrote(self, table: str, n: int) -> None:
         """`n` rows of `table` written by a statement `land` cannot run
@@ -2550,18 +3863,30 @@ class _Outcomes:
 
     def refuse(self, table: str, reason: str, n: int = 1) -> None:
         if reason not in REFUSALS:
-            raise ValueError(f"no such restore outcome: {reason}")
+            # a pass naming an outcome there is none of is a defect, never
+            # a cell: not a ValueError, which a row's reader skips
+            raise LookupError(f"no such restore outcome: {reason}")
         self._add(self.refused, table, reason, n)
+
+    def out_of_range(self, table: str, over: str) -> None:
+        """A row refused for a value past the bound `over` names."""
+        self.refuse(table, "out_of_range")
+        self._count(self.over_bound, over, 1)
+
+    def emptied(self, table: str, over: str) -> None:
+        """An optional value past the bound `over` names, left empty so
+        its row lands."""
+        self.repair(table, "value_emptied")
+        self._count(self.emptied_bound, over, 1)
 
     def repair(self, table: str, reason: str, n: int = 1) -> None:
         if reason not in REPAIRS:
-            raise ValueError(f"no such restore repair: {reason}")
+            raise LookupError(f"no such restore repair: {reason}")
         self._add(self.repaired, table, reason, n)
 
-    @staticmethod
-    def _add(into: dict, table: str, reason: str, n: int) -> None:
+    def _add(self, into: dict, table: str, reason: str, n: int) -> None:
         if n:
-            into[(table, reason)] = into.get((table, reason), 0) + n
+            self._count(into, (table, reason), n)
 
     def total(self, reason: str) -> int:
         src = self.repaired if reason in REPAIRS else self.refused
@@ -2686,6 +4011,21 @@ def _terminal_survivor(merged: dict, have: set, start: str):
     return last
 
 
+def _income_document_identity(r: dict, year, form, amounts) -> tuple:
+    """(the columns an archived tax document is stored and looked up by,
+    a hashable key over the same values). Both are taken from the amounts
+    as they are STORED — non-finite numbers read as null — so two archived
+    documents that store the same are the same document, and two that
+    store differently never share a key."""
+    stored = _finite_only(amounts)
+    ident = (year, form, r.get("payer") or None, _ein_last4_for_restore(r),
+             _f(r.get("primary_amount")),
+             jsonb(stored) if stored is not None else None,
+             r.get("notes") or None)
+    key = (*ident[:5], json.dumps(stored, sort_keys=True), ident[6])
+    return ident, key
+
+
 def _ein_last4_for_restore(r: dict) -> str | None:
     """The last four of a restored W-2's EIN, never the EIN.
 
@@ -2802,8 +4142,14 @@ _ENRICHMENT_TEXT = ("check_number", "payment_channel", "payment_processor",
                     "location_postal", "location_store", "mcc")
 
 
+# the migration that added transactions.category_source and derived it
+# for the rows already stored
+_CATEGORY_SOURCE_COLUMN = "098_txn_enrichment.sql"
+
+
 def upgrade_archived_txn(row: dict, raw: dict, *, on_card: bool,
-                         has_merchant: bool) -> dict:
+                         has_merchant: bool,
+                         before_category_source: bool = True) -> dict:
     """A restored transaction's cells as the migrations that rewrote stored
     rows left them, applied in the order they ran, to every archived row.
     Each step is the rule the ingest applies to a new row, so on a row an
@@ -2824,7 +4170,12 @@ def upgrade_archived_txn(row: dict, raw: dict, *, on_card: bool,
       093  and the pump goes in merchant_outlet instead (base.fuel_arm)
       094  a proven pump is filed as fuel
       098  the aggregator's facts in raw become columns, and the row says
-           who decided its category
+           who decided its category: only on an archive written before
+           the column existed (`before_category_source`, from the
+           archive's own age). A newer archive's empty source is the one
+           its household had, and lands as it was.
+      229  a Coinbase row (id `coinbase:…`, so `row` carries "id") takes
+           its amount from its record in the ledger's sign
 
     A person's category (category_override) is never read or written, a
     category a rule decided (category_source rule_*) is left as the rule
@@ -2903,7 +4254,26 @@ def upgrade_archived_txn(row: dict, raw: dict, *, on_card: bool,
             out["authorized_date"] = as_date(en["authorized_date"])
         except ValueError:
             pass
-    if out.get("category_source") is None and out.get("category_primary"):
+    # migration 223, on every archive: an inflow labelled income in another
+    # case is the INCOME every exact-match income filter reads (ASCII only,
+    # so no collation can read the label another way)
+    cp = out.get("category_primary")
+    if (isinstance(cp, str) and cp != "INCOME" and cp.isascii()
+            and cp.isalpha() and cp.lower() == "income" and amount < 0):
+        out["category_primary"] = "INCOME"
+    # migration 229, on every archive: a Coinbase row's amount is its
+    # record's native_amount in the ledger's sign (positive = money out),
+    # and a transfer label follows that sign; an archive written while the
+    # rows carried the wallet's sign lands corrected, a newer one as it was
+    if str(out.get("id") or "").startswith("coinbase:"):
+        from .coinbase_push import ledger_amount, transfer_label
+        cb = ledger_amount(raw)
+        if cb is not None:
+            out["amount"] = cb
+            if out.get("category_primary") in ("TRANSFER_IN", "TRANSFER_OUT"):
+                out["category_primary"] = transfer_label(cb)
+    if (before_category_source and out.get("category_source") is None
+            and out.get("category_primary")):
         plaid = out.get("category_plaid")
         out["category_source"] = (
             "plaid" if plaid and out["category_primary"] == plaid
@@ -2939,6 +4309,13 @@ def _persons_names(conn, z) -> set[str]:
                 and card_number.holds_number(canon)):
             names.add(canon.lower())
     return names
+
+
+def _alert_identity(kind, message) -> tuple:
+    """What makes two alerts one: the kind, and the message as every door
+    stores it now, card numbers cut. An older build stored some whole, so
+    the household's rows and the archive's are both read through this."""
+    return (kind, card_number.cut(message))
 
 
 def _cut_unless_held(conn, sql: str, value):
@@ -3001,6 +4378,27 @@ def _mark_merchant(conn, entity_id, name):
 
 _RULES_FROM_OVERRIDES = "035_canonical_category_backfill.sql"
 _MODEL_RULES_ON_THE_MERCHANT = "044_llm_rule_canonical_rekey.sql"
+_PRINTED_DAY_NOTE = "220_ofx_rows_dated_by_the_printed_day_say_so.sql"
+# the first migration that shipped with printed-day dating (210 and 211
+# came with the change, migration 220's own text says); a build older than
+# it dated every OFX row by its UTC day
+_PRINTED_DAY_DATING = "210_payee_keyed_settings_follow_a_cut_bill_name.sql"
+
+
+def _dated_by_the_utc_day(schema: str | None) -> bool:
+    """Did the build that wrote an archive at `schema` date OFX rows by the
+    UTC day? Every build before printed-day dating did, and an archive too
+    old to say its age is read as one of them."""
+    return _upgrades.older_than(schema, _PRINTED_DAY_DATING)
+# No build, on any install, dated OFX lines by the day the bank printed
+# before this instant. An archive's import batches keep the times its
+# source wrote them, so the destination's own upgrade time says nothing
+# about them; the earliest instant can only give the note to a row a
+# late-upgrading source still dated by the UTC day, which then doubles on
+# a re-import, and a doubled row can be removed, where a missing note can
+# lose a charge.
+_PRINTED_DAY_DATING_SINCE = _dt.datetime(2026, 11, 7, 17, 31,
+                                         tzinfo=_dt.timezone.utc)
 # a correction to one of these is a movement of money, never a spend rule
 _FLOW_OVERRIDES = _FLOW_PRIMARIES + ("BANK_FEES",)
 
@@ -3153,6 +4551,56 @@ def _offer_cut(conn, kind, payee, evidence: dict,
     return payee, evidence
 
 
+def _finite_num(v) -> bool:
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and math.isfinite(v))
+
+
+def _offer_evidence_typed(ev: dict) -> dict:
+    """A restored bill offer's evidence with every value the Bills screen
+    reads kept only in the type the detector writes it in: a price change's
+    amounts as finite numbers and its day as a date, the monthly totals as
+    a map of finite numbers, the named bill and merchant as text. A value
+    of any other shape is dropped, so the offer reads as less evidence
+    rather than a Bills screen that cannot load."""
+    ev = dict(ev)
+    for k in ("old", "new"):
+        if k in ev and not _finite_num(ev[k]):
+            del ev[k]
+    if "charged_on" in ev:
+        try:
+            if not isinstance(ev["charged_on"], str):
+                raise ValueError
+            as_date(ev["charged_on"])
+        except (TypeError, ValueError, OverflowError):
+            del ev["charged_on"]
+    mt = ev.pop("monthly_totals", None)
+    if isinstance(mt, dict):
+        mt = {str(k): v for k, v in mt.items() if _finite_num(v)}
+        if mt:
+            ev["monthly_totals"] = mt
+    for k in ("hits", "n"):
+        if k in ev and not (_finite_num(ev[k]) and ev[k] == int(ev[k])):
+            del ev[k]
+    for k in ("bill_payee", "merchant_name", "last_seen", "cycle_days"):
+        v = ev.get(k)
+        if v is not None and not (isinstance(v, str) or (
+                k == "cycle_days" and _finite_num(v))):
+            del ev[k]
+    # a measured cycle past the longest a bill may repeat on is no
+    # measurement: the lapse rule falls back to the offer's cadence
+    c = ev.get("cycle_days")
+    if _finite_num(c) and not 0 < c <= _bills.MAX_CYCLE_DAYS:
+        del ev["cycle_days"]
+    # the approve path hands last_seen to the bill writer as a date
+    if "last_seen" in ev:
+        try:
+            as_date(ev["last_seen"])
+        except (TypeError, ValueError, OverflowError):
+            del ev["last_seen"]
+    return ev
+
+
 def _plan_bill_moves(conn, rows: list) -> list:
     """Where each archived bill lands, decided for all of them before any
     is written: `rows` is (archived id, payee, made by a person) per bill,
@@ -3235,9 +4683,17 @@ def _restore(conn, data, out: _Outcomes, *, progress=None,
     moved = _MOVED_ACCOUNTS.set(_plan_moved_accounts(conn))
     sessions = _START_SESSIONS.set(_starter_watch(conn, starter))
     guard = _GUARD_V2.set(False)
+    columns = _COLUMNS.set({})
+    nul_cells = _NUL_KEY_CELLS.set({})
+    nul_sample = _NUL_KEY_SAMPLE.set({})
+    nul_drops = _NUL_KEY_DROPS.set(set())
     try:
         return _restore_zip(conn, data, out)
     finally:
+        _NUL_KEY_SAMPLE.reset(nul_sample)
+        _NUL_KEY_DROPS.reset(nul_drops)
+        _NUL_KEY_CELLS.reset(nul_cells)
+        _COLUMNS.reset(columns)
         _START_SESSIONS.reset(sessions)
         _GUARD_V2.reset(guard)
         _MOVED_TXNS.reset(moved_txns)
@@ -3305,6 +4761,9 @@ def _renumber_home_ranks(conn, groups: list[str]) -> int:
 
 _INVITES_MEMBER = "recipient_invites.csv"
 _RECIPIENT_INVITES = "074_recipient_invites.sql"
+# the build that gave Today its summary face (and the setting that picks
+# it) shipped with migration 090; an archive older than it never chose
+_TODAY_FACES = "090_tenant_categorizer_model.sql"
 _NO_INVITES = {"total": 0, "rows": 0, "accepted": 0, "declined": 0,
                "pending": 0}
 
@@ -3523,6 +4982,22 @@ def _restore_recipient_invites(conn, z, configured=()) -> dict:
             "pending": len(listed) - accepted - declined}
 
 
+def skipped_rows(out: _Outcomes) -> list[dict]:
+    """Per table, the rows no reader could read and the restore left out:
+    how many, the first few by id or line, and the sentence that says so.
+    The restore's result carries them as their own field, and the
+    sentences lead its notes."""
+    got = []
+    for table, (n, sample) in sorted(out.skipped.items()):
+        more = f", and {n - len(sample)} more" if n > len(sample) else ""
+        got.append({"table": table, "count": n, "sample": list(sample),
+                    "sentence": f"{_plural(n, 'row', 'rows')} of {table} "
+                                f"could not be read and "
+                                f"{'was' if n == 1 else 'were'} skipped "
+                                f"({', '.join(sample)}{more})"})
+    return got
+
+
 def _outcome_notes(out: _Outcomes) -> list[str]:
     """What the person restoring is told about the rows that did not come
     back as they were. `present` is said by the count alone."""
@@ -3536,9 +5011,16 @@ def _outcome_notes(out: _Outcomes) -> list[str]:
         notes.append(f"{orphaned} row(s) referred to a transaction, account, "
                      f"business or receipt the archive does not carry, or "
                      f"that this restore left out, and were left out too")
-    if out.total("out_of_range"):
-        notes.append(_out_of_range_note(out.total("out_of_range")))
-    malformed = out.total("malformed")
+    beyond_any_sum = (out.total("out_of_range")
+                      - sum(out.over_bound.values()))
+    if beyond_any_sum:
+        notes.append(_out_of_range_note(beyond_any_sum))
+    notes += _bounded_notes(out.over_bound, left="left out")
+    notes += _bounded_notes(out.emptied_bound,
+                            left="restored with that figure left empty")
+    notes += _bounded_notes(out.misfits, left="left out")
+    malformed = (out.total("malformed") - sum(out.misfits.values())
+                 - sum(n for n, _ in out.skipped.values()))
     if malformed:
         notes.append(f"{malformed} row(s) were in a shape no part of the app "
                      f"writes (a required cell blank, an unreadable id or "
@@ -3547,14 +5029,31 @@ def _outcome_notes(out: _Outcomes) -> list[str]:
     if over_cap:
         notes.append(f"{over_cap} row(s) were past a limit every household "
                      f"is held to (a receipt image over the upload size, an "
-                     f"account's id history) and were left out")
+                     f"account's id history, a reimbursement for a charge "
+                     f"already repaid in full or from a deposit already "
+                     f"used up) and were left out")
     repaired = out.total("amount_repaired")
     if repaired:
         notes.append(f"{repaired} transaction(s) had no amount in the "
                      f"archive and were restored with amount 0, keeping "
                      f"their receipts, notes and splits — edit the amount "
                      f"on each to correct it")
+    trimmed = out.total("payback_trimmed")
+    if trimmed:
+        notes.append(f"{trimmed} partial reimbursement(s) repaid more than "
+                     f"their charge cost or claimed more than their deposit "
+                     f"brought in, and were cut to it, the newest first; "
+                     f"the part that was cut counts as spend on its charge "
+                     f"and as income on its deposit again")
     return notes
+
+
+def _nul_key_notes() -> list[str]:
+    """Each file and column a value was left out of for a NUL in a key."""
+    drops = _NUL_KEY_DROPS.get() or set()
+    return [f"a value in {member}, column {col}, had a NUL character "
+            f"(U+0000) in a key, which no export writes, and was left out"
+            for member, col in sorted(drops)]
 
 
 PORTABILITY_REFUSAL = (
@@ -3578,7 +5077,7 @@ def _refuse_portability_archive(z: zipfile.ZipFile) -> None:
     names = z.namelist()
     if (any(_PORTABILITY_MEMBER.match(n) for n in names)
             and not any("/" not in n and n.endswith(".csv") for n in names)):
-        raise ValueError(PORTABILITY_REFUSAL)
+        raise _ArchiveRefused(PORTABILITY_REFUSAL)
     try:
         info = z.getinfo(_upgrades.MANIFEST)
     except KeyError:
@@ -3591,7 +5090,7 @@ def _refuse_portability_archive(z: zipfile.ZipFile) -> None:
         return
     if isinstance(doc, dict) and str(doc.get("export_format") or "") \
             .startswith(_PORTABILITY_FORMAT):
-        raise ValueError(PORTABILITY_REFUSAL)
+        raise _ArchiveRefused(PORTABILITY_REFUSAL)
 
 
 FOREIGN_ARCHIVE_REFUSAL = (
@@ -3634,10 +5133,13 @@ _EXPORT_MEMBERS = frozenset({
     "crypto_holdings.csv",
     "entity_membership.csv",
     "equity_movement.csv",
+    "forecast_nights.csv",
     "holdings.csv",
     "import_batches.csv",
     "income_annual.csv",
     "income_documents.csv",
+    "income_upload_values.csv",
+    "income_uploads.csv",
     "items.csv",
     "liabilities.csv",
     "manual_categories.csv",
@@ -3653,6 +5155,7 @@ _EXPORT_MEMBERS = frozenset({
     "receipts.csv",
     "recipient_invites.csv",
     "recurring.csv",
+    "recurring_proposals.csv",
     "reimburse_flags.csv",
     "reimbursements.csv",
     "tenant_settings.csv",
@@ -3687,9 +5190,20 @@ def foreign_archive_refusal(data) -> str | None:
     None for one that is. Read from the members' names (and the header of
     a lone transactions.csv, which a zipped spending export may share), so
     every door asks the same question of the same file before it writes."""
+    if not isinstance(data, zipfile.ZipFile):
+        # bounded before anything is parsed: a central directory listing
+        # millions of members costs gigabytes to open, and this runs
+        # before the step-up, on every door
+        problem = _upload_zip.central_directory_problem(data)
+        if problem == _upload_zip.UNREADABLE:
+            # damaged or not a ZIP at all: left unopened, and the restore's
+            # own refusal says so, as for any archive this sniff can't read
+            return None
+        if problem:
+            return problem
     try:
-        z = (data if isinstance(data, zipfile.ZipFile) else zipfile.ZipFile(
-            data if hasattr(data, "seek") else io.BytesIO(data)))
+        z = (data if isinstance(data, zipfile.ZipFile)
+             else _upload_zip.open_uploaded(data))
         names = set(z.namelist())
         if _is_export(z, names, ""):
             return None
@@ -3704,34 +5218,28 @@ def foreign_archive_refusal(data) -> str | None:
     return FOREIGN_ARCHIVE_REFUSAL
 
 
+ERASED_MSG = "this household is being deleted; nothing was restored"
+
+
 def _restore_zip(conn, data, out: _Outcomes) -> dict:
     # bytes (the API's small-archive door) or a seekable mapping (the
     # streamed restore door): reading a mapping through BytesIO would copy
     # the whole archive back into the heap the streaming was built to avoid
-    z = zipfile.ZipFile(data if hasattr(data, "seek") else io.BytesIO(data))
+    try:
+        z = _upload_zip.open_uploaded(data)
+    except _upload_zip.ArchiveRefused as e:
+        raise _ArchiveRefused(str(e)) from None
     _check_zip_sizes(z)          # refuse zip bombs before reading rows
     _refuse_portability_archive(z)
     refusal = foreign_archive_refusal(z)
     if refusal:
-        raise ValueError(refusal)
+        raise _ArchiveRefused(refusal)
     # how this archive's cells were guarded; restore_zip scopes the value
     _GUARD_V2.set(archive_guard_v2(z))
-    planned = _COMMA_RENAMES.get()
-    if planned is not None:
-        planned.update(_plan_comma_renames(conn, z))
-    moved_accounts = _MOVED_ACCOUNTS.get()
-    if moved_accounts is not None:
-        _resolve_cut_lineage(conn, z, moved_accounts)
-    carried = _MOVED_TXNS.get()
-    if carried is not None:
-        # read before any row lands: the pairing is against what the
-        # household held when the restore began. The exact map first: the
-        # pairing below reads the archive through it, so a row it places
-        # is never offered as a twin of another
-        carried.update(_plan_keyed_txns(conn, z))
-        carried.update(_plan_foreign_keyed_txns(conn, z, carried))
-        carried.update(_plan_moved_txns(conn, z))
-        carried.update(_plan_plain_by_content(conn, z, carried))
+    # the state the declared landers read, set as each part of it becomes
+    # true (see sync/landers.py)
+    from . import landers as _landers
+    ctx = _landers.Ctx()
 
     # Validate the incoming config FIRST — the connection is autocommit,
     # so a rejection after the row loops would still leave the ZIP's
@@ -3742,2242 +5250,277 @@ def _restore_zip(conn, data, out: _Outcomes) -> dict:
     cfg_in = (_j(settings[0]["config"])
               if settings and settings[0].get("config") else None)
     notes: list[str] = []
-    # the daily email's recipients the archive brings, as they land
-    archived_recipients: list = []
     if isinstance(cfg_in, dict):
         # The parsed cell can hold a NUL its CSV text spelled as an escape.
         # Settled here, before any key check reads it: values lose theirs,
-        # and a key holding one refuses the file, so the spelling every
-        # validator sees is the one that would be stored.
-        cfg_in = strip_nul(cfg_in)
+        # so the spelling every validator sees is the one that would be
+        # stored. A key holding one never gets this far: _j left the whole
+        # document out (no key check may see a rewritten key), as it does
+        # any JSON cell's value, and the summary says so.
+        try:
+            cfg_in = strip_nul(cfg_in)
+        except ValueError as e:
+            # nested past the walk: the file, named
+            raise _not_an_export("tenant_settings.csv", str(e)) from None
         notes = _check_config(cfg_in)
 
     # One transaction: a mid-restore failure (bad row deep in the ZIP,
     # connection drop) leaves nothing behind.
     with conn.transaction():
+        # Asked inside the restore's own transaction, before any lock or
+        # row, as every push door asks: it holds the push writer lock
+        # shared until the commit, so an erasure waits the restore out
+        # and then deletes what it wrote, and a restore that starts after
+        # the erasure began writes nothing — rows under an erased tenant
+        # id are never swept again
+        from .. import erasure as _erasure
+        if not _erasure.push_may_write(conn, _tenant_of(conn)):
+            raise HouseholdBeingDeleted(ERASED_MSG)
         # storage, pairing, identity, before any row lands: the order
         # every other writer takes them in (bulk_import)
         from ..web.bulk_import import hold_restore_write_locks
         hold_restore_write_locks(conn)
-        push_fed = None
-        for r in _rows(z, "items.csv"):
-            if not r.get("id"):
-                out.refuse("items", "malformed")
-                continue
-            aggregator = r.get("aggregator") or "manual"
-            if aggregator == "csv":
-                if push_fed is None:
-                    push_fed = _push_fed_items(z)
-                # a push door's connection an archive from before the doors
-                # stamped their own name still calls 'csv' (migration 022)
-                aggregator = push_fed.get(str(r["id"]), aggregator)
-            archived = ((r.get("status") or "") == "archived"
-                        or aggregator != (r.get("aggregator") or "manual"))
-            out.land(conn, "items",
-                """INSERT INTO items (id, aggregator, institution_id,
-                       institution_name, status, raw, logo, brand_color, url,
-                       archived_reason, archived_at, linked_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(r["id"], aggregator,
-                 r.get("institution_id") or None,
-                 r.get("institution_name") or None,
-                 # sync-less shell until the aggregator is reconnected —
-                 # except archived items (push-fed plan-CSV/coinbase, archived
-                 # simplefin children) which stay archived: 'restored' would
-                 # re-enter them into connection-freshness checks and the
-                 # hourly pull loop they were deliberately kept out of
-                 ("archived" if archived else "restored"),
-                 jsonb(_raw_dict(_j(r.get("raw")))),
-                 r.get("logo") or None, r.get("brand_color") or None,
-                 r.get("url") or None,
-                 # Why and when a disconnected bank went. The reason is what
-                 # refuses a reconnect that would bring its accounts in
-                 # twice (a newer link adopted them) or bring back one the
-                 # owner deleted, and what lets a new bridge token revive
-                 # only the banks that went down with the bridge; the date
-                 # is where its catch-up pull starts. Dropped, every
-                 # disconnected bank restores as an ordinary one and those
-                 # refusals stop. Only a disconnected row carries them: a
-                 # live connection restores as a shell, and a stray reason
-                 # on it would mean nothing. resync_from stays behind on
-                 # purpose — it is this instance's own pull bookkeeping.
-                 (r.get("archived_reason") or None) if archived else None,
-                 _ts(r.get("archived_at")) if archived else None,
-                 # when the bank was linked is the household's history, not
-                 # this instance's; an archive without it restores as now
-                 _ts(r.get("linked_at")))])
+        # What the archive plans against the household as it was — the
+        # account ids it renames, which archived row lands under which id —
+        # read under the write locks and before any row lands, so no writer
+        # moves the rows the plan was made against. The planners only read.
+        ctx.prepare(conn, z, notes=notes, cfg_in=cfg_in)
+        _landers.land_all(conn, z, ctx, out)
+        _landers.run_step(_landers.FINALIZE, conn, ctx, out)
+    return _landers.run_step(_landers.AFTER_COMMIT, conn, ctx, out)
 
-        # the merchant ROWS come before the transactions and aliases that
-        # point at them; an archive with no merchants file restores the
-        # rest, and the nightly resolve rebuilds identity from the raw
-        # records. Bare ON CONFLICT: merchants also has a partial unique
-        # index on plaid_entity_id, so an arbiter naming only the PK would
-        # let a row with a live entity id raise and abort the restore.
-        #
-        # A restore MERGES into the tenant, and a household that linked its
-        # banks before restoring already holds a merchant for every entity
-        # the aggregator named, under an id of its own. The archive's row
-        # for the same entity is the same merchant: it is not inserted, its
-        # id is mapped onto the live one, and everything later in the
-        # archive that names it (transactions, aliases, 1099 marks, merge
-        # pointers, merge decisions) follows the map. Without the map, every
-        # pointer at a folded merchant would look dangling and be dropped,
-        # undoing merges and resurfacing declined offers.
-        live_entities = {
-            r["plaid_entity_id"]: r["id"] for r in conn.execute(
-                "SELECT id::text AS id, plaid_entity_id FROM merchants "
-                "WHERE plaid_entity_id IS NOT NULL").fetchall()}
-        merchant_map: dict[str, str] = {}
-        folded: list[tuple[str, dict]] = []
-        # A machine's merchant name keeps only the last four of a card
-        # number, as the resolver writes it; a name a person gave (on the
-        # merchant, or as a manual alias's canonical) stays as they typed
-        # it. `machine_cut` maps each live machine name cut here, lowered,
-        # to its cut spelling: the rules and 1099 marks keyed on the whole
-        # name follow it below.
-        persons_names = _persons_names(conn, z)
-        machine_cut: dict[str, str] = {}
-        persons_live: set[str] = set()
-        for r in _rows(z, "merchants.csv"):
-            if not r.get("id") or not r.get("name"):
-                out.refuse("merchants", "malformed")
-                continue
-            m_name = _descriptor(r.get("name"))
-            m_source = r.get("name_source") or "layer1"
-            live_row = not r.get("merged_into")
-            if (m_source == "manual"
-                    or (isinstance(m_name, str)
-                        and m_name.lower() in persons_names)):
-                if live_row and isinstance(m_name, str):
-                    persons_live.add(m_name.lower())
-            else:
-                cut_name = card_number.cut(m_name)
-                if live_row and cut_name != m_name:
-                    machine_cut[m_name.lower()] = cut_name
-                m_name = cut_name
-            aid = str(r["id"]).strip().lower()
-            entity = r.get("plaid_entity_id") or None
-            live = live_entities.get(entity) if entity else None
-            if live is not None and live != aid:
-                merchant_map[aid] = live
-                folded.append((live, r))
-                out.refuse("merchants", "merged")
-                continue
-            landed = out.land(conn, "merchants",
-                """INSERT INTO merchants (id, plaid_entity_id, name, name_source,
-                       kind, logo_url, website, phone, mcc, parent_id,
-                       merged_into, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT DO NOTHING
-                   RETURNING id""",
-                [(r["id"], entity,
-                 # the same clamp the ledger's descriptors get: this name is
-                 # matched word by word against them
-                 m_name, m_source,
-                 r.get("kind") or "merchant", r.get("logo_url") or None,
-                 r.get("website") or None, r.get("phone") or None,
-                 r.get("mcc") or None, r.get("parent_id") or None,
-                 r.get("merged_into") or None, _ts(r.get("created_at")))])
-            if landed[0] is not None and entity:
-                live_entities[entity] = aid
-        if merchant_map:
-            _fold_mapped_merchants(conn, merchant_map, folded)
 
-        # An archive can point at merchants it does not carry — a partial
-        # export, a hand-edited CSV, a ZIP written before merchants existed
-        # for some of its rows. Every such pointer is a lie the rest of the
-        # restore would faithfully copy in, and the nightly identity pass
-        # then crashed on it for that household every night. Normalise the
-        # graph against what is ACTUALLY in the table now, and keep the set
-        # of real ids to screen the transaction and alias rows below.
-        known_merchants = _normalise_merchant_graph(conn)
-
-        # business_entity BEFORE accounts/transactions — their
-        # entity_id FK-references it. ein_enc is intentionally absent from the
-        # export (export invariant: the raw EIN only leaves via a gated
-        # reveal), so it restores NULL; ein_last4 carries for display.
-        for r in _rows(z, "business_entity.csv"):
-            if not r.get("id"):
-                out.refuse("business_entity", "malformed")
-                continue
-            out.land(conn, "business_entity",
-                """INSERT INTO business_entity (id, name, structure, state,
-                       formation_date, business_start_date, ein_last4,
-                       registered_agent, fiscal_year_end, status,
-                       home_office_sqft, income_tax_rate, filing_status,
-                       tax_reserve_account_id, archived_at, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(r["id"], r.get("name"), r.get("structure"),
-                 r.get("state") or None,
-                 as_date(r["formation_date"]) if r.get("formation_date") else None,
-                 as_date(r["business_start_date"]) if r.get("business_start_date") else None,
-                 r.get("ein_last4") or None, r.get("registered_agent") or None,
-                 r.get("fiscal_year_end") or None, r.get("status") or "active",
-                 _i(r.get("home_office_sqft")), _f(r.get("income_tax_rate")),
-                 r.get("filing_status") or None,
-                 # The export is SELECT *, so the ZIP carries this; without it
-                 # a round trip forgets which account the tax money sits in.
-                 _account_id(r.get("tax_reserve_account_id")) or None,
-                 # when the business was closed — an archived entity must
-                 # restore as archived-on-the-same-date, not freshly closed.
-                 # One archived before the date was kept was last touched
-                 # by the archiving itself, so that is its date, as
-                 # migration 089 dated the stored ones
-                 r.get("archived_at") or (
-                     _ts(r.get("updated_at"))
-                     if (r.get("status") or "") == "archived" else None),
-                 # when the business was set up is its history, not this
-                 # instance's; an archive without it restores as now
-                 _ts(r.get("created_at")))])
-
-        # An archive written table by table, each at its own moment, can hold
-        # a row whose parent it missed: an account opened after the
-        # connections were read, a business deleted after the ledger was. The
-        # export now reads one snapshot, but archives from before that
-        # exist, and one dangling pointer would roll back the whole restore.
-        # So parents are checked against what is here: a pointer to a
-        # missing business or connection is dropped (what deleting that
-        # parent does to it anyway), and a row that cannot exist without
-        # its missing parent is skipped.
-        known_entities = {str(r["id"]) for r in conn.execute(
-            "SELECT id FROM business_entity").fetchall()}
-        known_items = {r["id"] for r in conn.execute(
-            "SELECT id FROM items").fetchall()}
-
-        def _entity(v):
-            v = (v or "").strip().lower()
-            return v if v in known_entities else None
-
-        # ids the archive spells with a comma, and the name each restores
-        # under — the settings keys naming them are rewritten to match
-        renamed: dict[str, str] = {}
-        # the accounts this restore actually created, for the merge below
-        landed_accounts: set[str] = set()
-        # hand-made accounts whose id still spells a full account number
-        numbered_ids: list[str] = []
-        for r in _rows(z, "accounts.csv"):
-            if not r.get("id"):
-                out.refuse("accounts", "malformed")
-                continue
-            if _account_id(r["id"]) != r["id"]:
-                renamed[r["id"]] = _account_id(r["id"])
-            a_name = r.get("name")
-            # a display name is typed by a person whatever the account's
-            # source, so a card number typed into one is cut on every
-            # account, as the rename door and `oikonome migrate` cut it
-            a_display = _account_sources.stored_account_name(
-                r.get("display_name") or None)
-            a_official = r.get("official_name") or None
-            if r.get("item_id") == "manual":
-                # A folder import named the account after its file, and an
-                # archive written before the import cut the number from
-                # that name brings the full account number back with it —
-                # typed in groups too, in any of its names. `oikonome
-                # migrate` makes the same cut to stored names
-                # (base.mask_manual_account_names).
-                a_name, a_display, a_official = (
-                    _account_sources.stored_account_name(v)
-                    for v in (a_name, a_display, a_official))
-                # a hand-made id spelling a full number is re-keyed once
-                # the rows have landed (below); any other keeps it, and
-                # is named
-                restored_id = str(_account_id(r["id"]) or "")
-                if (card_number.LONG_RUN_RE.search(restored_id)
-                        and not _sync_base.NUMBERED_MANUAL_ID_RE.search(
-                            restored_id)):
-                    numbered_ids.append(a_name or "an account")
-            landed = out.land(conn, "accounts",
-                """INSERT INTO accounts (id, item_id, name, display_name,
-                       official_name, type, subtype, mask, balance_current,
-                       balance_available, currency, entity_id, owner, raw,
-                       user_removed_at, type_user_set, balance_limit)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(_account_id(r["id"]),
-                 r.get("item_id") if r.get("item_id") in known_items else None,
-                 a_name, a_display, a_official,
-                 r.get("type"), r.get("subtype") or None, r.get("mask") or None,
-                 # _f, not truthiness — a non-string 0 must
-                 # restore as 0, never NULL
-                 _balance(r.get("balance_current")),
-                 _balance(r.get("balance_available")),
-                 r.get("currency") or None, _entity(r.get("entity_id")),
-                 # the account's default owner label ("yours/mine/ours"); an
-                 # archive without the column restores as unattributed (None).
-                 r.get("owner") or None,
-                 jsonb(scrub_account_raw(_raw_dict(_j(r.get("raw"))))),
-                 # user_removed_at (the soft-hide): without it an
-                 # export→restore round trip UN-hides every account the user
-                 # hid — back in the lists, back in the money aggregates,
-                 # with no indication anything changed.
-                 _ts(r.get("user_removed_at")),
-                 # type_user_set stops sync from overwriting a type the USER
-                 # corrected; landed FALSE, the restored account looks right
-                 # until the next aggregator sync silently reclassifies it.
-                 # balance_limit rides along: it is what credit-utilisation
-                 # reads.
-                 _b(r.get("type_user_set")),
-                 _balance(r.get("balance_limit")))])
-            if landed[0] is not None:
-                landed_accounts.add(landed[0])
-        if numbered_ids:
-            # the id is permanent (history, adoptions and settings all name
-            # it), so it is not re-keyed; the note names each account by
-            # its masked name, never by the id that holds the number
-            notes.append(
-                f"{_plural(len(numbered_ids), 'account', 'accounts')} "
-                f"created from a file named after its full account number "
-                f"still carr{'ies' if len(numbered_ids) == 1 else 'y'} that "
-                f"number in an internal id that travels in exports: "
-                + ", ".join(numbered_ids)
-                + ". The importing guide says how to replace one")
-
-        # restored accounts may carry entity ids; the connection's entity
-        # scope was stamped at checkout, before they existed
-        from ..db import tenancy as _tenancy
-        _tenancy.set_entity_scope(conn)
-        # the accounts a restored stand-in note may name: those here now,
-        # under any id an adoption here moved them from
-        noted_accounts = {r["id"] for r in conn.execute(
-            "SELECT id FROM accounts").fetchall()} | {
-            r["old_account_id"] for r in conn.execute(
-                "SELECT old_account_id FROM account_adoptions").fetchall()}
-
-        def _txn_raw(r, amount_missing=False):
-            raw = scrub_transaction_raw(_raw_dict(_j(r.get("raw"))))
-            if amount_missing:
-                raw["_amount_missing"] = True
-            # an archive written before file rows' raw was masked still
-            # carries the full number in the cell the name was cut from
-            if _sync_base.is_file_import_id(r.get("id")):
-                raw = _sync_base.mask_file_raw(raw, r.get("name"),
-                                               r.get("merchant_name"))
-            # the row an earlier guard noted this one was carried from is
-            # named by id with no key to follow: it follows that row to
-            # the id it lands under here (see base._MENTIONS_SQL)
-            was = raw.get("_carried_from")
-            if carried and isinstance(was, str) and was in carried:
-                raw["_carried_from"] = carried[was]
-            return _sync_base.stood_in_for_restore(
-                raw, _account_id, noted_accounts)
-        # Transactions are BATCHED. Every other member here is
-        # bounded by user actions — accounts, bills, notes — but this one is
-        # the ledger: a restore can be tens of thousands of rows, and a
-        # per-row execute() pays a full client/server round trip for each.
-        # psycopg pipelines executemany, so the same INSERT ... ON CONFLICT
-        # DO NOTHING travels in chunks instead. Memory is unchanged: _rows
-        # still streams, and only CHUNK rows are held at a time.
-        def _txn_params(r):
-            # every live door writes a number here, and every ledger reader
-            # turns it into cents — the duplicate matchers first, so a blank
-            # row would fail every later import onto its account. Leaving
-            # the row out would drop its receipt, note and split as orphans,
-            # so it lands at 0 and its raw says the archive had no amount.
-            amount = _money(r.get("amount"))  # 0 is a real amount
-            amount_missing = amount is None
-            m_name, m_aside = _merchant_name_cells(r)
-            raw = _txn_raw(r, amount_missing)
-            merchant_id = _known_merchant(r.get("merchant_id"),
-                                          known_merchants, merchant_map)
-            # the migrations that rewrote stored rows, applied to this one
-            # (upgrade_archived_txn): an archive written before any of them
-            # lands in the shape they left the household's own rows in
-            c = upgrade_archived_txn({
-                "name": _descriptor(r.get("name")),
-                "merchant_name": m_name,
-                "merchant_name_set_aside": m_aside,
-                "merchant_outlet": _descriptor(r.get("merchant_outlet")) or None,
-                "amount": 0.0 if amount_missing else amount,
-                "removed": int(r.get("removed") or 0),
-                "category_primary": r.get("category_primary") or None,
-                "category_detailed": r.get("category_detailed") or None,
-                # The aggregator's OWN verdict and its confidence. These
-                # are what llm_categorize's low-confidence gate reads,
-                # so dropping them would silently change which rows the
-                # model revisits. The confidence is a TEXT tier
-                # ('VERY_HIGH'/'HIGH'/'LOW'/…), never a number —
-                # float-coercing it would raise on any Plaid row and, the
-                # restore being one transaction, abort all of it
-                "category_plaid": r.get("category_plaid") or None,
-                "category_plaid_detailed":
-                    r.get("category_plaid_detailed") or None,
-                "category_plaid_confidence":
-                    r.get("category_plaid_confidence") or None,
-                "category_override":
-                    _descriptor(r.get("category_override")) or None,
-                # migration 098: the aggregator's facts as columns
-                "category_source": r.get("category_source") or None,
-                "check_number": _descriptor(r.get("check_number")) or None,
-                "payment_channel": r.get("payment_channel") or None,
-                "payment_processor": r.get("payment_processor") or None,
-                "location_city": _descriptor(r.get("location_city")) or None,
-                "location_region": r.get("location_region") or None,
-                "location_address":
-                    _descriptor(r.get("location_address")) or None,
-                "location_postal": r.get("location_postal") or None,
-                "location_lat": (_f(r.get("location_lat"))
-                                 if r.get("location_lat") not in (None, "")
-                                 else None),
-                "location_lon": (_f(r.get("location_lon"))
-                                 if r.get("location_lon") not in (None, "")
-                                 else None),
-                "location_store": r.get("location_store") or None,
-                "mcc": r.get("mcc") or None,
-                "authorized_date": as_date(r.get("authorized_date") or None),
-            }, raw, on_card=_account_id(r.get("account_id")) in cards,
-                has_merchant=merchant_id is not None)
-            t_name, m_name, m_aside, outlet = (
-                c["name"], c["merchant_name"], c["merchant_name_set_aside"],
-                c["merchant_outlet"])
-            # a file import's names keep only the last four of any long
-            # digit run, as the upsert writes them — an archive written
-            # before that rule would otherwise bring a full account or card
-            # number back into the most travelled field of the row
-            if _sync_base.is_file_import_id(r["id"]):
-                t_name, m_name, m_aside, outlet = (
-                    card_number.cut(v)
-                    for v in (t_name, m_name, m_aside, outlet))
-            return (r["id"], _account_id(r.get("account_id")) or None,
-                    as_date(r["date"]),
-                    c["authorized_date"],
-                    c["amount"],
-                    t_name,
-                    m_name,
-                    c["category_primary"],
-                    c["category_detailed"],
-                    c["category_plaid"],
-                    c["category_plaid_detailed"],
-                    c["category_plaid_confidence"],
-                    c["category_override"],
-                    int(r.get("pending") or 0),
-                    r.get("pending_transaction_id") or None,
-                    c["payment_channel"],
-                    c["removed"],
-                    _entity(r.get("entity_id")),   # per-txn override
-                    # per-transaction owner exception (effective owner is
-                    # COALESCE(owner_override, account.owner)) and the
-                    # statement-derived outlet brand (payee display/search,
-                    # the merchant rename screen). Both ride the SELECT *
-                    # export.
-                    r.get("owner_override") or None,
-                    outlet,
-                    # the aggregator's name for this one charge, which the
-                    # resolver set aside in favour of the merchant the bank
-                    # line means. NULL when the archive never had one —
-                    # dropping it would re-key the row on a name the ledger
-                    # had already judged a misreading.
-                    m_aside,
-                    # the merchant ROW — but only when the archive
-                    # actually carried it. A pointer at a merchant that is
-                    # not here is worse than no pointer: identity reads
-                    # crash on it and the ledger shows nothing at all.
-                    merchant_id,
-                    jsonb(raw),
-                    c["category_source"],
-                    c["check_number"],
-                    c["payment_processor"],
-                    c["location_city"],
-                    c["location_region"],
-                    c["location_address"],
-                    c["location_postal"],
-                    c["location_lat"],
-                    c["location_lon"],
-                    c["location_store"],
-                    c["mcc"],
-                    r.get("override_source") or None,
-                    # a hold the person retired stays retired through the next sync
-                    r.get("retired_at") or None)
-
-        # EVERY column the export writes. The export is `SELECT *`, so a
-        # column left out here is silently lost on a round trip, degrading
-        # categorisation and bill matching in ways nothing reports.
-        _TXN_SQL = """INSERT INTO transactions (id, account_id, date,
-                          authorized_date, amount,
-                          name, merchant_name, category_primary,
-                          category_detailed, category_plaid,
-                          category_plaid_detailed, category_plaid_confidence,
-                          category_override, pending, pending_transaction_id,
-                          payment_channel, removed, entity_id, owner_override,
-                          merchant_outlet, merchant_name_set_aside,
-                          merchant_id, raw,
-                          category_source, check_number, payment_processor,
-                          location_city, location_region, location_address,
-                          location_postal, location_lat, location_lon,
-                          location_store, mcc, override_source, retired_at)
-                      VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                              %s,%s,%s,%s,%s,%s,%s,%s,
-                              %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                      ON CONFLICT (tenant_id, id) DO NOTHING
-                      RETURNING id"""
-        CHUNK = 1000
-        batch: list = []
-        overridden: list[str] = []
-        # beside `batch`, whether each row lands at 0 for want of an amount
-        batch_repaired: list[bool] = []
-
-        def _flush():
-            nonlocal batch, batch_repaired
-            landed = out.land(conn, "transactions", _TXN_SQL, batch)
-            # a repaired row counts only when ITS insert wrote it: one the
-            # destination already held keeps whatever amount it has there,
-            # and of an id the archive carries twice only the copy that
-            # landed says whether the amount was missing
-            out.repair("transactions", "amount_repaired", sum(
-                1 for got, fixed in zip(landed, batch_repaired)
-                if got is not None and fixed))
-            # the rows this restore wrote carrying a category override,
-            # which the rules derived from overrides are derived over
-            overridden.extend(got for got, params in zip(landed, batch)
-                              if got is not None and params[12])
-            batch = []
-            batch_repaired = []
-
-        known_accounts = {r["id"] for r in conn.execute(
-            "SELECT id FROM accounts").fetchall()}
-        # the context that lets a bare "payment" read as a card settlement
-        cards = _sync_base.credit_account_ids(conn)
-        # A PERSON's category on a row the destination already holds under
-        # the same id (a statement imported on both sides hashes to the same
-        # ids) replaces a bill's, a store's or no override there; the insert
-        # above skips the row whole, so these are applied after it. Only
-        # the id and the category are held, a few strings per correction.
-        user_ids: list[str] = []
-        user_cats: list = []
-        for r in _rows(z, "transactions.csv"):
-            if not r.get("id") or not r.get("date"):
-                out.refuse("transactions", "malformed")
-                continue
-            aid = _account_id(r.get("account_id"))
-            if aid and aid not in known_accounts:
-                out.refuse("transactions", "orphaned")
-                continue
+def _settle_settings(conn, ctx, out) -> None:
+    """The archive's settings merged key by key OVER the household's own,
+    under the settings row lock; checked at the door (`_check_config`)."""
+    cfg_in = ctx.cfg_in
+    if isinstance(cfg_in, dict):
+        # Belt to the netguard check above: a legit export never CARRIES
+        # credential-shaped keys (the export scrubs them) — any present in
+        # a ZIP are crafted. Drop them all so an injected key the
+        # destination lacks (e.g. an access_url) can never land. Same for
+        # policy keys (demo_mode /
+        # demo_login / smtp_starttls) — a ZIP must not flip the demo
+        # lockdown or downgrade SMTP to cleartext; deep-scrubbed so nested
+        # shapes can't smuggle them either.
+        cfg = scrub_config(cfg_in)
+        for k in _CREDENTIAL_COMPANION_KEYS:
+            cfg.pop(k, None)
+        ctx.notes.extend(normalize_notify_shapes(cfg))
+        clean_excluded_accounts(cfg)
+        ctx.notes.extend(clean_budget_amounts(cfg))
+        ctx.notes.extend(clean_income_scenarios(cfg))
+        ctx.notes.extend(clean_savings_goals(cfg))
+        ctx.notes.extend(clean_manual_assets(cfg))
+        ctx.notes.extend(clean_config_shapes(cfg))
+        _rename_account_keys(cfg, ctx._ready("renamed"))
+        _follow_moved_bills(cfg, ctx._ready("bill_payees"))
+        # The Enrich cap is the household's preference and restores, but
+        # only inside the range the settings door accepts: above the
+        # ceiling it would authorise spend the operator never allowed,
+        # and a value that is not a number would break every Enrich call
+        # until someone happened to save settings again. A malformed one
+        # is dropped, which leaves this instance's own value in place.
+        if "plaid_enrich_cap" in cfg:
+            from ..web.api import _enrich_cap_ceiling
             try:
-                params = _txn_params(r)
-            except _AmountOutOfRange:
-                out.refuse("transactions", "out_of_range")
-                continue
-            # lands at 0, see _txn_params
-            batch_repaired.append(_f(r.get("amount")) is None)
-            batch.append(params)
-            if r.get("override_source") == "user":
-                user_ids.append(r["id"])
-                user_cats.append(_descriptor(r.get("category_override")) or None)
-            if len(batch) >= CHUNK:
-                _flush()
-        _flush()
-        if user_ids:
-            conn.execute(
-                """UPDATE transactions t
-                      SET category_override = v.cat, override_source = 'user'
-                     FROM unnest(%s::text[], %s::text[]) AS v(id, cat)
-                    WHERE t.id = v.id
-                      AND t.override_source IS DISTINCT FROM 'user'""",
-                (user_ids, user_cats))
-        del user_ids, user_cats
-
-        # bills.csv since the rename; older backups say recurring.csv
-        bills_member = ("bills.csv" if "bills.csv" in z.namelist()
-                        else "recurring.csv")
-        bad_due = 0
-        # A restore is held to the same ceiling on active bills as a save:
-        # an archive is just another way to put rows in front of every
-        # Today load. Bills past it still come back, archived — the
-        # household loses nothing and can bring them back one by one —
-        # and the note says how many.
-        _bills.lock_active_bills(conn)
-        active_room = _bills.MAX_ACTIVE_BILLS - _bills.active_bill_count(conn)
-        over_cap = 0
-        # A detected bill is named by the ledger, and its id is the slug of
-        # its payee: one whose payee spells a card number lands under the
-        # cut name and that name's id, as the bill pass names it now. Where
-        # each archived bill lands is decided for all of them at once, before
-        # any is written (_plan_bill_moves), so the order the archive lists
-        # them in never changes the answer. What names a bill by its archived
-        # id or payee (pins, offers, two settings) follows `bill_ids` /
-        # `bill_payees` onto the one it landed as.
-        bill_ids: dict[str, str] = {}
-        bill_payees: dict[str, str] = {}
-        bill_rows: list[tuple] = []
-        for r in _rows(z, bills_member):
-            if not r.get("id"):
-                out.refuse("bills", "malformed")
-                continue
-            try:
-                amount = _money(r.get("amount"))
-                monthly = _money(r.get("monthly_amount"))
-            except _AmountOutOfRange:
-                out.refuse("bills", "out_of_range")
-                continue
-            bill_raw = clean_bill_raw(_j(r.get("raw")))
-            # an archive made before the mean-year rate carries the old
-            # 52-week figure; restate it as migration 183 did for stored rows
-            monthly = _bills.restated_monthly(amount, monthly, bill_raw)
-            # A due date past the years the product reads (a bill rolled
-            # on a centuries-long cycle by an older install) would abort
-            # the whole archive here, and every nightly pass after it; the
-            # bill is kept without its due date, and the note says so.
-            due_on = None
-            if r.get("due_on"):
-                due_on = _dt.date.fromisoformat(str(r["due_on"])[:10])
-                try:
-                    as_date(due_on)
-                except ValueError:
-                    due_on = None
-                    bill_raw.pop("dueOn", None)
-                    bad_due += 1
-            bill_rows.append((r, amount, monthly, bill_raw, due_on))
-        bill_plan = _plan_bill_moves(
-            conn, [(r["id"], _descriptor(r.get("payee")),
-                    bill_raw.get("source") == "manual")
-                   for r, _a, _m, bill_raw, _d in bill_rows])
-        for (r, amount, monthly, bill_raw, due_on), (bill_id, payee, held) \
-                in zip(bill_rows, bill_plan):
-            archived_id, archived_payee = r["id"], _descriptor(r.get("payee"))
-            if held is not None:
-                bill_ids[archived_id] = held[0]
-                bill_payees[archived_payee] = held[1]
-                out.refuse("bills", "present")
-                continue
-            if (bill_id, payee) != (archived_id, archived_payee):
-                bill_ids[archived_id] = bill_id
-                bill_payees[archived_payee] = payee
-            bill_active = int(r.get("active") or 1)
-            capped = bool(bill_active and active_room <= 0)
-            if capped:
-                bill_active = 0
-            landed = out.land(conn, "bills",
-                """INSERT INTO bills (id, type, payee, amount, frequency,
-                       monthly_amount, due_on, category, merchant, is_completed,
-                       active, synced_at, raw)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now(),%s)
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(bill_id, r.get("type"), payee,
-                 amount,
-                 r.get("frequency") or None,
-                 monthly,
-                 due_on,
-                 r.get("category") or None, r.get("merchant") or None,
-                 int(r.get("is_completed") or 0), bill_active,
-                 jsonb(bill_raw))])
-            wrote = 1 if landed[0] is not None else 0
-            if bill_active:
-                active_room -= wrote
-            if capped:
-                # written, archived: the note below says how many
-                over_cap += wrote
-        if over_cap:
-            notes.append(f"{over_cap} active bill{'s' if over_cap != 1 else ''}"
-                         f" past the limit of {_bills.MAX_ACTIVE_BILLS} "
-                         "came back archived")
-        if bad_due:
-            notes.append(f"{bad_due} bill{'s' if bad_due != 1 else ''} "
-                         "carried a due date outside the supported years "
-                         "and came back without one")
-
-        # The detected-bill offers and, above all, the ANSWERS to them —
-        # the same reasoning as the merchant merge offers below. A rejection
-        # is the household saying "that run of charges is not a bill I want
-        # tracked", and the detector's id is derived from the evidence
-        # (payee group, cycle, rounded amount), so the rejected row is the
-        # only thing keeping the offer from coming back: the nightly pass
-        # inserts ON CONFLICT DO NOTHING, so it re-derives the same id and
-        # writes nothing. Left out of a restore, every candidate the person
-        # has already turned down is offered again the first night on the
-        # destination, and an approved one is offered again beside the bill
-        # it already became.
-        #
-        # Undecided rows travel too, and cost nothing: the nightly recomputes
-        # them under the same ids. (The exception is an offer derived from an
-        # aggregator's own recurring stream, whose id IS the stream id —
-        # a re-linked connection numbers its streams afresh, so that one can
-        # be re-offered whatever this does.) A proposal names its bill by
-        # PAYEE STRING rather than by id, and the bills above carry their
-        # payees, so nothing has to be re-pointed; where the bill is missing
-        # entirely, approving already answers "that bill no longer exists"
-        # and leaves the offer standing.
-        for r in _rows(z, "bill_proposals.csv"):
-            if not r.get("id") or not r.get("payee"):
-                out.refuse("bill_proposals", "malformed")
-                continue
-            try:
-                amount = _money(r.get("amount"))
-            except _AmountOutOfRange:
-                out.refuse("bill_proposals", "out_of_range")
-                continue
-            p_payee, p_evidence = _offer_cut(
-                conn, r.get("kind") or None, _descriptor(r.get("payee")),
-                _raw_dict(_j(r.get("evidence"))), bill_payees)
-            out.land(conn, "bill_proposals",
-                """INSERT INTO bill_proposals (id, kind, bill_type, payee,
-                       amount, frequency, interval, next_due, evidence,
-                       llm_tag, status, created_at, decided_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                           COALESCE(%s, now()),%s)
-                   ON CONFLICT (tenant_id, id) DO UPDATE
-                      SET status = EXCLUDED.status,
-                          decided_at = COALESCE(EXCLUDED.decided_at, now())
-                    WHERE bill_proposals.status = 'pending'
-                      AND EXCLUDED.status IN ('approved', 'rejected')
-                   RETURNING id""",
-                # the destination's nightly may already have offered the
-                # same candidate under the same derived id: an offer it is
-                # still asking about takes the household's archived answer
-                [(r["id"], r.get("kind") or None,
-                 r.get("bill_type") or "occurrence",
-                 p_payee, amount,
-                 r.get("frequency") or None, _i(r.get("interval"), 1),
-                 as_date(r["next_due"]) if r.get("next_due") else None,
-                 # read with `.get` wherever it is used, so a cell carrying
-                 # a list or a number becomes no evidence rather than a
-                 # crash on the Bills screen
-                 jsonb(p_evidence),
-                 r.get("llm_tag") or None,
-                 # a hand-edited status the app never writes would sit in the
-                 # table invisible to every query that reads it; anything
-                 # unrecognised is simply an offer nobody has answered yet
-                 (r.get("status") if r.get("status") in
-                  ("pending", "approved", "rejected", "auto", "superseded")
-                  else "pending"),
-                 _ts(r.get("created_at")), _ts(r.get("decided_at")))])
-
-        # The import batches the restored ledger rows are tagged with. Batch
-        # ownership rides in each transaction's `raw._batches`, which the
-        # rows above carry, so without this table the tags point at batches
-        # that are not here: Recent imports lists nothing, and the one-click
-        # undo for a file the person imported — the only way back out of a
-        # bad import, since those rows come from no feed — is gone for good,
-        # while the rows themselves keep counting in every total. Restoring
-        # the record makes the door work on the destination exactly as it did
-        # on the source; `account_id` is the account the file was imported
-        # into, for display, and is not a pointer anything follows.
-        for r in _rows(z, "import_batches.csv"):
-            if not r.get("id") or not r.get("source"):
-                out.refuse("import_batches", "malformed")
-                continue
-            out.land(conn, "import_batches",
-                """INSERT INTO import_batches (id, source, account_id,
-                       filename, row_count, created_at)
-                   VALUES (%s,%s,%s,%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(r["id"], r["source"],
-                  _account_id(r.get("account_id")) or None,
-                  card_number.cut_as_slug_reads(
-                      _descriptor(r.get("filename"))) or None,
-                  _i(r.get("row_count"), 0) or 0, _ts(r.get("created_at")))])
-
-        link_marked = None
-        # the pins THIS restore inserted — the only ones an archive without
-        # the link mark may be classified over (below)
-        restored_pins: list[str] = []
-        for r in _rows(z, "manual_categories.csv"):
-            if link_marked is None:
-                link_marked = "link_made" in r
-            # link_prior's empty string (the person's "no category" pin the
-            # link replaced) and NULL (no pin replaced) are one empty cell
-            # in a CSV; an archive that says which it was carries
-            # link_prior_set beside it. Without it an empty cell means none,
-            # as it always has.
-            prior = r.get("link_prior") or None
-            if prior is None and _b(r.get("link_prior_set")):
-                prior = ""
-            if r.get("category") is None:
-                out.refuse("manual_categories", "malformed")
-            elif _txn_exists(conn, r.get("transaction_id")):
-                # bill_id (a bill's transaction category, not a person's
-                # correction) travels too, else a restore turns every
-                # bill-stamped row into a hand edit the bill can't revert.
-                # So does the link mark and the pin it replaced: without
-                # them an unlink after a restore would leave a link-made
-                # transfer behind, or lose the person's category the link
-                # had set aside. An archive written before pins carried the
-                # mark is classified below, once the pairs are back.
-                landed = out.land(conn, "manual_categories",
-                    """INSERT INTO manual_categories (transaction_id, category,
-                                                      bill_id, set_at,
-                                                      link_made, link_prior)
-                       VALUES (%s,%s,%s, COALESCE(%s, now()), %s, %s)
-                       ON CONFLICT (tenant_id, transaction_id) DO UPDATE
-                          SET category = EXCLUDED.category,
-                              bill_id = NULL,
-                              set_at = EXCLUDED.set_at,
-                              link_made = FALSE,
-                              link_prior = EXCLUDED.link_prior
-                        WHERE manual_categories.bill_id IS NOT NULL
-                          AND NOT manual_categories.link_made
-                          AND EXCLUDED.bill_id IS NULL
-                          AND NOT EXCLUDED.link_made
-                       RETURNING transaction_id""",
-                    # a pin a BILL wrote on the destination gives way to the
-                    # person's own pin for the same row from the archive; a
-                    # person's pin already here, or a link's, stays
-                    [(r["transaction_id"], r["category"],
-                      # a bill this restore landed under its cut id
-                      bill_ids.get(r.get("bill_id"), r.get("bill_id") or None),
-                      _ts(r.get("set_at")),
-                      _b(r.get("link_made")), prior)])
-                if landed[0] is not None:
-                    restored_pins.append(landed[0])
-            else:
-                out.refuse("manual_categories", "orphaned")
-        # an archive written before overrides carried their kind: classify
-        # them from the manual_categories rows just restored and the store
-        # prefixes, exactly as migration 127 did for live ledgers
-        from ..engine import categories as _cats
-        _cats.backfill_override_source(conn)
-        # an archive written before the feed's withdrawals were stamped:
-        # recognise them by the rule migration 157 applied to live ledgers
-        from .base import stamp_unstamped_feed_withdrawals
-        stamp_unstamped_feed_withdrawals(conn)
-
-        for r in _rows(z, "reimbursements.csv"):
-            if (_txn_exists(conn, r.get("expense_id"))
-                    and _txn_exists(conn, r.get("reimburse_id"))):
-                try:
-                    amount = _money(r.get("amount"))
-                except _AmountOutOfRange:
-                    out.refuse("reimbursements", "out_of_range")
-                    continue
-                # created_at is what an archive without the link mark is
-                # classified by (below). Without it the pair gets
-                # clock_timestamp(), later than the now() any undated pin
-                # was given: the tie breaks toward a pin looking hand-set,
-                # so an unlink may leave a link-made transfer behind but
-                # never clears one a person chose.
-                out.land(conn, "reimbursements",
-                    """INSERT INTO reimbursements (expense_id, reimburse_id,
-                           partial, amount, created_at)
-                       VALUES (%s,%s,%s,%s, COALESCE(%s, clock_timestamp()))
-                       ON CONFLICT (tenant_id, expense_id, reimburse_id)
-                       DO NOTHING
-                       RETURNING expense_id""",
-                    [(r["expense_id"], r["reimburse_id"],
-                      _i(r.get("partial"), 0) or 0, amount,
-                      _ts(r.get("created_at")))])
-            else:
-                out.refuse("reimbursements", "orphaned")
-        if link_marked is False and restored_pins:
-            from ..web.data import classify_link_made_pins
-            classify_link_made_pins(conn, restored_pins)
-
-        for r in _rows(z, "reimburse_flags.csv"):
-            if _txn_exists(conn, r.get("txn_id")):
-                try:
-                    expected = _money(r.get("expected"))
-                except _AmountOutOfRange:
-                    out.refuse("reimburse_flags", "out_of_range")
-                    continue
-                out.land(conn, "reimburse_flags",
-                    """INSERT INTO reimburse_flags (txn_id, partial, expected,
-                                                   flagged_at)
-                       VALUES (%s,%s,%s, COALESCE(%s, now()))
-                       ON CONFLICT (tenant_id, txn_id) DO NOTHING
-                       RETURNING txn_id""",
-                    # when it was flagged is what the waiting list shows
-                    [(r["txn_id"], _i(r.get("partial"), 0) or 0, expected,
-                      _ts(r.get("flagged_at")))])
-            else:
-                out.refuse("reimburse_flags", "orphaned")
-
-        # account_links IS the shadow set — without it a
-        # round trip un-shadows every duplicate source (Plaid + SimpleFIN
-        # of the same real account) and every money aggregate double-counts.
-        # Guarded on the account existing so a partial archive cannot plant
-        # dangling links.
-        touched_groups: set[str] = set()
-        link_accounts = {r["id"] for r in conn.execute(
-            "SELECT id FROM accounts").fetchall()}
-        for r in _rows(z, "account_links.csv"):
-            if not (r.get("group_id") and r.get("account_id")):
-                out.refuse("account_links", "malformed")
-                continue
-            if _account_id(r["account_id"]) not in link_accounts:
-                out.refuse("account_links", "orphaned")
-                continue
-            touched_groups.add(str(r["group_id"]))
-            out.land(conn, "account_links",
-                """INSERT INTO account_links (group_id, account_id, home_rank)
-                   VALUES (%s, %s, %s)
-                   ON CONFLICT (tenant_id, account_id) DO NOTHING
-                   RETURNING account_id""",
-                [(r["group_id"], _account_id(r["account_id"]),
-                  _i(r.get("home_rank"), 0))])
-        if touched_groups:
-            _renumber_home_ranks(conn, sorted(touched_groups))
-
-        # Which ids each account stood under before an adoption moved it.
-        # A file row keeps the id it was hashed under, so a statement
-        # re-imported after this restore finds its earlier rows only
-        # through this lineage (sync/base FileImportIds); without it every
-        # pre-feed line of the statement lands twice. Only the lineage is
-        # loaded: each row arrives reconciled with no cutoff, so the
-        # one-shot reconnect guard it once drove stays off here — this
-        # instance never held that backfill. Bounded, and only for an
-        # account the archive restored.
-        lineage = 0
-        adoptable = {r["id"] for r in conn.execute(
-            "SELECT id FROM accounts WHERE item_id IS NOT NULL").fetchall()}
-        for r in _rows(z, "account_adoptions.csv"):
-            new_id = _account_id(r.get("account_id"))
-            old_id = str(r.get("old_account_id") or "").strip()
-            if not new_id or not old_id or old_id == new_id:
-                out.refuse("account_adoptions", "malformed")
-                continue
-            if lineage >= _MAX_ADOPTION_LINEAGE:
-                out.refuse("account_adoptions", "over_cap")
-                continue
-            if new_id not in adoptable:
-                # the account is not here, or came back without the
-                # connection the lineage names it under
-                out.refuse("account_adoptions", "orphaned")
-                continue
-            landed = out.land(conn, "account_adoptions",
-                """INSERT INTO account_adoptions
-                       (account_id, old_account_id, item_id, adopted_at,
-                        reconciled_at)
-                   SELECT a.id, %s, a.item_id, COALESCE(%s, now()), now()
-                     FROM accounts a
-                    WHERE a.id = %s
-                      AND NOT EXISTS (
-                          SELECT 1 FROM account_adoptions x
-                           WHERE x.account_id = a.id
-                             AND x.old_account_id = %s)
-                   ON CONFLICT DO NOTHING
-                   RETURNING account_id""",
-                [(old_id[:_MAX_ACCOUNT_ID], _ts(r.get("adopted_at")), new_id,
-                  old_id[:_MAX_ACCOUNT_ID])])
-            lineage += landed[0] is not None
-
-        # Which account each source name fills (sync/account_sources).
-        # Keyed rows are HMACs under the secret of the household that
-        # wrote them, which never travels: restored into the same
-        # household they match again; restored elsewhere they match
-        # nothing, and its sources find their accounts by the stored-name
-        # rows, asked once when a name leads to several. Only for an
-        # account the archive restored; never re-pointed onto another.
-        source_accounts = {r["id"] for r in conn.execute(
-            "SELECT id FROM accounts").fetchall()}
-        for r in _rows(z, "account_sources.csv"):
-            door = str(r.get("door") or "").strip()
-            digest = str(r.get("source_hmac") or "").strip()
-            aid = _account_id(r.get("account_id"))
-            if not (door and digest and aid) or len(door) > 32 \
-                    or len(digest) > 80:
-                out.refuse("account_sources", "malformed")
-                continue
-            if aid not in source_accounts:
-                out.refuse("account_sources", "orphaned")
-                continue
-            # a stored-name row is a claim only while it is the digest of
-            # the cut name its account stores; any other is pruned below
-            # (account_sources.backfill), so it is refused, never counted
-            if digest.startswith("c:") and not _account_sources.c_row_holds(
-                    conn, digest, aid):
-                out.refuse("account_sources", "malformed")
-                continue
-            out.land(conn, "account_sources",
-                """INSERT INTO account_sources
-                       (door, source_hmac, account_id, created_at)
-                   VALUES (%s, %s, %s, COALESCE(%s, now()))
-                   ON CONFLICT DO NOTHING
-                   RETURNING account_id""",
-                [(door, digest, aid, _ts(r.get("created_at")))])
-
-        # Receipt images (base64 in the CSV) + tagged line
-        # items — the Schedule-C expense-report input. Guarded on the
-        # transaction / receipt existing, mirroring manual_categories.
-        import base64 as _b64
-
-        from ..engine import receipts as _receipts
-        for r in _rows(z, "receipts.csv"):
-            if not (r.get("id") and r.get("image")):
-                out.refuse("receipts", "malformed")
-                continue
-            # a receipt with no transaction is one WAITING for its charge
-            # (engine/receipt_match) and restores as waiting; one that names
-            # a transaction the archive does not carry is still skipped,
-            # never turned into a waiting receipt the household did not have
-            if r.get("txn_id") and not _txn_exists(conn, r.get("txn_id")):
-                out.refuse("receipts", "orphaned")
-                continue
-            # A ZIP cell must satisfy exactly what a live upload must
-            # (receipts.add): a mime on the allowlist and the same size cap.
-            # The stored mime is what /api/receipts/{rid}/image serves the
-            # bytes back as, so a crafted mime is a same-origin content
-            # type of the attacker's choosing, and an unbounded cell is a
-            # member-cell-sized allocation per row. Oversize or off-list
-            # rows are skipped like corrupt ones — the rest still restore.
-            mime = str(r.get("mime") or "image/jpeg").strip().lower()
-            if mime not in _receipts.ALLOWED_MIMES:
-                out.refuse("receipts", "malformed")
-                continue
-            if len(r["image"]) > _receipts.MAX_IMAGE * 4 // 3 + 4:
-                # cheaper than decoding first
-                out.refuse("receipts", "over_cap")
-                continue
-            try:
-                img = _b64.b64decode(r["image"], validate=True)
-            except Exception:
-                # corrupt cell — skip, not abort
-                out.refuse("receipts", "malformed")
-                continue
-            if not img:
-                out.refuse("receipts", "malformed")
-                continue
-            if len(img) > _receipts.MAX_IMAGE:
-                out.refuse("receipts", "over_cap")
-                continue
-            kind = r.get("kind") or "receipt"
-            if kind not in _receipts.KINDS:
-                kind = "receipt"
-            txn_id = r.get("txn_id") or None
-            if txn_id is None and kind != "receipt":
-                # only a receipt can wait
-                out.refuse("receipts", "malformed")
-                continue
-            method = r.get("match_method") or None
-            if method not in (None, "auto", "manual"):
-                method = None
-            # a waiting receipt keeps 'manual' only as the mark of a hand
-            # match whose charge went (the matcher leaves it to the person);
-            # a waiting 'auto' is not a state anything writes
-            if txn_id is None and method != "manual":
-                method = None
-            parsed = (_receipt_parsed(_j(r.get("parsed")))
-                      if r.get("parsed") else None)
-            unmatched = _j(r.get("unmatched_txn_ids"))
-            unmatched = ([str(x)[:200] for x in unmatched[:200]
-                          if isinstance(x, (str, int))]
-                         if isinstance(unmatched, list) else [])
-            opt, opt_mime = _receipt_optimized(r)
-            # the household's file storage is held to the same ceiling a
-            # snap is; a receipt already here costs nothing new
-            if not conn.execute("SELECT 1 FROM receipts WHERE id = %s",
-                                (r["id"],)).fetchone():
-                from ..engine import storage_quota as _sq
-                try:
-                    _sq.reserve(conn, len(img) + len(opt or b""))
-                except _sq.StorageQuotaExceeded:
-                    out.refuse("receipts", "over_cap")
-                    continue
-            out.land(conn, "receipts",
-                """INSERT INTO receipts (id, txn_id, image, mime, kind,
-                       status, parsed, error, created_at, parsed_at,
-                       matched_at, match_method, unmatched_txn_ids,
-                       image_optimized, optimized_mime)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,
-                           COALESCE(%s, now()), %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(r["id"], txn_id, img, mime,
-                 kind, r.get("status") or "uploaded",
-                 jsonb(parsed) if parsed is not None else None,
-                 r.get("error") or None,
-                 _receipt_ts(r.get("created_at")),
-                 _receipt_ts(r.get("parsed_at")),
-                 (_receipt_ts(r.get("matched_at"))
-                  if txn_id and method else None),
-                 method, unmatched, opt, opt_mime)])
-
-        for r in _rows(z, "receipt_items.csv"):
-            if not r.get("receipt_id"):
-                out.refuse("receipt_items", "malformed")
-                continue
-            try:
-                amount = _money(r.get("amount"))
-            except _AmountOutOfRange:
-                out.refuse("receipt_items", "out_of_range")
-                continue
-            if amount is None:
-                # a line item is a priced line: reading a receipt drops any
-                # line without a finite amount, and every client renders
-                # the amount as a number — so the archive may not bring
-                # in a shape the app itself never stores
-                out.refuse("receipt_items", "malformed")
-                continue
-            if not conn.execute("SELECT 1 FROM receipts WHERE id = %s",
-                                (r["receipt_id"],)).fetchone():
-                out.refuse("receipt_items", "orphaned")
-                continue
-            out.land(conn, "receipt_items",
-                """INSERT INTO receipt_items (receipt_id, line, description,
-                       qty, amount, tag)
-                   VALUES (%s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (tenant_id, receipt_id, line) DO NOTHING
-                   RETURNING receipt_id""",
-                [(r["receipt_id"], _i(r.get("line"), 0),
-                  r.get("description") or "", _f(r.get("qty")),
-                  amount, r.get("tag") or "")])
-
-        for r in _rows(z, "business_flags.csv"):
-            if _txn_exists(conn, r.get("txn_id")):
-                out.land(conn, "business_flags",
-                    """INSERT INTO business_flags (txn_id, flagged_at)
-                       VALUES (%s, COALESCE(%s, now()))
-                       ON CONFLICT (tenant_id, txn_id) DO NOTHING
-                       RETURNING txn_id""",
-                    [(r["txn_id"], _ts(r.get("flagged_at")))])
-            else:
-                out.refuse("business_flags", "orphaned")
-
-        # ---- business tables (entities restored above,
-        # transactions above — these depend on both) ----
-        for r in _rows(z, "entity_membership.csv"):
-            if not r.get("id") or not r.get("entity_id"):
-                out.refuse("entity_membership", "malformed")
-                continue
-            if _entity(r["entity_id"]) is None:
-                out.refuse("entity_membership", "orphaned")
-                continue
-            # The household mark comes back with the member: without it the
-            # estimate silently widens to every member's tax and the capital
-            # account loses the household's share. A business has at most one
-            # household member (the database enforces it), so a mark arrives
-            # only while its business has none — the destination's own mark,
-            # or the archive's first, is the one kept. A mark is taken under
-            # the same lock the Settings door marks under: the NOT EXISTS
-            # guard alone cannot see a mark another transaction has not
-            # committed, and the unique index would then refuse this insert
-            # and abort the whole restore.
-            if _b(r.get("is_household")):
-                _hold_household_mark(conn, r["entity_id"])
-            out.land(conn, "entity_membership",
-                """INSERT INTO entity_membership (id, entity_id, member_name,
-                       ownership_pct, is_manager, created_at, is_household)
-                   VALUES (%s,%s,%s,%s,%s, COALESCE(%s, now()),
-                           %s AND NOT EXISTS (
-                               SELECT 1 FROM entity_membership
-                                WHERE entity_id = %s AND is_household))
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(r["id"], r["entity_id"], r.get("member_name"),
-                  _f(r.get("ownership_pct")), _b(r.get("is_manager")),
-                  _ts(r.get("created_at")),
-                  _b(r.get("is_household")), r["entity_id"])])
-
-        # One fronted movement (a contribution or a reimbursement) per
-        # transaction: the database refuses a second one on an install
-        # that has the index, and the engine refuses one everywhere. An
-        # archive from an install that predates the rule can carry two;
-        # the one kept is the one the upgrade keeps — the movement for the
-        # business the cost is booked to now (the transaction's own
-        # assignment, else its account's), and the earliest recorded only
-        # when neither matches — so the result does not depend on the
-        # archive's row order or on whether this install has the index yet.
-        fronted_kinds = ("contribution", "reimbursement")
-        movements = [r for r in _rows(z, "equity_movement.csv")]
-        booked = {r["id"]: str(r["ent"]) if r["ent"] else None
-                  for r in conn.execute(
-                      "SELECT t.id, COALESCE(t.entity_id, a.entity_id) AS ent"
-                      "  FROM transactions t"
-                      "  LEFT JOIN accounts a ON a.id = t.account_id"
-                      " WHERE t.id = ANY(%s)",
-                      ([m["txn_id"] for m in movements
-                        if m.get("txn_id")],)).fetchall()}
-
-        def _keep_first(r):
-            ent = (r.get("entity_id") or "").strip().lower() or None
-            return (booked.get(r.get("txn_id")) != ent,
-                    str(r.get("created_at") or ""), str(r.get("id") or ""))
-        movements.sort(key=_keep_first)
-        fronted_clash = 0
-        for r in movements:
-            if not (r.get("id") and r.get("entity_id") and r.get("date")
-                    and r.get("kind") and _f(r.get("amount")) is not None):
-                out.refuse("equity_movement", "malformed")
-                continue
-            if _entity(r["entity_id"]) is None:
-                out.refuse("equity_movement", "orphaned")
-                continue
-            try:
-                amount = _money(r.get("amount"))
-            except _AmountOutOfRange:
-                out.refuse("equity_movement", "out_of_range")
-                continue
-            m_txn = (r.get("txn_id") if _txn_exists(conn, r.get("txn_id"))
-                     else None)
-            if (m_txn and r.get("kind") in fronted_kinds
-                    and conn.execute(
-                        "SELECT 1 FROM equity_movement WHERE txn_id = %s"
-                        " AND kind = ANY(%s) AND id::text <> %s",
-                        (m_txn, list(fronted_kinds), str(r["id"]))
-                    ).fetchone()):
-                # the charge's one fronted movement is already here
-                fronted_clash += 1
-                out.refuse("equity_movement", "present")
-                continue
-            out.land(conn, "equity_movement",
-                # bare ON CONFLICT: beyond (tenant_id, id) this table has a
-                # partial unique index on (tenant_id, txn_id, kind) — one
-                # movement per transaction per kind. A destination that
-                # already recorded the same movement under its OWN id passes
-                # an id-targeted conflict clause and the raise would roll
-                # back the entire all-or-nothing restore. Any unique match
-                # means "already present", which is exactly the skip the
-                # docstring promises.
-                # created_at too: it is what decides which of two fronted
-                # movements is the earlier one, here and on every upgrade
-                """INSERT INTO equity_movement (id, entity_id, kind, amount,
-                       date, member_id, txn_id, form, note, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT DO NOTHING
-                   RETURNING id""",
-                [(r["id"], r["entity_id"], r.get("kind"), amount,
-                 as_date(r["date"]) if r.get("date") else None,
-                 r.get("member_id") or None,
-                 # keep the movement even if its transaction is gone — the
-                 # FK is ON DELETE SET NULL for exactly this reason
-                 m_txn,
-                 r.get("form") or None, r.get("note") or None,
-                 _ts(r.get("created_at")))])
-        if fronted_clash:
-            notes.append(
-                f"{fronted_clash} business movement"
-                f"{'s' if fronted_clash != 1 else ''} left out: each was a "
-                "second contribution or reimbursement for a transaction "
-                "that already has one (the one for the business the "
-                "charge is booked to is kept, else the earliest)")
-
-        from ..engine.books import BUCKETS as _BUCKETS
-        for r in _rows(z, "business_txn_class.csv"):
-            if not _txn_exists(conn, r.get("txn_id")):
-                out.refuse("business_txn_class", "orphaned")
-                continue
-            # The bucket is an enum the app validates on write but the DB
-            # does not constrain, so a hand-edited ZIP is the one way a
-            # value outside the set can exist at all — and this column is
-            # exported to CSV, where arbitrary text is a formula-injection
-            # carrier. Refuse the row rather than plant it.
-            bucket = (r.get("bucket") or "").strip()
-            if bucket not in _BUCKETS:
-                out.refuse("business_txn_class", "malformed")
-                continue
-            out.land(conn, "business_txn_class",
-                """INSERT INTO business_txn_class (txn_id, bucket, sched_c_line,
-                       note)
-                   VALUES (%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, txn_id) DO NOTHING
-                   RETURNING txn_id""",
-                [(r["txn_id"], bucket, r.get("sched_c_line") or None,
-                  r.get("note") or None)])
-
-        for r in _rows(z, "compliance_obligation.csv"):
-            if not (r.get("id") and r.get("entity_id") and r.get("due_date")
-                    and r.get("title")):
-                out.refuse("compliance_obligation", "malformed")
-                continue
-            if _entity(r["entity_id"]) is None:
-                out.refuse("compliance_obligation", "orphaned")
-                continue
-            out.land(conn, "compliance_obligation",
-                """INSERT INTO compliance_obligation (id, entity_id, title,
-                       due_date, recurrence, fee, url, note, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(r["id"], r["entity_id"], r.get("title"),
-                  as_date(r["due_date"]) if r.get("due_date") else None,
-                  r.get("recurrence") or "yearly", _f(r.get("fee")),
-                  r.get("url") or None, r.get("note") or None,
-                  _ts(r.get("created_at")))])
-
-        for r in _rows(z, "mileage_log.csv"):
-            if not (r.get("id") and r.get("entity_id") and r.get("date")
-                    and _f(r.get("miles")) is not None):
-                out.refuse("mileage_log", "malformed")
-                continue
-            if _entity(r["entity_id"]) is None:
-                out.refuse("mileage_log", "orphaned")
-                continue
-            out.land(conn, "mileage_log",
-                """INSERT INTO mileage_log (id, entity_id, date, miles, purpose,
-                       note, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(r["id"], r["entity_id"],
-                  as_date(r["date"]) if r.get("date") else None,
-                  _f(r.get("miles")), r.get("purpose") or None,
-                  r.get("note") or None, _ts(r.get("created_at")))])
-
-        for r in _rows(z, "vendor_1099.csv"):
-            if not r.get("id") or not r.get("entity_id"):
-                out.refuse("vendor_1099", "malformed")
-                continue
-            if _entity(r["entity_id"]) is None:
-                out.refuse("vendor_1099", "orphaned")
-                continue
-            v_merchant_id = _known_merchant(r.get("merchant_id"),
-                                            known_merchants, merchant_map)
-            v_merchant = _mark_name(conn, r["entity_id"], r.get("merchant"),
-                                    v_merchant_id, machine_cut,
-                                    persons_names)
-            if v_merchant_id is None:
-                v_merchant_id = _mark_merchant(conn, r["entity_id"],
-                                               v_merchant)
-            out.land(conn, "vendor_1099",
-                # bare ON CONFLICT: vendor_1099 is also UNIQUE on
-                # (tenant_id, entity_id, merchant), so a destination that
-                # already marked this vendor under a different id must be a
-                # skip, not a UniqueViolation that aborts the whole restore.
-                # The mark follows its merchant (a rename must not drop a
-                # contractor off the year-end list), and merged_from is what
-                # undoing a merge puts back. A pointer to a merchant the
-                # archive does not carry is dropped; the name still finds it.
-                """INSERT INTO vendor_1099 (id, entity_id, merchant, reportable,
-                       tin_last4, note, merchant_id, merged_from, created_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT DO NOTHING
-                   RETURNING id""",
-                [(r["id"], r["entity_id"], v_merchant,
-                 _b(r.get("reportable")), r.get("tin_last4") or None,
-                 r.get("note") or None,
-                 v_merchant_id,
-                 jsonb([n for n in _json_list(_j(r.get("merged_from")))
-                        if isinstance(n, dict)]),
-                 _ts(r.get("created_at")))])
-
-        # A note is cut at the length the API stores when it is written: a
-        # longer one is a value no edit could have produced, and the next
-        # edit of it would silently cut it anyway. Cut, not refused — the
-        # rest of the note, and the archive, are still the household's.
-        from ..web.data import NOTE_MAX
-        cut_notes = 0
-        for r in _rows(z, "transaction_notes.csv"):
-            if not _txn_exists(conn, r.get("txn_id")):
-                out.refuse("transaction_notes", "orphaned")
-                continue
-            note = r.get("note")
-            if not note:
-                # clearing a note deletes its row: no door stores a blank one
-                out.refuse("transaction_notes", "malformed")
-                continue
-            if len(note) > NOTE_MAX:
-                note = note[:NOTE_MAX]
-                cut_notes += 1
-            out.land(conn, "transaction_notes",
-                """INSERT INTO transaction_notes (txn_id, note)
-                   VALUES (%s,%s)
-                   ON CONFLICT (tenant_id, txn_id) DO NOTHING
-                   RETURNING txn_id""",
-                [(r["txn_id"], note)])
-        if cut_notes:
-            log.warning("restore: %d transaction note(s) longer than %d "
-                        "characters were cut to that length",
-                        cut_notes, NOTE_MAX)
-
-        # A hand split is one statement about one charge — these parts,
-        # adding up to it — so it restores per transaction, whole or not at
-        # all. Merging an archive's lines into a split the row already has
-        # produced parts from both versions summing past the charge, and the
-        # sync's stale-split pass then deleted every part, the person's
-        # current split included. So: a row that already has a person's
-        # split keeps it; otherwise the archive's parts must pass the same validation a
-        # person's edit does against the restored amount, or none are
-        # written. A part whose row is absent (a pre-FK archive) is skipped
-        # like any other annotation.
-        from ..engine import splits as _splits
-        groups: dict[str, list] = {}
-        for r in _rows(z, "transaction_splits.csv"):
-            if not _txn_exists(conn, r.get("txn_id")):
-                out.refuse("transaction_splits", "orphaned")
-                continue
-            if not r.get("category") or _f(r.get("amount")) is None:
-                out.refuse("transaction_splits", "malformed")
-                continue
-            groups.setdefault(r["txn_id"], []).append(
-                (_i(r.get("line"), 0) or 0, r["category"], _f(r["amount"]),
-                 (r.get("source") or "user").strip() or "user"))
-        for txn_id, parts in groups.items():
-            parts.sort(key=lambda p: p[0])
-            # a store's parts are regenerated by its matcher from the
-            # restored records; only a person's are worth carrying
-            if any(src != "user" for *_, src in parts):
-                out.refuse("transaction_splits", "rebuilt", len(parts))
-                continue
-            # only a PERSON's split here outranks the archive's: a store
-            # matcher's parts are the receipt's reading, recomputed on every
-            # match run, and a person's split outranks those wherever it
-            # comes from — so they give way to the archive's hand split
-            have = conn.execute(
-                "SELECT 1 FROM transaction_splits WHERE txn_id = %s"
-                " AND source = 'user' LIMIT 1",
-                (txn_id,)).fetchone()
-            row = conn.execute(
-                "SELECT amount FROM transactions WHERE id = %s",
-                (txn_id,)).fetchone()
-            # the door's own rule: a split on a row the spend rollups do not
-            # read is counted by nothing and dropped by the next sync's
-            # stale sweep, so it is skipped rather than reported restored
-            if have:
-                out.refuse("transaction_splits", "present", len(parts))
-                continue
-            if not row or not _splits.splittable(conn, txn_id):
-                out.refuse("transaction_splits", "malformed", len(parts))
-                continue
-            try:
-                clean = _splits.validate(
-                    row["amount"], [{"category": c, "amount": a}
-                                    for _, c, a, _src in parts])
-            except _splits.SplitError:
-                out.refuse("transaction_splits", "malformed", len(parts))
-                continue
-            conn.execute(
-                "DELETE FROM transaction_splits WHERE txn_id = %s"
-                " AND source <> 'user'", (txn_id,))
-            for line, p in enumerate(clean, 1):
-                conn.execute(
-                    """INSERT INTO transaction_splits (txn_id, line, category,
-                                                      amount, source)
-                       VALUES (%s,%s,%s,%s,'user')""",
-                    (txn_id, line, p["category"], p["amount"]))
-            # validate returns one line per part, or raises
-            out.wrote("transaction_splits", len(clean))
-
-        # the activity log travels whole: it is the household's own record
-        # of who changed what, and nothing can regenerate it. The actor's
-        # user id is dropped (people are numbered per instance) and the
-        # actor TEXT kept, which is what the page shows anyway; a row
-        # already here (same UUID) is left alone, so restoring the same
-        # archive twice does not double the log.
-        for r in _rows(z, "activity_log.csv"):
-            if not (r.get("id") and r.get("actor") and r.get("kind")
-                    and r.get("action") and r.get("summary")):
-                out.refuse("activity_log", "malformed")
-                continue
-            at = _ts(r.get("at"))
-            if at is None:
-                out.refuse("activity_log", "malformed")
-                continue
-            # the whole restore is one transaction, so a malformed id must
-            # be caught here rather than left to the driver
-            try:
-                rid = str(uuid.UUID(str(r["id"])))
-            except ValueError:
-                out.refuse("activity_log", "malformed")
-                continue
-            detail = _j(r.get("detail"))
-            if not isinstance(detail, dict) or len(json.dumps(
-                    detail, default=str).encode()) > ACTIVITY_DETAIL_MAX:
-                detail = None
-            # an entry names a row by id with no key to follow: it follows
-            # the row to the id it lands under here, as every child does
-            # (a re-id'd row's old id beside the entry's sentence would
-            # give away what the re-id hid)
-            target = r.get("target")
-            if carried and target:
-                target = carried.get(target, target)
-            if (carried and detail is not None
-                    and isinstance(detail.get("ids"), list)):
-                detail["ids"] = [carried.get(x, x) if isinstance(x, str)
-                                 else x for x in detail["ids"]]
-            out.land(conn, "activity_log",
-                """INSERT INTO activity_log (id, at, actor_user_id, actor,
-                                             kind, action, target, label,
-                                             summary, detail)
-                   VALUES (%s::uuid,%s,NULL,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(rid, at, str(r["actor"])[:120], str(r["kind"])[:40],
-                 str(r["action"])[:40],
-                 (str(target)[:ACTIVITY_TARGET_MAX]
-                  if target else None),
-                 # cut, then clipped, as activity.record writes them: the
-                 # label and sentence quote a payee or a row as it read then
-                 card_number.cut(str(r.get("label") or ""))[:120],
-                 card_number.cut(str(r["summary"]))[:300],
-                 jsonb(detail) if detail is not None else None)])
-
-        # The alert log is this instance's operating state and the next
-        # Today build rebuilds it, so it stays behind, except for what in it
-        # is the household's own: the alerts the person dismissed. Dropped,
-        # every muted alert lights up again here. A dismissed row lands as
-        # it was (still active or cleared); over a row this household holds
-        # it only sets the mute, and never one the person un-muted here
-        # (mute_changed_at set), and with no `seen_at`: it is no view of the world, so the
-        # next snapshot decides it as usual (a still-active alert keeps the
-        # mute, a recurrence after a clearance is news). Its dates are held
-        # to today, or a crafted future `last_seen` would make every
-        # snapshot read as stale and freeze the row.
-        today = _dt.date.today()
-        for r in _rows(z, "alerts_log.csv"):
-            if not _b(r.get("dismissed")):
-                out.refuse("alerts_log", "rebuilt")
-                continue
-            kind, sev, msg = (str(r.get(k) or "").strip()
-                              for k in ("kind", "severity", "message"))
-            try:
-                first = min(as_date(r.get("first_seen")), today)
-                last = min(as_date(r.get("last_seen")), today)
-            except (TypeError, ValueError):
-                first = last = None
-            if (not kind or not sev or not msg or first is None
-                    or len(kind) > 60 or len(sev) > 20
-                    or len(msg) > ALERT_MESSAGE_MAX):
-                out.refuse("alerts_log", "malformed")
-                continue
-            # a restore is a merge: the same alert raised here since keeps
-            # its own dates and state, and only takes the person's mute
-            out.land(conn, "alerts_log",
-                """INSERT INTO alerts_log (kind, severity, message,
-                                           first_seen, last_seen, active,
-                                           dismissed)
-                   VALUES (%s,%s,%s,%s,%s,%s,1)
-                   ON CONFLICT (tenant_id, kind, message) DO UPDATE
-                      SET dismissed = 1
-                    WHERE alerts_log.dismissed = 0
-                      AND alerts_log.mute_changed_at IS NULL
-                   RETURNING id""",
-                [(kind, sev, card_number.cut(msg), min(first, last), last,
-                  1 if _b(r.get("active")) else 0)])
-
-        # ---- converter v2 (migration 008): history / reference tables ----
-
-        for r in _rows(z, "liabilities.csv"):
-            if not r.get("account_id"):
-                out.refuse("liabilities", "malformed")
-                continue
-            out.land(conn, "liabilities",
-                """INSERT INTO liabilities (account_id, as_of, raw)
-                   VALUES (%s, COALESCE(%s, now()), %s)
-                   ON CONFLICT (tenant_id, account_id) DO NOTHING
-                   RETURNING account_id""",
-                [(_account_id(r["account_id"]), _ts(r.get("as_of")),
-                 jsonb(scrub_liability_raw(
-                     clean_liability_raw(_j(r.get("raw"))))))])
-
-        for r in _rows(z, "holdings.csv"):
-            if not r.get("account_id") or not r.get("symbol"):
-                out.refuse("holdings", "malformed")
-                continue
-            try:
-                quantity, price, value = (_money(r.get("quantity")),
-                                          _money(r.get("price")),
-                                          _money(r.get("value")))
-            except _AmountOutOfRange:
-                out.refuse("holdings", "out_of_range")
-                continue
-            out.land(conn, "holdings",
-                """INSERT INTO holdings (account_id, symbol, name, quantity,
-                       price, value, as_of, raw)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, account_id, symbol) DO NOTHING
-                   RETURNING account_id""",
-                [(_account_id(r["account_id"]), r["symbol"], r.get("name") or None,
-                 quantity, price, value,
-                 _ts(r.get("as_of")), jsonb({k: v for k, v in _raw_dict(_j(r.get("raw"))).items()
-                        if k not in _PLAID_RAW_IDS}))])
-
-        for r in _rows(z, "crypto_holdings.csv"):
-            if not r.get("account_id") or not r.get("currency"):
-                out.refuse("crypto_holdings", "malformed")
-                continue
-            try:
-                quantity, native = (_money(r.get("quantity")),
-                                    _money(r.get("native_usd")))
-            except _AmountOutOfRange:
-                out.refuse("crypto_holdings", "out_of_range")
-                continue
-            out.land(conn, "crypto_holdings",
-                """INSERT INTO crypto_holdings (account_id, currency, quantity,
-                       native_usd, as_of, raw)
-                   VALUES (%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, account_id, currency) DO NOTHING
-                   RETURNING account_id""",
-                [(_account_id(r["account_id"]), r["currency"], quantity,
-                 native, _ts(r.get("as_of")),
-                 jsonb(_raw_dict(_j(r.get("raw")))))])
-
-        for r in _rows(z, "networth_recorded.csv"):
-            if not r.get("month") or r.get("total") in (None, ""):
-                out.refuse("networth_recorded", "malformed")
-                continue
-            try:
-                total = _money(r["total"])
-            except _AmountOutOfRange:
-                out.refuse("networth_recorded", "out_of_range")
-                continue
-            out.land(conn, "networth_recorded",
-                """INSERT INTO networth_recorded (month, total, source)
-                   VALUES (%s,%s,%s)
-                   ON CONFLICT (tenant_id, month) DO NOTHING
-                   RETURNING month""",
-                [(r["month"], total, r.get("source") or None)])
-
-        for r in _rows(z, "networth_snapshot.csv"):
-            if not r.get("date"):
-                out.refuse("networth_snapshot", "malformed")
-                continue
-            by_class = _j(r.get("by_class"))
-            try:
-                total = _money(r.get("total"))
-            except _AmountOutOfRange:
-                out.refuse("networth_snapshot", "out_of_range")
-                continue
-            out.land(conn, "networth_snapshot",
-                """INSERT INTO networth_snapshot (date, total, by_class)
-                   VALUES (%s,%s,%s)
-                   ON CONFLICT (tenant_id, date) DO NOTHING
-                   RETURNING date""",
-                [(as_date(r["date"]), total,
-                 jsonb(by_class) if by_class is not None else None)])
-
-        # per-month frozen budgets: without them every closed month on the
-        # destination falls back to the no-verdict net view. Scrubbed on
-        # the way in like the live settings blob — the snapshot only feeds
-        # month_status math, so a crafted ZIP must not smuggle credential
-        # or policy keys through this second config door. Destination rows
-        # win on conflict (a month already frozen here stays frozen).
-        for r in _rows(z, "budget_snapshots.csv"):
-            y_, m_ = _i(r.get("year")), _i(r.get("month"))
-            # non-finite budgets read as null BEFORE the numeric check, so
-            # that check refuses the month rather than the write aborting
-            snap_cfg = _finite_only(_j(r.get("config")))
-            if not y_ or not m_ or not (1 <= m_ <= 12) \
-                    or not isinstance(snap_cfg, dict):
-                out.refuse("budget_snapshots", "malformed")
-                continue
-            # the budgets must be NUMBERS — the live save path _num()s
-            # every write, and this ZIP is the one door that bypasses
-            # it. A stored "x" would 500 the history endpoint and the
-            # month/year lenses with no UI to remove the row.
-            from ..engine.budget import _snapshot_budgets_numeric
-            if not _snapshot_budgets_numeric(snap_cfg):
-                out.refuse("budget_snapshots", "malformed")
-                continue
-            # a frozen month is read back as a config like any other — the
-            # week lens hands its excluded list straight to the spend query
-            clean_excluded_accounts(snap_cfg)
-            _rename_account_keys(snap_cfg, renamed)
-            # the frozen bill schedule travels too; shape-checked here and
-            # row-by-row on read (snapshot_bill_rows), so a crafted blob
-            # degrades to "no frozen schedule", never a crash
-            snap_bills = _finite_only(_j(r.get("bills")))
-            if not (isinstance(snap_bills, dict)
-                    and isinstance(snap_bills.get("rows"), list)):
-                snap_bills = None
-            else:
-                # each frozen row's raw config gets the pass a live bill
-                # gets (clean_bill_raw): the lenses expand these rows the
-                # same way, and a recurrence that is a string or an
-                # interval that is text would 500 that month and its year.
-                # A row whose payee or amount is malformed is dropped.
-                snap_bills = {**snap_bills, "rows": [
-                    {**b, "raw": clean_bill_raw(b.get("raw"))}
-                    for b in snap_bills["rows"]
-                    if isinstance(b, dict)
-                    and isinstance(b.get("payee"), str)
-                    and isinstance(b.get("amount"), (int, float))
-                    and not isinstance(b.get("amount"), bool)]}
-            out.land(conn, "budget_snapshots",
-                """INSERT INTO budget_snapshots (year, month, config, bills,
-                       captured_at, source)
-                   VALUES (%s,%s,%s,%s,COALESCE(%s, now()),%s)
-                   ON CONFLICT (tenant_id, year, month) DO NOTHING
-                   RETURNING year""",
-                [(y_, m_, jsonb(scrub_config(snap_cfg)),
-                 jsonb(snap_bills) if snap_bills is not None else None,
-                 _ts(r.get("captured_at")),
-                 r.get("source") if r.get("source") in ("close", "backfill")
-                 else "close")])
-
-        for r in _rows(z, "income_annual.csv"):
-            if r.get("year") in (None, ""):
-                out.refuse("income_annual", "malformed")
-                continue
-            out.land(conn, "income_annual",
-                """INSERT INTO income_annual (year, total_income, agi,
-                       taxable_income, tax_paid, wages, primary_wages,
-                       investment_income, capital_gain, spouse_wages,
-                       ss_earnings, medicare_earnings, filing_status, joint,
-                       source, note)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, year) DO NOTHING
-                   RETURNING year""",
-                [(_i(r["year"]), _f(r.get("total_income")), _f(r.get("agi")),
-                 _f(r.get("taxable_income")), _f(r.get("tax_paid")),
-                 _f(r.get("wages")), _f(r.get("primary_wages")),
-                 _f(r.get("investment_income")), _f(r.get("capital_gain")),
-                 _f(r.get("spouse_wages")), _f(r.get("ss_earnings")),
-                 _f(r.get("medicare_earnings")), r.get("filing_status") or None,
-                 _i(r.get("joint"), 0), r.get("source") or None,
-                 r.get("note") or None)])
-
-        for r in _rows(z, "income_documents.csv"):
-            if r.get("id") in (None, "") or r.get("year") in (None, ""):
-                out.refuse("income_documents", "malformed")
-                continue
-            amounts = _j(r.get("amounts"))
-            # `ein` is DELIBERATELY not restored. Taxdocs persists only
-            # ein_last4, but an older archive may still carry the full W-2
-            # EIN in this CSV, and reading it back would store it again.
-            # The last four are restored instead, which is what the live
-            # write path stores (preferring the column it writes, falling
-            # back to the last four OF a legacy plaintext value).
-            doc = (_i(r["year"]), r.get("form") or "",
-                   r.get("owner") or "primary", r.get("payer") or None,
-                   _ein_last4_for_restore(r), _f(r.get("primary_amount")),
-                   jsonb(amounts) if amounts is not None else None,
-                   r.get("notes") or None)
-            # A document's id is only a number within its household (each
-            # one counts 1, 2, 3...), so an archive's ids collide with the
-            # documents a populated household already has, and keying on
-            # them would drop the archive's different documents as present.
-            # Present means the same document; one that is not lands under
-            # the next free id, as the live write path allocates it.
-            if conn.execute(
-                    """SELECT 1 FROM income_documents
-                        WHERE year = %s AND form = %s
-                          AND COALESCE(owner, 'primary') = %s
-                          AND payer IS NOT DISTINCT FROM %s
-                          AND ein_last4 IS NOT DISTINCT FROM %s
-                          AND primary_amount IS NOT DISTINCT FROM %s
-                          AND amounts IS NOT DISTINCT FROM %s::jsonb
-                          AND notes IS NOT DISTINCT FROM %s""",
-                    doc).fetchone():
-                # the same document is already here, under whatever id
-                out.refuse("income_documents", "present")
-                continue
-            doc_id = _i(r["id"])
-            if conn.execute("SELECT 1 FROM income_documents WHERE id = %s",
-                            (doc_id,)).fetchone():
-                doc_id = conn.execute(
-                    "SELECT COALESCE(MAX(id), 0) + 1 AS id "
-                    "FROM income_documents").fetchone()["id"]
-            out.land(conn, "income_documents",
-                """INSERT INTO income_documents (id, year, form, owner, payer,
-                       ein_last4, primary_amount, amounts, notes)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, id) DO NOTHING
-                   RETURNING id""",
-                [(doc_id, *doc)])
-
-        # An alias is keyed on the row's identity string, which for a file
-        # import is masked above (and by the live upsert). Its key is cut
-        # the same way whenever a restored file-import row now carries the
-        # masked string, so the alias goes on joining its rows and the full
-        # number does not survive in it; the full spelling is kept only
-        # while some row still keys on it (an aggregator row keeps its
-        # name). Migration 153 applies the same rule to stored aliases.
-        alias_keys: dict[str, tuple[bool, bool]] = {}
-
-        def _alias_where(raw):
-            """(a file-import row keys on the masked `raw`, some row still
-            keys on `raw` itself) — both False-True for a short raw."""
-            masked = card_number.cut(raw)
-            if masked == raw:
-                return False, True
-            if raw not in alias_keys:
-                from ..engine.merchant_sql import RAW_KEY
-                hit = conn.execute(
-                    f"""SELECT
-                          EXISTS (SELECT 1 FROM transactions t
-                                   WHERE split_part(t.id, ':', 1) = ANY(%s)
-                                     AND {RAW_KEY} = %s) AS filed,
-                          EXISTS (SELECT 1 FROM transactions t
-                                   WHERE {RAW_KEY} = %s) AS kept""",
-                    ([p.rstrip(":") for p in
-                      _sync_base.FILE_IMPORT_ID_PREFIXES], masked, raw)
-                ).fetchone()
-                alias_keys[raw] = (bool(hit["filed"]), bool(hit["kept"]))
-            return alias_keys[raw]
-
-        # a machine's alias names its merchant as the resolver does, cut;
-        # a person's says what they typed. (raw, whole canonical) of each
-        # machine alias cut here, for the journal below
-        cut_aliases: set[tuple[str, str]] = set()
-        for r in _rows(z, "merchant_canonical.csv"):
-            if not r.get("raw_merchant") or not r.get("canonical"):
-                out.refuse("merchant_canonical", "malformed")
-                continue
-            raw = _descriptor(r["raw_merchant"])
-            canonical = _descriptor(r["canonical"])
-            if (r.get("method") or "manual") != "manual":
-                cut_canonical = card_number.cut(canonical)
-                if cut_canonical != canonical:
-                    cut_aliases.add((r["raw_merchant"], canonical))
-                canonical = cut_canonical
-            filed, kept = _alias_where(raw)
-            keys = ([card_number.cut(raw)] if filed else []) + (
-                [raw] if kept or not filed else [])
-            # one archive row, restored or not, however many keys it took
-            out.land(conn, "merchant_canonical",
-                """INSERT INTO merchant_canonical (raw_merchant, canonical,
-                       method, as_of, merchant_id)
-                   VALUES (%s,%s,%s, COALESCE(%s, now()), %s)
-                   ON CONFLICT (tenant_id, raw_merchant) DO UPDATE
-                      SET canonical = EXCLUDED.canonical,
-                          method = EXCLUDED.method,
-                          as_of = EXCLUDED.as_of,
-                          merchant_id = EXCLUDED.merchant_id
-                    WHERE EXCLUDED.method = 'manual'
-                      AND merchant_canonical.method
-                          IS DISTINCT FROM 'manual'
-                RETURNING raw_merchant""",
-                # A person's alias (method 'manual') replaces the
-                # destination's machine alias for the same descriptor;
-                # anything else already here stays.
-                # A NULL method is a frozen mapping: the layer1 recompute
-                # only touches method='layer1' rows and the preservation
-                # logic only recognises 'llm'/'manual', so a row with no
-                # method is invisible to both forever. A hand-edited or
-                # pre-method CSV defaults to 'manual' — the preservation-
-                # safe choice, since manual rows are never recomputed over.
-                # The key is a bank descriptor, so it takes the descriptor
-                # clamp: the alias and the ledger string it has to equal are
-                # cut the same way and go on matching.
-                [(key, canonical,
-                 r.get("method") or "manual",
-                 _ts(r.get("as_of")),
-                 # same screen as the transactions above: an alias whose
-                 # merchant is not in the archive resolves by its canonical
-                 # string on the next pass, as an alias with no merchant does
-                 _known_merchant(r.get("merchant_id"), known_merchants,
-                                 merchant_map)) for key in keys],
-                as_one=True)
-
-        def _renamed_key(raw):
-            # the journal row follows its alias: onto the masked key when
-            # file-import rows carry it and nothing keys on the full one
-            filed, kept = _alias_where(raw)
-            return (card_number.cut(raw) if filed and not kept
-                    else raw)
-
-        # The journal's ids come from ONE sequence every household shares,
-        # and an archive's ids are whatever the file says. Kept, and the
-        # sequence advanced past them, one archive could spend the shared
-        # counter to the edge of its range and every household's next
-        # rename would fail. Nothing points at a journal row by id; the id
-        # only orders the rows. So each row gets a fresh id here, inserted
-        # in the archive's id order, and the sequence moves only as far as
-        # these inserts take it. A row already in the journal (the same
-        # archive restored twice) is recognised by what it says, not by id.
-        def _order(r):
-            try:
-                return (0, int(_f(r.get("id")) or 0))
+                cfg["plaid_enrich_cap"] = max(0, min(
+                    int(cfg["plaid_enrich_cap"]), _enrich_cap_ceiling()))
             except (TypeError, ValueError, OverflowError):
-                return (1, 0)
+                cfg.pop("plaid_enrich_cap")
+        # scrub_config drops
+        # secret/demo keys but NOT email_recipients — a crafted ZIP
+        # could plant an outsider address that then receives the
+        # household's cadence mail. Filter it to
+        # tenant members on HOSTED, same boundary as the settings save;
+        # a legit self-host export is untouched. This filter, not the
+        # invite table, is what keeps a household's balances off an
+        # outside inbox — see `_restore_recipient_invites`, which
+        # carries each address's ANSWER across so the mail resumes for
+        # the people who agreed to it and stays off for the ones who
+        # declined.
+        if cfg.get("email_recipients"):
+            from ..web import mailguard
+            kept = mailguard.filter_recipients(
+                conn, list(cfg["email_recipients"]))
+            if kept:
+                cfg["email_recipients"] = kept
+                ctx.archived_recipients = list(kept)
+            else:
+                cfg.pop("email_recipients", None)
+        # Merge OVER the destination's current config: keys present
+        # only in the destination — settings added since the export was
+        # taken — survive; the ZIP replaces exactly the keys it carries.
+        # A flat secret is safe by absence (the export scrubs
+        # plaid/mx/llm/smtp keys, crafted ones were dropped above), but a
+        # secret nested inside a key the ZIP DOES carry — every AI
+        # backend's api_key/extra_body under `llm_backends` — would be
+        # merged away with the value it lives in, so it is carried
+        # forward explicitly.
+        # …and take the ROW LOCK first, for the same reason
+        # `budget.config_txn` exists.
+        # This is the settings lost-update shape written in raw SQL:
+        # read the whole document, merge, write the whole document back.
+        # `ON CONFLICT DO UPDATE` locks at WRITE time, which is too late
+        # — a writer that commits between this read and that write (the
+        # nightly budget seed is the live one) has its keys merged out
+        # of the destination document we already read. We are inside
+        # `conn.transaction()`, so the lock is held until the restore
+        # commits.
+        cur = conn.execute(
+            "SELECT config FROM tenant_settings FOR UPDATE").fetchone()
+        dest = (cur["config"] if cur else {}) or {}
+        # role routing may only name known roles and backends that
+        # will exist after the merge (the ZIP's list if it brought one,
+        # else the destination's own) — same rule as the .oikx bundle
+        if "llm_roles" in cfg:
+            from .connections_bundle import _clean_roles
+            effective = (cfg["llm_backends"] if "llm_backends" in cfg
+                         else dest.get("llm_backends") or [])
+            ids = {str(b.get("id")) for b in effective
+                   if isinstance(b, dict) and b.get("id")}
+            cfg["llm_roles"] = _clean_roles(cfg["llm_roles"], ids)
+        # a per-cadence SMS toggle only means something against a
+        # number verified HERE; the ZIP never carries one, so unless the
+        # destination already has a live verified number the toggle is
+        # dropped rather than left armed for whatever number is verified
+        # later. The owner re-ticks it after re-verifying.
+        _drop_sms_toggles_without_verified_phone(cfg, dest)
+        _settle_masked_urls(cfg, dest)
+        merged = dict(dest)
+        for k, v in _finite_only(cfg).items():
+            merged[k] = (carry_forward_secrets(dest[k], v)
+                         if k in dest else v)
+        ctx.left_behind = (_drop_moved_credentials(dest, cfg, merged)
+                           + _backend_credentials_left_behind(dest, merged))
+        # an archived config without today_view chose the summary face
+        # (the settings door stores that choice as no key); the face a
+        # new account was seeded with is provisioning, not a choice
+        if "today_view" not in cfg:
+            merged.pop("today_view", None)
+            # ...unless the archive is older than the choice itself:
+            # before the summary face existed every household saw the
+            # full detail, so that is the face its owner knew
+            # (only when the archive's age is known: one that says
+            # nothing about itself keeps the summary rule above)
+            _age = _upgrades.archive_schema(ctx._ready("z"))
+            if _age is not None and _upgrades.older_than(_age,
+                                                         _TODAY_FACES):
+                merged["today_view"] = "detail"
+        # the destination's pause record is kept as it was (the ZIP's
+        # never reaches here — scrub_config drops it), and while it is
+        # armed it also covers whatever outbound setting this restore
+        # brought in
+        widen_armed_pause(dest, merged, conn)
+        pause_if_starter_signed_out(dest, merged, conn)
+        # judged on the documents as stored before and after, by the
+        # settings save's own rule: the merge carries the stored key
+        # onto an entry of the same id whatever URL the archive gave it
+        ctx.route_moved = ai_route_moved(conn, dest, merged)
+        conn.execute(
+            """INSERT INTO tenant_settings (config) VALUES (%s)
+               ON CONFLICT (tenant_id) DO UPDATE
+               SET config = EXCLUDED.config, updated_at = now()""",
+            (jsonb(merged),))
+        out.wrote("tenant_settings", 1)
+        # belt: this write bypasses budget.save_config — clear
+        # the demoguard cache the same way so no stale flag survives
+        from ..web import demoguard
+        row = conn.execute(
+            "SELECT current_setting('app.tenant_id', true) AS tid").fetchone()
+        demoguard.invalidate(row["tid"] if row and row["tid"] else None)
 
-        def _journalled(r) -> bool:
-            if r.get("raw_merchant") and r.get("to_canonical"):
-                return True
-            out.refuse("merchant_renames", "malformed")
-            return False
 
-        # A journal row's result is cut where it is what a machine's alias
-        # (cut above) still reads; then a `from` no journal row names as
-        # somebody's result is a machine's, and cut too. A person's stays.
-        journal = sorted((r for r in _rows(z, "merchant_renames.csv")
-                          if _journalled(r)),
-                         key=_order)
-        for r in journal:
-            if (r["raw_merchant"], r["to_canonical"]) in cut_aliases:
-                r["to_canonical"] = card_number.cut(r["to_canonical"])
-        results = {r["to_canonical"] for r in journal}
-        for r in journal:
-            frm = r.get("from_canonical") or None
-            if (card_number.holds_number(frm) and frm not in results
-                    and not conn.execute(
-                        "SELECT 1 FROM merchant_renames"
-                        " WHERE to_canonical = %s", (frm,)).fetchone()):
-                r["from_canonical"] = card_number.cut(frm)
-        for r in journal:
-            at = _ts(r.get("at"))
-            # what the rename did to the category rules it moved, so undoing
-            # it on this instance can put them back; anything but the object
-            # the rename writes is no note at all
-            moved_rules = _j(r.get("rules"))
-            moved_rules = (jsonb(moved_rules)
-                           if isinstance(moved_rules, dict) else None)
-            out.land(conn, "merchant_renames",
-                """INSERT INTO merchant_renames (raw_merchant,
-                       from_canonical, to_canonical, at, rules)
-                   SELECT %s, %s, %s, COALESCE(%s, now()), %s
-                    WHERE NOT EXISTS (
-                          SELECT 1 FROM merchant_renames j
-                           WHERE j.raw_merchant = %s
-                             AND j.from_canonical IS NOT DISTINCT FROM %s
-                             AND j.to_canonical = %s
-                             AND j.at = %s)
-                   RETURNING id""",
-                [(_renamed_key(r["raw_merchant"]),
-                 r.get("from_canonical") or None, r["to_canonical"], at,
-                 moved_rules,
-                 _renamed_key(r["raw_merchant"]),
-                 r.get("from_canonical") or None, r["to_canonical"], at)])
+def finalize(conn, ctx, out) -> None:
+    """The restore's last steps inside its transaction, once every member
+    has landed: what an older archive's rules and printed-day rows need,
+    the settings document, and the re-keys and cuts `oikonome migrate`
+    gives stored rows."""
+    # an archive written before the household's rules were derived from
+    # its own corrections (035) and its model rules keyed on the
+    # merchant (044) gets both, over what it brought. Read from the
+    # archive's own word about its age: waived, a household only keeps
+    # rules in the shape it exported them in, and applied to a newer
+    # archive the derivation could bring back a rule its person deleted
+    schema = _upgrades.archive_schema(ctx._ready("z"))
+    if _upgrades.older_than(schema, _RULES_FROM_OVERRIDES):
+        derive_user_rules_from_overrides(conn, ctx._ready("overridden"))
+    if _upgrades.older_than(schema, _MODEL_RULES_ON_THE_MERCHANT):
+        rekey_model_rules_on_the_merchant(conn)
+    if (not _dated_by_the_utc_day(schema)
+            and _upgrades.older_than(schema, _PRINTED_DAY_NOTE)):
+        # an archive from a build that dated OFX rows by the printed day
+        # but did not yet say so: the rows its later batches wrote are
+        # printed-day rows. An older build (or an archive too old to say
+        # its age) dated them by the UTC day, and a note there would
+        # stop a re-import moving them onto their printed day
+        # only the rows this restore wrote: the instant is a fact about
+        # the archive's source, and a row the household already had may
+        # have been dated by a build that upgraded later than that
+        from . import ofximport as _ofximport
+        _ofximport.mark_printed_day_rows(
+            conn, _PRINTED_DAY_DATING_SINCE, only_ids=ctx._ready("landed_ofx"))
+    _settle_settings(conn, ctx, out)
+    # A hand-made account an archive written before the re-key holds
+    # under an id spelling a full account number is moved onto its
+    # masked id here, as `oikonome migrate` moved the stored ones, once
+    # its rows, lineage and settings have landed — its rows re-hashed
+    # under the new id, and every adoption record naming it in full
+    # cut; the adoption it leaves is what a later restore of the same
+    # archive follows to it.
+    rekeyed = _sync_base.rekey_numbered_accounts(conn)
+    ctx.settled_accounts = {rekeyed.get(a, a)
+                            for a in ctx._ready("landed_accounts")}
+    # and the rows such an archive brings, each id an unkeyed hash over
+    # the full number, are re-id'd under this household's own secret
+    # (with every row whose id was hashed before its name was masked),
+    # as `oikonome migrate` re-ids the stored ones; the secret itself
+    # never travels, so another household's archive is keyed anew here
+    _sync_base.key_file_import_ids(conn)
+    # every hand-made account the archive brought without a
+    # stored-name row (one written before the table, or one a re-key
+    # just moved) gets one, as migration 207 gave the stored ones
+    _account_sources.backfill(conn)
+    # a detected bill's match key, and the names the log quotes, are
+    # cut as migration 208 cut the stored ones; after the merchants
+    # landed, because a name a live merchant holds whole stays whole
+    from ..engine import activity as _activity
+    _bills.cut_detected_keys(conn)
+    _activity.cut_stored_names(conn)
 
-        # A person's rule beats the destination's guess. A household that
-        # linked a bank before restoring already holds seed and model rules
-        # for the merchants its first sync saw; the archive's rule for the
-        # same merchant, when a PERSON set it, replaces the machine's. Two
-        # rules of the same kind leave the destination's in place.
-        #
-        # A rule is keyed on a merchant string, and follows the cut as the
-        # alias does: onto the cut key where file rows now carry it, the
-        # whole one kept only while a row still keys on it. A rule keyed on
-        # a machine merchant's whole name, with no alias of that key, is
-        # read through the merchant's name and follows it to the cut name
-        # (`machine_cut`); a person's merchant keeps its rule.
-        def _rule_keys(key):
-            filed, kept = _alias_where(key)
-            keys = ([card_number.cut(key)] if filed else []) + (
-                [key] if kept or not filed else [])
-            out_keys = []
-            for k in keys:
-                follow = machine_cut.get(k.lower())
-                if (follow is not None and k.lower() not in persons_live
-                        and not conn.execute(
-                            "SELECT 1 FROM merchant_canonical"
-                            " WHERE raw_merchant = %s", (k,)).fetchone()):
-                    k = follow
-                if k not in out_keys:
-                    out_keys.append(k)
-            return out_keys
 
-        for r in _rows(z, "merchant_categories.csv"):
-            if not r.get("merchant") or not r.get("category_primary"):
-                out.refuse("merchant_categories", "malformed")
-                continue
-            out.land(conn, "merchant_categories",
-                """INSERT INTO merchant_categories (merchant, category_primary,
-                       source, classified_at, disabled)
-                   VALUES (%s,%s,%s, COALESCE(%s, now()), %s)
-                   ON CONFLICT (tenant_id, merchant) DO UPDATE
-                      SET category_primary = EXCLUDED.category_primary,
-                          source = EXCLUDED.source,
-                          classified_at = EXCLUDED.classified_at,
-                          disabled = EXCLUDED.disabled
-                    WHERE EXCLUDED.source = 'user'
-                      AND merchant_categories.source <> 'user'
-                   RETURNING merchant""",
-                [(key, r["category_primary"],
-                 r.get("source") or "llm",
-                 _ts(r.get("classified_at")), _b(r.get("disabled")))
-                 for key in _rule_keys(_descriptor(r["merchant"]))],
-                as_one=True)
+def _untally_pruned_merchants(conn, ctx, out) -> None:
+    """An archived merchant the post-commit merchant pass pruned (nothing
+    here names it) was not kept: it moves from written to rebuilt, as the
+    household derives a merchant again when a row names one."""
+    landed = [str(m) for m in (ctx.landed_merchants or [])]
+    if not landed:
+        return
+    try:
+        here = {r["id"] for r in conn.execute(
+            "SELECT id::text AS id FROM merchants WHERE id::text = ANY(%s)",
+            (landed,)).fetchall()}
+    except Exception:                                    # noqa: BLE001
+        log.warning("restore: pruned merchants not counted", exc_info=True)
+        return
+    gone = len(set(landed) - here)
+    if gone:
+        out.written["merchants"] = out.written.get("merchants", 0) - gone
+        out.refuse("merchants", "rebuilt", gone)
 
-        # The merge offers and, above all, the DECISIONS on them. A
-        # rejection is the household saying "these two are different
-        # businesses"; the proposer's id is deterministic per pair, so the
-        # rejection is the only thing keeping the pair from being offered
-        # again. Left out of the archive, every pair the person has already
-        # turned down comes back the first night after a restore.
-        #
-        # Both merchant ids must be merchants this archive carried — the
-        # columns are NOT NULL, so unlike an alias there is no "resolve it
-        # later" form of the row, and a proposal about a merchant that is
-        # not here is about nothing. Merchant ids survive a restore (the
-        # merchants member above carries `id`), so the pair is restored by
-        # id rather than re-derived from names — except a side the restore
-        # mapped onto a live merchant: the proposer keys a pair by its two
-        # ids, so the decision is re-keyed onto the live pair, where the
-        # next proposal run will look for it.
-        #
-        # A pair the destination already offered and the household has not
-        # answered there takes the archive's ANSWER: a pending offer is the
-        # machine asking, a decision is the person's reply.
-        from ..engine.merchant_merge import _sig as _merge_pair_id
-        for r in _rows(z, "merchant_merge_proposals.csv"):
-            frm = _known_merchant(r.get("from_merchant_id"), known_merchants,
-                                  merchant_map)
-            into = _known_merchant(r.get("into_merchant_id"), known_merchants,
-                                   merchant_map)
-            if not r.get("id"):
-                out.refuse("merchant_merge_proposals", "malformed")
-                continue
-            if not frm or not into:
-                out.refuse("merchant_merge_proposals", "orphaned")
-                continue
-            if frm == into:
-                # both sides are one merchant here: the restore folded them
-                # onto the same live one, or the file names a pair of one
-                out.refuse("merchant_merge_proposals",
-                           "merged" if any(
-                               str(r.get(k) or "").strip().lower()
-                               in merchant_map
-                               for k in ("from_merchant_id",
-                                         "into_merchant_id"))
-                           else "malformed")
-                continue
-            pair_id = r["id"]
-            if any(str(r.get(k) or "").strip().lower() in merchant_map
-                   for k in ("from_merchant_id", "into_merchant_id")):
-                pair_id = _merge_pair_id(frm, into)
-            out.land(conn, "merchant_merge_proposals",
-                """INSERT INTO merchant_merge_proposals (id, from_merchant_id,
-                       into_merchant_id, evidence, status, created_at, decided_at)
-                   VALUES (%s,%s,%s, COALESCE(%s,'{}'::jsonb), %s,
-                           COALESCE(%s, now()), %s)
-                   ON CONFLICT (tenant_id, id) DO UPDATE
-                      SET status = EXCLUDED.status,
-                          decided_at = COALESCE(EXCLUDED.decided_at, now())
-                    WHERE merchant_merge_proposals.status = 'pending'
-                      AND EXCLUDED.status <> 'pending'
-                   RETURNING id""",
-                [(pair_id, frm, into,
-                 jsonb(_ev if isinstance(_ev := _j(r.get("evidence")), dict)
-                       else {}),
-                 # a hand-edited status the app never writes would sit in
-                 # the table unreadable by every query above; anything
-                 # unrecognised is simply an undecided offer
-                 (r.get("status") if r.get("status") in
-                  ("pending", "approved", "rejected", "stale") else "pending"),
-                 _ts(r.get("created_at")), _ts(r.get("decided_at")))])
 
-        for r in _rows(z, "amazon_orders.csv"):
-            if not r.get("dedup_key") or not r.get("date"):
-                out.refuse("amazon_orders", "malformed")
-                continue
-            try:
-                _money(r.get("amount"))
-            except _AmountOutOfRange:
-                out.refuse("amazon_orders", "out_of_range")
-                continue
-            out.land(conn, "amazon_orders",
-                """INSERT INTO amazon_orders (dedup_key, account, date, amount,
-                       payee, seller, memo, category, category_source,
-                       order_number, is_refund, payment_method, items_json,
-                       inserted_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, dedup_key) DO NOTHING
-                   RETURNING dedup_key""",
-                [(r["dedup_key"], r.get("account") or "", as_date(r["date"]),
-                 _money(r.get("amount")) or 0.0, r.get("payee") or "Amazon",
-                 r.get("seller") or "", r.get("memo") or "",
-                 r.get("category") or "", r.get("category_source") or "rules",
-                 r.get("order_number") or "", _i(r.get("is_refund"), 0),
-                 r.get("payment_method") or "",
-                 jsonb(_json_list(_j(r.get("items_json")))),
-                 _ts(r.get("inserted_at")))])
-
-        for r in _rows(z, "amazon_matches.csv"):
-            if not _txn_exists(conn, r.get("transaction_id")):
-                out.refuse("amazon_matches", "orphaned")
-                continue
-            out.land(conn, "amazon_matches",
-                """INSERT INTO amazon_matches (transaction_id, dedup_key,
-                       matched_at)
-                   VALUES (%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, transaction_id) DO NOTHING
-                   RETURNING transaction_id""",
-                [(r["transaction_id"], r.get("dedup_key") or None,
-                 _ts(r.get("matched_at")))])
-
-        for r in _rows(z, "costco_receipts.csv"):
-            if not r.get("dedup_key") or not r.get("date"):
-                out.refuse("costco_receipts", "malformed")
-                continue
-            try:
-                _money(r.get("amount"))
-            except _AmountOutOfRange:
-                out.refuse("costco_receipts", "out_of_range")
-                continue
-            out.land(conn, "costco_receipts",
-                """INSERT INTO costco_receipts (dedup_key, account, date,
-                       amount, receipt_type, warehouse, category,
-                       category_source, summary, is_refund, payment_method,
-                       items_json, inserted_at)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                   ON CONFLICT (tenant_id, dedup_key) DO NOTHING
-                   RETURNING dedup_key""",
-                [(r["dedup_key"], r.get("account") or "main",
-                 as_date(r["date"]), _money(r.get("amount")) or 0.0,
-                 r.get("receipt_type") or "warehouse",
-                 r.get("warehouse") or "", r.get("category") or "",
-                 r.get("category_source") or "rules", r.get("summary") or "",
-                 _i(r.get("is_refund"), 0), r.get("payment_method") or "",
-                 jsonb(_json_list(_j(r.get("items_json")))),
-                 _ts(r.get("inserted_at")))])
-
-        for r in _rows(z, "costco_matches.csv"):
-            if not _txn_exists(conn, r.get("transaction_id")):
-                out.refuse("costco_matches", "orphaned")
-                continue
-            out.land(conn, "costco_matches",
-                """INSERT INTO costco_matches (transaction_id, dedup_key,
-                       matched_at)
-                   VALUES (%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, transaction_id) DO NOTHING
-                   RETURNING transaction_id""",
-                [(r["transaction_id"], r.get("dedup_key") or None,
-                 _ts(r.get("matched_at")))])
-
-        for r in _rows(z, "amazon_summaries.csv"):
-            if not r.get("dedup_key") or not r.get("summary"):
-                out.refuse("amazon_summaries", "malformed")
-                continue
-            out.land(conn, "amazon_summaries",
-                """INSERT INTO amazon_summaries (dedup_key, summary, created_at)
-                   VALUES (%s,%s, COALESCE(%s, now()))
-                   ON CONFLICT (tenant_id, dedup_key) DO NOTHING
-                   RETURNING dedup_key""",
-                [(r["dedup_key"], r["summary"], _ts(r.get("created_at")))])
-
-        # an archive written before the household's rules were derived from
-        # its own corrections (035) and its model rules keyed on the
-        # merchant (044) gets both, over what it brought. Read from the
-        # archive's own word about its age: waived, a household only keeps
-        # rules in the shape it exported them in, and applied to a newer
-        # archive the derivation could bring back a rule its person deleted
-        schema = _upgrades.archive_schema(z)
-        if _upgrades.older_than(schema, _RULES_FROM_OVERRIDES):
-            derive_user_rules_from_overrides(conn, overridden)
-        if _upgrades.older_than(schema, _MODEL_RULES_ON_THE_MERCHANT):
-            rekey_model_rules_on_the_merchant(conn)
-
-        if isinstance(cfg_in, dict):
-            # Belt to the netguard check above: a legit export never CARRIES
-            # credential-shaped keys (the export scrubs them) — any present in
-            # a ZIP are crafted. Drop them all so an injected key the
-            # destination lacks (e.g. an access_url) can never land. Same for
-            # policy keys (demo_mode /
-            # demo_login / smtp_starttls) — a ZIP must not flip the demo
-            # lockdown or downgrade SMTP to cleartext; deep-scrubbed so nested
-            # shapes can't smuggle them either.
-            cfg = scrub_config(cfg_in)
-            for k in _CREDENTIAL_COMPANION_KEYS:
-                cfg.pop(k, None)
-            notes.extend(normalize_notify_shapes(cfg))
-            clean_excluded_accounts(cfg)
-            notes.extend(clean_budget_amounts(cfg))
-            notes.extend(clean_income_scenarios(cfg))
-            notes.extend(clean_savings_goals(cfg))
-            notes.extend(clean_manual_assets(cfg))
-            notes.extend(clean_config_shapes(cfg))
-            _rename_account_keys(cfg, renamed)
-            _follow_moved_bills(cfg, bill_payees)
-            # The Enrich cap is the household's preference and restores, but
-            # only inside the range the settings door accepts: above the
-            # ceiling it would authorise spend the operator never allowed,
-            # and a value that is not a number would break every Enrich call
-            # until someone happened to save settings again. A malformed one
-            # is dropped, which leaves this instance's own value in place.
-            if "plaid_enrich_cap" in cfg:
-                from ..web.api import _enrich_cap_ceiling
-                try:
-                    cfg["plaid_enrich_cap"] = max(0, min(
-                        int(cfg["plaid_enrich_cap"]), _enrich_cap_ceiling()))
-                except (TypeError, ValueError, OverflowError):
-                    cfg.pop("plaid_enrich_cap")
-            # scrub_config drops
-            # secret/demo keys but NOT email_recipients — a crafted ZIP
-            # could plant an outsider address that then receives the
-            # household's cadence mail. Filter it to
-            # tenant members on HOSTED, same boundary as the settings save;
-            # a legit self-host export is untouched. This filter, not the
-            # invite table, is what keeps a household's balances off an
-            # outside inbox — see `_restore_recipient_invites`, which
-            # carries each address's ANSWER across so the mail resumes for
-            # the people who agreed to it and stays off for the ones who
-            # declined.
-            if cfg.get("email_recipients"):
-                from ..web import mailguard
-                kept = mailguard.filter_recipients(
-                    conn, list(cfg["email_recipients"]))
-                if kept:
-                    cfg["email_recipients"] = kept
-                    archived_recipients = list(kept)
-                else:
-                    cfg.pop("email_recipients", None)
-            # Merge OVER the destination's current config: keys present
-            # only in the destination — settings added since the export was
-            # taken — survive; the ZIP replaces exactly the keys it carries.
-            # A flat secret is safe by absence (the export scrubs
-            # plaid/mx/llm/smtp keys, crafted ones were dropped above), but a
-            # secret nested inside a key the ZIP DOES carry — every AI
-            # backend's api_key/extra_body under `llm_backends` — would be
-            # merged away with the value it lives in, so it is carried
-            # forward explicitly.
-            # …and take the ROW LOCK first, for the same reason
-            # `budget.config_txn` exists.
-            # This is the settings lost-update shape written in raw SQL:
-            # read the whole document, merge, write the whole document back.
-            # `ON CONFLICT DO UPDATE` locks at WRITE time, which is too late
-            # — a writer that commits between this read and that write (the
-            # nightly budget seed is the live one) has its keys merged out
-            # of the destination document we already read. We are inside
-            # `conn.transaction()`, so the lock is held until the restore
-            # commits.
-            cur = conn.execute(
-                "SELECT config FROM tenant_settings FOR UPDATE").fetchone()
-            dest = (cur["config"] if cur else {}) or {}
-            # role routing may only name known roles and backends that
-            # will exist after the merge (the ZIP's list if it brought one,
-            # else the destination's own) — same rule as the .oikx bundle
-            if "llm_roles" in cfg:
-                from .connections_bundle import _clean_roles
-                effective = (cfg["llm_backends"] if "llm_backends" in cfg
-                             else dest.get("llm_backends") or [])
-                ids = {str(b.get("id")) for b in effective
-                       if isinstance(b, dict) and b.get("id")}
-                cfg["llm_roles"] = _clean_roles(cfg["llm_roles"], ids)
-            # a per-cadence SMS toggle only means something against a
-            # number verified HERE; the ZIP never carries one, so unless the
-            # destination already has a live verified number the toggle is
-            # dropped rather than left armed for whatever number is verified
-            # later. The owner re-ticks it after re-verifying.
-            _drop_sms_toggles_without_verified_phone(cfg, dest)
-            _settle_masked_urls(cfg, dest)
-            merged = dict(dest)
-            for k, v in _finite_only(cfg).items():
-                merged[k] = (carry_forward_secrets(dest[k], v)
-                             if k in dest else v)
-            # an archived config without today_view chose the summary face
-            # (the settings door stores that choice as no key); the face a
-            # new account was seeded with is provisioning, not a choice
-            if "today_view" not in cfg:
-                merged.pop("today_view", None)
-            # the destination's pause record is kept as it was (the ZIP's
-            # never reaches here — scrub_config drops it), and while it is
-            # armed it also covers whatever outbound setting this restore
-            # brought in
-            widen_armed_pause(dest, merged, conn)
-            pause_if_starter_signed_out(dest, merged, conn)
-            conn.execute(
-                """INSERT INTO tenant_settings (config) VALUES (%s)
-                   ON CONFLICT (tenant_id) DO UPDATE
-                   SET config = EXCLUDED.config, updated_at = now()""",
-                (jsonb(merged),))
-            out.wrote("tenant_settings", 1)
-            # belt: this write bypasses budget.save_config — clear
-            # the demoguard cache the same way so no stale flag survives
-            from ..web import demoguard
-            row = conn.execute(
-                "SELECT current_setting('app.tenant_id', true) AS tid").fetchone()
-            demoguard.invalidate(row["tid"] if row and row["tid"] else None)
-        # A hand-made account an archive written before the re-key holds
-        # under an id spelling a full account number is moved onto its
-        # masked id here, as `oikonome migrate` moved the stored ones, once
-        # its rows, lineage and settings have landed — its rows re-hashed
-        # under the new id, and every adoption record naming it in full
-        # cut; the adoption it leaves is what a later restore of the same
-        # archive follows to it.
-        rekeyed = _sync_base.rekey_numbered_accounts(conn)
-        landed_accounts = {rekeyed.get(a, a) for a in landed_accounts}
-        # and the rows such an archive brings, each id an unkeyed hash over
-        # the full number, are re-id'd under this household's own secret
-        # (with every row whose id was hashed before its name was masked),
-        # as `oikonome migrate` re-ids the stored ones; the secret itself
-        # never travels, so another household's archive is keyed anew here
-        _sync_base.key_file_import_ids(conn)
-        # every hand-made account the archive brought without a
-        # stored-name row (one written before the table, or one a re-key
-        # just moved) gets one, as migration 207 gave the stored ones
-        _account_sources.backfill(conn)
-        # a detected bill's match key, and the names the log quotes, are
-        # cut as migration 208 cut the stored ones; after the merchants
-        # landed, because a name a live merchant holds whole stays whole
-        from ..engine import activity as _activity
-        _bills.cut_detected_keys(conn)
-        _activity.cut_stored_names(conn)
+def after_commit(conn, ctx, out) -> dict:
+    """What the restore does once its rows have committed, and its summary:
+    each step its own transaction, so a failure costs that step and never
+    the restore. The summary is read off the tally after the merchant
+    resolve, which prunes an archived merchant nothing here names: such a
+    merchant is reported rebuilt, never written."""
+    notes = ctx._ready("notes")
+    if ctx.route_moved:
+        try:
+            _tell_the_owner_the_ai_route_moved(conn)
+        except Exception:                                # noqa: BLE001
+            log.exception("restore: the AI route notice could not be sent")
     # Restored AFTER the same bank was linked here: the link already holds
     # each account under its new Plaid id, and the archive just brought the
     # same account back under its old one on a tokenless shell. The link
@@ -5987,19 +5530,32 @@ def _restore_zip(conn, data, out: _Outcomes) -> dict:
     # account its merge and never the restore.
     try:
         from .adopt import merge_restored_onto_live
-        _merged, merge_notes = merge_restored_onto_live(conn, landed_accounts)
+        _merged, merge_notes = merge_restored_onto_live(
+            conn, ctx._ready("settled_accounts"))
         notes.extend(merge_notes)
     except Exception:                                    # noqa: BLE001
         log.exception("restore: merging onto linked accounts failed")
         notes.append("accounts already linked here could not be checked "
                      "against the restored ones — some may appear twice; "
                      "check the Accounts page")
+    # every restored receipt landed undecided (landers._receipt): which
+    # slip each is gets decided now, by the one decider, which keeps the
+    # archive's labels and every person's answer and only adds the joins
+    # of the same file, a local copy beside it included
+    # (specs/receipts.md)
+    try:
+        from ..engine import receipt_identity
+        receipt_identity.decide_backlog(
+            conn, passes=receipt_identity.RESTORE_PASSES)
+    except Exception:                                    # noqa: BLE001
+        log.exception("restore: receipt slips left for the next pass")
     # Outside the transaction above, because this one table is written over
     # the admin connection (migration 074 grants the app role nothing on
     # it) — so it lands only once the household's data has actually
     # committed.
     try:
-        inv = _restore_recipient_invites(conn, z, archived_recipients)
+        inv = _restore_recipient_invites(conn, ctx._ready("z"),
+                                         ctx.archived_recipients)
     except Exception:                                    # noqa: BLE001
         log.exception("recipient invites could not be restored")
         inv = dict(_NO_INVITES)
@@ -6023,16 +5579,6 @@ def _restore_zip(conn, data, out: _Outcomes) -> dict:
         notes.append(f"daily email — the archive listed {inv['total']} "
                      f"recipient(s): " + "; ".join(bits)
                      + ". Settings → Email is where you invite them")
-
-    # Counts are rows WRITTEN, each one a row its insert returned — a
-    # re-restore honestly reports 0, not the ZIP's size — and every row not
-    # written is under the one outcome that says why (REFUSALS).
-    counts = out.counts()
-    notes.extend(_outcome_notes(out))
-    # what the config check dropped, so the person restoring is told
-    # rather than left to discover a missing AI backend later
-    if notes:
-        counts["_notes"] = notes                      # not a row count
     # Rows from an archive without merchant_id get their merchant here — the
     # ledger shows names and logos on the first load after a restore, not
     # after the next nightly
@@ -6041,4 +5587,30 @@ def _restore_zip(conn, data, out: _Outcomes) -> dict:
         merchant_identity.resolve(conn)
     except Exception:                                    # noqa: BLE001
         log.warning("post-restore merchant resolve skipped", exc_info=True)
+    _untally_pruned_merchants(conn, ctx, out)
+    # Counts are rows WRITTEN, each one a row its insert returned — a
+    # re-restore honestly reports 0, not the ZIP's size — and every row not
+    # written is under the one outcome that says why (REFUSALS).
+    counts = RestoreCounts(out.counts())
+    counts.credentials_dropped = dropped_kinds(ctx.left_behind)
+    if counts.credentials_dropped:
+        # said now, not found out when the AI or the mail later fails
+        what = {"ai_key": "the AI service's key",
+                "mail_password": "the mail relay's password and login"}
+        notes.append(
+            "the archive points somewhere other than this instance's "
+            "settings, so " + " and ".join(
+                what[k] for k in counts.credentials_dropped)
+            + " saved here were not carried over — enter them again in "
+              "Settings for the new address")
+    notes.extend(_outcome_notes(out))
+    notes.extend(_nul_key_notes())
+    # rows in the archive that are not here, for a reason no check names:
+    # said before anything else
+    counts.skipped = skipped_rows(out)
+    notes[:0] = [s["sentence"] for s in counts.skipped]
+    # what the config check dropped, so the person restoring is told
+    # rather than left to discover a missing AI backend later
+    if notes:
+        counts["_notes"] = notes                      # not a row count
     return counts

@@ -4,7 +4,8 @@
 // (scripts/pure-logic-tests.mjs) — the words here are the web wizard's,
 // and a test pins each one.
 import { cadencePick, TWICE_A_MONTH } from "../lib/monthdays.ts";
-import { cadenceWords, money, numv, parseMoneyDraft } from "../lib/pure.ts";
+import { cadenceWords, money, numv, parseMoneyDraft,
+         PLANNER_BILLS_FAILED } from "../lib/pure.ts";
 
 export type WizardStep =
   "appearance" | "connect" | "bills" | "budgets" | "email" | "finish";
@@ -274,15 +275,40 @@ export function clockHour(h: number): string {
 
 export type Delivery = "email" | "push" | "both" | "off";
 
-/** The Done step's blurb: when the first message arrives, named for what
- *  was chosen — a push-only household gets a notification, not an email,
- *  and one that turned delivery off is promised nothing. */
-export function finishBlurb(delivery: Delivery, hour: number): string {
+/** Who the daily message reaches, as the server worked it out
+ *  (notify/reach.py: mutes, a mail relay, the browsers and phones
+ *  registered) — the settings view's `email_reach.daily`. */
+export type DailyReach = {
+  on: boolean; email: number; push: number; sms: boolean;
+  receiving: boolean; warn: boolean; text: string };
+
+/** What the first daily message is, or null when none will arrive: only a
+ *  channel the server counts as reaching someone is promised (the web's
+ *  firstMessage). */
+export function firstMessage(r: DailyReach | null | undefined):
+    "email" | "notification" | "text" | null {
+  if (!r || !r.on || !r.receiving) return null;
+  return r.email > 0 ? "email" : r.push > 0 ? "notification"
+    : r.sms ? "text" : null;
+}
+
+/** The Done step's and the Email & push step's line: the server's words,
+ *  marked when the schedule is on and nobody receives it. */
+export function reachLine(r: DailyReach | null | undefined): string | null {
+  return r ? (r.warn ? "⚠ " : "") + r.text : null;
+}
+
+/** The Done step's blurb: when the first message arrives, named for the
+ *  channel that reaches someone — a push-only household gets a
+ *  notification, not an email, and a schedule that is off or reaches
+ *  nobody is promised nothing. */
+export function finishBlurb(reach: DailyReach | null | undefined,
+                            hour: number): string {
+  const first = firstMessage(reach);
   return "That's everything. The Today page carries your daily verdict "
     + "from here on"
-    + (delivery === "off" ? ""
-      : `; the first ${delivery === "push" ? "notification" : "email"} `
-        + `arrives tomorrow at ${clockHour(hour)}`)
+    + (first === null ? ""
+      : `; the first ${first} arrives tomorrow at ${clockHour(hour)}`)
     + ".";
 }
 
@@ -378,13 +404,38 @@ const dollars = (v: number | null | undefined) =>
   v && v > 0 ? `$${Math.round(v).toLocaleString("en-US")}` : null;
 
 /** Done step: the Budgets line — the figures only once the household
- *  saved a budget of its own (onboarding's budgets_set); a provisional
- *  seed is the app's guess, not the person's plan. */
+ *  saved a budget of its own (budgetsStepKept); a first-run seed is the
+ *  app's guess, not the person's plan. */
 export function budgetsSummary(set: boolean, food: number | null | undefined,
                                other: number | null | undefined): string {
   if (!set) return "not set yet (Budget page any time)";
-  return `Food ${dollars(food) ?? "$0"} · Everything else `
-    + (dollars(other) ?? "$0");
+  // the month's total first: the stored "other" still holds every category
+  // carved out of it, which is not the Everything else row Today shows
+  return `${dollars((food ?? 0) + (other ?? 0)) ?? "$0"} a month · Food `
+    + (dollars(food) ?? "$0");
+}
+
+/** What the wizard reads to tell a plan the household saved from the
+ *  first-run seed the server stores on its own. */
+export type PlanSavedInput = { budgets_set?: boolean;
+                               budgets_saved_by_user?: boolean };
+
+/** Has the household saved a budget plan itself? The server's
+ *  budgets_saved_by_user: never true for the first-run seed the server
+ *  stores on its own once a month has closed, which budgets_set counts.
+ *  The setup wizard opens on the saved plan only then. An older server
+ *  without the field answers with budgets_set, the rule this replaces
+ *  (specs/wizard-budgets-refine.md, "Who saved the plan"). The web keeps
+ *  the same rule in src/checklist.ts. */
+export function planSaved(ob: PlanSavedInput): boolean {
+  return !!(ob.budgets_saved_by_user ?? ob.budgets_set);
+}
+
+/** The wizard's budgets step is kept — Continue may leave it, and Done
+ *  reports its figures: the household saved a plan, and the plan holds
+ *  a budget (budgets_set, the verdict's own gate). */
+export function budgetsStepKept(ob: PlanSavedInput): boolean {
+  return planSaved(ob) && !!ob.budgets_set;
 }
 
 /** The stored figures the manual budgets step reads and writes. */
@@ -399,10 +450,10 @@ export type StoredBudgets = {
  *  budget starts blank. A blank box would otherwise save as $0 and wipe
  *  a figure the person could not see. */
 export function manualBudgetsPrefill(
-  ob: { budgets_set?: boolean; wizard_steps?: Record<string, string> },
+  ob: PlanSavedInput & { wizard_steps?: Record<string, string> },
   s: StoredBudgets,
 ): { income: string; food: string; other: string } {
-  if (!(ob.wizard_steps?.budgets === "done" || ob.budgets_set))
+  if (!(ob.wizard_steps?.budgets === "done" || planSaved(ob)))
     return { income: "", food: "", other: "" };
   const str = (v: number | null | undefined) => (v && v > 0 ? String(v) : "");
   return { income: str(s.budgeted_income_monthly), food: str(s.food_monthly),
@@ -432,16 +483,19 @@ export function manualBudgetsRefusal(food: string, other: string):
 
 /** The fields the manual budgets save sends, and the Savings goal's
  *  monthly plan computed from the figures that will actually stand.
- *  `hasBudget` is onboarding's budgets_set, read fresh at save time.
+ *  `hasBudget` is planSaved over onboarding, read fresh at save time.
  *  Over a stored budget a blank or zero food/everything-else box is left
  *  out of the body so the server keeps that figure; with nothing stored
  *  there is nothing to protect and the empty one is written as none.
  *  Income at zero means "not set" to the server either way, so a blank
- *  one is always left out and a stored figure stands. */
+ *  one is always left out and a stored figure stands. `bills` null: the
+ *  read it comes from has not answered, and a Savings plan worked out
+ *  without it is refused rather than saved as if bills were $0. */
 export function manualBudgetsBody(
   draft: { income: string; food: string; other: string },
-  stored: StoredBudgets, hasBudget: boolean, bills: number,
+  stored: StoredBudgets, hasBudget: boolean, bills: number | null,
 ): { body: Record<string, number>; monthlyPlan: number } {
+  if (bills === null) throw new Error(PLANNER_BILLS_FAILED);
   const body: Record<string, number> = {};
   const put = (key: string, v: string, s: number | null | undefined) => {
     if (draftNum(v) > 0) { body[key] = draftNum(v); return draftNum(v); }

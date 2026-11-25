@@ -86,6 +86,9 @@ def short_daily(d: dict, bucket_names: bool = True) -> str:
                     for k in ("food", "other"))):
         from ..web.todayview import allowances
         allow, kids, tiles = allowances(d)
+        # a parent whose whole budget went to named categories has no tile
+        # on the page, so it has no rate to name here either
+        tiles = [(label, a) for label, a in tiles if not a.get("empty")]
         # the days the rates cover: once today has spend a tile's rate
         # spreads over the days after today, so the count is the tiles'
         # own rate_days, not the calendar's days left. Tiles can differ
@@ -93,8 +96,12 @@ def short_daily(d: dict, bucket_names: bool = True) -> str:
         # promises a day's room the rate was not spread over.
         days_left = min((a["rate_days"] for _l, a in tiles),
                         default=max(1, dim - today.day + 1))
+        # the whole dollars the tiles and the recovery sentence print
+        # (budget.shown_daily), never a second rounding
+        from ..engine.budget import shown_daily
         if bucket_names:
-            rates = [f"{_m(a['rate'])}/day {label}" for label, a in tiles]
+            rates = [f"${a['rate_dollars']:,}/day {label}"
+                     for label, a in tiles]
         else:
             # allowances lists Food's carve-outs before Everything else's;
             # each rate is already floored at zero, as its tile shows it
@@ -103,7 +110,8 @@ def short_daily(d: dict, bucket_names: bool = True) -> str:
                        + sum(k["rate"] for k in kids[:n_food])),
                       ("Everything else", allow["other"]["rate"]
                        + sum(k["rate"] for k in kids[n_food:])))
-            rates = [f"{_m(r)}/day {label}" for label, r in folded]
+            rates = [f"${shown_daily(r):,}/day {label}"
+                     for label, r in folded]
         if rates:
             lines.append("Spend at most " + ", ".join(rates)
                          + f" — {days_left} day{'' if days_left == 1 else 's'} left.")
@@ -155,7 +163,7 @@ def short_yearly(d: dict, year: int) -> str:
         if t.get("income") is not None:
             line += f" on {_m(t['income'])} income"
             if t.get("saved") is not None:
-                line += f" — saved {_m(t['saved'])}"
+                line += f" — {_m(t['saved'])} left over"
                 if t.get("rate") is not None:
                     line += f" ({t['rate']:.0f}%)"
         lines.append(line + ".")

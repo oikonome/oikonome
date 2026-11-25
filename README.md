@@ -86,30 +86,34 @@ around a single daily email, so the tool does the checking, not you.
 | Capability |
 |---|
 | Daily budget verdict email (on / over / under + today's number), ending in a *Needs you* section whose buttons confirm a bill or file a charge without signing in |
-| 60-day cash-flow forecast with card-payoff scenarios |
-| Cash Flow report — flow picture, saved-by-month with a 60-day forecast tail, spending & income breakdowns with income by source, and interest & fees paid by year |
-| Debt payoff planner — every card and loan on one schedule, avalanche or snowball, with an extra-payment what-if and the debt-free month |
+| 60-day cash-flow forecast in three card views (your usual, pay all cards today, pay on the due date), with each card's due dates marked and what is still on the cards at each low |
+| A forecast that grades itself: every night it keeps what it predicted, checks it against your real balance, and shows its track record ("How has the forecast done?") with why it missed on any day |
+| Cash Flow report — flow picture, left over by month with a 60-day forecast tail, spending & income breakdowns with income by source (every Spending figure opens the exact charges it counted), and interest & fees paid by year |
+| Debt payoff planner — every card and loan on one schedule (loans you typed in included; cards paid in full each month listed apart), avalanche or snowball, with an extra-payment what-if and the debt-free month |
 | Automatic recurring-bill detection with evidence + approve, adjust or reject — or enter bills yourself with new-bill detection off |
 | Envelope budgets — monthly **and** lumpy annual pools; a first month paces from the day the ledger begins, with suggestions scaled from the days seen so far |
-| Retirement projection via historical market replay |
-| Bank sync — Plaid · MX · SimpleFIN, on your own keys |
+| Retirement projection led by a replay of every past market since 1928, with your saving read from the ledger |
+| Savings goals measured from the ledger, each with a target and date read against its own schedule: on pace or off pace, however your deposits arrive |
+| Lifetime income history from SSA earnings records, IRS transcripts, 1040s and W-2s — every stored document listed with the years it wrote, removable with a 30-day put-back |
+| Bank sync — Plaid · MX · SimpleFIN, on your own keys; several banks in one Plaid sign-in |
 | File imports — CSV · OFX/QFX · Quicken QIF · Mint · YNAB · PDF, one file or a whole folder at once (run in the background); re-importing a file corrects rows an earlier version read differently; one history window (last month to everything) bounds every import and new bank link |
 | Multi-source accounts with automatic failover |
-| Receipt & check image parsing (vision line-items); snap a receipt before the charge posts and it matches itself when the charge arrives; a mixed Costco or Amazon order splits its charge by the items' categories |
+| Receipt & check image parsing (vision line-items, each counted once at what it cost and checked against the charge); one slip counts once (the same file attached twice is one receipt; two that only read alike both count until you answer *Same receipt* or *Two purchases*); a return slip on its refund counts back; a check's payee asked once and kept; snap a receipt before the charge posts and it matches itself when the charge arrives; a mixed Costco or Amazon order splits its charge by the items' categories |
 | Local-LLM categorization — data never leaves the box |
 | Net worth over time, with an estimate of advisory fees your broker does not itemize and money-in overrides for in-kind transfers, both set in Settings |
 | Merchant identity you control — logos, chain outlets under their brand, rename, merge spelling variants, undo |
 | Transaction provenance — check number, payment channel, location, line of business, and *why* a row has its category |
 | Split one charge across several categories by hand |
-| Ledger search with totals, the average per visit and spending per day for any month, category or date range — and a CSV or .xlsx download of exactly the rows a view shows |
+| Ledger search with money out / in / net, the average per visit and spending per day for any month, category or date range — and a CSV or .xlsx download of exactly the rows a view shows |
 | Ask-your-ledger assistant — a chat of conversations over read-only summaries, answered by the on-box model; draws charts and tables, keeps every conversation for the household, and saves one as a self-contained HTML report |
-| Business / self-employed tracking — entities, P&L, Schedule C, mileage, estimated tax |
+| Business / self-employed tracking — entities, P&L, Schedule C lines, owner's capital (costs paid personally included), owner transfers, mileage, estimated tax, federal and state deadlines |
 | Household logins — members and view-only readers with their own second factor and email preferences, and an activity log of who changed what |
 | Continuity packet — one printable PDF of the accounts, debts, bills, income and businesses, for whoever has to run the household without you |
 | Passkeys / TOTP 2FA, per-tenant encryption at rest |
 | Email, SMS (your own Twilio credentials) and push delivery of the summaries |
-| Webhooks, a Prometheus `/metrics` exporter, Home Assistant sensors and a local MCP server — on read-only tokens |
+| Webhooks, a Prometheus `/metrics` exporter, Home Assistant sensors, a local MCP server and an MCP endpoint on the instance itself (off by default) — on read-only tokens |
 | One-command manager (install / backup / restore / upgrade), with a database snapshot before every upgrade, a documented rollback, a configurable backup folder the admin console also reads, and a self-refreshing "back in a moment" page behind the bundled HTTPS proxy while the app restarts |
+| Accessible on both apps — every chart says its figures in a sentence with a **Show numbers** table, keyboard and screen-reader reachable controls, reduced motion honoured, phone text that grows without cutting money short |
 | Native iOS and Android app with a home-screen widget — it offers the store's newer build when one exists; source in `mobile/`, built pinned to your own server |
 
 <sub>Nothing here is gated: a self-hosted instance has every feature, with
@@ -183,7 +187,9 @@ in the **[quick start guide](docs/quickstart.md)**.
   endpoint) under Settings → AI and route each task — assistant,
   categorization, receipts — to a different one.
 - **Packaging** — Docker / Podman Compose, one folder, one manager script;
-  Caddy provides automatic-certificate TLS.
+  Caddy provides automatic-certificate TLS. The image installs exactly the
+  committed, hash-checked resolution of the server's dependencies
+  (`server/requirements.txt`), the same one the test suite runs on.
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for the fuller
 architecture and how to run the test suite — a comprehensive `unittest` suite

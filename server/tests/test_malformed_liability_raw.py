@@ -17,7 +17,7 @@ import json
 import unittest
 import zipfile
 
-from oikonome.engine import forecast
+from oikonome.engine import business_days, forecast
 from oikonome.engine.compat import jsonb
 from oikonome.sync import restore
 from oikonome.web import data
@@ -120,7 +120,7 @@ class RestoreThenForecastTests(unittest.TestCase):
         # no usable due date or statement: the full balance, tomorrow
         self.assertEqual(f["card_events"],
                          [((TODAY + dt.timedelta(days=1)).isoformat(),
-                           -250.0, "Test Card payment")])
+                           -250.0, "Card payment — Test Card")])
         card = next(r for r in data.accounts_detail(self.conn)
                     if r["id"] == "card")
         self.assertIsNone(card["card_statement"])
@@ -160,11 +160,15 @@ class TolerantReadTests(unittest.TestCase):
                              (TODAY + dt.timedelta(days=10)).isoformat()})
         f = forecast.build(self.conn, today=TODAY, days=30)
         due = (TODAY + dt.timedelta(days=10)).isoformat()
-        self.assertEqual(f["card_events"], [(due, -250.0, "Test Card payment")])
+        self.assertEqual(f["card_events"], [(due, -250.0, "Card payment — Test Card")])
         # an unusable statement balance means the full balance, as when
-        # the issuer never gave one
+        # the issuer never gave one; the payment leaves checking the
+        # business day after a weekend due date (07/25/26 is a Saturday),
+        # as every card payment the walk dates does
+        paid = business_days.next_business_day(
+            TODAY + dt.timedelta(days=10)).isoformat()
         self.assertEqual([(d, a) for d, a, _ in f["card_events_stmt"]],
-                         [(due, -250.0)])
+                         [(paid, -250.0)])
 
     def test_forecast_survives_an_unparsable_due_date(self):
         for bad in ("soon", "2026-13-45", "0999-01-01", 12345):
@@ -173,7 +177,7 @@ class TolerantReadTests(unittest.TestCase):
             f = forecast.build(self.conn, today=TODAY, days=30)
             tomorrow = (TODAY + dt.timedelta(days=1)).isoformat()
             self.assertEqual(f["card_events"],
-                             [(tomorrow, -250.0, "Test Card payment")], bad)
+                             [(tomorrow, -250.0, "Card payment — Test Card")], bad)
             # the assumed date is not a calendar fact: no chart marker
             self.assertEqual(f["card_autopay"], [], bad)
 
@@ -192,9 +196,11 @@ class TolerantReadTests(unittest.TestCase):
                     if r["id"] == "card")
         self.assertEqual(card["card_statement"], 120.25)
         f = forecast.build(self.conn, today=TODAY, days=60)
+        # the next statement's due date, 09/05/26, is the Saturday before
+        # Labor Day: it leaves checking on Tuesday 09/08
         self.assertEqual([(d, a) for d, a, _ in f["card_events_stmt"]],
                          [("2026-08-05", -120.25),
-                          ("2026-09-05", -129.75)])
+                          ("2026-09-08", -129.75)])
 
 
 if __name__ == "__main__":

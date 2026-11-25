@@ -35,9 +35,25 @@ class BudgetOrderTests(unittest.TestCase):
         term, whose absence made the email's flow land on a number its own
         terms could not produce."""
         hero = self.page[:self.page.index("This month")]
-        for term in ("in", "bills due", "to spend", "saved", "excess"):
+        # the bills leg's words are the server's ("bills & envelopes" with
+        # a pool), "bills" from an older server
+        for term in ("in", "{d.plan_bills_label ?? bills}", "to spend",
+                     "saved"):
             self.assertIn(f"> {term}</span>", hero.replace('"', ""),
                           f"the flow line is missing {term!r}")
+        # the excess's words are the server's (plan_excess_words)
+        self.assertIn("{d.plan_excess_words.text}</span>", hero,
+                      "the flow line is missing its excess words")
+
+    def test_a_plan_only_row_without_words_keeps_its_figure(self):
+        """The words-only form is for a plan-only row the server words
+        (the Excess cash row's caption). A plan-only Savings row carries
+        no caption, and in that form it printed its name with no amount,
+        while Today's footer and the email print its plan figure."""
+        bars = _src("components/PlanBars.tsx")
+        self.assertIn('if (row.actualLabel === "—" && row.caption)', bars)
+        # the other rows, plan-only Savings included, print their budget
+        self.assertIn("money(row.budget)", bars)
 
     def test_the_excess_caption_is_not_repeated_under_the_bars(self):
         self.assertNotIn("income minus typical", self.page,

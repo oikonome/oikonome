@@ -32,7 +32,7 @@ export type AccountSection = {
 
 export const ext = {
   account: null as AccountSection | null,
-  // cards the add-on adds to Settings → Users, under the household roster
+  // cards the add-on adds to Settings → Household, under the household roster
   householdCards: [] as ComponentType[],
   lockouts: [] as Lockout[],
   // a write refused with 402: the toast's fallback sentence and where a

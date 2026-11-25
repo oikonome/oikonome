@@ -53,7 +53,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from ..db import tenancy
-from ..sync.plaid import ENV_URLS
+from ..sync.plaid import ENV_URLS, PlaidError, instance_env
 from .security import _sec_event, current_ip, limit
 
 log = logging.getLogger(__name__)
@@ -96,12 +96,20 @@ _FETCH_SEM = asyncio.Semaphore(_FETCH_CEILING)
 
 
 def _platform_creds() -> tuple[str, str, str] | None:
+    """The platform's keys and the environment they belong to, or None.
+    An OIKONOME_PLAID_ENV naming no environment fetches no key (so every
+    webhook is refused) rather than sending the keys to production."""
     cid = os.environ.get("OIKONOME_PLAID_CLIENT_ID")
     secret = os.environ.get("OIKONOME_PLAID_SECRET")
-    env = os.environ.get("OIKONOME_PLAID_ENV", "production")
     if not cid or not secret:
         return None
-    return cid, secret, ENV_URLS.get(env, ENV_URLS["production"])
+    try:
+        env = instance_env()
+    except PlaidError:
+        log.warning("plaid webhook: OIKONOME_PLAID_ENV names no Plaid "
+                    "environment; no verification key is fetched")
+        return None
+    return cid, secret, ENV_URLS[env]
 
 
 async def _fetch_key(kid: str) -> dict | None:
@@ -321,12 +329,24 @@ async def _enqueue_sync(tenant_id: str, item_id: str) -> bool:
 _LINK_FINISHED = ("SESSION_FINISHED", "ITEM_ADD_RESULT")
 
 
-async def _enqueue_link_finish(tenant_id: str, link_token: str) -> bool:
+def _link_tokens(event: dict) -> list[str]:
+    """The public tokens a LINK webhook names: ITEM_ADD_RESULT's one,
+    SESSION_FINISHED's list (Plaid's word on which banks the session
+    made, reconciled against what was exchanged)."""
+    raw = [event.get("public_token")]
+    if isinstance(event.get("public_tokens"), list):
+        raw += event["public_tokens"][:20]
+    return [t for t in raw if isinstance(t, str) and 0 < len(t) <= 512]
+
+
+async def _enqueue_link_finish(tenant_id: str, link_token: str,
+                               tokens: list | None = None) -> bool:
     """Queue the server-side finish of a link session on the worker. False
     (logged) when Redis is unreachable; the handler answers 503 so Plaid
     tries again, and the sweep remains the floor."""
     from ..jobs import worker
-    ok = await worker.enqueue_job("plaid_link_finish", tenant_id, link_token)
+    ok = await worker.enqueue_job("plaid_link_finish", tenant_id, link_token,
+                                  *([tokens] if tokens else []))
     if not ok:
         log.warning("plaid webhook: link finish enqueue failed")
     return ok
@@ -517,11 +537,21 @@ async def plaid_webhook(request: Request):
             from ..jobs import plaid_links
             tenant_id = await asyncio.to_thread(plaid_links.tenant_for_link,
                                                 link_token)
+        tokens = _link_tokens(event)
         if tenant_id:
-            if not await _enqueue_link_finish(tenant_id, link_token):
+            if not await _enqueue_link_finish(tenant_id, link_token,
+                                              tokens):
                 raise _queue_down()
             disposition = "link-finish-enqueued"
         else:
+            if tokens:
+                # a bank for a session past its window (or never ours):
+                # the residual the window bounds — named by Plaid's
+                # session id only, never by a token
+                lsid = event.get("link_session_id")
+                log.warning("plaid LINK %s for no open session (link "
+                            "session %s)", wcode,
+                            lsid[:64] if isinstance(lsid, str) else "?")
             disposition = "unknown-link"
     elif wtype == "ITEM" and wcode in _ITEM_CLEARED and item_id:
         cleared = await asyncio.to_thread(_clear_item_status, item_id)

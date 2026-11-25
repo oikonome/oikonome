@@ -48,13 +48,17 @@ class WebMerchantsShape(unittest.TestCase):
     def test_a_row_opens_a_panel_beside_the_list(self):
         self.assertIn('className="side-panel"', self.src)
         self.assertIn("Recent changes", self.src)
-        self.assertIn('<details className="card fold"', self.src)
+        self.assertIn('<details className="card disclosure"', self.src)
 
-    def test_this_month_filter_uses_the_local_month(self):
-        """The UTC month is already next month on the last evening of a
-        month west of Greenwich, which emptied the "this month" filter."""
-        self.assertNotIn("new Date().toISOString().slice(0, 7)", self.src)
-        self.assertIn("localYmd(new Date()).slice(0, 7)", self.src)
+    def test_the_list_is_printed_in_the_servers_order(self):
+        """The server filters and sorts the catalog by the household's own
+        month and its own "unnamed" test. A second pass here, by the
+        device's clock and a client pattern, dropped rows the server sent
+        (near midnight, or in another time zone)."""
+        self.assertIn("const rows = list.data?.merchants ?? [];", self.src)
+        for cut in ("localYmd(", "looksUnnamed", "r.filter(",
+                    ".sort((a, b)"):
+            self.assertNotIn(cut, self.src)
 
 
 class MobileMerchantsShape(unittest.TestCase):
@@ -70,8 +74,13 @@ class MobileMerchantsShape(unittest.TestCase):
     def test_the_list_mirrors_the_web(self):
         for word in ("Needs a look", '"details"', "New detection", "History",
                      "After merge", "Merge all", "Recent changes",
-                     "MERCHANT_ORDERS", "MERCHANT_FILTERS", "sortMerchants"):
+                     "MERCHANT_ORDERS", "MERCHANT_FILTERS"):
             self.assertIn(word, self.list)
+        # printed in the server's order, never filtered or sorted again by
+        # the phone's own clock (the web does the same)
+        self.assertIn("const rows = query.data?.merchants ?? [];", self.list)
+        self.assertNotIn("sortMerchants", self.list)
+        self.assertNotIn("sortMerchants", self.pure)
         # a row opens the merchant's own screen, which the stack knows
         self.assertIn('pathname: "/merchant"', self.list)
         self.assertIn('name="merchant"', self.layout)

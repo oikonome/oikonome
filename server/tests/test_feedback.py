@@ -84,6 +84,30 @@ class FeedbackTests(unittest.TestCase):
         self.assertEqual(row["delivery"], "downloaded")
         self.assertEqual(row["message"], "broken thing")
 
+    def test_a_non_owners_download_carries_no_owner_only_setup(self):
+        """A member or viewer handed the package back (no mail relay) gets
+        the bundle's member view and no app log: the AI models and the
+        hosts the log names are household setup kept to the owner."""
+        from oikonome.web import doctor
+        seen = []
+        real = doctor.bundle
+
+        def spy(tid, owner=True):
+            seen.append(owner)
+            return real(tid, owner=owner)
+        with mock.patch.dict("os.environ", {"OIKONOME_SMTP_HOST": ""}), \
+             mock.patch.object(feedback, "_single_tenant_instance",
+                               return_value=True), \
+             mock.patch.object(doctor, "bundle", side_effect=spy):
+            r = feedback.submit(self.conn, self.tid, "broken", owner=False)
+            mine = feedback.submit(self.conn, self.tid, "broken")
+        self.assertEqual(r["delivery"], "downloaded")
+        with zipfile.ZipFile(io.BytesIO(r["package"])) as z:
+            self.assertNotIn(f"{r['number']}/app-logs.txt", z.namelist())
+        self.assertEqual(seen[-2:], [False, True])
+        with zipfile.ZipFile(io.BytesIO(mine["package"])) as z:
+            self.assertIn(f"{mine['number']}/app-logs.txt", z.namelist())
+
     def test_smtp_emails_with_attachment(self):
         with mock.patch.dict("os.environ",
                              {"OIKONOME_SMTP_HOST": "smtp.test",

@@ -31,6 +31,10 @@ class ReadmeTests(unittest.TestCase):
         for line in src.splitlines():
             if re.search(r"\b[a-z_]+_member\s*=|^\s+else \"[a-z_]+\.csv\"", line):
                 read |= set(re.findall(r'"([a-z_0-9]+)\.csv"', line))
+        # and every member a declared lander reads (sync/landers.py)
+        from oikonome.sync.landers import LANDERS
+        read |= {m.removesuffix(".csv") for lander in LANDERS.values()
+                 for m in lander.members}
         self.assertEqual(read, set(restore.RESTORED_MEMBERS))
         self.assertIn("bills", restore.RESTORED_MEMBERS)
 

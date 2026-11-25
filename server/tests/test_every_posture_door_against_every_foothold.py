@@ -319,6 +319,13 @@ class EveryDoorClosesExactlyItsLevel(unittest.TestCase):
         self.assertEqual(diff, {}, f"{door} (level {level}): these "
                                    f"footholds did not do what the level "
                                    f"says")
+        # an undone address change is remembered (it holds off a
+        # factor-clearing reset for a while), and only the undo records one
+        row = self.cc.execute("SELECT reverted_at FROM users WHERE id=%s",
+                              (p["uid"],)).fetchone()
+        self.assertEqual(bool(row and row["reverted_at"]), level == P.REVERT,
+                         f"{door} (level {level}): the undone-change stamp "
+                         f"is not what the level says")
         if caller_kept:
             self.assertEqual(self.client.get("/api/me").status_code, 200,
                              f"{door} signed its own caller out")
@@ -543,7 +550,7 @@ class EveryLevelIsATableRow(unittest.TestCase):
         self.assertEqual(used, set(P.LEVELS))
 
     def test_routine_sheet_is_sign_in_only(self):
-        # the user's decision: a routine regenerate stops at sign-in
+        # a routine regenerate stops at sign-in
         self.assertEqual(P.LEVELS[P.SHEET], {
             P.SESSIONS, P.DEVICES, P.MINT_TICKETS, P.PUSH, P.RECOVERIES})
 

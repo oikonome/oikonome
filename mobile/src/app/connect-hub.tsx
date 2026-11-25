@@ -13,17 +13,17 @@ import { Alert, Linking, Pressable, RefreshControl, ScrollView, StyleSheet,
          Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card, H, Pill, SharedLock } from "../components/ui";
+import { StaleLine } from "../components/loaded";
+import { Card, H, Pill, SharedLock, Note } from "../components/ui";
 import { patchQuery } from "../lib/cache";
 import { ago } from "../lib/dates";
-import { PendingLinkRows } from "../components/pending-links";
+import { BankLinkLine, PendingLinkRows } from "../components/pending-links";
 import { isPendingCancelled, markPendingResumed, PLAID_LINK_WAIT_MS,
          type PlaidLinkOutcome, resolvePending, setPlaidLinkAside,
          startPlaidLink,
          useFirstSyncLanding } from "../lib/plaid";
 import { bankAwaitsConfirm, bankLinkHoldNote, FIRST_SYNC_RUNNING,
-         institutionAllowance, linkedLine, linkPollMayRetry, showsProviderDoor, type BankLinkHoldView } from "../lib/pure";
+         institutionAllowance, addedLine, linkPollMayRetry, showsProviderDoor, type BankLinkHoldView } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { ext } from "../ext";
 import { C } from "../lib/theme";
@@ -31,6 +31,7 @@ import { useOwner, useSharedLock } from "../lib/viewer";
 import { errText, type Me } from "../lib/api";
 import { CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "../components/verify-email-card";
+import { fieldA11y } from "../components/field";
 
 
 /** Pick up this household's bank links still able to finish — ones the
@@ -70,7 +71,7 @@ export function usePlaidLinkResume(onDone: (r: PlaidLinkOutcome) => void) {
           // abandoned link would otherwise hold the household's last slot
           const s = await client.req<{ done: boolean } & PlaidLinkOutcome>(
             `/accounts/plaid/link/${encodeURIComponent(token)}`
-            + "/status?resume=1");
+            + "/status?resume=1&v=2");
           wait = 2500;
           if (s.done) {
             resolvePending(token, s, kind);
@@ -116,8 +117,12 @@ export default function ConnectHub() {
   const { client } = useSession();
   const router = useRouter();
   const qc = useQueryClient();
+  // while the bank door waits on the emailed link, ask again: the link
+  // is opened in the mail app or on another device, and a door that stays
+  // shut after "Email confirmed" reads as broken (the web's ConnectHub)
   const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
-    enabled: !!client, staleTime: 5 * 60_000 });
+    enabled: !!client, staleTime: 5 * 60_000,
+    refetchInterval: (q) => bankAwaitsConfirm(q.state.data) ? 5000 : false });
   const settings = useQuery({ queryKey: ["settings"],
     queryFn: () => client!.settingsFull(), enabled: !!client });
   const d = settings.data as (Record<string, unknown> | undefined);
@@ -169,7 +174,7 @@ export default function ConnectHub() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => settings.refetch()} />}>
-      <StaleBanner query={settings} />
+      <StaleLine query={settings} />
       <Card>
         <H>Where should your data come from?</H>
         <Text style={s.mut}>
@@ -184,7 +189,9 @@ export default function ConnectHub() {
           BYO token there, so the paste form was a dead end */}
       {ROWS.filter((r) => showsProviderDoor(r.key, hosted)).map((r) => (
         <Card key={r.key}>
-          <Pressable onPress={() => setOpen(open === r.key ? null : r.key)}>
+          <Pressable onPress={() => setOpen(open === r.key ? null : r.key)}
+                     accessibilityRole="button"
+                     accessibilityState={{ expanded: open === r.key }}>
             <View style={{ flexDirection: "row", alignItems: "center",
                            gap: 8 }}>
               <Text style={{ color: C.text, fontSize: 15,
@@ -254,7 +261,8 @@ function HostedHub({ bankLink, me, cap, used }: {
   const credentialLock = useSharedLock("credential");
   const onLinked = (r: PlaidLinkOutcome) => {
     setMsg(
-      r.kind === "add" ? linkedLine(r.institution, r.first_sync)
+      r.kind === "add" ? addedLine(r)
+      : r.kind === "add_failed" && r.summary ? r.summary
       : r.kind === "exited" || r.kind === "cancelled"
         ? "No bank was linked — the sign-in window was closed. Connect "
           + "again whenever you're ready."
@@ -312,7 +320,7 @@ function HostedHub({ bankLink, me, cap, used }: {
                                         void conns.refetch()
                                           .finally(() => setPulling(false));
                                       }} />}>
-      <StaleBanner query={conns} />
+      <StaleLine query={conns} />
       {bankLink && confirmFirst && (
         <VerifyEmailCard me={me} note={CONFIRM_TO_CONNECT} />)}
       <Card>
@@ -336,7 +344,8 @@ function HostedHub({ bankLink, me, cap, used }: {
               </Text>
             )}
             <SharedLock note={credentialLock}>
-            <Pressable style={[s.btn, (link.isPending || full || confirmFirst)
+            <Pressable accessibilityRole="button"
+                       style={[s.btn, (link.isPending || full || confirmFirst)
                                       && { opacity: 0.5 }]}
                        disabled={link.isPending || full || confirmFirst
                                  || !!credentialLock}
@@ -359,6 +368,7 @@ function HostedHub({ bankLink, me, cap, used }: {
               connection appears below so you can link another or carry
               on.
             </Text>
+            <BankLinkLine />
           </>
         ) : (
           <Text style={[s.mut, { color: C.warn }]}>
@@ -367,7 +377,7 @@ function HostedHub({ bankLink, me, cap, used }: {
             imports or an API script below.
           </Text>
         )}
-        {msg && <Text style={s.mut}>{msg}</Text>}
+        {msg && <Note style={s.mut}>{msg}</Note>}
         {linked.length > 0 && (
           <View style={{ marginTop: 12 }}>
             <View style={{ flexDirection: "row", alignItems: "center",
@@ -383,8 +393,9 @@ function HostedHub({ bankLink, me, cap, used }: {
                 pull — the same anatomy the web's linked list uses */}
             {linked.map((c) => {
               const name = c.institution_name || c.id;
-              const bad = (c.status || "").startsWith("error")
-                || c.status === "reaped";
+              // the server's test; a removed link linked again since
+              // (replaced) says so in its own words and is only forgotten
+              const bad = c.needs_attention;
               return (
                 <View key={c.id}
                       style={{ flexDirection: "row", alignItems: "center",
@@ -397,14 +408,15 @@ function HostedHub({ bankLink, me, cap, used }: {
                         ? `${c.accounts} `
                           + (c.accounts === 1 ? "account · " : "accounts · ")
                         : ""}
-                      {bad ? "needs attention"
+                      {c.replaced ? c.removed_text
+                        : bad ? "needs attention"
                         : c.last_ok ? `synced ${ago(c.last_ok)}`
                                     : FIRST_SYNC_RUNNING}
                       {/* the bank's own clock: sync reads Plaid's copy,
                           and the bank refreshes that copy on its own
                           schedule — this is the number that explains a
                           sync which found nothing */}
-                      {!bad && c.bank_updated_at
+                      {!bad && !c.replaced && c.bank_updated_at
                         ? ` · bank sent data ${ago(c.bank_updated_at)}` : ""}
                     </Text>
                   </View>
@@ -414,13 +426,13 @@ function HostedHub({ bankLink, me, cap, used }: {
                                  opacity: credentialLock ? 0.55 : 1 }}
                         disabled={!!credentialLock}
                         onPress={() => !disc.isPending && !credentialLock
-                          && Alert.alert(
+                          && (c.replaced ? disc.mutate(c.id) : Alert.alert(
                           `Disconnect ${name}?`,
                           "It stops syncing (history is kept).",
                           [{ text: "Cancel", style: "cancel" },
                            { text: "Disconnect", style: "destructive",
-                             onPress: () => disc.mutate(c.id) }])}>
-                    Disconnect</Text>
+                             onPress: () => disc.mutate(c.id) }]))}>
+                    {c.replaced ? "Forget" : "Disconnect"}</Text>
                 </View>
               );
             })}
@@ -451,7 +463,7 @@ function Field({ ph, v, set, secret }: {
   ph: string; v: string; set: (x: string) => void; secret?: boolean;
 }) {
   return (
-    <TextInput style={s.input} placeholder={ph}
+    <TextInput {...fieldA11y(ph.split(" — ")[0])} style={s.input} placeholder={ph}
                placeholderTextColor={C.mut} autoCapitalize="none"
                autoCorrect={false} secureTextEntry={secret}
                value={v} onChangeText={set} />
@@ -464,7 +476,7 @@ function EnvChips({ v, set, opts }: {
   return (
     <View style={{ flexDirection: "row", gap: 6, marginTop: 6 }}>
       {opts.map(([val, label]) => (
-        <Pressable key={val} style={[s.chip, v === val && s.chipOn]}
+        <Pressable accessibilityRole="button" key={val} style={[s.chip, v === val && s.chipOn]}
                    onPress={() => set(val)}>
           <Text style={{ color: v === val ? C.text : C.mut,
                          fontSize: 11 }}>{label}</Text>
@@ -513,7 +525,8 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
   const onLinked2 = (r: PlaidLinkOutcome) => {
     if (r.kind !== "cancelled") {
       setMsg(
-        r.kind === "add" ? linkedLine(r.institution, r.first_sync)
+        r.kind === "add" ? addedLine(r)
+        : r.kind === "add_failed" && r.summary ? r.summary
         : r.kind === "exited"
           ? "No change — the sign-in window was closed."
           : String(r.error ?? "link failed"));
@@ -561,9 +574,9 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
       <EnvChips v={env} set={(v) => { setEnv(v); setValidated(false); }}
                 opts={[["production", "production (real banks)"],
                        ["sandbox", "sandbox (test banks)"]]} />
-      {err && <Text style={{ color: C.bad, fontSize: 12 }}>{err}</Text>}
+      {err && <Note bad style={{ color: C.bad, fontSize: 12 }}>{err}</Note>}
       <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
-        <Pressable style={[s.btn, (validate.isPending || !clientId
+        <Pressable accessibilityRole="button" style={[s.btn, (validate.isPending || !clientId
                      || !secret) && { opacity: 0.5 }]}
                    disabled={validate.isPending || !clientId || !secret}
                    onPress={() => validate.mutate()}>
@@ -572,7 +585,7 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
                                 : "Validate keys"}
           </Text>
         </Pressable>
-        <Pressable style={[s.btn, (!validated || save.isPending)
+        <Pressable accessibilityRole="button" style={[s.btn, (!validated || save.isPending)
                      && { opacity: 0.5 }]}
                    disabled={!validated || save.isPending}
                    onPress={() => save.mutate()}>
@@ -588,7 +601,7 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
                                  marginTop: 8 }]}>
             Keys saved ✓ — now link your bank(s):
           </Text>
-          <Pressable style={[s.btn, (link.isPending || !!held)
+          <Pressable accessibilityRole="button" style={[s.btn, (link.isPending || !!held)
                        && { opacity: 0.5 }]}
                      disabled={link.isPending || !!held}
                      onPress={() => link.mutate()}>
@@ -597,9 +610,10 @@ function PlaidFlow({ d }: { d?: Record<string, unknown> }) {
                               : "+ Link a bank via Plaid ↗"}
             </Text>
           </Pressable>
+          <BankLinkLine />
           {held ? <Text style={{ color: C.warn, fontSize: 12 }}>{held}</Text>
                 : null}
-          {msg && <Text style={s.mut}>{msg}</Text>}
+          {msg && <Note style={s.mut}>{msg}</Note>}
           <Text style={{ color: C.bad, fontSize: 12, marginTop: 6 }}
                 onPress={() => !clear.isPending && clear.mutate()}>
             {clear.isPending ? "clearing…" : "Clear the stored keys"}
@@ -665,9 +679,10 @@ function MxFlow({ d }: { d?: Record<string, unknown> }) {
       <EnvChips v={env} set={setEnv}
                 opts={[["sandbox", "sandbox (free, test banks)"],
                        ["production", "production"]]} />
-      {err && <Text style={{ color: C.bad, fontSize: 12 }}>{err}</Text>}
+      {err && <Note bad style={{ color: C.bad, fontSize: 12 }}>{err}</Note>}
       <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
-        <Pressable style={[s.btn, (save.isPending || !clientId || !apiKey)
+        <Pressable accessibilityRole="button"
+                   style={[s.btn, (save.isPending || !clientId || !apiKey)
                      && { opacity: 0.5 }]}
                    disabled={save.isPending || !clientId || !apiKey}
                    onPress={() => save.mutate()}>
@@ -676,7 +691,7 @@ function MxFlow({ d }: { d?: Record<string, unknown> }) {
               : saved ? "Keys saved ✓" : "Validate & save keys"}
           </Text>
         </Pressable>
-        <Pressable style={[s.btn, (!saved || connect.isPending || !!held)
+        <Pressable accessibilityRole="button" style={[s.btn, (!saved || connect.isPending || !!held)
                      && { opacity: 0.5 }]}
                    disabled={!saved || connect.isPending || !!held}
                    onPress={() => connect.mutate()}>
@@ -684,7 +699,7 @@ function MxFlow({ d }: { d?: Record<string, unknown> }) {
             {connect.isPending ? "…" : "Open MX Connect (link a bank)"}
           </Text>
         </Pressable>
-        <Pressable style={[s.btn, (!saved || sync.isPending)
+        <Pressable accessibilityRole="button" style={[s.btn, (!saved || sync.isPending)
                      && { opacity: 0.5 }]}
                    disabled={!saved || sync.isPending}
                    onPress={() => sync.mutate()}>
@@ -695,7 +710,7 @@ function MxFlow({ d }: { d?: Record<string, unknown> }) {
       </View>
       {held ? <Text style={{ color: C.warn, fontSize: 12 }}>{held}</Text>
             : null}
-      {msg && <Text style={s.mut}>{msg}</Text>}
+      {msg && <Note style={s.mut}>{msg}</Note>}
       <Text style={s.mut}>
         Link banks in the MX window, then hit Sync now — accounts and
         transactions land on the Accounts page; the hourly worker keeps
@@ -740,15 +755,15 @@ function SimplefinFlow() {
         3. Paste it here — it&apos;s claimed and your first sync runs
         immediately:
       </Text>
-      <TextInput style={[s.input, { minHeight: 64,
+      <TextInput {...fieldA11y("SimpleFIN setup token", err)} style={[s.input, { minHeight: 64,
                                     textAlignVertical: "top" }]}
                  placeholder="paste the SimpleFIN setup token"
                  placeholderTextColor={C.mut} multiline
                  autoCapitalize="none" autoCorrect={false}
                  value={token} onChangeText={setToken} />
-      {err && <Text style={{ color: C.bad, fontSize: 12 }}>{err}</Text>}
-      {msg && <Text style={{ color: C.good, fontSize: 12 }}>{msg}</Text>}
-      <Pressable style={[s.btn, (connect.isPending || !token.trim())
+      {err && <Note bad style={{ color: C.bad, fontSize: 12 }}>{err}</Note>}
+      {msg && <Note style={{ color: C.good, fontSize: 12 }}>{msg}</Note>}
+      <Pressable accessibilityRole="button" style={[s.btn, (connect.isPending || !token.trim())
                    && { opacity: 0.5 }]}
                  disabled={connect.isPending || !token.trim()}
                  onPress={() => connect.mutate()}>
@@ -765,14 +780,14 @@ const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   center: { color: C.mut, textAlign: "center", padding: 20 },
   mut: { color: C.mut, fontSize: 12, lineHeight: 18, marginTop: 4 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8, marginTop: 6 },
   chip: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
           borderRadius: 14, paddingHorizontal: 10, paddingVertical: 4 },
   chipOn: { borderColor: C.accent, backgroundColor: C.hover },
   dot: { width: 8, height: 8, borderRadius: 4, backgroundColor: C.good },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 12, paddingVertical: 8, marginTop: 8,
          alignSelf: "flex-start" },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

@@ -19,6 +19,14 @@ from ..db import crypto, tenancy
 
 STRUCTURES = ("single_member_llc", "multi_member_llc", "sole_prop", "s_corp")
 
+# Whose business it is (specs/business-books.md, "Whose business it is"):
+# whose W-2 Social Security wages close its self-employment wage base. The
+# labels are the server's; both clients' pickers print them in this order.
+OWNERS = ("primary", "spouse", "unknown")
+OWNER_OPTIONS = ({"value": "primary", "label": "Primary earner"},
+                 {"value": "spouse", "label": "Spouse"},
+                 {"value": "unknown", "label": "Not set"})
+
 # columns safe to return to the client (no ein ciphertext). The table's
 # filing_status column is left out here and below: no estimate reads it, so
 # offering it would be a setting that changes nothing. The column stays for
@@ -26,7 +34,7 @@ STRUCTURES = ("single_member_llc", "multi_member_llc", "sole_prop", "s_corp")
 _PUBLIC = ("id", "name", "structure", "state", "formation_date",
            "business_start_date", "ein_last4", "registered_agent",
            "fiscal_year_end", "status", "home_office_sqft", "income_tax_rate",
-           "tax_reserve_account_id", "archived_at",
+           "tax_reserve_account_id", "archived_at", "owner",
            "created_at", "updated_at")
 
 
@@ -56,6 +64,8 @@ def _row(r: dict) -> dict:
     if out.get("income_tax_rate") is not None:
         out["income_tax_rate"] = float(out["income_tax_rate"])
     out["id"] = str(out["id"])
+    out["owner"] = out.get("owner") or "unknown"
+    out["owner_options"] = [dict(o) for o in OWNER_OPTIONS]
     return out
 
 
@@ -107,8 +117,10 @@ def _fiscal_year_end(v) -> str | None:
 def create_entity(conn, *, name: str, structure: str, state: str | None = None,
                   formation_date=None, business_start_date=None,
                   ein: str | None = None, registered_agent: str | None = None,
-                  fiscal_year_end: str | None = None) -> dict:
+                  fiscal_year_end: str | None = None,
+                  owner: str | None = None) -> dict:
     name = _name(name)
+    owner = check_field("owner", owner or "unknown")
     state = _text("state", state)
     registered_agent = _text("registered_agent", registered_agent)
     fiscal_year_end = _fiscal_year_end(fiscal_year_end)
@@ -123,11 +135,12 @@ def create_entity(conn, *, name: str, structure: str, state: str | None = None,
     row = conn.execute(
         """INSERT INTO business_entity
              (name, structure, state, formation_date, business_start_date,
-              ein_enc, ein_last4, registered_agent, fiscal_year_end)
-           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+              ein_enc, ein_last4, registered_agent, fiscal_year_end, owner)
+           VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
            RETURNING *""",
         (name, structure, state, formation_date, business_start_date,
-         ein_enc, ein_last4, registered_agent, fiscal_year_end)).fetchone()
+         ein_enc, ein_last4, registered_agent, fiscal_year_end,
+         owner)).fetchone()
     return _row(row)
 
 
@@ -206,7 +219,53 @@ def reveal_ein(conn, entity_id: str) -> str | None:
 _EDITABLE = {"name", "state", "formation_date", "business_start_date",
              "registered_agent", "fiscal_year_end", "structure",
              "home_office_sqft", "income_tax_rate",
-             "tax_reserve_account_id"}
+             "tax_reserve_account_id", "owner"}
+
+
+def check_field(k: str, v):
+    """One business field as it is stored, or ValueError: the page's own
+    judgement of it, which both doors that write a business apply (an
+    edit here, a restore's archived row). The tax reserve is judged
+    against the accounts, by the door that has them."""
+    from .compat import as_date
+    if k == "structure":
+        if not isinstance(v, str) or v not in STRUCTURES:
+            raise ValueError(f"structure must be one of {STRUCTURES}")
+        return v
+    if k == "owner":
+        if not isinstance(v, str) or v not in OWNERS:
+            raise ValueError(f"owner must be one of {OWNERS}")
+        return v
+    if k == "name":
+        return _name(v)
+    if k == "fiscal_year_end":
+        return _fiscal_year_end(v)
+    if k in _TEXT:
+        return _text(k, v)
+    if k in ("formation_date", "business_start_date"):
+        return as_date(v)                        # parse/validate → 400 not 500
+    if k == "income_tax_rate" and v is not None and v != "":
+        try:
+            v = float(v)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("income_tax_rate must be a number")
+        if not 0 <= v <= 100:
+            raise ValueError("income_tax_rate must be 0–100")
+        return v
+    if k == "home_office_sqft" and v is not None and v != "":
+        try:
+            v = int(v)
+        # OverflowError: JSON 1e999 / Infinity parse to float inf
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("home_office_sqft must be a whole number")
+        # upper bound too: the column is fixed-precision, and an
+        # out-of-range value becomes a psycopg NumericValueOutOfRange
+        # 500 rather than the 400 the lower bound produces.
+        # 4.3 billion sq ft is ~154 sq miles of home office.
+        if not 0 <= v <= 1_000_000_000:
+            raise ValueError("home_office_sqft must be between 0 and 1e9")
+        return v
+    return v
 
 
 def update_entity(conn, entity_id: str, **fields) -> dict | None:
@@ -218,31 +277,16 @@ def update_entity(conn, entity_id: str, **fields) -> dict | None:
         return None
     if cur["status"] != "active":
         raise ValueError("entity is archived (read-only)")
-    from .compat import as_date
-    if "structure" in fields and (not isinstance(fields["structure"], str)
-                                  or fields["structure"] not in STRUCTURES):
-        raise ValueError(f"structure must be one of {STRUCTURES}")
+    if "structure" in fields:
+        check_field("structure", fields["structure"])
     sets, params = [], []
     for k in _EDITABLE:
         if k not in fields:
             continue
         v = fields[k]
-        if k == "name":
-            v = _name(v)
-        elif k == "fiscal_year_end":
-            v = _fiscal_year_end(v)
-        elif k in _TEXT:
-            v = _text(k, v)
-        elif k in ("formation_date", "business_start_date"):
-            v = as_date(v)                        # parse/validate → 400 not 500
-        elif k == "income_tax_rate" and v is not None and v != "":
-            try:
-                v = float(v)
-            except (TypeError, ValueError, OverflowError):
-                raise ValueError("income_tax_rate must be a number")
-            if not 0 <= v <= 100:
-                raise ValueError("income_tax_rate must be 0–100")
-        elif k == "tax_reserve_account_id":
+        if k != "tax_reserve_account_id":
+            v = check_field(k, v)
+        else:
             # "" clears the nomination — the picker's own empty option, and
             # the difference between "no reserve account" and "the account
             # whose id is the empty string" is not one the DB should have to
@@ -259,18 +303,6 @@ def update_entity(conn, entity_id: str, **fields) -> dict | None:
                 raise ValueError(
                     "the tax reserve must be an account assigned to this "
                     "business")
-        elif k == "home_office_sqft" and v is not None and v != "":
-            try:
-                v = int(v)
-            # OverflowError: JSON 1e999 / Infinity parse to float inf
-            except (TypeError, ValueError, OverflowError):
-                raise ValueError("home_office_sqft must be a whole number")
-            # upper bound too: the column is fixed-precision, and an
-            # out-of-range value becomes a psycopg NumericValueOutOfRange
-            # 500 rather than the 400 the lower bound produces.
-            # 4.3 billion sq ft is ~154 sq miles of home office.
-            if not 0 <= v <= 1_000_000_000:
-                raise ValueError("home_office_sqft must be between 0 and 1e9")
         sets.append(f"{k} = %s")
         params.append(v)
     if "ein" in fields:

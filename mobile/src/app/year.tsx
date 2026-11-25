@@ -3,22 +3,22 @@
 import { useQuery } from "@tanstack/react-query";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Modal, Pressable, ScrollView, StyleSheet, Text, View }
+  from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import MoneyMap, { planRows } from "../components/money-map";
+import MoneyMap, { sentPlanRows, sentPlanTotal } from "../components/money-map";
 import LensSwitch from "../components/lens-switch";
-import StaleBanner from "../components/stale-banner";
-import { Card, H, KV } from "../components/ui";
-import { useRefetchWhenShown } from "../lib/focus";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, H, KV, Skeleton } from "../components/ui";
 import { useSession } from "../lib/session";
 import { VERDICT } from "../lib/verdict";
-import type { YearLensData } from "../lib/api";
+import type { Change, YearLensData } from "../lib/api";
 import { C, money } from "../lib/theme";
-import { catLabel, householdDay, isPlanSavingsGoal, routeInt } from "../lib/pure";
+import { catLabel, changeLook, householdDay, netSign, routeInt,
+  signedMoney, signedPct } from "../lib/pure";
 import { useMe } from "../lib/viewer";
-import { ESTIMATED_SAVINGS_CAPTION, labelSavingsRow, yearSavings }
-  from "../lib/planner";
+import { useSheetAnimation } from "../lib/a11y";
 
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
                 "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
@@ -31,9 +31,6 @@ function priorYearLabel(d: YearLensData): string {
   return m ? `${d.y - 1} (to ${MONTHS[m - 1]} ${day})` : `${d.y - 1}`;
 }
 
-/** The plan savings goal as the lens payload carries it. */
-type LensGoal = { monthly_plan: number; rate_90d: number | null } | null;
-const TODAY_KEY = ["today"];
 
 export default function YearLens() {
   const { client } = useSession();
@@ -53,29 +50,15 @@ export default function YearLens() {
     // ‹ › keeps the last year on screen (dimmed) while the next loads
     placeholderData: (prev) => prev,
   });
-  // the savings goal for the money map's row: the lens payload names it
-  // (savings_goal; null = none). Only an older server's payload, which
-  // lacks the key, sends the screen to the whole Today payload for it.
-  const lensGoal = (query.data as { savings_goal?: LensGoal } | undefined)
-    ?.savings_goal;
-  const needToday = query.isSuccess && lensGoal === undefined;
-  const today = useQuery({ queryKey: ["today"],
-    queryFn: () => client!.todayFull(), enabled: !!client && needToday });
-  // a write on a screen pushed over this one defers its ["today"]
-  // refetch to whoever shows it — this screen does, on the way back, but
-  // only while it reads the goal from Today at all
-  useRefetchWhenShown({ isStale: today.isStale, isFetching: today.isFetching,
-    refetch: () => (needToday ? today.refetch() : undefined) }, TODAY_KEY);
-  const goal = lensGoal !== undefined ? lensGoal
-    : (today.data?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
   const d = query.data;
-  const atNow = y === now.getFullYear();
+  const atNow = y >= now.getFullYear();
   const floor = d?.first_year ?? 1990;
-  // the year money map covers elapsed BUDGETED months on one dollar
-  // scale — "net" months had no plan, so they don't scale the map
-  const elapsed = (d?.cells ?? [])
-    .filter((c) => c.status === "final" || c.status === "projected").length;
-  const ySav = yearSavings(goal, d?.saved_ytd, elapsed);
+  // the web's year dropdown: any year of the ledger, one tap away
+  const sheetAnim = useSheetAnimation();
+  const [picking, setPicking] = useState(false);
+  const years: number[] = [];
+  for (let yy = now.getFullYear(); yy >= Math.min(floor, now.getFullYear());
+       yy--) years.push(yy);
 
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}
@@ -84,22 +67,47 @@ export default function YearLens() {
                                       onRefresh={() => query.refetch()} />}>
       <View style={s.nav}>
         <Pressable style={[s.navBtn, y <= floor && { opacity: 0.3 }]}
-                   disabled={y <= floor} onPress={() => setY(y - 1)}>
+                   disabled={y <= floor}
+                   accessibilityRole="button" accessibilityLabel="Previous year"
+                   onPress={() => setY(y - 1)}>
           <Text style={s.navText}>‹</Text>
         </Pressable>
-        <Text style={s.navLabel}>{y}</Text>
+        <Pressable onPress={() => setPicking(true)}
+                   accessibilityRole="button"
+                   accessibilityLabel={`${y}, choose a year`}>
+          <Text style={s.navLabel}>{y} ▾</Text>
+        </Pressable>
         <Pressable style={[s.navBtn, atNow && { opacity: 0.3 }]}
-                   disabled={atNow} onPress={() => setY(y + 1)}>
+                   disabled={atNow}
+                   accessibilityRole="button" accessibilityLabel="Next year"
+                   onPress={() => setY(y + 1)}>
           <Text style={s.navText}>›</Text>
         </Pressable>
       </View>
+      <Modal visible={picking} animationType={sheetAnim} transparent
+             onRequestClose={() => setPicking(false)}>
+        <View style={s.sheetWrap}>
+          <View style={s.sheet}>
+            <Text style={{ color: C.text, fontSize: 16,
+                           fontWeight: "700" }}>Jump to</Text>
+            <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+              {years.map((yy) => (
+                <Pressable accessibilityRole="button" key={yy}
+                           style={[s.chip, yy === y && s.chipOn]}
+                           onPress={() => { setY(yy); setPicking(false); }}>
+                  <Text style={{ color: yy === y ? C.text : C.mut,
+                                 fontSize: 13 }}>{yy}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </View>
+        </View>
+      </Modal>
       <LensSwitch active="year" />
-      <StaleBanner query={query} />
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      <StaleLine query={query} />
+      {query.isPending && <Skeleton />}
       {query.isError && !d && (
-        <Text style={[s.center, { color: C.bad }]}>
-          Couldn't reach the server — pull down to retry.
-        </Text>
+        <FailedLine q={query} what="the year" />
       )}
       {/* last year's cells stand in dimmed while this one loads — and
           not tappable, or a tap would open the wrong year's month */}
@@ -108,18 +116,27 @@ export default function YearLens() {
               pointerEvents={query.isPlaceholderData ? "none" : "auto"}>
           <Card>
             <View style={s.grid}>
-              {/* each cell is the month's verdict + variance, and a door
+              {/* each cell is the month's verdict + margin, and a door
                   into that month's lens — the web's year→month path */}
               {d.cells.map((c) => {
                 // "net" = no budget snapshot for the month — show its
                 // cash flow, muted, never a verdict (matches the web)
                 const isNet = c.status === "net";
-                const v = c.verdict ? VERDICT[c.verdict] : undefined;
-                const color = v?.color ?? (c.verdict ? C.good : C.hover);
+                // a verdict this build does not know reads as on plan
+                // (the web's fallback to ON BUDGET)
+                const v = c.verdict
+                  ? VERDICT[c.verdict] ?? VERDICT["ON BUDGET"] : undefined;
+                const color = v?.color ?? C.hover;
                 const proj = c.status === "projected";
+                // the server's words for the cell (lenses.cell_words; web:
+                // YearLens): pill, figure, and the note that greys a month
+                // whose income the bank feed does not measure
+                const tone = c.tone === "pos" ? C.good
+                  : c.tone === "neg" ? C.bad : C.mut;
                 return (
-                  <Pressable key={c.m}
+                  <Pressable accessibilityRole="button" key={c.m}
                     style={({ pressed }) => [s.cell, { borderColor: color },
+                      c.note ? { opacity: 0.6 } : null,
                       pressed && { backgroundColor: C.hover }]}
                     disabled={c.status === "future"}
                     onPress={() => router.push({ pathname: "/month",
@@ -132,28 +149,31 @@ export default function YearLens() {
                         value */}
                     <Text style={{ color: isNet ? C.mut : color,
                                    fontSize: 10, fontWeight: "700" }}>
-                      {c.status === "future" ? "—"
-                        : isNet ? "NET"
-                        : v?.label ?? (c.verdict ? "On plan" : "—")}
+                      {/* the server's label as sent (the web's pill) */}
+                      {isNet ? (c.label ?? "net") : v?.label ?? "—"}
                     </Text>
                     {isNet ? (
-                      <Text style={{ color: c.net != null
-                                       ? (c.net >= 0 ? C.good : C.bad)
-                                       : C.mut,
+                      // older-server path: stands in for `label`/`figure`
+                      // (the cell's net, signed, as before)
+                      <Text style={{ color: c.label ? tone
+                                       : c.net != null
+                                         ? (c.net >= 0 ? C.good : C.bad)
+                                         : C.mut,
                                      fontSize: 10,
                                      fontVariant: ["tabular-nums"] }}>
-                        {c.net != null
-                          ? `${c.net >= 0 ? "+" : "−"}${
-                              money(Math.abs(c.net), false)}`
-                          : money(c.spend ?? 0, false)}
+                        {/* the server's figure and tone when it sends them */}
+                        {c.label ? (c.figure ?? "—")
+                          : c.net != null
+                            ? `${c.net >= 0 ? "+" : "−"}${
+                                money(Math.abs(c.net), false)}`
+                            : "—"}
                       </Text>
-                    ) : c.variance !== null && c.status !== "future" && (
-                      <Text style={{ color: c.variance > 0
-                                       ? C.bad : C.good,
-                                     fontSize: 10,
+                    ) : v && c.figure != null && (
+                      // the margin in the server's words ("over by $300"):
+                      // on this page only a net carries a sign
+                      <Text style={{ color: tone, fontSize: 10,
                                      fontVariant: ["tabular-nums"] }}>
-                        {c.variance > 0 ? "+" : "−"}
-                        {money(Math.abs(c.variance), false)}
+                        {c.figure}
                       </Text>
                     )}
                   </Pressable>
@@ -170,53 +190,87 @@ export default function YearLens() {
               </Text>
             )}
           </Card>
-          {d.buckets_annual && elapsed > 0 && (
+          {/* the server's rows over the elapsed budgeted months
+              (lenses.year_summary → plan_rows): null when nothing was
+              budgeted, absent from an older server — no card either way */}
+          {d.plan_rows && (
             <Card>
               <H>Yearly budget</H>
-              <MoneyMap rows={labelSavingsRow(planRows(
-                { food: d.buckets_annual.food,
-                  other: d.buckets_annual.other },
-                { // a label opens the year's bucket: the same months
-                  // this map summed, as one listing
-                  period: { y },
-                  fixedActual: d.buckets_annual.fixed.actual,
-                  fixedBudget: d.buckets_annual.fixed.month_budget,
-                  savings: ySav,
-                  excess: d.plan_surplus != null && elapsed > 0
-                    ? d.plan_surplus * elapsed : null }),
-                // the 90-day projection is not what was transferred
-                !!ySav?.estimated, ESTIMATED_SAVINGS_CAPTION)} />
+              {/* the server's words for which months the card covers */}
+              {d.plan_caption ? (
+                <Text style={{ color: C.mut, fontSize: 12, marginBottom: 6 }}>
+                  {d.plan_caption}</Text>) : null}
+              <MoneyMap rows={sentPlanRows(d.plan_rows)}
+                        total={sentPlanTotal(d.plan_total)}
+                        footnote={d.excess_text ? (
+                          // the server's sentence: what an ordinary month
+                          // leaves, absent under a year over budget
+                          <Text style={{ color: C.mut, fontSize: 12,
+                                         marginTop: 8 }}>
+                            {d.excess_text}</Text>) : null} />
             </Card>
           )}
           <Card>
             <H>{y} totals</H>
             {/* the web's four KPIs: income and savings rate render "·"
                 when unknown rather than vanishing */}
-            <KV k="Income" v={d.totals.income !== null
-                  ? money(d.totals.income, false) : "·"}
-                tone={d.totals.income !== null ? "good" : "mut"} />
-            <KV k="Spend" v={money(d.totals.spend, false)} />
-            <KV k="Saved"
-                v={d.totals.saved !== null
-                  ? `${d.totals.saved >= 0 ? "+" : ""}${
-                      money(d.totals.saved, false)}` : "·"}
-                tone={d.totals.saved === null ? "mut"
-                  : d.totals.saved >= 0 ? "good" : "bad"} />
+            {/* neutral, as the web's income figure */}
+            {/* the server's whole dollars (lenses.totals_dollars): left
+                over is the printed income less the printed spend */}
+            {/* the left over's sign as printed: $0 is even, untoned,
+                with no rate (the web's rule, netSign) */}
+            {(() => { const shown = totalsShown(d.totals);
+              const sign = shown.saved !== null ? netSign(shown.saved) : null;
+              return (<>
+            <KV k="Income" v={shown.income !== null
+                  ? money(shown.income, false) : "·"}
+                tone={d.totals.income !== null ? undefined : "mut"} />
+            <KV k="Spend" v={money(shown.spend, false)} />
+            <KV k="Left over"
+                v={shown.saved !== null
+                  ? signedMoney(shown.saved, (n) => money(n, false), true)
+                  : "·"}
+                tone={sign === null ? "mut"
+                  : sign === 1 ? "good" : sign === -1 ? "bad" : undefined} />
             <KV k="Savings rate"
-                v={d.totals.rate !== null ? `${d.totals.rate}%` : "·"}
+                v={d.totals.rate !== null && sign !== 0
+                  ? signedPct(d.totals.rate) : "·"}
                 tone="mut" />
-            {d.totals.income === null && (
+            </>); })()}
+            {/* the server's words when a month's income is incomplete:
+                income, left over and the rate then count the other months
+                (the web's Year lens) */}
+            {!!d.totals.incomplete_text && (
+              <Text style={{ color: C.mut, fontSize: 11 }}>
+                {d.totals.incomplete_text}
+              </Text>
+            )}
+            {d.dating === "bill_month" && (
+              <Text style={{ color: C.mut, fontSize: 11 }}>
+                the sum of the months above; a bill counts in the month it
+                belongs to — Cash Flow dates spending by the day it was paid
+              </Text>
+            )}
+            {/* the server's words when no month of the year has bank
+                data; nothing of the client's own */}
+            {!!d.totals.unknown_text && (
               <Text style={{ color: C.mut, fontSize: 12 }}>
-                Income isn't known for every month of {y} (no bank
-                account feeds part of it) — income and savings are
-                unknown, not $0.
+                {d.totals.unknown_text}
+              </Text>
+            )}
+            {/* older-server path: stands in for `unknown_text` (its null
+                income meant no month had bank data) */}
+            {d.totals.unknown_text === undefined && d.totals.income === null && (
+              <Text style={{ color: C.mut, fontSize: 12 }}>
+                No month of {y} so far has bank data — income and savings
+                are unknown, not $0.
               </Text>
             )}
           </Card>
           {d.categories.length > 0 ? (
             <Card>
               <H>Spending by category — {y} vs {priorYearLabel(d)}</H>
-              {d.categories.map(([name, cur, prev, key]) => (
+              {d.categories.map(([name, cur, prev, key], i) => (
                 <KV key={name} k={catLabel(name)}
                     // the stored key, not the display name the row
                     // prints — the endpoint matches the key exactly
@@ -226,21 +280,17 @@ export default function YearLens() {
                                 date_to: `${y}-12-31`, counted: "1" } } as never)
                       : undefined}
                     v={`${money(cur, false)}  ·  ${priorYearLabel(d)} ${
-                        money(prev, false)}  ·  ${
-                        cur - prev >= 0 ? "+" : "−"}${
-                        money(Math.abs(cur - prev), false)}`}
-                    tone="mut" />
+                        money(prev, false)}${
+                        yearChangeText(d.changes?.categories[i])}`}
+                    // the change's colour, as the web's Δ column
+                    tone={yearChangeTone(d.changes?.categories[i])} />
               ))}
               {d.prev_totals.spend > 0 && (
                 <KV k="Total spend"
                     v={`${money(d.totals.spend, false)}  ·  ${priorYearLabel(d)} ${
-                        money(d.prev_totals.spend, false)}  ·  ${
-                        d.totals.spend - d.prev_totals.spend >= 0
-                          ? "+" : "−"}${money(Math.abs(
-                            d.totals.spend - d.prev_totals.spend),
-                            false)}`}
-                    tone={d.totals.spend - d.prev_totals.spend > 0
-                      ? "bad" : "good"} />)}
+                        money(d.prev_totals.spend, false)}${
+                        yearChangeText(d.changes?.spend)}`}
+                    tone={yearChangeTone(d.changes?.spend)} />)}
             </Card>
           ) : (
             <Text style={{ color: C.mut, fontSize: 12,
@@ -260,10 +310,46 @@ const s = StyleSheet.create({
   nav: { alignItems: "center", flexDirection: "row",
          justifyContent: "space-between", paddingHorizontal: 12,
          paddingTop: 8 },
-  navBtn: { paddingHorizontal: 18, paddingVertical: 4 },
+  // a fingertip in each direction: the arrows are the screen's main control
+  navBtn: { paddingHorizontal: 18, paddingVertical: 4, minHeight: 44,
+            minWidth: 44, alignItems: "center", justifyContent: "center" },
   navText: { color: C.accent, fontSize: 24 },
   navLabel: { color: C.text, fontSize: 16, fontWeight: "600" },
   grid: { flexDirection: "row", flexWrap: "wrap", gap: 8 },
+  sheetWrap: { flex: 1, justifyContent: "flex-end",
+               backgroundColor: "rgba(0,0,0,0.55)" },
+  sheet: { backgroundColor: C.card, borderTopLeftRadius: 16,
+           borderTopRightRadius: 16, padding: 16, gap: 12 },
+  chip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+          borderRadius: 999, paddingHorizontal: 12, paddingVertical: 7 },
+  chipOn: { borderColor: C.accent, backgroundColor: C.hover },
   cell: { flexBasis: "22%", flexGrow: 1, borderWidth: 1, borderRadius: 8,
           padding: 8, alignItems: "center", gap: 2 },
 });
+
+/** The year's totals in the whole dollars the server prints them in. */
+function totalsShown(t: { income: number | null; spend: number;
+                          saved: number | null;
+                          dollars?: { income: number | null; spend: number;
+                                      saved: number | null } }) {
+  return t.dollars !== undefined
+    ? t.dollars
+    // older-server path: stands in for `dollars`
+    : { income: t.income, spend: t.spend, saved: t.saved };
+}
+
+/** "  ·  +$120" — the server's change from last year (reporting.change,
+ *  the printed figure minus the printed figure), "unchanged" at $0 as on
+ *  the web; nothing from an older server, which sends none. */
+function yearChangeText(ch: Change | null | undefined): string {
+  const c = changeLook(ch, true);
+  if (!c) return "";
+  return c.unchanged ? "  ·  unchanged"
+    : `  ·  ${c.sign}${money(c.dollars, false)}`;
+}
+
+function yearChangeTone(ch: Change | null | undefined)
+  : "good" | "bad" | "mut" {
+  const c = changeLook(ch, true);
+  return !c || c.unchanged ? "mut" : c.good ? "good" : "bad";
+}

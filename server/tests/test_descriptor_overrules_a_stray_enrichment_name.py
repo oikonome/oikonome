@@ -262,8 +262,8 @@ class StrayEnrichmentNameTests(unittest.TestCase):
         self.conn.execute(
             "UPDATE merchant_canonical SET canonical='12 Harbor Kite Works', "
             "method='llm' WHERE merchant_id=%s", (mid,))
-        self.assertEqual(merchant_dedup.canonical_merchant("10 Harbor"), "Harbor")
-        add_txn(self.conn, "2025-06-07", 6.45, line, merchant="10 Harbor",
+        self.assertEqual(merchant_dedup.canonical_merchant("310 Harbor"), "Harbor")
+        add_txn(self.conn, "2025-06-07", 6.45, line, merchant="310 Harbor",
                 txn_id="ten1")
         merchant_identity.resolve(self.conn)
         self.assertEqual(self._merchant_of("ten1")["id"], mid)

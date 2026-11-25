@@ -67,8 +67,10 @@ class RowActionsTests(unittest.TestCase):
 
     def test_the_phone_grid_gives_the_menu_its_own_column(self):
         css = _src("index.css")
-        self.assertIn('"date merch amt  clip"', css)
-        self.assertIn('"cat  cat   cat  clip"', css)
+        # the row menu keeps a column of its own on both lines of the
+        # stacked phone row, so it never sits on top of the amount
+        self.assertIn('"pick merch merch amt clip"', css)
+        self.assertIn('"pick date  cat   cat clip"', css)
         m = re.search(r"\.txn-table \.row-menu\{([^}]*)\}", css)
         self.assertIsNotNone(m, "no phone touch target for the row menu")
         self.assertIn("2.75rem", m.group(1), "touch target under 44px")

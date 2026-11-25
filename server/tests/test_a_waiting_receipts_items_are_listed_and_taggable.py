@@ -5,7 +5,8 @@ so its lines are real purchases — but the Items page joined every line to
 its transaction, so those lines were invisible (and could not be tagged
 from there) until a charge arrived, which for a cash purchase is never.
 They are listed with the store and date the receipt itself printed; a
-line whose charge was removed from the ledger stays hidden. A receipt that
+line whose charge was removed from the ledger is still listed (and stays
+off the expense report, which counts charges on the ledger). A receipt that
 printed no store totals under the name the clients show for one, and a
 tagged waiting line reaches the tag's expense report."""
 
@@ -81,7 +82,10 @@ class WaitingItems(unittest.TestCase):
         self.assertEqual(
             len(receipts.search_items(self.conn, q="glue")["rows"]), 1)
 
-    def test_lines_of_a_removed_charge_stay_hidden(self):
+    def test_lines_of_a_removed_charge_are_still_listed(self):
+        """The slip is the person's record of the purchase whatever the
+        feed did with the charge: hidden, its lines could be found on no
+        screen until a later pass moved the receipt."""
         txn = add_txn(self.conn, TODAY, 63.00, "BIGBOX WHOLESALE")
         rid = receipts.add(self.conn, txn, b"\x89PNG...", "image/png")
         receipts.parse_one(self.conn, rid, transport=_reply(LLM_JSON))
@@ -90,7 +94,7 @@ class WaitingItems(unittest.TestCase):
         self.conn.execute("UPDATE transactions SET removed=1 WHERE id=%s",
                           (txn,))
         self.assertEqual(
-            receipts.search_items(self.conn, q="paper")["rows"], [])
+            len(receipts.search_items(self.conn, q="paper")["rows"]), 1)
         # the waiting receipt is unaffected
         self.assertEqual(
             len(receipts.search_items(self.conn, q="glue")["rows"]), 1)

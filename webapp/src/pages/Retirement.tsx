@@ -6,20 +6,25 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { useSearchParams } from "react-router";
 import { isViewer } from "../role";
-import { api, errText, money, pyround, type RetirementData } from "../api/client";
+import { api, errText, money, pyround, type RetirementData,
+         type RetirementInputs, type RetSpendSource } from "../api/client";
 import { saveSettings } from "../api/cache";
 import AreaChart from "../components/AreaChart";
-import RetireWizard from "../components/RetireWizard";
+import RetireWizard, { retWizardMidway } from "../components/RetireWizard";
 import { parseMoneyDraft } from "../moneymath";
 import { rebaseSsDraft, ssDraftOf } from "../ssDraft";
 import { SS_CLAIM_AGES, ssEstimatesBody } from "../ssEstimates";
+import PageSkeleton from "../components/PageSkeleton";
+import { FailedLine } from "../components/Loaded";
+import { keyRetireAges } from "../keyages";
+import Note from "../components/Note";
 
 // /api/retirement takes the dollar boxes as whole numbers and refuses
 // "250.50" or "60,000" outright, so they are parsed and rounded before
 // they ride the query — the form, the wizard and a /retirement/setup URL
 // all pass through here. Text that is not an amount rides as typed and
 // the refusal shows beside the form.
-const MONEY_KEYS = ["spend", "employer_mo", "taxable_mo"];
+const MONEY_KEYS = ["spend", "employer_mo", "roth_mo", "taxable_mo"];
 const whatIfParams = (p: Record<string, string>) =>
   Object.fromEntries(Object.entries(p).map(([k, v]) => {
     if (!MONEY_KEYS.includes(k)) return [k, v];
@@ -101,7 +106,109 @@ function SsEstimates({ saved }: { saved: Record<string, number> | null }) {
           {busy ? "Saving…" : "Save"}</button>
         {done && <span className="pos">Saved</span>}
       </div>
-      {err && <div className="note bad" style={{ marginTop: ".5rem" }}>{err}</div>}
+      {err && <Note tone="bad" style={{ marginTop: ".5rem" }}>{err}</Note>}
+    </form>
+  );
+}
+
+// where the projection's spend and saving came from, as the assumptions
+// line words it (the server names the source; the page only says it)
+const SPEND_FROM: Record<RetSpendSource, string> = {
+  what_if: "what-if", saved: "your answer", ledger: "your last 12 months",
+  needed: "not set",
+};
+const SAVING_FROM: Record<RetirementInputs["saving_basis"], string> = {
+  what_if: "what-if", saved: "your answer", ledger: "from your last 12 months",
+  none: "none entered",
+};
+
+// the catch-up's closing words: what the extra adds to, as the
+// assumptions line counts it (specs/retirement-figures.md)
+const onTopOf = (inp: RetirementInputs) => inp.saving_mo > 0
+  ? ` — starting now, on top of the ${money(inp.saving_mo)}/mo already counted (${SAVING_FROM[inp.saving_basis]}).`
+  : " — starting now.";
+
+// No saved spend and too little history to read one from: the plan needs
+// one before it can project anything. Saved with the walkthrough's
+// answers, so every device opens on it.
+function SpendAsk({ onWizard }: { onWizard: () => void }) {
+  const qc = useQueryClient();
+  const [v, setV] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const save = (e: React.FormEvent) => {
+    e.preventDefault();
+    const n = parseMoneyDraft(v);
+    if (n === null) { setErr("Enter an amount, like 60,000."); return; }
+    setErr(null);
+    setBusy(true);
+    saveSettings(qc, { ret_wizard_answers: { spend: n }, ret_answers_v: 2 })
+      .then(() => qc.invalidateQueries({ queryKey: ["retirement"] }))
+      .catch((x) => setErr(errText(x)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <form onSubmit={save} noValidate
+          style={{ display: "flex", gap: ".6rem", flexWrap: "wrap",
+                   alignItems: "flex-end", marginTop: ".6rem" }}>
+      <Fld name="spend" label="spend $/yr in retirement" value={v} text
+           w="9rem" onChange={(_, x) => setV(x)} />
+      <button className="pri" disabled={busy}>
+        {busy ? "Saving…" : "Plan with this"}</button>
+      <button type="button" className="linklike"
+              style={{ background: "none", border: "none", cursor: "pointer",
+                       color: "var(--blue)", fontSize: 13 }}
+              onClick={onWizard}>or answer the walkthrough</button>
+      {err && <Note tone="bad" style={{ flex: "1 1 100%" }}>{err}</Note>}
+    </form>
+  );
+}
+
+// No saved saving answer: the projection counts no new saving (the
+// server's "none") and the page asks for one, the spend ask's pattern.
+// Blank box = $0 there; at least one amount is needed to save.
+function SavingAsk() {
+  const qc = useQueryClient();
+  const [emp, setEmp] = useState("");
+  const [roth, setRoth] = useState("");
+  const [tax, setTax] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const save = (e: React.FormEvent) => {
+    e.preventDefault();
+    const blank = (v: string) => v.replace(/[$\s]/g, "") === "";
+    if (blank(emp) && blank(roth) && blank(tax)) {
+      setErr("Enter an amount, like 500."); return;
+    }
+    const e1 = blank(emp) ? 0 : parseMoneyDraft(emp);
+    const r1 = blank(roth) ? 0 : parseMoneyDraft(roth);
+    const t1 = blank(tax) ? 0 : parseMoneyDraft(tax);
+    if (e1 === null || r1 === null || t1 === null) {
+      setErr("Enter an amount, like 500."); return;
+    }
+    setErr(null);
+    setBusy(true);
+    // the Roth figure rides beside the answers: an older server refuses a
+    // whole save over an answer key it does not know
+    saveSettings(qc, { ret_wizard_answers: { employer_mo: e1, taxable_mo: t1 },
+                    ret_wizard_roth_mo: r1, ret_answers_v: 2 })
+      .then(() => qc.invalidateQueries({ queryKey: ["retirement"] }))
+      .catch((x) => setErr(errText(x)))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <form onSubmit={save} noValidate
+          style={{ display: "flex", gap: ".6rem", flexWrap: "wrap",
+                   alignItems: "flex-end", marginTop: ".5rem" }}>
+      <Fld name="employer_mo" label="employer retirement $/mo" value={emp} text
+           w="8rem" onChange={(_, x) => setEmp(x)} />
+      <Fld name="roth_mo" label="Roth retirement $/mo" value={roth} text
+           w="8rem" onChange={(_, x) => setRoth(x)} />
+      <Fld name="taxable_mo" label="taxable saving $/mo" value={tax} text
+           w="8rem" onChange={(_, x) => setTax(x)} />
+      <button className="pri" disabled={busy}>
+        {busy ? "Saving…" : "Save"}</button>
+      {err && <Note tone="bad" style={{ flex: "1 1 100%" }}>{err}</Note>}
     </form>
   );
 }
@@ -125,6 +232,8 @@ export default function Retirement() {
   const [wizard, setWizard] = useState<boolean | null>(forced ? true : null);
   // the ten assumption fields open from the hero's summary line
   const [adjust, setAdjust] = useState(false);
+  // "Retire at each age" opens on the ages that decide it
+  const [everyAge, setEveryAge] = useState(false);
   const q = useQuery({
     queryKey: ["retirement", whatIfParams(params)],
     queryFn: () => api.retirement(whatIfParams(params)),
@@ -152,19 +261,29 @@ export default function Retirement() {
   // a whole body over one bad field, so riding with the mark would let a
   // refused birthdate drop the mark and reopen the walkthrough every visit.
   const [birthErr, setBirthErr] = useState<string | null>(null);
+  // the "saving not set — add it" box under the assumptions line
+  const [askSaving, setAskSaving] = useState(false);
+  // The wizard's step saves and these exits share one chain: a mark sent
+  // beside a step still in flight can be answered first, and the step's
+  // reply (a whole document without the mark) would then seed the cache
+  // last and reopen the walkthrough.
+  const wizSaves = useRef<Promise<unknown>>(Promise.resolve());
   const markWizard = (v: "done" | "skipped", birthdate = "") => {
-    saveSettings(qc, { ret_wizard_steps: { done: v } }).catch(() => {});
+    wizSaves.current = wizSaves.current
+      .then(() => saveSettings(qc, { ret_wizard_steps: { done: v } }))
+      .catch(() => {});
     if (birthdate)
-      saveSettings(qc, { birthdate })
+      wizSaves.current = wizSaves.current
+        .then(() => saveSettings(qc, { birthdate }))
         // a birthdate saved on the way out changes the model's starting age
         .then(() => qc.invalidateQueries({ queryKey: ["retirement"] }),
               (e) => setBirthErr(errText(e)));
   };
   const [form, setForm] = useState<Record<string, number | string> | null>(null);
 
-  if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
+  if (q.isPending) return <PageSkeleton />;
   const r: RetirementData | undefined = q.data ?? lastGood;
-  if (!r) return <div className="note bad">Couldn't load: {errText(q.error)}</div>;
+  if (!r) return <FailedLine q={q} what="the retirement plan" />;
   const whatIfErr = q.isError && !q.data ? errText(q.error) : null;
   const inp = r.inputs;
   // First visit with no birthdate and default-looking age → offer wizard.
@@ -181,7 +300,10 @@ export default function Retirement() {
     && !viewer
     && settings.data !== undefined
     && !settings.data.ret_wizard_steps?.done
-    && !settings.data.birthdate
+    // a walkthrough left halfway re-opens where it stopped: its first
+    // answer saved the birthdate, which alone would read as "no need"
+    && (!settings.data.birthdate
+        || retWizardMidway(settings.data.ret_wizard_steps))
     && Object.keys(params).length === 0;
   const showWizard = wizard === true || (wizard === null && needsWizard);
 
@@ -194,17 +316,24 @@ export default function Retirement() {
           not blank assumptions. You can skip and edit everything later.
         </p>
         <RetireWizard
+          saves={wizSaves}
+          splitSeed={!!inp.saving_hint}
           onBirthChange={(b) => { birthRef.current = b; }}
           defaults={{
             age: inp.age, spend: inp.spend,
-            employer_mo: inp.employer_mo, taxable_mo: inp.taxable_mo,
-            ret: inp.ret, infl: inp.infl, end: inp.end,
+            // the tax-deferred box is td_mo; employer_mo is the older
+            // clients' figure, with the ledger's Roth inside it
+            employer_mo: inp.td_mo, roth_mo: inp.roth_mo,
+            taxable_mo: inp.taxable_mo, ret: inp.ret, infl: inp.infl, end: inp.end, ssage: inp.ssage,
           }}
           onDone={(p) => {
+            // the answers are saved and the projection reads them; `p`
+            // holds only answers that did not save, as what-ifs
             setParams(p);
             setWizard(false);
             setForm(null);
             markWizard("done");
+            qc.invalidateQueries({ queryKey: ["retirement"] });
             if (forced) { search.delete("wizard"); setSearch(search, { replace: true }); }
           }} />
         <button type="button" className="linklike mut"
@@ -228,11 +357,11 @@ export default function Retirement() {
   }
 
   const f = form ?? {
-    age: inp.age, spend: inp.spend,
+    age: inp.age, spend: inp.spend ?? "",
     // the server renders these as Python floats — "7.0", "3.0"
     ret: inp.ret.toFixed(1), infl: inp.infl.toFixed(1), end: inp.end,
-    ssage: inp.ssage, stockpct: inp.stockpct, employer_mo: inp.employer_mo,
-    taxable_mo: inp.taxable_mo, resume: inp.resume,
+    ssage: inp.ssage, stockpct: inp.stockpct, employer_mo: inp.td_mo,
+    roth_mo: inp.roth_mo, taxable_mo: inp.taxable_mo, resume: inp.resume,
     // blank = the server's default (cash keeps pace with inflation)
     cash: inp.cash == null ? "" : inp.cash.toFixed(1),
   };
@@ -241,16 +370,52 @@ export default function Retirement() {
     e.preventDefault();
     // a blank field is "use the default", so it must not ride the query
     // string as an empty value the server would refuse to parse
+    // — except the Roth box, which always rides (blank is $0): a query
+    // without it is an older client's, whose employer figure holds the
+    // ledger's Roth (specs/retirement-figures.md)
     setParams(Object.fromEntries(Object.entries(f)
-      .filter(([, v]) => String(v) !== "")
-      .map(([k, v]) => [k, String(v)])));
+      .map(([k, v]) => [k, k === "roth_mo" && String(v).trim() === ""
+                              ? "0" : String(v)] as [string, string])
+      .filter(([, v]) => v !== "")));
   };
 
-  const can = r.earliest;
-  const worst = Math.min(...r.stress.filter((s) => s.label !== "Average markets")
-                                   .map((s) => s.max_spend_at_ref));
-  const margin = worst - r.spend;
+  // the headline is the history replay; the flat rate is "steady markets"
+  const v = r.verdict;
+  const can = v?.age ?? null;
+  // the worst stress scenario's spend and the target's margin under it,
+  // both the server's
+  const worst = r.stress_floor_spend;
+  const margin = r.stress_floor_vs_spend;
   const lastAge = r.rows[r.rows.length - 1]?.age;
+  const keyAges = keyRetireAges(r.rows.map((row) => row.age), can,
+                                r.stress_ref_age);
+
+  if (r.spend === null || r.spend_now === null || r.stress_ref_age === null) {
+    // no saved spend and too little ledger to read one: nothing is
+    // projected on an assumed figure — the page asks for one instead
+    return (
+      <>
+        <h1>Retirement</h1>
+        <div className="card" style={{ marginTop: 0 }}>
+          <div className="sub">Retirement plan</div>
+          <div style={{ fontSize: "1.4rem", fontWeight: 700 }}>
+            What do you plan to spend a year?</div>
+          <p className="mut" style={{ margin: ".3rem 0 0", maxWidth: "36rem" }}>
+            Your ledger doesn&apos;t hold a year of spending to start from yet,
+            so the plan needs the amount you expect to spend each year in
+            retirement, in today&apos;s dollars. Nothing is projected until it
+            has one.</p>
+          {viewer
+            ? <p className="sub">The household&apos;s owner can add it.</p>
+            : <SpendAsk onWizard={() => setWizard(true)} />}
+          {whatIfErr && (
+            <Note tone="bad" style={{ marginTop: ".5rem" }}>
+              Couldn&apos;t recalculate: {whatIfErr}</Note>
+          )}
+        </div>
+      </>
+    );
+  }
 
   return (
     <>
@@ -259,39 +424,51 @@ export default function Retirement() {
           input fields and not one of four equal tiles below two form
           cards. */}
       <div className="card" style={{ marginTop: 0 }}>
-        <div className="sub">Earliest retirement at {money(r.spend)}/yr</div>
-        {can !== null ? (
+        <div className="sub">Earliest retirement at {money(r.spend)}/yr
+          <span className="mut"> · spend: {SPEND_FROM[inp.spend_source]}</span></div>
+        {v && can !== null ? (
           <div style={{ display: "flex", gap: ".6rem", alignItems: "baseline",
                         flexWrap: "wrap" }}>
             <span style={{ fontSize: "2rem", fontWeight: 700,
                            letterSpacing: "-.02em" }}>age {can}</span>
-            <span className="pos">feasible — money lasts to {inp.end}</span>
+            <span className="pos">lasts in {v.in_ten} of 10 past markets —
+              money lasts to {inp.end}</span>
           </div>
-        ) : (
+        ) : v && (
           <div style={{ display: "flex", gap: ".6rem", alignItems: "baseline",
                         flexWrap: "wrap" }}>
             <span className="neg" style={{ fontSize: "2rem", fontWeight: 700,
                            letterSpacing: "-.02em" }}>not by {lastAge}</span>
-            <span className="neg">not sustainable on this portfolio without
-              more saving</span>
-            {(r.catch_up ?? []).length > 0 && (
+            <span className="neg">lasts in {v.in_ten} of 10 past markets at{" "}
+              {v.at_age}</span>
+            {(v.catch_up ?? []).length > 0 && (
               <div style={{ flex: "1 1 100%" }}>
-                To get back on track, save{" "}
-                {(r.catch_up ?? []).map((c, k) => (
+                To last in 9 of 10, save{" "}
+                {(v.catch_up ?? []).map((c, k) => (
                   <span key={c.age}>
                     {k > 0 && ", or "}
                     <b>{money(c.extra_monthly)}/mo more</b> to retire at {c.age}
                   </span>
                 ))}
-                <span className="mut"> — starting now, on top of what the
-                  plan already saves.</span>
+                <span className="mut">{onTopOf(inp)}</span>
               </div>
             )}
           </div>
         )}
+        {v && (
+          <div className="sub" style={{ marginTop: ".3rem" }}>
+            Steady markets ({(r.real_return * 100).toFixed(1)}% a year after
+            inflation, every year):{" "}
+            {v.steady_age !== null ? `age ${v.steady_age}` : `not by ${lastAge}`}
+            {v.steady_age === null && (r.catch_up ?? []).length > 0 && (
+              <> — save {(r.catch_up ?? []).map((c, k) => (
+                <span key={c.age}>{k > 0 && " or "}{money(c.extra_monthly)}/mo
+                  more to retire at {c.age}</span>))}</>)}
+          </div>
+        )}
         <div className="grid cols3" style={{ gap: ".6rem", marginTop: ".8rem" }}>
           <div className="tile">
-            <div className="sub">Retire today ({inp.age}) supports</div>
+            <div className="sub">Retire today ({inp.age}) supports, steady markets</div>
             <div className="kpi sm">{money(r.spend_now)}
               <span className="sub">/yr</span></div>
             <div className="sub">after-tax, today's dollars</div>
@@ -299,18 +476,22 @@ export default function Retirement() {
           <div className="tile">
             <div className="sub">You have today</div>
             <div className="kpi sm">{money(r.buckets.total)}</div>
+            <div className="sub">accounts less card balances — property
+              isn&apos;t counted</div>
             {r.grow_to_67 != null && (
               <div className="sub">→ ~{money(r.grow_to_67)} by 67 at{" "}
                 {(r.real_return * 100).toFixed(1)}%/yr real
                 {!inp.saving_yr && " (saving nothing)"}</div>)}
           </div>
+          {worst !== null && margin !== null && (
           <div className="tile">
-            <div className="sub">Crash-proof spend at {r.stress_ref_age}</div>
+            <div className="sub">Worst stress scenario, retiring at {r.stress_ref_age}</div>
             <div className="kpi sm">{money(worst)}<span className="sub">/yr</span></div>
             <div className={`sub ${margin >= 0 ? "pos" : "neg"}`}>
               {margin >= 0 ? "+" : "−"}{money(Math.abs(margin))} vs target —
-              survives the worst stress scenario</div>
-          </div>
+              the most you could spend and survive the worst stress
+              scenario</div>
+          </div>)}
         </div>
 
         {/* the two form cards collapse to ONE summary line; their status
@@ -319,7 +500,7 @@ export default function Retirement() {
           <span><b style={{ color: "var(--ink)" }}>Assumptions:</b>{" "}
             {inp.ret}% return · {inp.infl}% inflation
             {inp.cash != null ? ` · cash ${inp.cash}%` : ""}
-            · to {inp.end} · SS at {inp.ssage}
+            {" "}· to {inp.end} · SS at {inp.ssage}
             {inp.has_sched ? ` (${money(inp.your_ss)}/mo)`
               : !viewer ? (
                 <> (<button type="button" className="linklike"
@@ -329,10 +510,19 @@ export default function Retirement() {
                             onClick={() => setAdjust(true)}>no SSA statement</button>)</>
               ) : " (no SSA statement)"}
             {" "}· {inp.stockpct}% stocks ·{" "}
-            {inp.saving_yr
-              ? `saving ${money(inp.saving_yr)}/yr`
-                + (inp.resume > inp.age ? ` from ${inp.resume}` : "")
-              : "saving paused"}</span>
+            {inp.saving_source === "none" ? (!viewer ? (
+                <button type="button" className="linklike"
+                        style={{ background: "none", border: "none",
+                                 cursor: "pointer", padding: 0,
+                                 color: "var(--blue)", fontSize: 13 }}
+                        onClick={() => setAskSaving((a) => !a)}>
+                  saving not set — add it</button>
+              ) : "saving not set")
+              : <>{inp.saving_yr
+                  ? `saving ${money(inp.saving_yr)}/yr`
+                    + (inp.resume > inp.age ? ` from ${inp.resume}` : "")
+                  : "saving nothing"}
+                {` (${SAVING_FROM[inp.saving_basis]})`}</>}</span>
           <button type="button" className="linklike"
                   style={{ marginLeft: "auto", background: "none",
                            border: "none", cursor: "pointer",
@@ -344,13 +534,22 @@ export default function Retirement() {
                            cursor: "pointer", fontSize: 13 }}
                   onClick={() => setWizard(true)}>re-run wizard</button>
         </div>
+        {/* each saving figure by its tax treatment, and an offer of the
+            ledger's Roth saving a saved answer leaves out — the server's
+            words (specs/retirement-figures.md) */}
+        {inp.saving_parts.length > 0 && (
+          <div className="sub mut" style={{ marginTop: ".3rem" }}>
+            {inp.saving_parts.map((p) => p.text).join(" · ")}</div>)}
+        {inp.saving_hint && (
+          <Note style={{ marginTop: ".4rem" }}>{inp.saving_hint}</Note>)}
+        {askSaving && !viewer && inp.saving_source === "none" && <SavingAsk />}
         {birthErr && (
-          <div className="note bad" style={{ marginTop: ".5rem" }}>
-            Birthdate not saved: {birthErr}</div>
+          <Note tone="bad" style={{ marginTop: ".5rem" }}>
+            Birthdate not saved: {birthErr}</Note>
         )}
         {whatIfErr && (
-          <div className="note bad" style={{ marginTop: ".5rem" }}>
-            Couldn&apos;t recalculate: {whatIfErr}</div>
+          <Note tone="bad" style={{ marginTop: ".5rem" }}>
+            Couldn&apos;t recalculate: {whatIfErr}</Note>
         )}
         {adjust && (
           <form onSubmit={recalc} noValidate
@@ -373,6 +572,8 @@ export default function Retirement() {
                  w="4.5rem" onChange={set} />
             <Fld name="employer_mo" label="employer $/mo" value={f.employer_mo}
                  step="50" w="6rem" onChange={set} />
+            <Fld name="roth_mo" label="Roth $/mo" value={f.roth_mo}
+                 step="50" w="6rem" onChange={set} />
             <Fld name="taxable_mo" label="taxable $/mo" value={f.taxable_mo}
                  step="50" w="6rem" onChange={set} />
             <Fld name="resume" label="resume at" value={f.resume} w="5rem"
@@ -387,18 +588,20 @@ export default function Retirement() {
           <SsEstimates saved={settings.data.ss_estimates} />
         )}
         {adjust && !viewer && !ssFresh && (
-          <div className="sub" style={{ marginTop: ".5rem" }}>
-            {settings.isError
-              ? "Couldn't load your Social Security estimates — reload to retry."
-              : "Loading your Social Security estimates…"}
-          </div>
+          settings.isError
+            ? <FailedLine q={settings} what="your Social Security estimates" />
+            : <div className="sub" style={{ marginTop: ".5rem" }}>
+                Loading your Social Security estimates…</div>
         )}
       </div>
 
       <div className="card">
         <h2>Projected portfolio <span className="sub" style={{ fontWeight: 400 }}>
-          — today's dollars</span></h2>
-        <AreaChart points={r.growth_path} xticks="years" />
+          — {r.growth_path_retire_age !== null
+            ? `retiring at ${r.growth_path_retire_age}, the middle of past markets, `
+            : ""}today's dollars</span></h2>
+        <AreaChart points={r.growth_path} xticks="years"
+                   subject="Projected portfolio in today's dollars" />
       </div>
 
       <div className="grid cols2">
@@ -413,7 +616,9 @@ export default function Retirement() {
             <tr><td>Taxable + crypto</td><td className="num">{money(r.buckets.taxable)}</td>
               <td className="mut">capital gains</td></tr>
             <tr><td>Cash</td><td className="num">{money(r.buckets.cash)}</td>
-              <td className="mut">—</td></tr>
+              <td className="mut">{r.buckets.cards_from_cash > 0
+                ? `after ${money(r.buckets.cards_from_cash)} of card balances`
+                : "—"}</td></tr>
           </tbody></table>
         </div>
       </div>
@@ -434,7 +639,8 @@ export default function Retirement() {
               <div className="kpi sm">{money(r.hist.spend90)}<span className="sub">/yr</span></div>
             </div>
             <div>
-              <span className="sub">spend that survived ALL of history</span>
+              <span className="sub">the most you could spend and survive
+                every year since 1928</span>
               <div className="kpi sm">{money(r.hist.spend100)}<span className="sub">/yr</span></div>
             </div>
           </div>
@@ -458,7 +664,7 @@ export default function Retirement() {
                 <td>{s.earliest !== null
                   ? <span className="pill g">age {s.earliest}</span>
                   : <span className="pill r">not by {lastAge}</span>}</td>
-                <td className={`num ${s.max_spend_at_ref < r.spend ? "neg" : ""}`}>
+                <td className={`num ${s.under_target ? "neg" : ""}`}>
                   {money(s.max_spend_at_ref)}</td>
               </tr>
             ))}
@@ -470,40 +676,49 @@ export default function Retirement() {
         <h2>Retire at each age</h2>
         <table>
           <thead><tr>
-            <th>Retire at age</th><th className="num">Portfolio then</th>
-            <th>At target?</th>
+            <th>Retire at age</th><th className="num hide-m">Portfolio then</th>
+            <th className="num">Past markets</th>
+            <th>Steady markets</th>
             <th className="num">Max spend/yr</th>
-            <th className="num">History</th>
           </tr></thead>
           <tbody>
-            {r.rows.map((row) => (
+            {(everyAge ? r.rows : r.rows.filter((row) => keyAges.has(row.age)))
+              .map((row) => (
               <tr key={row.age}
                   style={row.age === can ? { background: "rgba(92,181,107,.10)" } : undefined}>
                 <td>{row.age}{row.age === can &&
                   <> <span className="pill g">earliest</span></>}</td>
-                <td className="num">{money(row.at_retire)}</td>
-                <td>{row.feasible
-                  ? <span className="pill g">yes</span>
-                  : <span className="pill r">no{row.fail_age
-                      ? ` · runs out at ${row.fail_age}` : ""}</span>}</td>
-                <td className={`num ${row.max_spend >= r.spend ? "pos" : ""}`}>
-                  {money(row.max_spend)}</td>
-                <td className={`num ${(row.hist_pct ?? 0) >= 90 ? "pos"
-                    : (row.hist_pct ?? 0) < 75 ? "neg" : ""}`}>
+                <td className="num hide-m">{money(row.at_retire)}</td>
+                {/* one verdict a row, the headline's: the replay of past
+                    markets carries the colour; the steady model is the
+                    second reading, in plain text */}
+                <td className={`num ${row.hist_lasts ? "pos" : "neg"}`}>
                   {row.hist_pct !== null ? `${row.hist_pct.toFixed(1)}%` : "·"}</td>
+                <td className="mut">{row.feasible ? "lasts"
+                  : row.fail_age ? `runs out at ${row.fail_age}` : "no"}</td>
+                <td className={`num ${row.meets_target ? "pos" : ""}`}>
+                  {money(row.max_spend)}</td>
               </tr>
             ))}
           </tbody>
         </table>
+        {keyAges.size < r.rows.length && (
+          <button type="button" className="show-more"
+                  aria-expanded={everyAge}
+                  onClick={() => setEveryAge(!everyAge)}>
+            {everyAge ? "Show key ages only"
+              : `Show every age (${r.rows.length})`}</button>)}
         {/* how to read this, in the one place every term in it appears —
             rather than two permanent paragraphs above the table */}
         <p className="sub" style={{ margin: ".6rem 0 0" }}>
           Today's dollars, after tax, drawn cash → taxable → tax-deferred →
           Roth; Social Security from your claim age; RMDs from 72, 73 or 75
           by birth year (IRS Uniform Lifetime Table), with any excess
-          reinvested taxable. “Max spend” is
-          the largest annual draw that just lasts to {inp.end}. “History” is
-          the share of every return sequence since 1928 that survived.
+          reinvested taxable. “Past markets” is the share of every return
+          sequence since 1928 that lasted to {inp.end} — green from 9 in 10,
+          which is how the earliest age is chosen. “Steady markets” is the
+          same plan at {inp.ret}% a year every year; “Max spend” is the
+          largest annual draw that just lasts to {inp.end} there.
         </p>
       </div>
     </>

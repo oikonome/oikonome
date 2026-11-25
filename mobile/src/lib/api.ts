@@ -6,22 +6,28 @@ import type { AnswerBlock, HistoryCursor } from "./answer-pure";
  *  service (`host` named only when the household configured it), or
  *  nowhere. Every "stays on this instance" line reads this — absent
  *  (loading, an older server) is never read as "stays here". */
-export interface AiDestination { where: "local" | "remote" | "off"; host: string }
-export interface AssistantStatus {
-  available: boolean; local: boolean; host?: string | null;
-  roles?: Partial<Record<"categorize" | "assistant" | "vision", AiDestination>>;
-}
+export type AiDestination = S["AiDestination"];
+export type AssistantStatus =
+  Omit<OlderServer<S["AssistantStatus"], "host" | "roles">, "roles">
+  & { roles?: Partial<S["AiRoles"]> };
 
-export interface AssistantTurn {
-  id: string; asked_at: string; asked_by: string; question: string;
-  answer: string; blocks: AnswerBlock[]; tools_used: string[];
-  /** the conversation this turn belongs to; absent on an older server */
-  thread_id?: string | null;
-}
-import type { Txn } from "./ledger-row.generated";
+export type AssistantTurn = OlderServer<S["AssistantTurn"], "thread_id">;
+import type { components } from "./api.generated";
 import { downloadsToSweep, isPickerScratch, isReauthReply, isSharedDownload,
-         PICKER_SCRATCH } from "./pure.ts";
+         PICKER_SCRATCH, busyText, failCause, readFinished,
+         restartingText } from "./pure.ts";
 import type { MintGrant } from "./pure.ts";
+import { fetchStamped } from "./connection.ts";
+// the server's documented shapes (api.generated.ts, specs/api-types.md)
+type S = components["schemas"];
+/** `T` with the named fields optional: what an older self-hosted
+ *  server, which does not send them yet, may hand this build. */
+type OlderServer<T, K extends keyof T> = Omit<T, K> & Partial<Pick<T, K>>;
+/** A factor, password or sheet door's answer with the rotation report's
+ *  counts optional: an older server answers those doors without some of
+ *  them. `Keep` names the keys this build needs present. */
+type Rotated<T, Keep extends keyof T = never> = OlderServer<T,
+  Exclude<keyof T & keyof S["PasswordChanged"], "ok" | Keep>>;
 /** One multipart file part, in the shape the runtime's fetch can send.
  *  React Native's `{ uri, name, type }` descriptor is refused by Expo's
  *  fetch ("Unsupported FormDataPart implementation"): it serialises a part
@@ -43,9 +49,11 @@ async function filePart(uri: string, name?: string, type?: string): Promise<Blob
 // /api — the app holds no business logic. Types mirror webapp/src/api's
 // contract for the endpoints the app consumes.
 
-// The ledger row is ONE shape across server, web and mobile — generated
-// from specs/ledger-row.schema.json (scripts/gen-ledger-row-types.py).
-export type { Txn } from "./ledger-row.generated";
+// The ledger row is ONE shape across server, web and mobile: the server's
+// Txn model (web/schemas/ledger.py), generated like every other shape.
+export type Txn = S["Txn"];
+export type ForecastScorePanel = S["ForecastScorePanel"];
+export type ForecastMiss = S["ForecastMiss"];
 
 // ---- cache-epoch abort hook ----
 // query.ts binds this at startup so every request carries the CURRENT
@@ -58,112 +66,36 @@ export function bindEpochSignal(fn: () => AbortSignal): void {
   epochSignal = fn;
 }
 
-export interface Alert {
-  kind: string; severity: string; message: string; link?: string | null;
-}
+export type Alert =
+  OlderServer<S["Alert"], "link">;
 
-export interface TodayFull {
-  date: string; is_today: boolean;
-  real_today?: string; min_date?: string | null;
-  day_of_month: number; days_in_month: number;
-  verdict: string; variance: number; tolerance: number;
-  // which hero face the account shows (today_view setting; the page's
-  // toggle writes it back through /api/settings) and the simple face's
-  // server-composed pieces, shared with web + email so nothing drifts
-  today_view: "summary" | "detail";
-  simple: { left_today: number;
-            chips: { text: string; tone: string }[] };
-  variable_actual: number; variable_budget: number;
-  // the hero's "$X of $Y left": the month's spendable share (the whole
-  // month unless the ledger began inside it) and what is left of it —
-  // one server figure, equal to the tiles times the days left
-  month_share?: number; variable_budget_paced?: number;
-  month_remaining_paced?: number;
-  income: number | null; plan_surplus: number | null;
-  savings_plan?: number;
-  // the bills this month is SCHEDULED to owe — the plan chain's middle
-  // figure, so in → bills due → to spend adds up even when an early
-  // autopay of next month's bill already left as cash (that stays in
-  // buckets.fixed.month_budget, the fixed bar's basis). Absent from older
-  // servers; fall back to the fixed bucket then.
-  scheduled_month?: number;
-  // this month's income in its two halves — landed, and still due; absent
-  // when `income` is the budgeted figure (no income series) or on older servers
-  income_received?: number | null; income_expected?: number | null;
-  // sweep goals: plan cap, month-to-date availability, and the
-  // server-composed sentence (identical wording in the daily email)
-  sweep_plan?: number;
-  sweep_available?: number | null;
-  sweep_line?: string | null;
-  variable_scale: { factor: number; static_total: number;
-                    available: number } | null;
-  // food/other may carry the custom-bucket decomposition: children carve
-  // spend out of the parent for display; display_* / remaining_budget are
-  // the parent AFTER the carve-outs
-  // paced_*: the budget share the month may spend (less than the whole
-  // when the ledger began inside the month) — what the rows measure against
-  buckets: Record<string, {
-    actual: number; expected: number; month_budget: number;
-    paced_budget?: number;
-    children?: { name: string; actual: number; expected: number;
-                 month_budget: number; paced_budget?: number }[];
-    display_actual?: number; display_expected?: number;
-    remaining_budget?: number; paced_remaining_budget?: number;
-  }>;
-  fixed_unpaid_due?: number;
-  irregular_bills?: { payee: string; amount: number; label: string }[];
-  // [payee, amount, due, withdrawn_on] — withdrawn_on is when the bank feed
-  // took the posted charge back (null: it never posted); an older server
-  // sends only the first three
-  overdue_unpaid?: [string, number, string, (string | null)?][];
-  mtd: [string, number][];
-  bills_remaining_month: number | null;
-  /** the paychecks still due this month: ISO dates and their sum (null = no income series) */
-  income_due_dates?: string[] | null;
-  income_due_total?: number | null;
-  /** why there is no paycheck figure (null when there is one) */
-  income_due_note?: "none" | "budgeted" | "off" | null;
-  forecast_rows: { date: string; amount: number; label: string;
-                   bal_now: number | null; bal_stmt: number | null }[];
-  pace_line?: string;
-  allow: Record<string, {
-    rate: number; plan: number;
-    spent_today: number; today_allowance: number; left_today: number;
-    month_budget: number; month_spent: number;
-    daily_note: string | null;
-    recover_days: number | null; recover_note: string | null;
-  }>;
-  bill_cards: { kind: string; label: string; left: number; over: boolean;
-                sub: string; frac: number; pace_frac: number;
-                status: string | null; status_tone: "neg" | "pos" | "warn" | null }[];
-  days_left: number; headroom: number | null;
-  /** checking is null (and no_checking true) when the household has no
-   *  checking account: an unknown balance, never a $0 one */
-  runway: { checking: number | null; card_debt: number; due_total: number;
-            balance_unreliable?: boolean; no_checking?: boolean } | null;
-  next_paycheck: string | null;
-  recent: Txn[];
-  allow_kids: { name: string; rate: number; plan: number;
-                spent_today: number; today_allowance: number;
-                left_today: number; month_budget: number;
-                month_spent: number; daily_note: string | null;
-                recover_days: number | null;
-                recover_note: string | null }[];
-  why?: { headline: string; recovery?: string | null;
-          entries: { name: string; tone: "over" | "on" | "under";
-                     text: string }[] } | null;
-  why_chips?: { payee: string; amount: number; count: number }[];
-  savings_goals: SavingsGoalProgress[];
-  alerts: Alert[];
-  forecast: { days: number; checking: number; card_debt: number;
-              /** no checking account: the walk starts from nothing, so its
-               *  balances and lows are not a forecast of anything */
-              no_checking?: boolean;
-              pace_now: Series; pace_stmt: Series;
-              /** [date, amount, card name] — dated card autopays the cash
-               *  chart draws as lines; amount is negative (money leaving) */
-              card_autopay: [string, number, string][] } | null;
-}
+/** One plan row as the server builds it (todayview._plan_rows). */
+export type ServerPlanRow =
+  OlderServer<S["ServerPlanRow"], "status">;
+export type PlanTotal = OlderServer<S["PlanTotal"], "status">;
+export type RowStatus = S["RowStatus"];
+
+/** Today's cash notice: `kind` picks the sentence, `amount` the dollar it
+ *  quotes, `until` the date it runs to; `ask` (no paycheck scheduled)
+ *  replaces the alarm with the missing setup step. */
+export type CashNotice =
+  S["CashNotice"];
+
+export type TodayFull =
+  Omit<OlderServer<S["TodayFull"],
+      "real_today" | "min_date" | "month_share" | "variable_budget_paced"
+      | "paced_from" | "month_remaining_paced" | "savings_plan"
+      | "plan_goals" | "plan_line" | "plan_legs" | "avg_bills_count" | "plan_rows"
+      | "plan_total"
+      | "after_cards_bills" | "after_cards_bills_paychecks" | "cash_notice"
+      | "day_meter" | "recent_variable_spending" | "avg_bills"
+      | "plan_variable" | "scheduled_month" | "income_received"
+      | "income_expected" | "income_source" | "sweep_plan"
+      | "sweep_available" | "sweep_line" | "fixed_unpaid_due"
+      | "irregular_bills" | "overdue_unpaid" | "income_due_dates"
+      | "income_due_total" | "income_due_note" | "pace_line" | "why"
+      | "why_chips">, "recent">
+  & { recent: Txn[] };
 
 // what the ledger holds under one side of a merge offer, read live
 export interface MergeSideFacts {
@@ -177,10 +109,16 @@ export interface MergeProposal {
   // the surviving merchant's own name — `into` is the brand on a chain offer
   into_name?: string;
   from_facts?: MergeSideFacts | null; into_facts?: MergeSideFacts | null;
+  // the "After merge" box as the server adds it: both sides together and
+  // the signed change the folded side makes; absent from an older server
+  merged?: S["MergedFacts"] | null;
   from_logo?: string | null; into_logo?: string | null;
   from_rows?: number | null; into_rows?: number | null;
   from_samples: string[]; into_samples: string[];
   signals: string[]; supports: string[];
+  // "Merge all" may take it (one name is the other cut short); any other
+  // offer carries the caution it is shown with, one at a time
+  bulk: boolean; caution: string | null;
 }
 export interface MerchantCatalog {
   // `variant_count` is the TRUE number of source strings behind a display
@@ -190,9 +128,14 @@ export interface MerchantCatalog {
                first: string; last: string; variants: string[];
                variant_count?: number; business_rows?: number;
                logo?: string | null; website?: string | null;
-               kind?: string | null; plaid?: boolean; parent?: string | null }[];
+               kind?: string | null; plaid?: boolean; parent?: string | null;
+               // the total with its direction ("$1,250 spent")
+               total_label?: string | null }[];
+  // `label` / `line`: the change in words, and the bank line when it is
+  // neither name (merchant_dedup.rename_words)
   recent: { id: number; raw_merchant: string; from_canonical: string | null;
-            to_canonical: string; at: string }[];
+            to_canonical: string; at: string;
+            label?: string | null; line?: string | null }[];
   // merchants the ledger thinks are one business (web: "Looks like one
   // merchant"), for the person to merge or keep apart
   merges?: MergeProposal[];
@@ -207,11 +150,15 @@ export interface MerchantDetail {
   variants: string[]; logo?: string | null; website?: string | null;
   phone?: string | null; kind?: string | null; mcc?: string | null;
   plaid?: boolean; parent?: string | null; category?: string | null;
-  rule?: { category_primary: string; source: string } | null;
+  // `label`: what the rule does for new charges, in words
+  rule?: { category_primary: string; source: string;
+           label?: string | null } | null;
   locations: { city: string | null; region: string | null;
                address: string | null; postal: string | null;
                lat: number | null; lon: number | null;
                n: number; last: string }[];
+  /** the total with its direction ("$1,250 spent") */
+  total_label?: string | null;
 }
 
 /** Everything /api/transactions accepts. Two modes: a month browse (y+m
@@ -230,178 +177,58 @@ export interface TxnQuery {
   /** with `cat` and y+m or one whole year: the rows a lens category
    *  label summed, totalled as the label */
   counted?: string;
+  /** a Spending figure's rows over one range key (with `cat`, `merchant`
+   *  or neither; `side` "previous" for the window before), totalled as
+   *  the figure */
+  spend?: string; merchant?: string; side?: string;
 }
 
-export interface TxnPage {
-  mode: string; rows: Txn[]; total?: number;
-  // a plan-bucket question (bucket=food|other|<carve-out name> with y+m)
-  // answers in the search shape and says which bucket it answered and
-  // what to call it ("Food", "Everything else", the carve-out's name)
-  bucket?: string; bucket_label?: string;
-  // the figure the label wore (reimbursements netted, envelope overflow
-  // counted as the plan counts it) and whether the door was a month's or
-  // a whole year's (y with no m)
-  bucket_amount?: number; bucket_scope?: "month" | "year";
-  // month mode: the month's cash flow by the Cash Flow page's definitions
-  // (spend / income / income − spend) — transfers and card payments are
-  // excluded, so these are not row sums. In and net are null for a month
-  // before the bank feed starts: its income is unknown, not $0
-  out_sum?: number; in_sum?: number | null; net_sum?: number | null;
-  // the current month's paychecks still due before month end
-  in_expected?: number | null;
-  // listed/matched rows that belong to a business (not in the totals
-  // unless the business scope was asked for)
-  biz_count?: number;
-  amount_sum?: number;
-  // average spending per day over the window (a month so far, a bucket's
-  // month, a date range); null when there is no window
-  per_day?: number | null; per_day_days?: number | null;
-  // a mixed Amazon box counts the whole charge — the true per-item spend
-  // travels beside search totals
-  amazon_items?: { count: number; sum: number; unpriced: number } | null;
-  // search only: what one purchase from this merchant costs on average,
-  // computed server-side over the whole result set and over spending rows
-  // only. null when nothing matched counts as spending.
-  spend_count?: number; spend_sum?: number; spend_avg?: number | null;
-  // search only: accounts the term matched by name (rename or the bank's
-  // own) — via_bank marks a renamed account found through the bank's name,
-  // so the screen can explain those rows
-  account_hits?: { id: string; label: string; bank_name: string;
-                   via_bank: boolean }[];
-}
+export type TxnPage =
+  OlderServer<S["TxnPage"], "biz_count" | "per_day" | "per_day_days">;
 
 // script token scope: push = the import doors (a collector); read = the
 // integrations doors (a scraper, a sensor, an MCP server). Never both.
-export type TokenScope = "push" | "read";
+export type TokenScope = S["ApiToken"]["scope"];
 
 // outbound webhooks — the secret appears only in the create response
-export interface Webhook {
-  id: string; url: string; name: string; events: string[]; enabled: boolean;
-  created_at: string; last_attempt_at: string | null;
-  last_status: number | null; last_error: string | null; failures: number;
-  disabled_reason: string | null;
-}
-export interface WebhookEvent { name: string; description: string }
+export type Webhook = S["Webhook"];
+export type WebhookEvent = S["IntegrationEvent"];
 
 // the household activity log: one hand-authored act per row, the sentence
 // composed by the server so every client reads the same words
-export interface ActivityRow {
-  id: string; at: string; actor: string; actor_user_id: string | null;
-  kind: string; action: string; target: string | null; label: string;
-  summary: string; detail: Record<string, unknown> | null;
-}
-export interface ActivityPage {
-  rows: ActivityRow[]; more: boolean; next: string | null;
-  actors: string[]; kinds: string[];
-}
-export interface Continuity {
-  note: string; prepared_for: string;
-  mail_configured: boolean; members_only: boolean; members: string[];
-  note_max: number;
-}
+export type ActivityRow =
+  S["ActivityRow"];
+export type ActivityPage =
+  S["ActivityPage"];
+// The continuity packet's doors, generated from the server's documented
+// shapes (specs/api-types.md).
+export type Continuity = S["Continuity"];
+export type ContinuitySaved = S["ContinuitySaved"];
+export type ContinuityEmailed = S["ContinuityEmailed"];
 
 /** One member's notices: their email switches and their push switch with
  *  the devices it governs (the web's MemberNotify). */
-export interface MemberNotify {
-  on_mail: boolean; mail_listed?: boolean; email_muted: boolean;
-  email_prefs: Partial<Record<string, boolean>>;
-  push_muted: boolean; push_browsers: number; push_phones: number;
-}
-export interface Me {
-  /** The day counts the Accounts copy prints, from the server's own
-   *  settings: how long a failing connection lasts before it is removed
-   *  (null while the instance does not remove them) and how long a
-   *  released bank keeps its place under the allowance. Absent from an
-   *  older server; read them through `plaidReapDays()` /
-   *  `releasedHoldDays()`, which fall back to the defaults. */
-  day_counts?: { plaid_reap_days?: number | null;
-                 released_hold_days?: number | null };
-  // this login's own switch for the household's push notices (absent on
-  // older servers)
-  push_muted?: boolean;
-  email: string; tenant_id: string; role: "owner" | "viewer";
-  version: string; hosted: boolean; demo: boolean;
-  // the shared demonstration login (an owner whose password is handed
-  // out): the server refuses it every posture change and every durable
-  // grant, so those controls are switched off for it (pure.sharedLock)
-  shared_login?: boolean;
-  // hosted one-door bank linking: true once the PLATFORM's aggregator
-  // credentials are live. False means the door is honest about not being
-  // switched on yet rather than opening onto a failure.
-  bank_link?: boolean;
-  // the IANA zone every scheduled hour is kept in — the household's own
-  // when set, else the instance's — and which it is (web: client.ts Me)
-  timezone?: string; timezone_source?: "household" | "instance";
-  instance_timezone?: string;
-  donate_url?: string | null;
-  totp_enabled?: boolean; verified?: boolean;
-  created_at?: string | null;
-  // when the nightly sweep freezes a never-confirmed household (ISO);
-  // null unless hosted, unverified and nobody here ever confirmed
-  verify_deadline?: string | null;
-  // a requested sign-in address waiting for its mailbox's confirm button
-  // (hosted); the sign-in email stays `email` until then
-  pending_email?: string | null;
-  pending_email_expires_at?: string | null;
-  recovery_codes_left?: number;
-  // when a factor-clearing recovery someone asked for lands (ISO), or null;
-  // the security screen offers the cancel, since an open session is no
-  // new sign-in
-  factor_reset_pending?: string | null;
-  has_business?: boolean;
-  // the household's allowance. institution_cap is how many banks the
-  // instance allows it and institutions_used how many are spent — both counted
-  // server-side, because the cap has a per-tenant override an operator
-  // can raise and a hardcoded client number would then be a lie.
-  features?: { institution_cap?: number | null;
-               institutions_used?: number; sms?: boolean;
-               // false when the plan does not include Plaid's recurring
-               // cross-check
-               plaid_recurring?: boolean;
-               enrich?: boolean;
-               // true when no bank can be connected until an owner
-               // confirms their email address — the server's own reason
-               // for an allowance of 0; absent from an older server
-               bank_awaits_confirm?: boolean };
-  // merchant logos on ledger/merchants/spending (Settings; default on)
-  merchant_logos?: boolean;
-  needs_2fa?: boolean;
-  // the household's daily-email schedule + whether THIS login is muted
-  daily_email?: { on: boolean; hour: number; summary: boolean;
-                  muted: boolean;
-                  // which kinds of the household's mail reach this inbox,
-                  // and which cadences the household sends at all
-                  prefs?: Partial<Record<string, boolean>>;
-                  cadences?: Partial<Record<string, boolean>> };
-  email_delivery?: { state: "bouncing" | "complained";
-    bounce_type: string | null; reason: string | null;
-    did_you_mean: string | null } | null;
-  broadcast: { message: string; severity: "info" | "warn";
-               deadline?: string | null } | null;
-}
+export type MemberNotify = OlderServer<S["MemberNotify"], "mail_listed">;
+/** GET /api/me (web/schemas/household.py). The fields marked here are
+ *  absent from an older server, the daily-email kinds and cadences
+ *  included. */
+export type Me =
+  Omit<OlderServer<S["Me"],
+      "day_counts" | "push_muted" | "shared_login" | "bank_link" | "timezone"
+      | "timezone_source" | "instance_timezone" | "donate_url"
+      | "totp_enabled" | "verified" | "created_at" | "verify_deadline"
+      | "pending_email" | "pending_email_expires_at" | "recovery_codes_left"
+      | "factor_reset_pending" | "has_business" | "features"
+      | "merchant_logos" | "needs_2fa" | "email_delivery" | "plan">,
+    "daily_email">
+  & { daily_email?: OlderServer<S["MeDailyEmail"], "prefs" | "cadences"> };
 
-export interface Account {
-  id: string; name: string; mask: string | null; kind: string;
-  /** The aggregator's own name, kept under any rename — the editor shows
-   *  it beside a custom display name and reverting restores it. */
-  bank_name?: string | null;
-  balance_current: number | null; balance_available: number | null;
-  item_id?: string | null;
-  institution_name: string; status: string | null;
-  // institution branding (Plaid optional metadata): base64 PNG + brand hex
-  // the bank's logo as a server path (/api/institutions/<item>/logo);
-  // the phone fetches it with its bearer header and caches the image
-  inst_logo_url?: string | null; inst_color?: string | null; inst_url?: string | null;
-  owner?: string | null; entity_id?: string | null; txns: number;
-  aggregator?: string | null;
-  // a card's next due date + statement balance from the liabilities pull
-  card_due?: string | null; card_statement?: number | null;
-  user_removed_at?: string | null;
-  link?: { group_id: string; home_rank: number; primary: boolean;
-           healthy: boolean } | null;
-  script?: { source: string; last_push: string; ok: boolean;
-             token_revoked_at?: string | null } | null;
-}
+export type Account =
+  OlderServer<S["Account"],
+      "bank_name" | "item_id" | "inst_logo_url" | "inst_color" | "inst_url"
+      | "owner" | "entity_id" | "aggregator" | "card_due" | "card_statement"
+      | "user_removed_at" | "link" | "script" | "goal_destination"
+      | "can_exclude" | "can_pin">;
 
 /** Whether an account's balance belongs in a money aggregate.
  *
@@ -447,55 +274,20 @@ export const inOperatingProfit = (
       || (businessStart && x.date && x.date < businessStart
           ? "startup_195" : "operating")) === "operating";
 
-export interface Connection {
-  id: string; aggregator: string; institution_name: string | null;
-  status: string | null; last_ok: string | null;
-  // last_ok is when WE last read Plaid's copy; bank_updated is when the
-  // BANK last refreshed that copy. Showing only the first makes a correct
-  // no-op sync look like a broken one.
-  bank_updated_at?: string | null; bank_failed_at?: string | null;
-  // classified server-side: ok | retrying (bank outage, nothing to do) |
-  // reauth (sign in again / share accounts) | gone | attention. Never
-  // re-derive it from `status` — an outage is not a broken login.
-  status_kind?: "ok" | "retrying" | "reauth" | "gone" | "attention";
-  // why a 'reaped' connection was removed: the reaper after its run of
-  // failures, Plaid no longer holding the Item, or the plan ending.
-  // Absent from an older server — the clients then name no cause.
-  archived_reason?: "auto-reap" | "plaid-gone" | "sub-ended" | null;
-  // Plaid's fleet-wide login health for the bank (HEALTHY | DEGRADED |
-  // DOWN), cached hourly server-side; stale readings are dropped there
-  institution_health?: string | null;
-  // why a billed product returns nothing for this item: 'consent' (never
-  // granted — a re-link can attach it) vs 'not_supported' (the bank
-  // cannot provide it). Explains a forecast with no autopay line.
-  product_issues?: Record<string, { cause: "consent" | "not_supported";
-                                    code?: string }> | null;
-  accounts?: number;
-  // the history window this bank was linked with (1/3/6/12 months, null
-  // = everything). Fixed at Plaid when the Item was created: a wider
-  // choice made later only reaches it through a relink.
-  history_months?: 1 | 3 | 6 | 12 | null;
-}
-export interface Holding {
-  acct: string; symbol: string; fund: string | null;
-  qty: number | null; price: number | null; value: number;
-}
+export type Connection =
+  OlderServer<S["Connection"],
+      "bank_updated_at" | "bank_failed_at" | "status_kind"
+      | "archived_reason" | "institution_health" | "product_issues"
+      | "accounts" | "history_months">;
+export type Holding =
+  S["Holding"];
 export type AccountRemoveMode =
   "hide" | "disconnect" | "disconnect_purge" | "purge";
 
-export interface Proposal {
-  id: string; kind: string; bill_type?: string | null;
-  payee: string; amount: number;
-  cadence: string; summary: string; income?: boolean;
-  next_due?: string | null; llm_tag?: string | null;
-  /** the cadence's raw pieces (MONTHLY + 1) — what the Adjust form's
-   *  cadence picker starts on, in the bill forms' FREQ:interval values */
-  frequency?: string | null; interval?: number | null;
-  /** the days of an offer on several days of the month, else null */
-  by_month_day?: number[] | null;
-  /** an "attach" (fee) or "merchant" proposal: the bill it would join */
-  bill_payee?: string | null;
-}
+export type Proposal =
+  OlderServer<S["BillProposal"],
+      "bill_type" | "income" | "next_due" | "llm_tag" | "frequency"
+      | "interval" | "by_month_day" | "bill_payee">;
 /** The Adjust form's changes to a proposal, sent with its approve. */
 export type ProposalAdjust = { name?: string; amount?: number;
                                cadence?: string; due_day?: number;
@@ -503,215 +295,116 @@ export type ProposalAdjust = { name?: string; amount?: number;
 
 /** GET /api/onboarding — the wizard's counts, step marks and the three
  *  first-run choices it asks for. */
-export interface Onboarding {
-  accounts: number; transactions: number; bills: number;
-  connections: number; pending_proposals: number;
-  budgets_set: boolean; primary_checking_set: boolean;
-  // the pinned primary checking, and the accounts the forecast could
-  // anchor on (one is pinned by itself when the wizard's connect step is
-  // left; two or more are a question the step asks)
-  primary_checking_id?: string | null;
-  checking_candidates?: string[];
-  wizard_done: boolean;
-  // per-step done/skipped marks — where the wizard resumes
-  wizard_steps: Record<string, string>;
-  // how far back a new link or import reaches (null = everything)
-  history_months?: 1 | 3 | 6 | 12 | null;
-  // how bills & budgets are set up: proposed from the ledger, or typed
-  setup_mode?: "auto" | "manual";
-  // whether the finder may scan on its own (manual turns it off)
-  bill_detection_auto?: boolean;
-}
+export type Onboarding =
+  OlderServer<S["Onboarding"],
+      "primary_checking_id" | "checking_candidates" | "history_months"
+      | "setup_mode" | "bill_detection_auto" | "budgets_saved_by_user">;
 
-export interface Bill {
-  // the fees that ride with the payment ("incl. $1 fee")
-  companions?: Companion[]; fee_total?: number;
-  // the merchants the bill pays, by display name — its identity (web:
-  // "Merchants" on the edit form)
-  merchants?: string[];
-  payee: string; amount: number; income: boolean; cadence: string;
-  disabled?: boolean;
-  // ok | stale | mismatch | drifting | misdated | off-ledger | withdrawn
-  // (the missed cycle's charge was taken back by the bank feed — amber,
-  // never in the triage queue; mirrors webapp)
-  due_on: string | null; health: string | null; health_dismissed: boolean;
-  // the newest ledger charge for this merchant, whatever its amount
-  last_seen?: { date: string; amount: number } | null;
-  // the attention queue's raw material: when the bill last matched, its
-  // cycle, and the ONE action the server's evidence supports — rendered
-  // verbatim, never invented client-side (mirrors webapp)
-  last_match?: string | null;
-  cycle_days?: number | null;
-  suggestion?: { action: "accept_amount" | "disable" | "review";
-                 amount?: number; reason: string } | null;
-  cadence_value?: string;
-  // the days of a rule on several days of the month, else null: the
-  // FREQ:interval value above cannot say them
-  by_month_day?: number[] | null;
-  fit?: LedgerFit | null; fit_diverges?: boolean;
-  hint_dismissed?: boolean;
-  occurrences: number; paid: number; paid_amount: number;
-  used: number | null; overflow: number | null; next_unpaid: string | null;
-  // this month's missed occurrence: the date the bank feed withdrew its
-  // charge (still unpaid, worded as a warning rather than overdue). The ONLY
-  // date that may turn the row's status amber
-  withdrawn_on?: string | null;
-  // the earlier cycle behind a "withdrawn" health verdict — for the health
-  // pill alone, never the status: a later cycle that was never charged is
-  // still overdue
-  health_withdrawn_on?: string | null;
-  pool: number | null; period_months: number | null;
-  period_used: number | null; period_left: number | null;
-}
-export interface BillsData {
-  proposals: Proposal[]; bills: Bill[];
-  // the month the per-bill stats describe (YYYY-MM) and whether it is a
-  // closed month read back (the schedule itself is always the live one)
-  month?: string; month_final?: boolean;
-  archived: { payee: string; amount: number; frequency?: string | null;
-              synced_at?: string | null }[];
-  totals?: { bills_monthly: number; income_monthly: number;
-             income_basis?: "actual" | "schedule"; income_months?: number | null;
-             week_total: number; week_count: number; attention: number };
-  // the cadence picker's options, FREQ:interval value + words
-  cadences?: [string, string][];
-}
+export type Bill =
+  OlderServer<S["Bill"],
+      "companions" | "fee_total" | "merchants" | "disabled" | "last_seen"
+      | "last_match" | "cycle_days" | "suggestion" | "cadence_value"
+      | "by_month_day" | "fit" | "fit_diverges" | "hint_dismissed"
+      | "withdrawn_on" | "health_withdrawn_on">;
+export type BillsData =
+  Omit<OlderServer<S["BillsData"],
+      "month" | "month_final" | "totals" | "cadences">, "bills" | "proposals">
+  & { bills: Bill[]; proposals: Proposal[] };
 
-export interface PLRow {
-  name: string; value: number; pl: number; pct: number | null;
-  invested?: number; basis?: number; contributed?: number;
-  cash_in?: number; cash_out?: number;
-}
-export interface NetWorthReport {
-  current_total: number; property_net: number; full_total: number;
-  property_items: { name: string; kind: string; value: number;
-                    source?: string }[];
-  by_institution: [string, number][];
-  by_asset_class: [string, number][];
-  trend: [string, number][];
-  // the same months with the property layer added, ending at full_total
-  // (absent from an older server)
-  full_trend?: [string, number][];
-  coinbase_pl: PLRow[];
-  retirement_combined: {
-    groups?: { provider: string; accounts: PLRow[]; invested: number;
-               value: number; pl: number; pct: number | null }[];
-    total?: { invested: number; value: number; pl: number;
-              pct: number | null };
-  };
-  trend_estimated_until: number;
-  _built_at?: string;
-}
-export interface FeesReport {
-  by_platform: [string, number, number][];
-  by_year: [string, number][];
-  total: number;
-}
-export interface ManualAsset {
-  name: string; value: number; kind?: string | null;
-  as_of?: string | null; auto?: string | null;
-}
-export interface SpendingReport {
-  by_year: [string, number, number][];
-  by_month: [string, number][];
-  // [payee, amount, count, logo_url|null]
-  top_merchants: [string, number, number, (string | null)?][];
-  category_totals: [string, number][];
-  amazon: [string, number, number][];
-  yoy_years: string[];
-  yoy_cats: string[];
-  yoy_matrix: (string | number)[][];
-  _built_at?: string;
-}
+export type PLRow = S["CoinbasePl"] | S["InvestedPl"];
+/** The Accounts screen's figures, server-decided (the web's AccountTotals):
+ *  the headline is Net Worth's Financial accounts figure; loans are listed
+ *  as owed; section and institution subtotals per pane. */
+export type AccountTotals =
+  Omit<S["AccountTotals"], "sections">
+  & { sections: Record<string, Record<string, SectionTotal>> };
+/** A section's figures; `shown` (the whole dollars the screen prints,
+ *  adding up as shown) is left out by an older server. */
+export type SectionTotal = OlderServer<S["SectionTotal"], "shown">;
+export type AccountsData = Omit<S["AccountsData"], "totals">
+  & { totals: AccountTotals };
+/** One Over-time timeframe over `full_trend` (the web's TrendWindow). */
+export type TrendWindow = S["TrendWindow"];
+/** A breakdown list's figures; `shown` (whole dollars and shares, adding
+ *  up as shown) is left out by an older server. */
+export type RingFigures = OlderServer<S["RingFigures"], "shown">;
+// fields an older server leaves out stay optional (specs/api-types.md)
+export type NetWorthReport =
+  Omit<OlderServer<S["NetWorthReport"],
+    "full_trend" | "month_change" | "financial_month_change"
+    | "property_month_change" | "mortgage_payoff"
+    | "full_trend_estimated_until" | "trend_windows"
+    | "snapshot_trend" | "savings_trend" | "_built_at">,
+    "property_items" | "rings">
+  & { property_items: OlderServer<S["PropertyItem"],
+        "source" | "entered_text" | "update_due">[];
+      rings?: { by_asset_class: RingFigures; by_institution: RingFigures } };
+export type FeesReport =
+  OlderServer<S["FeesReport"], "_built_at" | "platform_counts">;
+export type ManualAsset =
+  OlderServer<S["ManualAsset"], "kind" | "as_of">;
+export type SpendingReport = OlderServer<S["SpendingReport"], "_built_at">;
 // where the money came from and where it went, for one period — income by
 // kind on the left, fixed / variable / saved on the right (mirrors the web)
-export interface FlowPeriod {
-  from: string; to: string; label: string;
-  // true when the household's ledger starts this month, so the range shows
-  // the month so far instead of complete months
-  live_month?: boolean;
-  // true when the window was cut to start at the first month with known
-  // income (the bank feed's first); `label` already names the cut range
-  income_clipped?: boolean;
-  // months inside the window left out on both sides because no bank feed
-  // covers them (their income is unknown, not $0); `label` names them
-  income_gap_months?: number;
-  // true when no bank feed covers the window (none linked, or it starts
-  // after the window): income is not known, so `in.*`, `saved` and
-  // `rate` are null rather than a misleading 0
-  income_unknown?: boolean;
-  in: { total: number | null; paychecks: number | null;
-        interest: number | null; other: number | null };
-  out: { total: number; fixed: number; variable: number };
-  saved: number | null; rate: number | null;
-}
+// each side's `shown` (the nodes as printed) is left out by an older server
+export type FlowPeriod =
+  Omit<OlderServer<S["FlowPeriod"],
+    "live_month" | "income_clipped" | "income_gap_months" | "income_unknown"
+    | "incomplete_months" | "dating" | "saved_months_known"
+    | "saved_months_total" | "invested" | "invested_text" | "_built_at">,
+    "in" | "out">
+  & { in: OlderServer<S["FlowIn"], "shown">;
+      out: OlderServer<S["FlowOut"], "shown" | "variable_scheduled"
+        | "unsplit" | "unsplit_text" | "split_shown" | "fixed_basis_text"> };
 // served per range (the site-wide 3m/6m/1y/3y/5y/all vocabulary), not in
 // the report — the fixed split walks months and 'all' costs seconds
 export type FlowKey = "cur" | "1m" | "3m" | "6m" | "1y" | "3y" | "5y" | "all";
 // the Spending tab's windowed view — ranked lists each carry the previous
 // equal window's figure (null when the range is 'all': no previous window)
-export interface SpendingWindow {
-  from: string; to: string; label: string; months: number;
-  // true when the household's ledger starts this month: the range shows
-  // the month so far, and there is no previous window to compare with
-  live_month?: boolean;
-  total: number; prev_total: number | null;
-  by_month: [string, number][];
-  // ranked by this window; categories spent on only in the previous
-  // window follow at 0, so a drop to nothing shows as a change
-  categories: [string, number, number | null][];
-  // [payee, amount, visits, prev-window amount|null, logo]
-  merchants: [string, number, number, number | null, string | null][];
-  // same shape, merchants paid only in the previous window (amount 0)
-  dropped_merchants?: [string, number, number, number | null, string | null][];
-}
-export interface IncomeKinds { paychecks: number; interest: number; other: number }
-export interface IncomeWindow {
-  from: string; to: string; label: string; months: number;
-  // true when the household's ledger starts this month: the range shows
-  // the month so far, and there is no previous window to compare with
-  live_month?: boolean;
-  total: number; prev_total: number | null;
-  kinds: IncomeKinds; prev_kinds: IncomeKinds | null;
-  by_month: [string, number][];
-  // [payer, amount, deposits, prev-window amount|null, logo]
-  sources: [string, number, number, number | null, string | null][];
-  // same shape, payers seen only in the previous window (amount 0)
-  dropped_sources?: [string, number, number, number | null, string | null][];
-}
+export type SpendingWindow =
+  OlderServer<S["SpendingWindow"],
+    "live_month" | "incomplete_months" | "dating" | "dropped_merchants"
+    | "category_shares" | "per_month" | "per_month_by_category" | "change"
+    | "category_changes" | "merchant_changes" | "movers" | "_built_at">;
+export type Change = S["Change"];
+export type SpendingMover = S["SpendingMover"];
+export type IncomeKinds = S["IncomeKinds"];
+export type IncomeWindow =
+  OlderServer<S["IncomeWindow"],
+    "live_month" | "per_month" | "paycheck_share" | "incomplete_months"
+    | "dropped_sources" | "source_shares" | "change" | "kind_changes"
+    | "source_changes" | "source_paychecks" | "kinds_shown" | "_built_at">;
+/** One income-by-source row's paycheck verdict (specs/paychecks.md). */
+export type SourcePaycheck = S["SourcePaycheck"];
 /** Interest and fees paid on bank and card accounts, by year — what
  *  holding money costs, net of what the bank refunded. Empty `by_year`
  *  means the section has nothing to say. */
-export interface CashCostYear {
-  year: string; interest: number; fees: number; refunds: number; net: number;
-  // [name, amount, date, kind] of the year's largest charge
-  biggest: [string, number, string, "interest" | "fee"] | null;
-}
-export interface CashCostsReport {
-  by_year: CashCostYear[];
-  ytd: CashCostYear | null;
-  interest_ever: number;
-  earned_ytd: number;
-  // [name, amount, date, kind, account] of the newest charge
-  latest: [string, number, string, "interest" | "fee", string] | null;
-  _built_at?: string;
-}
-export interface CashflowReport {
-  savings_by_year: [string, number | null, number,
-                    number | null, number | null][];
-  monthly_by_year: Record<string, [string, number][]>;
-  income_by_month: [string, number][];
-  investment_funding: [string, number][];
-  career_income: [number, number][];
-  reported_income: [number, number | null, number | null, number | null,
-                    number | null, boolean | number | null][];
-  cash_graph: { points: [string, number][]; forecast_from: number };
-  _built_at?: string;
-}
+/** A year of interest and fees; an older server sends neither its
+ *  printed cells (`shown`) nor `biggest_text`. */
+export type CashCostYear =
+  OlderServer<S["CashCostYear"], "shown" | "biggest_text">;
+export type CashCostsReport =
+  Omit<OlderServer<S["CashCostsReport"],
+    "vs_earned_ytd" | "_built_at" | "paid_ytd" | "shown">, "by_year" | "ytd">
+  & { by_year: CashCostYear[]; ytd: CashCostYear | null };
+export type CashflowReport =
+  Omit<OlderServer<S["CashflowReport"],
+    "savings_by_year_months" | "savings_by_year_notes" | "months_by_year"
+    | "incomplete_months" | "incomplete_label" | "dating"
+    | "brokerage_funding_mtd"
+    | "brokerage_funding_ytd"
+    | "_built_at">, "cash_graph">
+  & { cash_graph: OlderServer<S["CashGraph"],
+        "current" | "forecast_days" | "extremes" | "windows"> };
 
 export interface AlertRow {
-  kind: string; severity: string; message: string;
+  kind: string; severity: string; message: string; link?: string | null;
   first_seen: string; last_seen: string; active: number; dismissed: number;
+  /** the history's name for the kind, and the chip that lists it */
+  kind_label?: string | null; group?: string | null;
+  /** the words the history prints (`message` stays the dismiss/restore
+   *  key); absent from an older server */
+  text?: string;
 }
 
 export interface EmailSchedule {
@@ -721,177 +414,67 @@ export interface EmailSchedule {
   yearly?: { on: boolean; hour: number; sms?: boolean; push?: boolean };
 }
 
-export interface MobileDevice {
-  id: string; device_name: string; platform: string;
-  created_at: string; last_seen: string | null; current: boolean;
-  /** native push on this row: "on", "dead" (the relay gave up on the
-   *  token), null (never registered) */
-  push?: "on" | "dead" | null;
-}
+export type MobileDevice = S["MobileDevice"];
 
 /** What an unknown store is called on the Receipts screen (the web
  *  client's UNKNOWN_STORE). */
 export const UNKNOWN_STORE = "Unknown store";
-export interface ReceiptItem {
-  line: number; description: string; qty: number | null;
-  amount: number; tag: string;
-}
+export type ReceiptItem =
+  S["ReceiptItem"];
+/** Another receipt of a receipt's slip, or one read alike that is not */
+export type ReceiptTwin = S["ReceiptTwin"];
 /** One part of a hand-split charge (Txn.split) */
-export type SplitPart = { category: string; amount: number };
+export type SplitPart = S["SplitPart"];
 
-export interface Receipt {
-  id: string; mime: string; has_optimized?: boolean;
-  kind: "receipt" | "check";
-  status: "uploaded" | "parsing" | "parsed" | "failed";
-  parsed: { merchant?: string | null; date?: string | null;
-            total?: number | null; tax?: number | null;
-            tip?: number | null;
-            // check-kind fields (front-of-check parse)
-            check_number?: string | null; payee?: string | null;
-            amount?: number | null; memo?: string | null;
-            bank?: string | null } | null;
-  // parsed check amount disagrees with the transaction (display only)
-  amount_mismatch?: boolean;
-  // how a receipt snapped before its charge found it: the matcher ('auto')
-  // or a person ('manual'); null when attached from the transaction itself
-  match_method?: "auto" | "manual" | null;
-  matched_at?: string | null;
-  // when the current parse attempt began, or the server's own verdict that
-  // it has outlived the reclaim window — either lets a stalled read be
-  // retried (both absent from older servers)
-  parse_started_at?: string | null; parse_stale?: boolean;
-  error: string | null; created_at: string; items?: ReceiptItem[];
-}
+export type Receipt =
+  Omit<OlderServer<S["Receipt"],
+      "has_optimized" | "amount_mismatch" | "match_method" | "matched_at"
+      | "parse_started_at" | "parse_stale" | "duplicate_of" | "lines_gap">,
+      "items">
+  & { items: ReceiptItem[] };
 
 // receipts snapped before their transaction reached the ledger (the web
 // client's WaitingReceipts shapes, field for field)
-export interface WaitingCandidate {
-  txn_id: string; date: string; amount: number; payee: string | null;
-  account: string | null; pending: boolean; exact: boolean;
-  merchant_match: "same" | "different" | "unknown";
-}
-export interface WaitingReceipt {
-  id: string; mime: string; kind: "receipt";
-  status: Receipt["status"]; parsed: Receipt["parsed"];
-  error: string | null; created_at: string; has_optimized: boolean;
-  // the parsed total and store, and the printed date (else the snap date)
-  total: number | null; date: string | null; merchant: string | null;
-  // two charges fit equally well — the matcher leaves the choice to you
-  tie: boolean;
-  // still waiting stale_days after its date
-  stale: boolean;
-  // nothing is going to read its total: no AI on this instance, or the AI
-  // could not — it waits on a person to type the total and date in
-  needs_details: boolean;
-  // its total and date were typed in by a person; no parse overwrites them
-  manual: boolean;
-  // a person had paired it by hand and that charge was later removed: it is
-  // back here, and the matcher leaves it for the person to pair again
-  released?: boolean;
-  // when the current read began, and whether it has outlived the reclaim
-  // window (both absent from older servers)
-  parse_started_at?: string | null; parse_stale?: boolean;
-  candidates: WaitingCandidate[];
-}
-export interface RecentMatch {
-  id: string; mime: string; parsed: Receipt["parsed"];
-  has_optimized: boolean; matched_at: string;
-  match_method: "auto" | "manual"; txn_id: string; txn_date: string;
-  txn_amount: number; payee: string | null;
-}
-export interface WaitingReceipts {
-  count: number; stale_days: number;
-  // this instance has a vision model to read receipts with
-  ai_available: boolean;
-  // `count` is every receipt waiting; `waiting` is one page of them, read
-  // from `offset` (at most `limit` per page)
-  limit?: number; offset?: number;
-  waiting: WaitingReceipt[]; recent: RecentMatch[];
-}
+export type WaitingCandidate =
+  S["WaitingCandidate"];
+export type WaitingReceipt =
+  Omit<OlderServer<S["WaitingReceipt"],
+      "released" | "parse_started_at" | "parse_stale">, "candidates">
+  & { candidates: WaitingCandidate[] };
+export type RecentMatch =
+  S["RecentMatch"];
+export type WaitingReceipts =
+  Omit<OlderServer<S["WaitingReceipts"], "limit" | "offset">, "waiting" | "recent">
+  & { waiting: WaitingReceipt[]; recent: RecentMatch[] };
 
-export interface BillDetail {
-  payee: string; amount: number; income: boolean; cadence: string;
-  by_month_day?: number[] | null;
-  next_due: string; bill_type: string; source: string;
-  category: string | null; merchant: string | null; active: boolean;
-  cap: number | null; disabled: boolean;
-  show_today: boolean; match_category: boolean;
-  // the TRANSACTION category stamped on the rows this bill matches ("" =
-  // none) — the web's "matched charges are …"
-  txn_category?: string;
-  // the fees that ride with the payment (web: "Fees & add-ons")
-  companions?: Companion[]; fee_total?: number;
-  // the merchants the bill pays (see Bill.merchants)
-  merchants?: string[];
-  cadences: [string, string][];
-}
-export interface Companion { tokens: string; amount: number; window_days: number }
-export interface LedgerFit {
-  kind: string; amount: number; cadence: string; next_due: string;
-  short: string; label: string; cycle_days?: number; hits?: number;
-  // the two days a twice-a-month fit landed on; `cadence` reads MONTHLY:1
-  by_month_day?: number[] | null;
-}
+export type BillDetail =
+  OlderServer<S["BillDetail"],
+      "by_month_day" | "txn_category" | "companions" | "fee_total"
+      | "merchants">;
+export type Companion = S["Companion"];
+export type LedgerFit =
+  OlderServer<S["LedgerFit"], "cycle_days" | "hits" | "by_month_day">;
 // history rows are the Transactions-page shape plus the matcher verdict
-export type HistoryTxn = Txn & { txn_id: string; hit: boolean };
-export interface BillsHistoryData {
-  payee: string;
-  logo?: string | null;
-  txns: HistoryTxn[];
-  monthly: { month: string; total: number; count: number }[];
-  fit: LedgerFit | null;
-  lifetime: { total: number; count: number;
-              first: string | null; last: string | null;
-              active_months: number; avg_monthly_active: number };
-  inflow: boolean;
-  bill: { amount: number; bill_type: string; source: string;
-          cadence: string; by_month_day?: number[] | null;
-          due_on: string | null; income: boolean } | null;
-  health: { health: string; last_match: string | null;
-            matched?: number; fit_diverges?: boolean;
-            // behind a "withdrawn" verdict: when the feed took the charge back
-            withdrawn_on?: string | null } | null;
-  proposals: Proposal[];
-  covered_by: string | null;
-  hint_dismissed: boolean;
-  // an archived bill sits under this payee (`bill` is null for it): offer
-  // Restore, not a new bill. Absent from older servers.
-  bill_archived?: boolean;
-  // the payee is a name ledger rows display, so the merchant rename/merge
-  // applies to it; absent from older servers
-  merchant_in_use?: boolean;
-  cadences: [string, string][];
-}
+export type HistoryTxn = S["HistoryTxn"];
+export type BillsHistoryData =
+  Omit<OlderServer<S["BillsHistory"], "logo" | "bill_archived" | "merchant_in_use">, "txns" | "fit">
+  & { txns: HistoryTxn[]; fit: LedgerFit | null };
 
-export interface PendingReimb {
-  id: string; date: string; amount: number; payee: string;
-  category: string; pending: number; account: string | null;
-  partial?: number; expected?: number | null; received?: number;
-}
-export interface ReimbCandidate {
-  id: string; date: string; amount: number; payee: string;
-  account: string | null;
-  // 1 while the bank still shows it as pending (the row may be replaced
-  // when it posts); the match reason is derived client-side, as the web
-  // does — the server sends none
-  pending?: number | boolean | null;
-  // what of it no link has claimed yet — the figure the server ranks by
-  left_amount?: number | null;
-}
+export type PendingReimb =
+  OlderServer<S["PendingReimb"],
+    "partial" | "expected" | "received" | "flagged_at" | "received_pct">;
+export type ReimbPending =
+  Omit<OlderServer<S["ReimbPending"], "owed">, "pending">
+  & { pending: PendingReimb[] };
+export type ReimbCandidate =
+  OlderServer<S["ReimbCandidate"], "pending" | "left_amount">;
 /** The candidates door's anchor: what it still needs (`left_amount`) and
  *  what already came back to it (`received`), the figures the matcher
  *  words its rows and its gap line by. */
-export interface ReimbAnchor {
-  id: string; date: string; amount: number;
-  left_amount?: number | null; received?: number | null;
-}
-export interface ReimbPairsPage { pairs: ReimbPair[]; more?: boolean }
-export interface ReimbPair {
-  expense_id: string; reimburse_id: string; partial: number;
-  received: number | null; created_at: string;
-  expense_date: string; expense_amount: number; expense_payee: string;
-  deposit_date: string; deposit_amount: number; deposit_payee: string;
-}
+export type ReimbAnchor =
+  OlderServer<S["ReimbAnchor"], "left_amount" | "received">;
+export type ReimbPairsPage = OlderServer<S["ReimbPairsPage"], "more" | "page">;
+export type ReimbPair = S["ReimbPair"];
 export interface RuleRow {
   merchant: string; category_primary: string; source: string;
   disabled: boolean; count: number;
@@ -900,162 +483,80 @@ export interface RulesPage {
   rules: RuleRow[]; total: number; page: number; per_page: number;
   counts: { user: number; llm: number; seed: number; model?: number };
 }
-export interface RetirementInputs {
-  age: number; spend: number; ret: number; infl: number; end: number;
-  ssage: number; employer_mo: number; taxable_mo: number; resume: number;
-  stockpct: number; saving_yr: number; your_ss: number;
-  has_sched: boolean;
-  // the cash bucket's nominal yield in %; null = keeps pace with
-  // inflation (0% real), the default (web: client.ts RetirementInputs)
-  cash: number | null;
-}
-// GET /api/debt-plan — every card and loan with a balance, on one
-// schedule (web: client.ts DebtPlan)
-export type DebtMethod = "avalanche" | "snowball";
-export interface DebtRow {
-  id: string; name: string; kind: "card" | "mortgage" | "loan";
-  mask: string | null; institution: string | null;
-  balance: number;
-  apr: number; apr_source: "issuer" | "you" | "none";
-  apr_issuer: number | null;
-  min_payment: number; min_source: "issuer" | "you" | "estimate";
-  min_issuer: number | null;
-  // a mortgage's servicer payment including escrow (min_issuer is then the
-  // principal-and-interest part); null for every other kind
-  payment_reported?: number | null;
-  skip: boolean;
-}
-export interface DebtSchedule {
-  method: DebtMethod; extra: number;
-  months: number | null;            // null = not within fifty years
-  debt_free: string | null;         // ISO day of the last payment
-  total_interest: number; total_paid: number;
-  monthly: number;                  // every minimum + the extra
-  starting: number;
-  growing: boolean;                 // the minimums do not cover the interest
-  // false = the walk stopped at fifty years: total_interest is a cut-off
-  // figure, never shown as what the plan costs (absent from an older server)
-  finishes?: boolean;
-  series: [string, number][];       // today, then each month's first
-  debts: { id: string; order: number; paid_off: string | null;
-           interest: number; paid: number; remaining: number }[];
-}
-export interface DebtPlan {
-  today: string;
-  method: DebtMethod; extra_monthly: number;
-  saved: { method: DebtMethod; extra_monthly: number };
-  debts: DebtRow[];
-  plan: DebtSchedule;               // the chosen method
-  alt: DebtSchedule;                // the other method, same money
-  minimums: DebtSchedule;           // minimums only, nothing rolled
-  estimated: boolean;               // some input is a labelled estimate
-}
-export interface DebtPlanSave {
-  method: DebtMethod; extra_monthly: number | string;
-  debts: Record<string, { apr?: number | string | null;
-                          min_payment?: number | string | null;
-                          skip?: boolean }>;
-}
+// The Retirement and Debt pages' doors, generated from the server's
+// documented shapes (specs/api-types.md). A self-hosted server may be
+// older than this build, so the fields an older server does not send stay
+// optional here (OlderServer); the web, always served by its own server,
+// takes the generated types as they are. Where the projection's spend and
+// saving came from: a what-if, the saved answers, the ledger's year, or
+// (spend) "needed": nothing to plan for, nothing projected.
+export type RetirementInputs =
+  OlderServer<S["RetirementInputs"], "spend_source" | "saving_source"
+                                     | "saving_basis" | "saving_mo"
+                                     | "saving_found_mo" | "roth_mo" | "td_mo"
+                                     | "saving_parts" | "saving_hint">;
+export type RetSpendSource = S["RetirementInputs"]["spend_source"];
+export type RetSavingSource = S["RetirementInputs"]["saving_source"];
+export type RetirementData =
+  Omit<OlderServer<S["RetirementData"], "catch_up" | "stress_floor_spend"
+                                        | "stress_floor_vs_spend" | "verdict"
+                                        | "growth_path_retire_age">,
+       "inputs" | "buckets" | "rows">
+  & { inputs: RetirementInputs;
+      buckets: OlderServer<S["RetirementBuckets"], "cards_from_cash"
+                           | "cards_from_taxable" | "cards_from_td"
+                           | "cards_from_roth">;
+      rows: OlderServer<S["RetirementRow"], "hist_lasts">[] };
+export type DebtRow =
+  OlderServer<S["DebtRow"], "apr_default" | "min_default" | "estimated"
+                            | "payment_reported" | "due_now" | "origin"
+                            | "min_basis" | "rate_needed">;
+export type DebtSchedule = OlderServer<S["DebtSchedule"], "finishes">;
+export type DebtPlan =
+  Omit<OlderServer<S["DebtPlan"], "saves_vs_minimums" | "alt_extra_interest"
+                                  | "overrides" | "paid_in_full"
+                                  | "alt_same_path">,
+       "debts" | "plan" | "alt" | "minimums">
+  & { debts: DebtRow[]; plan: DebtSchedule; alt: DebtSchedule;
+      minimums: DebtSchedule };
+export type DebtPlanSave = S["DebtPlanSave"];
+export type DebtMethod = S["DebtPlan"]["method"];
 
-export interface RetirementData {
-  // null while some age works; otherwise the extra monthly saving, from
-  // now, that would make each listed age work (empty: no saving would)
-  catch_up?: { age: number; extra_monthly: number }[] | null;
-  buckets: { cash: number; taxable: number; td: number; roth: number;
-             total: number };
-  earliest: number | null;
-  real_return: number;
-  spend: number; spend_now: number;
-  // null when the curve has no point at 67 (already past it, or the plan
-  // ends first)
-  grow_to_67: number | null;
-  growth_path: [string, number][];
-  rows: { age: number; at_retire: number; feasible: boolean;
-          fail_age: number | null; max_spend: number;
-          hist_pct: number | null }[];
-  stress: { label: string; earliest: number | null;
-            max_spend_at_ref: number }[];
-  stress_ref_age: number;
-  hist: { ok: number; n: number; pct: number; spend90: number;
-          spend100: number; stock_frac: number } | null;
-  inputs: RetirementInputs;
-}
-export interface Batch {
-  id: string; created_at: string; filename: string | null;
-  source: string; row_count: number | null;
-  // receipts, notes, pairings, tags and overrides people added to this
-  // batch's rows since — a rollback deletes them too
-  annotations?: number;
-}
+export type Batch =
+  OlderServer<S["ImportBatch"], "annotations">;
 // a picked file as RN's networking layer wants it
 export interface PickedFile { uri: string; name: string; mime?: string }
-export interface RestoreProgress {
-  state: "idle" | "running" | "done" | "error";
-  started_at?: string | null;
-  progress: {
-    table?: string | null; rows?: number; tables_done?: number;
-    error?: string; result?: ImportResult;
-  };
-}
+export type RestoreProgress =
+  OlderServer<S["RestoreProgress"], "started_at">;
 // An account a refusal asks the person to choose, described by what tells
 // two cards sharing their last four apart when their names read the same.
-export interface AccountChoice {
-  id: string; name: string; mask: string | null;
-  rows: number; first_date: string | null; last_date: string | null;
-  balance_cents: number | null;
-}
-export interface ImportResult {
-  error?: string; imported?: number; skipped_duplicates?: number;
-  // a typed new-account name that leads to several accounts: the ones it
-  // could mean, and (on the YNAB card) the YNAB account it was typed for
-  choices?: AccountChoice[]; choice_for?: string;
-  // Mapped-CSV refusals only. `token` is a fresh claim token for the same
-  // upload — the mapping is correctable, submit again with it. `expired`
-  // says the upload is gone for good and the file has to be re-uploaded.
-  token?: string; expired?: boolean;
-  restore_started?: boolean; job?: string;
-  source?: string; confidence?: number; warnings?: string[];
-  note?: string; split_accounts?: Record<string, number>;
-  // rows an earlier import stored under a reading this import corrected
-  corrected?: number;
-  // a YNAB register placed per account: rows an earlier whole-register
-  // import left on the picked account that were removed, kept because a
-  // person had added something to them, or left because nothing proves
-  // they came from this file
-  removed_earlier?: number; kept_annotated?: number; foreign_left?: number;
-  // rows dated before the household's history window, left out
-  skipped_older?: number;
-}
+export type AccountChoice =
+  S["AccountChoice"];
+export type ImportResult =
+  OlderServer<S["ImportResult"],
+      "error" | "imported" | "skipped_duplicates" | "matched" | "choices"
+      | "choice_for" | "token" | "expired" | "restore_started" | "job"
+      | "source" | "confidence" | "warnings" | "note" | "split_accounts"
+      | "corrected" | "removed_earlier" | "kept_annotated" | "foreign_left"
+      | "skipped_older" | "credentials_dropped">;
 // A CSV whose columns could not be read: the person maps them.
-export interface ColumnMappingNeeded {
-  kind?: "columns";
-  token: string; header: string[]; filename: string;
-  sample?: string[][];
-}
+export type ColumnMappingNeeded =
+  OlderServer<S["ColumnMappingNeeded"], "kind" | "sample">;
 // One YNAB account a register names; `name` is the key the answer uses
 // ("" for lines with no account name), `label` what the person reads.
-export interface YnabAccountGroup {
-  name: string; label: string; rows: number;
-  first_date: string; last_date: string;
-  // rows an earlier import of the whole register left on the picked account
-  stored_on_pick: number;
-}
+export type YnabAccountGroup =
+  S["YnabAccountGroup"];
 // A YNAB register of several accounts: the person says where each goes.
-export interface YnabAccountsNeeded {
-  kind: "ynab_accounts";
-  token: string; filename: string; pick: string;
-  accounts: YnabAccountGroup[];
-}
+export type YnabAccountsNeeded =
+  S["YnabAccountsNeeded"];
 export type MappingNeeded = ColumnMappingNeeded | YnabAccountsNeeded;
 // Where one YNAB account goes: an account id, "skip", or a new account.
 // an account id, "skip", a new account, or an account picked from those a
 // typed new-account name could mean, with that name (remembered under it)
 export type YnabDestination = string | { new: string }
   | { id: string; typed: string };
-export interface ImportOutcome {
-  result: ImportResult | null;
-  mapping_needed: MappingNeeded | null;
-}
+export type ImportOutcome =
+  S["ImportOutcome"];
 export interface PlanFile {
   index: number; name: string; kind: string; size: number;
   action: "import" | "skip"; account_id: string | null;
@@ -1068,205 +569,78 @@ export interface PlanFile {
   // each described (AccountChoice)
   choices?: AccountChoice[];
 }
-export interface TaxdocRow {
-  year: number; exists?: boolean;
-  total_income?: number | null; agi?: number | null;
-  taxable_income?: number | null; tax_paid?: number | null;
-  wages?: number | null; ss_earnings?: number | null;
-  medicare_earnings?: number | null;
-  employer?: string | null; ein?: string | null;
-  // a W-2's boxes as read ("1" = wages); the commit stores this object
-  boxes?: Record<string, number>; box1?: number | null;
-}
-export interface TaxdocPlan { token: string; kind: string; rows: TaxdocRow[] }
-export interface SyncStatus {
-  state: "none" | "running" | "done" | "error";
-  progress: { ok?: boolean; error?: string };
-}
-export interface Entity {
-  id: string; name: string; structure: string; status: string;
-  /** when the business was closed (null while active) */
-  archived_at?: string | null;
-  state?: string | null; formation_date?: string | null;
-  business_start_date?: string | null; ein_last4?: string | null;
-  home_office_sqft?: number | null; income_tax_rate?: number | null;
-  tax_reserve_account_id?: string | null;
-  members?: { id: string; member_name: string;
-              ownership_pct: number | null; is_manager: boolean 
-              /** the member this household is — at most one per business */
-              is_household?: boolean }[];
-}
-export interface EntityDeleteImpact {
-  id: string; name: string;
-  /** rows the CASCADE FKs destroy with the entity, counted per table */
-  destroyed: { members: number; equity_movements: number;
-               compliance_obligations: number; mileage_trips: number;
-               vendors_1099: number };
-  /** rows that survive with the assignment cleared (back to personal) */
-  detached: { accounts: number; transactions: number };
-}
-export interface BizData {
-  rows: { id: string; date: string; amount: number; payee: string;
-          category: string; account: string | null; pending: number;
-          note?: string | null }[];
-  total: number; count: number; years: number[];
-}
-export interface Capital {
-  contributions: number; draws: number; distributions: number;
-  reimbursements: number; capital_balance: number; net_income?: number;
-  /** the household member's ownership % and their share of
-   *  capital_balance, when one member is marked "this is us" and carries
-   *  a share; null otherwise, absent on older servers */
-  household_share_pct?: number | null;
-  household_capital?: number | null;
-}
-export interface Pnl {
-  year: number | null; revenue: number; operating_expenses: number;
-  operating_by_line: Record<string, number>; net_operating: number;
-  /** tax the business already paid toward this year (kept off expenses) */
-  estimated_tax_paid?: number;
-  organizational: number; startup_195: number;
-  organizational_deduction: { total: number; immediate: number;
-    amortizable: number; monthly_amortization: number };
-  startup_deduction: { total: number; immediate: number;
-    amortizable: number; monthly_amortization: number };
-  capital: Capital;
-}
-export interface BizTxn {
-  id: string; date: string | null; amount: number; payee: string;
-  category: string | null; note?: string | null;
-  cat_detailed: string | null;
-  /** the aggregator's original category — a TRANSFER_IN later renamed by
-   *  an override is still not revenue (books._pnl_core's was_transfer) */
-  cat_original?: string | null;
-  /** the amount net of partial reimbursement links (ledger sign kept) —
-   *  what the P&L counts; `amount` stays what the bank recorded */
-  net_amount?: number | null;
-  /** a deposit whose links claim only part of it: still revenue */
-  partly_claimed?: boolean | null;
-  bucket: string | null; sched_c_line: string | null;
-  /** the bucket the P&L counted the row in (a refund: its reversed cost's
-   *  bucket); null for money in that is not a refund */
-  effective_bucket?: string | null;
-}
-export interface EstimatedTax {
-  year: number; net_profit: number; mileage_deduction: number;
-  home_office_deduction: number;
-  /** this year's share of the start-up + organizational allowance */
-  startup_deduction: number;
-  taxable_profit: number; se_tax: number;
-  income_tax_rate: number | null; income_tax: number | null;
-  /** se_tax, income_tax and total_estimated are on profit so far in `year` */
-  total_estimated: number;
-  household?: { member_name: string; ownership_pct: number; share_of_profit: number;
-                se_tax: number; income_tax: number | null; total: number } | null;
-  /** the business as a whole, beside the household's share */
-  business_total?: number | null;
-  /** what total_estimated is measured against: the profit it is a rate of
-   *  and the estimates already paid toward it — the household member's
-   *  share of each when covers is "household", the business's otherwise.
-   *  Absent on older servers (use net_profit / estimated_tax_paid). */
-  covered_profit?: number;
-  covered_tax_paid?: number;
-  /** why a figure covering every member is not the household's share:
-   *  an S-corp is never split; a marked member whose shares do not total
-   *  100% cannot be; or nobody is marked. Null when it is the share. */
-  household_unavailable?: "s_corp" | "shares_incomplete" | "none_marked" | null;
-  /** a quarter of annualized_total (of total_estimated on older servers) */
-  quarterly: number; deadlines: string[];
-  /** the next 1040-ES due date, and the installment due on it: from
-   *  January 1 to 15 that is last year's fourth, not a quarter of this
-   *  year's projection. Null past the year's last deadline; absent on
-   *  older servers, which only send `quarterly`. */
-  next_deadline?: string | null;
-  next_payment?: number | null;
-  /** true for the year in progress: the so-far profit projected over the year */
-  annualized?: boolean;
-  /** actual car costs added back because the standard mileage rate,
-   *  which replaces them, was taken; absent on older servers */
-  vehicle_expenses_added_back?: number;
-  /** which car deduction the estimate took: the standard mileage rate or
-   *  the actual costs, whichever is larger; null with neither. Absent on
-   *  older servers, as is the mileage log's own figure */
-  vehicle_method?: "standard_mileage" | "actual" | null;
-  mileage_logged?: number;
-  /** what annualized_total stands on: "prior_year" early in the year, when
-   *  it is last year's tax rather than a projection of this year's */
-  basis?: "projected" | "prior_year" | "year";
-  annualized_taxable_profit?: number;
-  annualized_total?: number;
-  /** false for an S-corp: Social Security and Medicare go through payroll */
-  se_tax_applies?: boolean;
-  /** whose tax the figure is: the owner's, or every member's together */
-  covers?: "owner" | "all_members" | "household";
-  structure?: string | null;
-  members?: { member_name: string; ownership_pct: number;
-              share_of_profit: number; se_tax: number }[];
-}
-export interface Obligation {
-  id?: string; title: string; due: string; fee: number | null;
-  url: string | null; recurrence: string;
-}
-export interface MileageTrip {
-  id: string; date: string | null; miles: number;
-  purpose: string | null;
-}
-export interface Vendor {
-  merchant: string; paid: number; paid_by_card: number; reportable: boolean;
-  // last four of the payee's TIN on file, null when none was given
-  tin_last4: string | null; needs_1099: boolean;
-}
+export type TaxdocRow =
+  OlderServer<S["TaxdocRow"],
+      "exists" | "total_income" | "agi" | "taxable_income" | "tax_paid"
+      | "wages" | "ss_earnings" | "medicare_earnings" | "employer" | "ein"
+      | "boxes" | "box1" | "owner" | "matches" | "replaces">;
+export type W2Match =
+  S["W2Match"];
+export type TaxdocPlan =
+  S["TaxdocPlan"];
+// a stored W-2; "unassigned" = nobody has said whose it is yet, and it
+// counts toward nobody's wages until someone does
+/** What the stored list showed for a W-2, sent back with a removal or an
+ *  owner change so a reused id never acts on another form. */
+export const w2Seen = (w: StoredW2) => ({
+  year: w.year, box1: w.box1, employer: w.employer, ein: w.ein,
+  owner: w.owner });
 
-export interface CustomBucket {
-  name: string; parent: "food" | "other"; monthly: number;
-  categories: string[]; merchants: string[];
-}
-export interface IncomeScenario {
-  name: string; take_home: number; cadence: string;
-}
-export interface SavingsGoal {
-  name: string; target: number; target_date?: string | null;
-  monthly_plan: number; account_id?: string | null;
-  tokens: string[]; start_balance: number;
-  // absent = "monthly" (fixed commitment); "sweep" contributes at month
-  // end, only what the month's realized surplus covers (web's naming)
-  mode?: "monthly" | "sweep" | null;
-}
+export type StoredW2 =
+  S["StoredW2"];
+// every stored tax and income document, in the server's words
+export type StoredDoc = S["StoredDoc"];
+export type SyncStatus =
+  S["SyncStatus"];
+export type Entity =
+  OlderServer<S["Entity"],
+      "archived_at" | "state" | "formation_date" | "business_start_date"
+      | "ein_last4" | "home_office_sqft" | "income_tax_rate"
+      | "tax_reserve_account_id" | "members">;
+export type EntityDeleteImpact =
+  S["EntityDeleteImpact"];
+export type BizData =
+  S["BizData"];
+export type Capital =
+  OlderServer<S["Capital"], "net_income" | "household_share_pct" | "household_capital"
+      | "paid_personally">;
+export type Pnl =
+  OlderServer<S["Pnl"], "estimated_tax_paid" | "this_month" | "cash">;
+export type BizTxn =
+  OlderServer<S["BizTxn"],
+      "note" | "cat_original" | "net_amount" | "partly_claimed"
+      | "effective_bucket" | "role" | "paid_personally" | "owner_recorded"
+      | "ledger_line" | "account_id">;
+export type EstimatedTax =
+  OlderServer<S["EstimatedTax"],
+      "household" | "business_total" | "covered_profit" | "covered_tax_paid"
+      | "household_unavailable" | "next_deadline" | "next_payment"
+      | "annualized" | "vehicle_expenses_added_back" | "vehicle_method"
+      | "mileage_logged" | "basis" | "annualized_taxable_profit"
+      | "startup_label" | "loss_note"
+      | "annualized_total" | "se_tax_applies" | "covers" | "structure"
+      | "members" | "set_aside">;
+export type Obligation =
+  OlderServer<S["Obligation"], "id">;
+export type MileageTrip =
+  S["MileageTrip"];
+export type Vendor =
+  S["Vendor"];
+
+export type CustomBucket =
+  S["CustomBucket"];
+export type IncomeScenario =
+  S["IncomeScenario"];
+export type SavingsGoal =
+  OlderServer<S["SavingsGoal"], "target_date" | "account_id" | "mode">;
 // the slice of /api/settings the budget screens read/write
 /** GET /api/settings — and what every settings write returns. */
-export type SettingsView = BudgetSettings & Record<string, unknown> & {
-  // the household's pinned look; absent = never chosen, which the
-  // clients read as auto
-  theme?: "auto" | "light" | "dark" | null;
-  // the wizard's three first-run choices (see Onboarding)
-  history_months?: 1 | 3 | 6 | 12 | null;
-  setup_mode?: "auto" | "manual";
-  bill_detection_auto?: boolean;
-  // what a credential rotation paused until the owner confirms it
-  // (null = nothing): the Settings relay, extra recipients, the AI endpoint
-  outbound_paused?: { at: string; reason: "rotation" | "recovery";
-                      smtp: boolean; recipients: string[]; llm: boolean;
-                      /** members an owner's recovery removed (joined in the
-                       *  last days through the owner's own invites) */
-                      removed_members?: { email: string; role: string;
-                                          joined: string }[];
-                      /** what a non-owner is told instead of the names */
-                      removed_members_count?: number;
-                      /** true while new bank links are held on the
-                       *  household's own Plaid / MX keys (the bank-link
-                       *  hold): a new link, a re-auth and the MX widget are
-                       *  refused until the owner resumes or removes the
-                       *  keys. Syncs of banks already linked keep running */
-                      aggregator?: boolean;
-                      /** owner only: which clients are held (ids are not
-                       *  secrets); saved_at null = saved before the stamp */
-                      aggregator_keys?: { provider: "plaid" | "mx";
-                                          client_id: string; env: string;
-                                          saved_at: string | null }[];
-                      /** a hash of the record; the resume names it so a
-                       *  record that changed since it was read is refused */
-                      version?: string } | null;
-};
+// the settings document (web/schemas/settings.py). Every key is optional
+// here: which keys a reader gets depends on their role and on the server's
+// age, and the budget half is typed by BudgetSettings. The open record
+// lets the generic setting readers take it.
+export type SettingsView = BudgetSettings & Record<string, unknown>
+  & Partial<S["SettingsView"]>;
 
 export interface BudgetSettings {
   // default landing page per client (absent = Today) — mirrors web
@@ -1283,148 +657,50 @@ export interface BudgetSettings {
   disabled_bills: string[] | null;
   dismissed_hints: Record<string, unknown> | null;
 }
-export interface BudgetSuggestions {
-  months: string[];
-  suggestions: { food_monthly?: number; other_monthly?: number;
-                 income_monthly?: number; buckets: Record<string, number> };
-  bucket_candidates?: { name: string; category: string;
-                        monthly: number }[];
-  avg_bills_monthly?: number; bills_count?: number;
-  // the history behind the suggestions: days of ledger in the window,
-  // whether every figure is a partial month scaled up, and the fewest
-  // days the scaling ever stretches (the planner's history line)
-  history_days?: number; history_scaled?: boolean; min_rate_days?: number;
-  // no finished day of ledger yet: no suggestion is offered
-  not_enough_history?: boolean;
-}
+export type BudgetSuggestions =
+  OlderServer<S["BudgetSuggestions"],
+      "bucket_candidates" | "avg_bills_monthly" | "bills_count"
+      | "history_days" | "history_scaled" | "min_rate_days"
+      | "not_enough_history">;
 
-export interface Series {
-  series: [string, number][]; min: number; min_date: string;
-  negative_date: string | null; end: number; rate: number;
-  first_neg_amount?: number | null;
-}
+export type Series =
+  OlderServer<S["Series"], "first_neg_amount">;
 
 /** a member an owner's credential change (or recovery) removed: they
  *  joined in the last days through the owner's own invites */
 export interface RemovedMember { email: string; role: string; joined: string }
 
-export interface SavingsGoalProgress {
-  name: string; target: number; target_date: string | null;
-  monthly_plan: number;
-  saved: number | null; rate_90d: number | null;
-  pct: number | null; eta: string | null;
-  on_pace: boolean | null; plan_only: boolean;
-  // a plan-only goal that has match words: it needs an account to be
-  // measured (absent from older servers, read as false)
-  needs_account?: boolean;
-  mode?: "monthly" | "sweep";
-  // sweep goals only: matched-transfer evidence this month and whether
-  // it already covers the plan (the month is satisfied)
-  swept_this_month?: number | null;
-  sweep_satisfied?: boolean | null;
-  // Today only: what was posted toward the plan this month (null for a
-  // plan-only goal; absent from older servers)
-  saved_this_month?: number | null;
-}
+export type SavingsGoalProgress =
+  OlderServer<S["SavingsGoalProgress"],
+      "saved_90d" | "contributed_90d" | "needs_account" | "mode"
+      | "swept_this_month" | "sweep_satisfied" | "saved_this_month">;
 
-export interface LensTxn {
-  date: string; amount: number; payee: string; category: string;
-  account: string | null; pending: boolean; fixed: boolean;
-}
-export interface MonthLensData {
-  y: number; m: number; status: string; as_of: string;
-  days_in_month?: number;
-  // verdict null (and budget_set false): no budget the household saved
-  // stands behind the month — the lens shows no verdict
-  verdict: string | null; variance: number; tolerance?: number;
-  budget_set?: boolean;
-  // null when unjudged (budget_set false): no spendable to measure against
-  variable_actual: number; variable_budget: number | null;
-  variable_scale?: { factor: number; static_total: number } | null;
-  projection: { pace_total: number; variance: number;
-                tolerance?: number; verdict: string } | null;
-  buckets: Record<string, {
-    actual: number; expected: number; month_budget: number;
-    children?: { name: string; actual: number; expected: number;
-                 month_budget: number }[];
-    display_actual?: number; display_expected?: number;
-    remaining_budget?: number;
-  }>;
-  bills: { posted: number; planned: number; awaiting: number;
-           paid?: { date: string; amount: number; payee: string }[];
-           overdue: [string, number, string, (string | null)?][];
-           envelopes?: { payee: string; used: number; monthly: number;
-                         overflow: number }[] };
-  // [display label, amount, the STORED category key the ledger filters
-  // on]. The label is the display form ("FOOD AND DRINK"); only the key
-  // ("FOOD_AND_DRINK") matches server-side. null on the clustered Amazon
-  // parent — no single category stands behind that number — and "?" is
-  // uncategorized.
-  by_category: [string, number, string | null][];
-  amazon_subs?: [string, number, string | null][];
-  biggest: LensTxn[];
-  income: { actual: number | null; budgeted: number | null };
-  spend_total: number;
-  saved_month?: number | null;
-  savings_goal?: { monthly_plan: number; rate_90d: number | null } | null;
-  plan_surplus?: number | null;
-  // "snapshot": closed month judged against its frozen budget; "live":
-  // today's config (the page notes the retroactive judgment)
-  budget_source?: "snapshot" | "live";
-  // same flag for the bill schedule — "live" on a closed month means its
-  // snapshot predates bill freezing, so today's schedule applied
-  bills_source?: "snapshot" | "live";
-  first_year?: number | null;
-}
-export interface YearCell {
-  m: number; status: string; verdict: string | null;
-  variance: number | null; variable_actual: number | null;
-  variable_budget: number | null;
-  // "net" cells only — a closed month with no budget snapshot shows its
-  // cash flow (income − spending) instead of a verdict
-  income?: number | null; spend?: number; net?: number | null;
-}
-export interface YearTotals {
-  income: number | null; spend: number; saved: number | null;
-  rate: number | null;
-}
+export type LensTxn =
+  S["LensTxn"];
+export type MonthLensData =
+  Omit<OlderServer<S["MonthLensData"],
+      "days_in_month" | "tolerance" | "budget_set" | "variable_scale"
+      | "amazon_subs" | "dating" | "saved_month" | "savings_goal"
+      | "plan_surplus" | "budget_source" | "bills_source" | "first_year"
+      | "remaining" | "net">, "bills">
+  // the bills card's count words are left out by an older server
+  & { bills: OlderServer<S["LensBills"], "posted_counts"> };
+export type YearCell =
+  OlderServer<S["YearCell"], "income" | "spend" | "net">;
+export type YearTotals =
+  OlderServer<S["YearTotals"],
+    "saved_months_known" | "saved_months_total" | "unknown_text"
+    | "incomplete_text">;
 // Budget history (the Budget page's card) — each frozen month's variable
 // budgets, how it was captured ("close" as the month ran, "backfill" =
 // applied retroactively by the owner), and how many closed months since
 // the ledger began have no snapshot.
-export interface BudgetSnapshots {
-  months: { y: number; m: number; food_monthly: number;
-            other_monthly: number; variable_budget: number;
-            source: "close" | "backfill"; captured_at: string;
-            // the schedule frozen with the budget — absent on snapshots
-            // that predate bill freezing
-            bills_monthly?: number; income_monthly?: number }[];
-  missing: number;
-  budget_set: boolean;
-}
-export interface YearLensData {
-  y: number; cells: YearCell[];
-  totals: YearTotals; prev_totals: YearTotals;
-  // the last day of the prior year the comparison counts ("YYYY-MM-DD"):
-  // a year in progress is set against the same span of the year before,
-  // so the column reads "2025 (to Jun 30)"; null when both years are whole
-  prev_through?: string | null;
-  // [display label, this year, last year, the STORED category key]; the
-  // key is what the ledger filters on, null when no single category
-  // stands behind the row
-  categories: [string, number, number, string | null][];
-  first_year: number | null;
-  buckets_annual?: Record<"food" | "other" | "fixed", {
-    actual: number; expected: number; month_budget: number;
-    children?: { name: string; actual: number; expected: number;
-                 month_budget: number }[];
-    display_actual?: number; display_expected?: number;
-    remaining_budget?: number;
-  }>;
-  saved_ytd?: number | null;
-  savings_goal?: { monthly_plan: number; rate_90d: number | null } | null;
-  plan_surplus?: number | null;
-}
+export type BudgetSnapshots =
+  S["BudgetSnapshots"];
+export type YearLensData =
+  OlderServer<S["YearLensData"],
+      "dating" | "prev_through" | "buckets_annual" | "saved_ytd"
+      | "savings_goal" | "plan_surplus" | "changes">;
 
 
 // ---- session elevation ("sudo mode") — the controller ----
@@ -1445,16 +721,11 @@ export interface YearLensData {
 // file does not resolve — every other sibling import here is type-only.
 
 /** GET /api/auth/elevation — and what a successful POST returns. */
-export interface ElevationStatus {
-  elevated: boolean;
-  until: string | null;
-  // ["passkey"], ["password"], or ["passkey", "password"] (passkey first)
-  // for an account holding both a passkey and a password+TOTP. A hosted
-  // passkey-only account reads ["passkey", "recovery+password"]: its
-  // lost-key fallback is a recovery code sent WITH the password.
-  methods: ("passkey" | "password" | "recovery+password")[];
-  totp: boolean;
-}
+// methods: ["passkey"], ["password"], or ["passkey", "password"] (passkey
+// first) for an account holding both a passkey and a password+TOTP. A
+// hosted passkey-only account reads ["passkey", "recovery+password"]: its
+// lost-key fallback is a recovery code sent WITH the password.
+export type ElevationStatus = S["Elevation"];
 
 /** POST /api/auth/elevate — exactly one proof per call. */
 export type ElevationProof =
@@ -1651,6 +922,10 @@ export function removedConnectionNote(
 }
 
 export function errText(e: unknown): string {
+  // no answer, a 5xx or a bare refusal: the cause in the app's words,
+  // never "TypeError: Network request failed" or a status on its own
+  const cause = failCause(e, "phone");
+  if (cause) return cause;
   if (e instanceof ApiError && e.detail) return e.detail;
   const raw = e instanceof Error ? e.message : String(e);
   const m = /^(\d{3}):\s*([\s\S]*)$/.exec(raw);
@@ -1674,7 +949,7 @@ export function errText(e: unknown): string {
 export function whatIfRefusal(e: unknown): string | null {
   if (!(e instanceof ApiError) || e.status < 400 || e.status >= 500
       || e.status === 401) return null;
-  return e.detail ? e.detail : `Couldn't load: ${e.status}`;
+  return e.detail ? e.detail : failCause(e, "phone") ?? "The server refused the request.";
 }
 
 /** normalize what a person types into an origin the client can call */
@@ -1869,26 +1144,10 @@ function appJson(ct: string, text: string): boolean {
   try { JSON.parse(t); return true; } catch { return false; }
 }
 
-/** "a moment." or "N seconds." — the wait both sentences below share */
-function inWait(retryAfter?: string | null): string {
-  const secs = parseInt(retryAfter ?? "", 10);
-  return secs > 0 && secs <= 120
-    ? `${secs} second${secs === 1 ? "" : "s"}.`
-    : "a moment.";
-}
-
-/** "The server is busy — try again in a moment.", or in N seconds when
- *  the server's Retry-After named a short wait. Same words as the web. */
-export function busyText(retryAfter?: string | null): string {
-  return "The server is busy — try again in " + inWait(retryAfter);
-}
-
-/** The same shape for the proxy's answer while the app restarts: it is
- *  not overloaded, it is coming back, so it says that. Same words as the
- *  web. */
-export function restartingText(retryAfter?: string | null): string {
-  return "The server is restarting — try again in " + inWait(retryAfter);
-}
+// busyText / restartingText live in the screen-states twin block
+// (pure.ts), so the failed-read line and the sign-in screen say the web's
+// words.
+export { busyText, restartingText };
 
 /** The sign-in screen's sentence for a failure: a 503 is the server
  *  shedding load (sign-ins hashing at once, or the database full) — never
@@ -1949,7 +1208,7 @@ export function makeClient(baseUrl: string, token: string,
     // no-store keeps the reply out of the platform's own HTTP disk cache
     // (OkHttp's on Android, URLCache on iOS), which nothing here can
     // encrypt or wipe at sign-out; expo/fetch takes no `cache` option.
-    const r = await fetch(baseUrl + path, {
+    const r = await fetchStamped(baseUrl + path, {
       ...init,
       signal: init?.signal ?? epochSignal(),
       headers: { Authorization: `Bearer ${token}`,
@@ -1957,10 +1216,15 @@ export function makeClient(baseUrl: string, token: string,
                  "Cache-Control": "no-store",
                  ...(init?.headers || {}) },
     });
-    await checkAuth(r, init?.method ?? "GET");
-    if (!r.ok) throw await parseError(r);
-    return parseOkBody<T>(r.status, r.headers.get("content-type"),
-                          await r.text());
+    try {
+      await checkAuth(r, init?.method ?? "GET");
+      if (!r.ok) throw await parseError(r);
+      return parseOkBody<T>(r.status, r.headers.get("content-type"),
+                            await r.text());
+    } finally {
+      // the body is read: the read stops watching the epoch for it
+      readFinished(r);
+    }
   };
   // step-up: an inline passkey assertion mints a 5-minute single-use
   // ticket that the destructive endpoints redeem out of the same
@@ -1968,11 +1232,11 @@ export function makeClient(baseUrl: string, token: string,
   // `req` — the step-up doors are what answers a step-up refusal, so
   // routing them back through the retry would be circular.
   const stepupPasskeyOptions = () =>
-    send<{ challenge_id: string; options: unknown }>(
+    send<S["PasskeyAssertOptions"]>(
       "/api/stepup/passkey/options", { method: "POST",
         headers: { "Content-Type": "application/json" }, body: "{}" });
   const stepupPasskey = (challenge_id: string, credential: unknown) =>
-    send<{ stepup_ticket: string }>("/api/stepup/passkey", {
+    send<S["StepUpTicket"]>("/api/stepup/passkey", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ challenge_id, credential }) });
   // The two elevation doors go through `send`, never `withElevation`:
@@ -2109,6 +1373,12 @@ export function makeClient(baseUrl: string, token: string,
     todayFull: (date?: string) =>
       req<TodayFull>("/api/today/full"
         + (date ? `?date=${encodeURIComponent(date)}` : "")),
+    // how close the cash forecast has landed (specs/forecast-grading.md);
+    // an older server has neither door, and the phone offers no panel
+    forecastScore: () => req<ForecastScorePanel>("/api/today/forecast-score"),
+    forecastMiss: (day: string, horizon = 30) =>
+      req<ForecastMiss>("/api/today/forecast-score/miss?day="
+        + encodeURIComponent(day) + `&horizon=${horizon}`),
     onboarding: () => req<Onboarding>("/api/onboarding"),
     // where each bank connection stands in its one-time history backfill;
     // polling it also nudges the server to keep pulling (same door the
@@ -2128,7 +1398,7 @@ export function makeClient(baseUrl: string, token: string,
     // when a backfill has gone quiet is this owner-only POST — the wizard
     // fires it once when its gate mounts, and ignores a viewer's 403
     onboardingBackfillNudge: () =>
-      req<{ all_ready: boolean; syncing: boolean }>(
+      req<S["BackfillStatus"]>(
         "/api/onboarding/backfill/nudge", { method: "POST",
           headers: { "Content-Type": "application/json" }, body: "{}" }),
     // a one-shot ticket the export download redeems within a minute. The
@@ -2137,15 +1407,15 @@ export function makeClient(baseUrl: string, token: string,
     // the continuity packet (web: client.ts continuity*)
     continuity: () => req<Continuity>("/api/continuity"),
     continuitySave: (body: { note?: string; prepared_for?: string }) =>
-      req<Continuity>("/api/continuity", {
+      req<ContinuitySaved>("/api/continuity", {
         method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body) }),
     continuityEmail: (to: string) =>
-      req<{ ok: boolean; to: string }>("/api/continuity/email", {
+      req<ContinuityEmailed>("/api/continuity/email", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ to }) }),
     exportTicket: (kind: "zip" | "dump" | "continuity") =>
-      req<{ ok: boolean; token: string; url: string; expires_in: number }>(
+      req<S["ExportTicket"]>(
         "/api/export/token", { method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ kind }) }),
@@ -2153,14 +1423,16 @@ export function makeClient(baseUrl: string, token: string,
       req<TxnPage>("/api/transactions?" + new URLSearchParams(
         Object.entries(params)
           .filter(([, v]) => v !== undefined) as [string, string][])),
-    /** ONE ledger row, read back from the server. There is no single-row
-     *  door, and the ledger search scoped to the row's own DAY is the
-     *  narrowest one there is — it answers in exactly the shape every
-     *  ledger surface already renders, provenance and all. For a screen
-     *  holding its row in local state that needs the server's answer to a
-     *  write it cannot compute itself. Null when the row is not in that
-     *  day's listing (a hidden account's row, or a day longer than the
-     *  pages walked here), which callers read as "keep what you have". */
+    /** ONE ledger row by id, the list door's row exactly (GET
+     *  /api/transactions/one). A 404 is "this household holds no such
+     *  row" — or a server older than the door, which callers treat the
+     *  same: nothing to show, never an error. */
+    txn: (id: string) =>
+      req<Txn>("/api/transactions/one?" + new URLSearchParams({ id })),
+    /** ONE ledger row found through its own DAY's listing — the fallback
+     *  for a server older than /api/transactions/one (`txn` above). Null
+     *  when the row is not in that listing (a hidden account's row, or a
+     *  day longer than the pages walked here): "keep what you have". */
     txnById: async (id: string, date: string): Promise<Txn | null> => {
       const day = date.slice(0, 10);
       let seen = 0;
@@ -2179,9 +1451,7 @@ export function makeClient(baseUrl: string, token: string,
     // live pin, else the largest-balance pick) — the ledger heads itself
     // with its balance; absent from older servers. primary_pin_unused: why
     // the saved pin is not that account (the web's)
-    accounts: () => req<{ accounts: Account[];
-                          primary_checking_id?: string | null;
-                          primary_pin_unused?: string | null }>("/api/accounts"),
+    accounts: () => req<AccountsData>("/api/accounts"),
     // `month` (YYYY-MM) reads a past month's paid/received per bill
     bills: (month?: string) =>
       req<BillsData>(month ? `/api/bills?month=${month}` : "/api/bills"),
@@ -2198,18 +1468,18 @@ export function makeClient(baseUrl: string, token: string,
     reportCashCosts: () => req<CashCostsReport>("/api/reports/cash-costs"),
     alertsHistory: () => req<{ alerts: AlertRow[] }>("/api/alerts/history"),
     alertDismiss: (kind: string, message: string) =>
-      req<{ ok: boolean }>("/api/alerts/dismiss", {
+      req<S["AlertsDismissed"]>("/api/alerts/dismiss", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ kind, message }),
       }),
     alertRestore: (kind: string, message: string) =>
-      req<{ ok: boolean }>("/api/alerts/restore", {
+      req<S["AlertsRestored"]>("/api/alerts/restore", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ kind, message }),
       }),
-    devices: () => req<{ devices: MobileDevice[]; hidden?: boolean }>("/api/devices"),
+    devices: () => req<S["MobileDevices"]>("/api/devices"),
     // ---- security self-service ----
     // Every posture change below is elevation-gated server-side: the
     // session proves itself once in the sheet and these calls carry no
@@ -2218,15 +1488,9 @@ export function makeClient(baseUrl: string, token: string,
     passwordChange: (current_password: string, new_password: string) =>
       // the server reports what the rotation removed, so a phone or
       // passkey that stops working right after is explained, not a mystery
-      req<{ ok: boolean; passkeys_removed?: number; passkeys_kept?: number;
-            devices_revoked?: number;
-            tokens_revoked?: number; invites_removed?: number;
-            sms_number_needs_verify?: boolean;
-            members_removed?: RemovedMember[];
-            other_sessions_signed_out?: number;
-            // the rotation voided the recovery sheet; this is the one
-            // that stands (null when the account has no second factor)
-            recovery_codes?: string[] | null }>(
+      // recovery_codes: the rotation voided the recovery sheet; this is
+      // the one that stands (null when the account has no second factor)
+      req<Rotated<S["PasswordChanged"]>>(
         "/api/password/change", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2238,16 +1502,7 @@ export function makeClient(baseUrl: string, token: string,
     // on hosted the address does not move yet: `email` is still the
     // sign-in address and `pending_email` the one awaiting its button
     emailChange: (new_email: string) =>
-      req<{ ok: boolean; email: string; pending_email?: string | null;
-            verify_sent?: boolean;
-            hint?: string | null; passkeys_removed?: number;
-            passkeys_kept?: number; mail_list_entry_dropped?: boolean;
-            sms_number_needs_verify?: boolean;
-            members_removed?: RemovedMember[];
-            other_sessions_signed_out?: number;
-            // the rotation voided the recovery sheet; this is the one
-            // that stands (null when the account has no second factor)
-            recovery_codes?: string[] | null }>(
+      req<S["EmailChanged"]>(
         "/api/email/change", {
         method: "POST",
         headers: { "Content-Type":
@@ -2258,16 +1513,14 @@ export function makeClient(baseUrl: string, token: string,
                                     reissue_codes: "1" }).toString(),
       }),
     totpEnroll: () =>
-      req<{ secret: string; qr: string }>("/api/totp/enroll", {
+      req<S["TotpEnrollment"]>("/api/totp/enroll", {
         method: "POST",
         headers: { "Content-Type":
                      "application/x-www-form-urlencoded" },
         body: "",
       }),
     totpConfirm: (secret: string, code: string) =>
-      req<{ ok: boolean; recovery_codes: string[] | null;
-            sms_number_needs_verify?: boolean;
-            members_removed?: RemovedMember[] }>(
+      req<Rotated<S["TotpConfirmed"], "recovery_codes">>(
         "/api/totp/confirm", {
           method: "POST",
           headers: { "Content-Type":
@@ -2280,9 +1533,7 @@ export function makeClient(baseUrl: string, token: string,
     totpDisable: (code: string) =>
       // turned off while a passkey stays, the old recovery sheet is voided
       // and the new one returned (null when no factor remains)
-      sendOneTimeCode<{ ok: boolean; sms_number_needs_verify?: boolean;
-                        recovery_codes?: string[] | null;
-                        members_removed?: RemovedMember[] }>(
+      sendOneTimeCode<Rotated<S["TotpDisabled"]>>(
         "/api/totp/disable", {
         method: "POST",
         headers: { "Content-Type":
@@ -2295,18 +1546,15 @@ export function makeClient(baseUrl: string, token: string,
     // cancelling is the safe direction)
     // withdraw a pending sign-in address change
     emailChangeCancel: () =>
-      req<{ ok: boolean; cancelled: boolean }>(
+      req<S["EmailChangeCancelled"]>(
         "/api/email/change/cancel", { method: "POST" }),
     cancelPendingRecovery: () =>
-      req<{ ok: boolean; cancelled: number }>(
+      req<S["RecoveryCancelled"]>(
         "/api/recovery/cancel-pending", { method: "POST" }),
     // the old sheet is voided, and what it could have reached is swept
     // with it — the same fields turning 2FA off answers with
     recoveryRegenerate: () =>
-      req<{ ok: boolean; recovery_codes: string[];
-            other_sessions_signed_out?: number;
-            sms_number_needs_verify?: boolean;
-            members_removed?: RemovedMember[] }>(
+      req<Rotated<S["RecoveryRegenerated"], "recovery_codes">>(
         "/api/totp/recovery-regenerate", {
           method: "POST",
           headers: { "Content-Type":
@@ -2314,28 +1562,24 @@ export function makeClient(baseUrl: string, token: string,
           body: "",
         }),
     sessions: () =>
-      req<{ sessions: { id: string; created_at: string;
-            last_seen: string | null; expires_at: string;
-            user_agent: string; ip: string | null;
-            current: boolean }[];
-            // withheld for a demo or a login every visitor shares
-            hidden?: boolean }>("/api/sessions"),
+      // `hidden`: withheld for a demo or a login every visitor shares
+      req<S["AuthSessions"]>("/api/sessions"),
     // signing another session out is a posture change — elevation-gated
     sessionRevoke: (body: { all_others?: boolean; id?: string }) =>
-      req<{ ok: boolean; revoked: number }>("/api/sessions/revoke", {
+      req<S["SessionsRevoked"]>("/api/sessions/revoke", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }),
     deviceRevoke: (body: { id: string }) =>
-      req<{ ok: boolean; revoked: number }>("/api/devices/revoke", {
+      req<S["DeviceRevoked"]>("/api/devices/revoke", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       }),
     // a household member removes their OWN login (owner + data untouched)
     accountLeave: () =>
-      req<{ ok: boolean }>("/api/account/leave", {
+      req<S["Ok"]>("/api/account/leave", {
         method: "POST",
         headers: { "Content-Type":
                      "application/x-www-form-urlencoded" },
@@ -2343,39 +1587,38 @@ export function makeClient(baseUrl: string, token: string,
       }),
     // this login's own daily-email delivery (viewers may)
     meEmail: (muted: boolean) =>
-      req<{ ok: boolean; muted: boolean }>("/api/me/email", {
+      req<S["MeEmailChanged"]>("/api/me/email", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ muted }) }),
     // one kind of the household's mail on or off for my own inbox
     // this login's own switch for the household's push notices (every
     // role); the phone stays registered, account notices still arrive
     mePush: (muted: boolean) =>
-      req<{ ok: boolean; muted: boolean }>("/api/me/push", {
+      req<S["MePushChanged"]>("/api/me/push", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ muted }) }),
     meEmailPref: (kind: string, on: boolean) =>
-      req<{ ok: boolean; prefs: Record<string, boolean> }>("/api/me/email", {
+      req<S["MeEmailChanged"]>("/api/me/email", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ kind, on }) }),
     // wants FRESH elevation: the sheet shows even inside a live window
     accountDelete: () =>
-      req<{ ok: boolean }>("/api/account/delete", {
+      req<S["Ok"]>("/api/account/delete", {
         method: "POST",
         headers: { "Content-Type":
                      "application/x-www-form-urlencoded" },
         body: "",
       }),
     supportAccess: () =>
-      req<{ granted: boolean; expires_at: string | null;
-            reason: string | null }>("/api/support-access"),
+      req<S["SupportAccess"]>("/api/support-access"),
     supportAccessGrant: (hours: number, reason: string) =>
-      req<{ ok: boolean }>("/api/support-access", {
+      req<S["SupportAccessGranted"]>("/api/support-access", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ hours, reason }),
       }),
     supportAccessRevoke: () =>
-      req<{ ok: boolean }>("/api/support-access/revoke", {
+      req<S["Ok"]>("/api/support-access/revoke", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
@@ -2383,11 +1626,9 @@ export function makeClient(baseUrl: string, token: string,
     // ---- script tokens (self-host collectors, and the read half the
     // integrations use) ----
     tokens: () =>
-      req<{ tokens: { id: string; name: string; created_at: string;
-            last_used_at: string | null;
-            revoked_at: string | null; scope?: TokenScope }[] }>("/api/tokens"),
+      req<{ tokens: OlderServer<S["ApiToken"], "scope">[] }>("/api/tokens"),
     tokenMint: (name: string, scope: TokenScope = "push") =>
-      req<{ id: string; name: string; token: string; scope: TokenScope }>(
+      req<S["ApiTokenMinted"]>(
         "/api/tokens", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2395,9 +1636,9 @@ export function makeClient(baseUrl: string, token: string,
         }),
     // ---- outbound webhooks (Settings → Integrations on the web) ----
     webhooks: () =>
-      req<{ webhooks: Webhook[]; events: WebhookEvent[] }>("/api/webhooks"),
+      req<S["Webhooks"]>("/api/webhooks"),
     webhookCreate: (body: { url: string; events: string[]; name: string }) =>
-      req<Webhook & { secret: string }>("/api/webhooks", {
+      req<S["WebhookWithSecret"]>("/api/webhooks", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
@@ -2410,20 +1651,20 @@ export function makeClient(baseUrl: string, token: string,
         body: JSON.stringify(body),
       }),
     webhookDelete: (id: string) =>
-      req<{ ok: boolean }>(`/api/webhooks/${id}/delete`, {
+      req<S["Ok"]>(`/api/webhooks/${id}/delete`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       }),
     webhookTest: (id: string) =>
-      req<{ ok: boolean; status: number | null; error: string | null }>(
+      req<S["WebhookTested"]>(
         `/api/webhooks/${id}/test`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{}",
         }),
     tokenRevoke: (id: string) =>
-      req<{ ok: boolean }>("/api/tokens/revoke", {
+      req<S["Ok"]>("/api/tokens/revoke", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id }),
@@ -2435,7 +1676,7 @@ export function makeClient(baseUrl: string, token: string,
     // leaves in one file.
     connectionsExport: async (passphrase: string) => {
       const r = await withElevation(async () => {
-        const r0 = await fetch(baseUrl + "/api/connections/export", {
+        const r0 = await fetchStamped(baseUrl + "/api/connections/export", {
           method: "POST", signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}`,
                      "Content-Type": "application/json" },
@@ -2470,13 +1711,14 @@ export function makeClient(baseUrl: string, token: string,
       fd.append("passphrase", passphrase);
       fd.append("file", await filePart(file.uri, file.name, "application/octet-stream"));
       return withElevation(async () => {
-        const r = await fetch(baseUrl + "/api/connections/import",
+        const r = await fetchStamped(baseUrl + "/api/connections/import",
           { method: "POST", body: fd, signal: epochSignal(),
             headers: { Authorization: `Bearer ${token}` } });
         await checkAuth(r, "POST");
         if (!r.ok) throw await parseError(r);
         return parseOkBody<{ ok: boolean; config: string[];
-                             items: number }>(
+                             items: number;
+                             credentials_dropped?: string[] }>(
           r.status, r.headers.get("content-type"), await r.text());
       });
     },
@@ -2484,26 +1726,24 @@ export function makeClient(baseUrl: string, token: string,
     // an older server leaves `sent` out and always sent
     // the owner confirms the paused relay / recipients / AI endpoint are theirs
     outboundResume: (version?: string) =>
-      req<{ ok: boolean; resumed: boolean }>("/api/settings/outbound/resume",
+      req<S["OutboundResumed"]>("/api/settings/outbound/resume",
         { method: "POST", headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ version }) }),
     recipientInviteResend: (email: string) =>
-      req<{ ok: boolean; sent?: boolean; reason?: string }>("/api/settings/recipients/resend", {
+      req<S["RecipientResent"]>("/api/settings/recipients/resend", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email }),
       }),
     smtpTest: () =>
-      req<{ ok: boolean; sent_to: string[];
-            skipped?: { email: string; reason: string }[];
-            failed: { email: string; error: string }[]; via: string }>(
+      req<S["SmtpTested"]>(
         "/api/settings/smtp-test", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: "{}",
         }),
     verifyResend: () =>
-      req<{ ok: boolean; verified: boolean }>(
+      req<S["VerifyResent"]>(
         "/api/verify-email/resend", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2511,19 +1751,18 @@ export function makeClient(baseUrl: string, token: string,
         }),
     // ---- household members + invites ----
     members: () =>
-      req<{ users: { id: string; email: string; role: string;
-            created_at: string; me: boolean;
-            // what this person receives — the owner gets every member's,
-            // everyone else only their own row's; absent on older servers
-            notify?: MemberNotify | null }[];
-            assignable_roles: string[] }>("/api/users"),
+      // what each person receives: the owner gets every member's,
+      // everyone else only their own row's
+      req<Omit<S["HouseholdUsers"], "users">
+          & { users: (Omit<S["HouseholdUser"], "notify">
+                      & { notify?: MemberNotify | null })[] }>("/api/users"),
     // the owner sets one member's switches — the same places the member's
     // own doors write, so the roster and their screen agree
     memberNotify: (id: string, body: { push_muted?: boolean;
                                        email_muted?: boolean;
                                        email_pref?: { kind: string;
                                                       on: boolean } }) =>
-      req<{ ok: boolean; notify: MemberNotify }>(
+      req<Omit<S["UserNotifyChanged"], "notify"> & { notify: MemberNotify }>(
         `/api/users/${encodeURIComponent(id)}/notify`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2532,38 +1771,36 @@ export function makeClient(baseUrl: string, token: string,
     // "viewer" (reads everything, changes nothing). Elevation-gated, like
     // every other durable grant.
     memberSetRole: (id: string, role: string) =>
-      req<{ ok: boolean; role: string }>(
+      req<S["UserRoleChanged"]>(
         `/api/users/${encodeURIComponent(id)}/role`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ role }),
         }),
     memberRemove: (id: string) =>
-      req<{ ok: boolean }>(`/api/users/${encodeURIComponent(id)}`, {
+      req<S["Ok"]>(`/api/users/${encodeURIComponent(id)}`, {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       }),
     invites: () =>
-      req<{ invites: { token_hash: string; role: string; label: string;
-            created_at: string; expires_at: string }[] }>("/api/invites"),
+      req<S["Invites"]>("/api/invites"),
     // `url` is null on hosted: the server mails the claim link to the
     // address on the invite and keeps it out of the reply, because holding
     // a claimable link is the mailbox proof the claim door runs on. Render
     // the outcome through `inviteOutcome`, never the URL alone.
     inviteCreate: (label: string, role = "viewer") =>
-      req<{ url: string | null; role: string; label: string;
-            expires_at: string; emailed: boolean }>("/api/invites", {
+      req<S["InviteCreated"]>("/api/invites", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ label, role }),
       }),
     inviteRevoke: (tokenHash: string) =>
-      req<{ ok: boolean }>(
+      req<S["Ok"]>(
         `/api/invites/${encodeURIComponent(tokenHash)}`,
         { method: "DELETE" }),
     revokeSelf: (id: string) =>
-      req<{ ok: boolean }>("/api/devices/revoke", {
+      req<S["DeviceRevoked"]>("/api/devices/revoke", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ id }),
@@ -2572,28 +1809,27 @@ export function makeClient(baseUrl: string, token: string,
     // device) and the payload that door serves — the app reads it too,
     // to refresh the widget from the numbers it just showed
     widgetToken: () =>
-      req<{ token: string }>("/api/devices/widget", { method: "POST" }),
-    glance: () => req<Glance>("/api/today/glance"),
+      req<S["WidgetToken"]>("/api/devices/widget", { method: "POST" }),
+    glance: () => req<S["TodayGlance"]>("/api/today/glance"),
     registerPush: (token: string, platform: "fcm" | "apns") =>
-      req<{ ok: boolean }>("/api/devices/push", {
+      req<S["DevicePushSaved"]>("/api/devices/push", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token, platform }),
       }),
     txnBulk: (ids: string[], action: string, category?: string) =>
-      req<{ ok: boolean; applied: number; missing: number; flow: number }>(
+      req<S["TxnBulkDone"]>(
         "/api/transactions/bulk", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ ids, action, category }),
         }),
     categories: () =>
-      req<{ categories: string[]; plaid_spend: string[];
-            plaid_flow: string[] }>("/api/categories"),
+      req<S["Categories"]>("/api/categories"),
     // scope "all" also teaches the merchant (a Rules-page rule); the
     // picker asks explicitly, same as the web
     setCategory: (id: string, category: string, scope: "one" | "all") =>
-      req<{ ok: boolean; scope: string; rule_written: boolean }>(
+      req<S["TxnCategorySet"]>(
         `/api/transactions/${encodeURIComponent(id)}/category`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2602,24 +1838,32 @@ export function makeClient(baseUrl: string, token: string,
     reimbFlag: (id: string,
                 opts: { partial?: boolean;
                         expected?: number | null } = {}) =>
-      req<{ ok: boolean }>(`/api/reimburse/${encodeURIComponent(id)}/flag`, {
+      req<S["ReimbFlagged"]>(`/api/reimburse/${encodeURIComponent(id)}/flag`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(opts),
       }),
     reimbUnflag: (id: string) =>
-      req<{ ok: boolean }>(
+      req<S["ReimbUnflagged"]>(
         `/api/reimburse/${encodeURIComponent(id)}/unflag`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({}),
         }),
     // every pending proposal in one click (the wizard's bills step)
-    billsApproveAll: () =>
+    // `pids` are the offers on screen: one a scan files after the list
+    // loaded is never approved unseen
+    billsApproveAll: (pids: string[]) =>
       req<{ ok: boolean; approved: number; payees: string[];
-            failed: { pid: string; error: string }[];
+            // superseded: withdrawn as already tracked (an older server
+            // sends no flag)
+            failed: { pid: string; error: string; superseded?: boolean }[];
             notes?: { payee: string; note: string }[] }>(
-        "/api/bills/proposals/approve-all", { method: "POST" }),
+        "/api/bills/proposals/approve-all", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pids }),
+        }),
     // `note` is present when the approve changed something the person set
     // (a pinned amount cleared) and must be shown to them
     // `adjust` (approve only) is what the person changed in the wizard's
@@ -2640,7 +1884,7 @@ export function makeClient(baseUrl: string, token: string,
     // BYO provider keys (self-host): validated live before saving,
     // clearable — the web ConnectHub's endpoints, verbatim
     plaidValidate: (client_id: string, secret: string, env: string) =>
-      req<{ ok: boolean; env: string }>("/api/accounts/plaid/validate", {
+      req<S["KeysSaved"]>("/api/accounts/plaid/validate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ client_id, secret, env }),
@@ -2652,7 +1896,7 @@ export function makeClient(baseUrl: string, token: string,
         body: JSON.stringify({ client_id, secret, env }),
       }),
     plaidKeysClear: () =>
-      req<{ ok: boolean }>("/api/accounts/plaid/keys",
+      req<S["KeysSaved"]>("/api/accounts/plaid/keys",
                            { method: "DELETE" }),
     mxKeys: (client_id: string, api_key: string, env: string) =>
       req<{ ok: boolean; env: string }>("/api/accounts/mx/keys", {
@@ -2661,31 +1905,40 @@ export function makeClient(baseUrl: string, token: string,
         body: JSON.stringify({ client_id, api_key, env }),
       }),
     mxKeysClear: () =>
-      req<{ ok: boolean }>("/api/accounts/mx/keys", { method: "DELETE" }),
+      req<S["MxKeysCleared"]>("/api/accounts/mx/keys", { method: "DELETE" }),
     mxConnect: () =>
-      req<{ url: string }>("/api/accounts/mx/connect", {
+      req<S["MxConnect"]>("/api/accounts/mx/connect", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       }),
     mxSyncNow: () =>
-      req<{ ok: boolean; transactions: number }>("/api/accounts/mx/sync", {
+      req<S["MxSynced"]>("/api/accounts/mx/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       }),
     budgetSnapshots: () => req<BudgetSnapshots>("/api/budget/snapshots"),
     budgetBackfill: () =>
-      req<{ backfilled: number }>("/api/budget/snapshots/backfill",
+      req<S["SnapshotsBackfilled"]>("/api/budget/snapshots/backfill",
                                   { method: "POST" }),
     reimbPending: () =>
-      req<{ pending: PendingReimb[] }>("/api/reimburse/pending"),
+      req<ReimbPending>("/api/reimburse/pending"),
     reimbCandidates: (id: string, q = "") =>
-      req<{ anchor?: ReimbAnchor; candidates: ReimbCandidate[] }>(
+      req<OlderServer<S["ReimbCandidates"], "pairs" | "anchor">
+        & { anchor?: ReimbAnchor; candidates: ReimbCandidate[] }>(
         `/api/reimburse/${encodeURIComponent(id)}/candidates` +
         (q ? `?q=${encodeURIComponent(q)}` : "")),
     reimbLink: (txn_id: string, other_ids: string[], partial = false) =>
-      req<{ linked: number; errors: string[]; notes?: string[] }>("/api/reimburse/link", {
+      req<OlderServer<S["ReimbLinked"], "txn_id">>("/api/reimburse/link", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ txn_id, other_ids, partial }),
+      }),
+    // the line beside Pair for the ticked rows, by the link rule (nothing
+    // is linked); an older server has no such door
+    reimbSelection: (txn_id: string, other_ids: string[], partial = false) =>
+      req<S["ReimbSelection"]>("/api/reimburse/selection", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ txn_id, other_ids, partial }),
@@ -2696,7 +1949,7 @@ export function makeClient(baseUrl: string, token: string,
       `/api/reimburse/pairs?page=${page}`
       + (q ? `&q=${encodeURIComponent(q)}` : "")),
     reimbUnlink: (expense_id: string, reimburse_id: string) =>
-      req<{ ok: boolean }>("/api/reimburse/unlink", {
+      req<S["ReimbUnlinked"]>("/api/reimburse/unlink", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ expense_id, reimburse_id }),
@@ -2722,60 +1975,65 @@ export function makeClient(baseUrl: string, token: string,
                           + encodeURIComponent(display)),
     // rename and merge are one call: naming an existing merchant merges
     merchantRename: (display: string, to: string) =>
-      req<{ raws: number; rows: number }>("/api/merchants/rename", {
+      req<S["MerchantRenamed"]>("/api/merchants/rename", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ display, to }),
       }),
     // approve = merge through the journalled rename (undo works); reject =
     // keep apart, never offered again
-    merchantMerge: (pid: string, action: "approve" | "reject") =>
-      req<{ ok: boolean }>("/api/merchants/merge", {
+    // bulk = "Merge all": a pair the batch already changed answers 409
+    // into_id = the survivor the list showed: an offer a sync turned since
+    // answers 409 and nothing merges (web: client.ts)
+    merchantMerge: (pid: string, action: "approve" | "reject",
+                    into_id: string, bulk = false) =>
+      req<S["MerchantMerged"]>("/api/merchants/merge", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ pid, action }),
+        body: JSON.stringify(bulk ? { pid, action, into_id, bulk }
+                                  : { pid, action, into_id }),
       }),
     merchantUndo: (id: number) =>
-      req<{ raw_merchant: string; restored: string | null }>(
+      req<S["MerchantUndone"]>(
         "/api/merchants/undo", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id }),
         }),
     rules: (source: "user" | "llm" | "seed" | "model", q = "", page = 1) =>
-      req<RulesPage>(`/api/rules?source=${source}&q=${
+      req<S["RulesPage"]>(`/api/rules?source=${source}&q=${
         encodeURIComponent(q)}&page=${page}`),
     ruleDisable: (merchant: string, disabled: boolean) =>
-      req<{ ok: boolean }>("/api/rules/disable", {
+      req<S["Ok"]>("/api/rules/disable", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ merchant, disabled }),
       }),
     ruleDelete: (merchant: string) =>
-      req<{ ok: boolean; deleted: number }>("/api/rules/delete", {
+      req<S["RuleDeleted"]>("/api/rules/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ merchant }),
       }),
     // rename a free-form custom category everywhere it appears
     categoryRename: (oldName: string, newName: string) =>
-      req<{ old: string; new: string; overrides: number;
-            primaries: number; rules: number; buckets: number }>(
+      req<S["CategoryRenamed"]>(
         "/api/categories/rename", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ old: oldName, new: newName }),
         }),
     ruleSet: (merchant: string, category: string) =>
-      req<{ count: number }>("/api/rules/set", {
+      req<S["RuleSet"]>("/api/rules/set", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ merchant, category }),
       }),
+    // ask_spend: this build asks for a spend when none is set, so the
+    // server may answer without projecting one (an older build cannot)
     retirement: (params: Record<string, string> = {}) =>
-      req<RetirementData>("/api/retirement"
-        + (Object.keys(params).length
-          ? "?" + new URLSearchParams(params) : "")),
+      req<RetirementData>("/api/retirement?"
+        + new URLSearchParams({ ...params, ask_spend: "1" })),
     // debt payoff planner — method/extra are what-if overrides, unsaved
     debtPlan: (params: Record<string, string> = {}) =>
       req<DebtPlan>("/api/debt-plan"
@@ -2860,12 +2118,19 @@ export function makeClient(baseUrl: string, token: string,
             capital_account: number;
             /** the household member's share of capital_account */
             household_share_pct?: number | null;
-            household_capital?: number | null }>(
+            household_capital?: number | null;
+            /** why capital and net assets differ, the server's sentences
+             *  (absent from an older server) */
+            reconcile?: string[];
+            capital_gap?: number }>(
         `/api/business/entities/${encodeURIComponent(id)}/balance-sheet`),
     entityEquity: (id: string) =>
       req<{ movements: { id: string; kind: string; amount: number;
               date: string | null; form: string | null }[];
-            capital: Capital }>(
+            capital: Capital;
+            /** owner money moved in or out, offered as a contribution or
+             *  a draw (absent from an older server) */
+            owner_transfers?: S["OwnerTransfer"][] }>(
         `/api/business/entities/${encodeURIComponent(id)}/equity`),
     equityRecord: (id: string, body: { kind: string; amount: number;
                      date: string; form?: string }) =>
@@ -2932,9 +2197,12 @@ export function makeClient(baseUrl: string, token: string,
         + (year ? `?year=${year}` : "")),
     receiptReport: (tag: string, y: number, m: number) =>
       req<{ tag: string; total: number; count: number;
+            // the server's words when the total may hold a purchase twice
+            note?: string | null;
             rows: { date: string; payee: string; description: string;
                     qty: number | null; amount: number;
-                    receipt_id: string; txn_id: string }[] }>(
+                    receipt_id: string; txn_id: string;
+                    suspected?: boolean; note?: string | null }[] }>(
         `/api/receipts/report?tag=${encodeURIComponent(tag)}&y=${y}&m=${m}`),
     bizSuggestions: (id: string) =>
       req<{ lines: string[]; suggestions: {
@@ -2952,13 +2220,11 @@ export function makeClient(baseUrl: string, token: string,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         }),
-    importBatches: () => req<{ batches: Batch[] }>("/api/import/batches"),
+    importBatches: () => req<S["ImportBatches"]>("/api/import/batches"),
     // `forceKept`: the owner's "undo anyway" after the server asked about
     // rows only a note naming no feed account would keep
     importRollback: (batch_id: string, forceKept = false) =>
-      req<{ ok: boolean; deleted: number; warning: string | null;
-            // rows the bank feed relies on stay, and the note says so
-            kept?: number; note?: string | null }>(
+      req<S["RolledBack"]>(
         "/api/import/rollback", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -2969,7 +2235,7 @@ export function makeClient(baseUrl: string, token: string,
       const fd = new FormData();
       for (const f of files)
         fd.append("files", await filePart(f.uri, f.name, f.mime || "application/octet-stream"));
-      const r = await fetch(baseUrl + "/api/import/bulk/analyze",
+      const r = await fetchStamped(baseUrl + "/api/import/bulk/analyze",
         { method: "POST", body: fd, signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}` } });
       await checkAuth(r, "POST");
@@ -3031,7 +2297,7 @@ export function makeClient(baseUrl: string, token: string,
       // this app can ask where each account of a multi-account YNAB
       // register goes, so the server parks such a file and asks
       fd.append("ynab_choice", "1");
-      const r = await fetch(baseUrl + "/api/import",
+      const r = await fetchStamped(baseUrl + "/api/import",
         { method: "POST", body: fd, signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}` } });
       await checkAuth(r, "POST");
@@ -3050,7 +2316,7 @@ export function makeClient(baseUrl: string, token: string,
         fd.append("file", await filePart(f.uri, f.name, f.mime || "application/zip"));
         fd.append("account_id", "");
         fd.append("amount_sign", "bank");
-        const r = await fetch(baseUrl + "/api/import",
+        const r = await fetchStamped(baseUrl + "/api/import",
           { method: "POST", body: fd, signal: epochSignal(),
             headers: { Authorization: `Bearer ${token}` } });
         await checkAuth(r, "POST");
@@ -3064,7 +2330,7 @@ export function makeClient(baseUrl: string, token: string,
       });
     },
     importMapped: (mapToken: string, cols: Record<string, string>) =>
-      req<{ result: ImportResult }>("/api/import/mapped", {
+      req<S["ImportResultReply"]>("/api/import/mapped", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: mapToken, ...cols }),
@@ -3072,7 +2338,7 @@ export function makeClient(baseUrl: string, token: string,
     importYnabAccounts: (mapToken: string,
                          accounts: Record<string, YnabDestination>,
                          removeEarlier: Record<string, boolean>) =>
-      req<{ result: ImportResult }>("/api/import/ynab-accounts", {
+      req<S["ImportResultReply"]>("/api/import/ynab-accounts", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: mapToken, accounts,
@@ -3081,7 +2347,7 @@ export function makeClient(baseUrl: string, token: string,
     taxdocAnalyze: async (f: PickedFile) => {
       const fd = new FormData();
       fd.append("file", await filePart(f.uri, f.name, f.mime || "application/octet-stream"));
-      const r = await fetch(baseUrl + "/api/import/taxdoc/analyze",
+      const r = await fetchStamped(baseUrl + "/api/import/taxdoc/analyze",
         { method: "POST", body: fd, signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}` } });
       await checkAuth(r, "POST");
@@ -3090,14 +2356,55 @@ export function makeClient(baseUrl: string, token: string,
         r.status, r.headers.get("content-type"), await r.text());
     },
     taxdocCommit: (planToken: string, rows: TaxdocRow[]) =>
-      req<{ kind: string; updated: number; created: number;
-            documents: number }>("/api/import/taxdoc/commit", {
+      req<S["TaxdocCommitted"]>("/api/import/taxdoc/commit", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ token: planToken, rows }),
       }),
+    taxdocW2s: () => req<S["StoredW2s"]>("/api/import/taxdoc/w2s"),
+    // a removal or owner change names the W-2 by what the list showed: an
+    // id comes back after a removal, and a stale list's id may name another
+    // form, which the server refuses (409). In the body, never the URL.
+    taxdocW2Delete: (w: StoredW2) =>
+      req<{ ok: boolean }>(`/api/import/taxdoc/w2s/${w.id}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seen: w2Seen(w) }),
+      }),
+    taxdocW2Owner: (w: StoredW2, owner: "primary" | "spouse") =>
+      req<{ ok: boolean }>(`/api/import/taxdoc/w2s/${w.id}/owner`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ owner, seen: w2Seen(w) }),
+      }),
+    // the stored documents: a removal or a put-back names the document by
+    // what the list showed (`seen`, in the body), so a stale list is
+    // refused (web same)
+    taxdocStored: () => req<S["StoredDocs"]>("/api/import/taxdoc/stored"),
+    taxdocStoredEffect: (d: StoredDoc) =>
+      req<S["StoredDocEffect"]>(`/api/import/taxdoc/stored/${d.id}/effect`),
+    taxdocStoredDelete: (d: StoredDoc) =>
+      req<S["StoredDocRemoved"]>(`/api/import/taxdoc/stored/${d.id}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seen: d.seen }),
+      }),
+    taxdocStoredRestore: (d: StoredDoc) =>
+      req<S["StoredDocRemoved"]>(`/api/import/taxdoc/stored/${d.id}/restore`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seen: d.seen }),
+      }),
+    // the payer's name on a stored document, under the stored name listed
+    // (a server older than the door lists no `payer`, so it is not offered)
+    taxdocStoredPayer: (d: StoredDoc, name: string) =>
+      req<S["StoredDocRemoved"]>(`/api/import/taxdoc/stored/${d.id}/payer`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ seen: d.seen, payer: d.payer, name }),
+      }),
     syncStart: () =>
-      req<{ ok: boolean; started: boolean; reason?: string }>(
+      req<S["SyncStarted"]>(
         "/api/jobs/sync/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -3105,12 +2412,9 @@ export function makeClient(baseUrl: string, token: string,
         }),
     syncStatus: () => req<SyncStatus>("/api/jobs/sync/status"),
     connections: () =>
-      req<{ connections: Connection[]; last_sync: string | null;
-            syncing: boolean;
-            sync_progress: { done: number; total: number;
-                             phase?: string | null } | null }>(
+      req<S["Connections"]>(
         "/api/connections"),
-    holdings: () => req<{ holdings: Holding[] }>("/api/holdings"),
+    holdings: () => req<S["Holdings"]>("/api/holdings"),
     // `forceKept`: the owner's "delete anyway" after the server asked
     // about rows only a note naming no feed account keeps
     accountRemove: (accountId: string, mode: AccountRemoveMode,
@@ -3158,7 +2462,7 @@ export function makeClient(baseUrl: string, token: string,
         if (!(e instanceof ApiError && e.status === 404
               && e.detail === "Not Found")) throw e;
       }
-      const r = await fetch(baseUrl + "/accounts/sync", {
+      const r = await fetchStamped(baseUrl + "/accounts/sync", {
         method: "POST", signal: epochSignal(),
         headers: { Authorization: `Bearer ${token}`,
                    "Content-Type": "application/x-www-form-urlencoded" },
@@ -3195,25 +2499,30 @@ export function makeClient(baseUrl: string, token: string,
                  | "exited";
             institution?: string; error?: string;
             // "pending": saved, its first pull queued on the worker
-            first_sync?: "pending" | "ok" }>(
-        `/accounts/plaid/link/${encodeURIComponent(linkToken)}/status`),
+            first_sync?: "pending" | "ok";
+            // a session that came back with several banks: each one, and
+            // the sentence that words them all (also on a busy answer
+            // while the person may still add another)
+            results?: { institution: string | null; connected: boolean;
+                        error?: string }[];
+            summary?: string;
+            // a busy several-bank session: the banks connected so far, as
+            // the row under the button says it
+            progress?: string;
+            // answered because the session went quiet: the bank window
+            // may still be open (a bank added there is taken later)
+            quiet?: boolean }>(
+        // v=2: this app keeps its in-app browser open on a quiet answer
+        `/accounts/plaid/link/${encodeURIComponent(linkToken)}/status?v=2`),
     simplefinConnect: (sfToken: string) =>
-      req<{ ok: boolean; accounts: number; transactions: number }>(
+      req<S["SimplefinConnected"]>(
         "/api/accounts/simplefin", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token: sfToken }),
         }),
     accountLinks: () =>
-      req<{ groups: { group_id: string;
-              members: { account_id: string; home_rank: number;
-                         healthy: boolean; primary: boolean }[] }[];
-            suggestions: { key: string;
-              a: { id: string; name: string; mask: string | null;
-                   institution_name: string | null };
-              b: { id: string; name: string; mask: string | null;
-                   institution_name: string | null } }[];
-            card_dismissed: boolean }>(
+      req<S["AccountLinks"]>(
         "/api/accounts/links"),
     accountLinkCreate: (accountIds: string[]) =>
       req<{ group_id: string }>("/api/accounts/links", {
@@ -3247,7 +2556,7 @@ export function makeClient(baseUrl: string, token: string,
         body: JSON.stringify({ card: dismissed }),
       }),
     accountAdd: (name: string, kind: string, balance = "") =>
-      req<{ ok: boolean; account_id: string }>("/api/accounts/add", {
+      req<S["AccountAdded"]>("/api/accounts/add", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name, kind, balance }),
@@ -3267,14 +2576,14 @@ export function makeClient(baseUrl: string, token: string,
           body: JSON.stringify({ entity_id: entityId }),
         }),
     accountBalance: (account_id: string, balance: string) =>
-      req<{ ok: boolean }>("/api/accounts/balance", {
+      req<S["Ok"]>("/api/accounts/balance", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account_id, balance }),
       }),
     // answers the label as stored: a typed card number keeps its last four
     accountRename: (account_id: string, name: string) =>
-      req<{ ok: boolean; name?: string | null }>("/api/accounts/rename", {
+      req<S["AccountRenamed"]>("/api/accounts/rename", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account_id, name }),
@@ -3282,14 +2591,14 @@ export function makeClient(baseUrl: string, token: string,
     // primary_checking left out = the household's anchor stays put
     accountClassify: (account_id: string, kind: string,
                       primary_checking?: boolean) =>
-      req<unknown>("/api/accounts/classify", {
+      req<S["Ok"]>("/api/accounts/classify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account_id, kind,
           ...(primary_checking === undefined ? {} : { primary_checking }) }),
       }),
     accountExclude: (account_id: string, excluded: boolean) =>
-      req<{ ok: boolean }>("/api/accounts/exclude", {
+      req<S["AccountExcluded"]>("/api/accounts/exclude", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ account_id, excluded }),
@@ -3302,13 +2611,13 @@ export function makeClient(baseUrl: string, token: string,
           body: JSON.stringify({ hidden }),
         }),
     accountOwner: (account_id: string, owner: string) =>
-      req<unknown>(
+      req<S["AccountOwnerSet"]>(
         `/api/accounts/${encodeURIComponent(account_id)}/owner`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ owner }),
         }),
-    owners: () => req<{ owners: string[] }>("/api/owners"),
+    owners: () => req<S["Owners"]>("/api/owners"),
     // the slice of /api/settings the Accounts editor needs: which account
     // anchors the cash forecast, and which are excluded from budget math
     settingsAccounts: () =>
@@ -3321,7 +2630,7 @@ export function makeClient(baseUrl: string, token: string,
     // distinct ledger merchants, most-frequent first — the add-a-bill
     // picker, so a manual bill's match key lines up with real payees
     merchants: () =>
-      req<{ merchants: string[] }>("/api/merchants"),
+      req<S["Merchants"]>("/api/merchants"),
     billsBill: (payee: string) =>
       req<BillDetail>(`/api/bills/bill?payee=${encodeURIComponent(payee)}`),
     billsSave: (body: {
@@ -3342,6 +2651,15 @@ export function makeClient(baseUrl: string, token: string,
     // decided against whatever the server holds, so a stale screen or a
     // retried request would toggle the bill the opposite way to the button
     // the person pressed (web too)
+    // the household's word on whether one payer's deposits are paychecks
+    // ("auto": the rules decide) — the web's incomePayer
+    incomePayer: (key: string, count_as: "paycheck" | "never" | "auto",
+                  name?: string) =>
+      req<S["IncomePayerSaved"]>("/api/income/payer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key, count_as, name }),
+      }),
     billsToggle: (payee: string, disabled: boolean) =>
       req<{ ok: boolean; disabled: boolean }>("/api/bills/toggle", {
         method: "POST",
@@ -3409,8 +2727,17 @@ export function makeClient(baseUrl: string, token: string,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ undo }),
         }),
+    // who a written check paid, asked once (specs/ledger-figures.md):
+    // written as its note, and run through the check-image machinery
+    checkPayee: (id: string, payee: string) =>
+      req<S["CheckPayeeSaved"]>(
+        `/api/transactions/${encodeURIComponent(id)}/check-payee`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ payee }),
+        }),
     setTxnNote: (id: string, note: string) =>
-      req<{ ok: boolean; note: string }>(
+      req<S["TxnNoteSaved"]>(
         `/api/transactions/${encodeURIComponent(id)}/note`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -3422,11 +2749,20 @@ export function makeClient(baseUrl: string, token: string,
     // retire it. The server refuses a row that is not pending or is
     // younger than two weeks; its detail text is what the caller shows.
     retirePending: (id: string) =>
-      req<{ ok: boolean; id: string }>(
+      req<S["PendingRetired"]>(
         "/api/transactions/retire-pending", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id }),
+        }),
+    // an owner transfer on a business account, recorded as a contribution
+    // (money in) or a draw (money out) at the row's own amount and date
+    bizOwnerTransfer: (entityId: string, txnId: string) =>
+      req<S["EquityMovement"]>(
+        `/api/business/entities/${encodeURIComponent(entityId)}/owner-transfer`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ txn_id: txnId }),
         }),
     // capitalize / reimburse a personally-paid business expense — assign
     // it to the entity and record the equity movement
@@ -3459,7 +2795,7 @@ export function makeClient(baseUrl: string, token: string,
       // default to the camera JPEG and carry a picked PDF's real identity
       fd.append("file", await filePart(uri, name, type));
       fd.append("kind", kind);
-      const r = await fetch(
+      const r = await fetchStamped(
         `${baseUrl}/api/transactions/${encodeURIComponent(txnId)}/receipt`,
         { method: "POST", body: fd, signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}` } });
@@ -3473,10 +2809,25 @@ export function makeClient(baseUrl: string, token: string,
                     // null on a receipt still waiting for its charge;
                     // its store may be unknown too
                     txn_id: string | null; date: string;
-                    payee: string | null }[];
+                    payee: string | null;
+                    // false: listed, not added up (a copy of a slip
+                    // counted on another receipt, or off the ledger);
+                    // an older server sends neither
+                    counts?: boolean;
+                    why?: "same_slip" | "off_ledger" | null;
+                    // counted, and another counted receipt reads alike:
+                    // the totals may hold it twice; `note` is the words
+                    // printed beside the line, decided by the server
+                    suspected?: boolean;
+                    note?: string | null }[];
             // key null: the store group for an unknown store
-            groups: { key: string | null; n: number; total: number;
-                      last_date?: string | null }[];
+            // bought: quantity; receipts: the slips (receipts.search_items)
+            // note: the server's words when the total may hold a
+            // purchase twice
+            groups: { key: string | null; n: number; bought: number;
+                      receipts: number; total: number;
+                      last_date?: string | null;
+                      note?: string | null }[];
             truncated: boolean }>(
         `/api/receipts/items?q=${encodeURIComponent(q)}&group=${group}`),
     receiptTag: (id: string, line: number, tag: string) =>
@@ -3494,7 +2845,7 @@ export function makeClient(baseUrl: string, token: string,
                         type = "image/jpeg") => {
       const fd = new FormData();
       fd.append("file", await filePart(uri, name, type));
-      const r = await fetch(`${baseUrl}/api/receipts`,
+      const r = await fetchStamped(`${baseUrl}/api/receipts`,
         { method: "POST", body: fd, signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}` } });
       if (!r.ok) throw await parseError(r);
@@ -3520,6 +2871,16 @@ export function makeClient(baseUrl: string, token: string,
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
         }),
+    // a person's answer about two receipts read alike: one slip (counted
+    // once) or two purchases (each counted); stored, never asked again
+    receiptSlipAnswer: (id: string, other: string, same: boolean) =>
+      req<S["ReceiptSlipAnswered"]>(
+        `/api/receipts/${encodeURIComponent(id)}/`
+          + (same ? "same-slip" : "two-purchases"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ other }),
+        }),
     receiptUnmatch: (id: string) =>
       req<WaitingReceipts & { txn_id: string }>(
         `/api/receipts/${encodeURIComponent(id)}/unmatch`, {
@@ -3531,14 +2892,14 @@ export function makeClient(baseUrl: string, token: string,
     // (stored category keys + cent-exact amounts summing to the charge).
     // PUT replaces the whole split; a 400 carries the reason in words.
     txnSplitSet: (txnId: string, parts: SplitPart[]) =>
-      req<{ ok: boolean; split: SplitPart[] }>(
+      req<S["SplitSaved"]>(
         `/api/transactions/${encodeURIComponent(txnId)}/split`, {
           method: "PUT",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ parts }),
         }),
     txnSplitClear: (txnId: string) =>
-      req<{ ok: boolean; split: null }>(
+      req<S["SplitSaved"]>(
         `/api/transactions/${encodeURIComponent(txnId)}/split`,
         { method: "DELETE" }),
     receiptParse: (id: string) =>
@@ -3548,21 +2909,23 @@ export function makeClient(baseUrl: string, token: string,
         body: "{}",
       }),
     notifyTest: (channel: "sms" | "push") =>
-      req<{ ok: boolean; delivered?: number }>("/api/notify/test", {
+      req<S["NotifyTested"]>("/api/notify/test", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ channel }),
       }),
     calendar: (days = 35) =>
       req<{ days: number; start: string;
-            calendar: { date: string; total: number;
+            // came_in / went_out: absent from an older server
+            calendar: { date: string; total: number; came_in?: number;
+                        went_out?: number;
+                        // name / note: absent from an older server
                         events: { label: string; amount: number;
-                                  kind: string }[] }[] }>(
+                                  kind: string; name?: string;
+                                  note?: string | null }[] }[] }>(
         `/api/calendar?days=${days}`),
     doctor: () =>
-      req<{ ok: boolean; checks: { section: string; name: string;
-            ok: boolean; severity: string; detail: string }[] }>(
-        "/api/doctor"),
+      req<S["DoctorReport"]>("/api/doctor"),
     // capital contributions and reimbursements whose charge was deleted
     doctorUnlinked: () =>
       req<{ movements: { id: string; entity_id: string;
@@ -3574,16 +2937,11 @@ export function makeClient(baseUrl: string, token: string,
         `/api/doctor/unlinked-movements/${encodeURIComponent(id)}`,
         { method: "DELETE" }),
     doctorScripts: () =>
-      req<{ scripts: { source: string; label?: string;
-            last_push: string | null; ok: boolean;
-            status?: string; age_hours?: number | null;
-            last_rows?: number | null;
-            expected_hours: number | null; alerts: number }[] }>(
-        "/api/doctor/scripts"),
+      req<S["ScriptHeartbeats"]>("/api/doctor/scripts"),
     doctorScriptUpdate: (source: string,
                          body: { expected_hours?: number;
                                  alerts?: boolean }) =>
-      req<unknown>(
+      req<S["Ok"]>(
         `/api/doctor/scripts/${encodeURIComponent(source)}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -3599,7 +2957,7 @@ export function makeClient(baseUrl: string, token: string,
       fd.append("kind", kind);
       if (shot)
         fd.append("screenshot", await filePart(shot.uri, shot.name, shot.mime || "image/jpeg"));
-      const r = await fetch(baseUrl + "/api/testing/feedback",
+      const r = await fetchStamped(baseUrl + "/api/testing/feedback",
         { method: "POST", body: fd, signal: epochSignal(),
           headers: { Authorization: `Bearer ${token}` } });
       await checkAuth(r, "POST");
@@ -3676,39 +3034,30 @@ export function makeClient(baseUrl: string, token: string,
         { method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ name }) }),
-    help: () => req<{ topics: { id: string; title: string;
-                                body: string }[] }>("/api/help"),
+    // an older server's topics carry no group
+    help: () => req<{ topics: OlderServer<S["HelpTopic"], "group">[] }>(
+      "/api/help"),
     // which delivery channels can actually deliver — gates the SMS/push
     // toggles the way the web Settings page does
     notifyStatus: () =>
-      req<{ sms_available: boolean; sms_entitled?: boolean;
-            phone: string | null; phone_verified: boolean;
-            phone_pending: string | null;
-            // when a credential change paused the stored number; absent on
-            // servers that predate it
-            phone_paused_at?: string | null;
-            // push_available is BROWSER push (VAPID); native_push_available
-            // is the relay this app's own pushes ride
-            push_available: boolean; native_push_available?: boolean;
-            native_push_devices?: number;
-            // no public address, so no recipient invitation can be
-            // mailed; absent on servers that predate it
-            invites_need_base_url?: boolean }>(
+      req<OlderServer<S["NotifyStatus"], "sms_entitled" | "phone_paused_at"
+              | "native_push_available" | "native_push_devices"
+              | "invites_need_base_url">>(
         "/api/notify"),
     notifyPhone: (number: string, consent: string[] = []) =>
-      req<{ ok: boolean }>("/api/notify/phone", {
+      req<S["NotifyPhoneSet"]>("/api/notify/phone", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ number, consent }),
       }),
     notifyPhoneVerify: (code: string) =>
-      req<{ ok: boolean }>("/api/notify/phone/verify", {
+      req<S["Ok"]>("/api/notify/phone/verify", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ code }),
       }),
     jobsEmail: () =>
-      req<{ ok: boolean; subject: string }>("/api/jobs/email", {
+      req<S["EmailSent"]>("/api/jobs/email", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
@@ -3717,10 +3066,7 @@ export function makeClient(baseUrl: string, token: string,
       req<SettingsView>("/api/settings"),
     // Plaid Enrich for imported history — status + a capped run (owner)
     enrichStatus: () =>
-      req<{ candidates: number; plaid_configured: boolean; cap: number;
-            used: number; month: string; remaining: number;
-            // the web's: the run waits on a confirmed address
-            awaits_confirm?: boolean }>("/api/import/enrich"),
+      req<S["EnrichStatus"]>("/api/import/enrich"),
     enrichRun: (limit = 100) =>
       req<{ sent: number; enriched: number; cap_hit: boolean; error: string | null }>(
         "/api/import/enrich", { method: "POST",
@@ -3738,9 +3084,12 @@ export function makeClient(baseUrl: string, token: string,
       }),
     budgetsSuggest: () =>
       req<BudgetSuggestions>("/api/budgets/suggest"),
-    settingsSchedule: () =>
-      req<{ email_schedule: EmailSchedule | null }>("/api/settings")
-        .then((s0) => s0.email_schedule ?? null),
+    // the same, with the planner's take-home box as typed: the server
+    // measures the savings suggestion on it only when history names no
+    // income (an older server ignores it and sends no suggestion)
+    budgetsSuggestTyped: (income: string) =>
+      req<BudgetSuggestions>("/api/budgets/suggest?"
+                             + new URLSearchParams({ income })),
     // the household's zone ("" = follow the instance); the server refuses a
     // name it cannot load, so a typo never silently moves the clock
     settingsSaveTimezone: (timezone: string, adopted = false) =>
@@ -3751,12 +3100,6 @@ export function makeClient(baseUrl: string, token: string,
         // household chose a zone by hand
         body: JSON.stringify(adopted ? { timezone, timezone_adopted: true }
                                      : { timezone }),
-      }),
-    settingsSaveSchedule: (email_schedule: EmailSchedule) =>
-      req<SettingsView>("/api/settings", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email_schedule }),
       }),
     // local = the bundled/env backend or a loopback/compose host: nothing
     // leaves the box; otherwise host names where the questions go
@@ -3814,7 +3157,7 @@ export function makeClient(baseUrl: string, token: string,
     // alone instead of refusing with "nothing to report".
     assistantReport: async (turns: { question: string; blocks: AnswerBlock[] }[],
                             partial = false) => {
-      const r = await fetch(baseUrl + "/api/assistant/report", {
+      const r = await fetchStamped(baseUrl + "/api/assistant/report", {
         method: "POST", signal: epochSignal(),
         headers: { Authorization: `Bearer ${token}`,
                    "Content-Type": "application/json" },
@@ -3848,13 +3191,18 @@ export async function loginAndMintDevice(
    *  device limit — the id comes from the 409 the previous attempt
    *  returned, so the choice is always the person's */
   replaceDeviceId = "",
+  /** the sign-in code the confirmed emailed link showed — only a sign-in
+   *  carrying it spends the unlock, so a stranger who knows the address
+   *  cannot spend it first */
+  unlockProof = "",
 ): Promise<{ token: string; id: string }> {
-  const login = await fetch(baseUrl + "/api/login", {
+  const login = await fetchStamped(baseUrl + "/api/login", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded",
                Accept: "application/json" },
     body: new URLSearchParams({
-      email, password, totp_code: totpCode }).toString(),
+      email, password, totp_code: totpCode,
+      ...(unlockProof ? { unlock_proof: unlockProof } : {}) }).toString(),
   });
   if (!login.ok) throw await parseError(login);
   return mintDeviceFromSession(baseUrl, login, deviceName, platform,
@@ -3869,7 +3217,9 @@ export async function loginAndMintDevice(
  *  sign-in above works again. It is not a sign-in — the link carries no
  *  session — so the app only asks for the mail and says what to do next.
  *  The server answers 200 whether or not the address exists (the web page
- *  does the same), so there is nothing to read back but the status.
+ *  does the same), so there is nothing to read back but the status. The
+ *  page the link opens shows a sign-in code; the person types it here and
+ *  the sign-in carries it, since only that spends the unlock.
  *
  *  A REFUSAL is not JSON either: /unlock is a page route, so its 429 (the
  *  door's hourly cap) and its 404 (a demo instance, which has no such
@@ -3880,7 +3230,7 @@ export async function loginAndMintDevice(
  *  reaches the screen in words. */
 export async function requestUnlock(baseUrl: string, email: string):
     Promise<void> {
-  const r = await fetch(baseUrl + "/unlock", {
+  const r = await fetchStamped(baseUrl + "/unlock", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ email }).toString(),
@@ -3941,7 +3291,7 @@ export async function mintDeviceWithGrant(
 ): Promise<{ token: string; id: string }> {
   const withCookie: Record<string, string> =
     grant.cookie ? { Cookie: grant.cookie } : {};
-  const mint = await fetch(baseUrl + "/api/devices", {
+  const mint = await fetchStamped(baseUrl + "/api/devices", {
     method: "POST",
     headers: { "Content-Type": "application/json",
                Accept: "application/json", ...withCookie },
@@ -3959,13 +3309,13 @@ export async function mintDeviceWithGrant(
   // .json() on that throws a SyntaxError that is not an ApiError — the
   // login screen's error branch would print the parser's words instead of
   // the one message written for exactly this situation.
-  const minted = parseOkBody<{ token: string; id: string }>(
+  const minted = parseOkBody<S["DeviceMinted"]>(
     mint.status, mint.headers.get("content-type"), await mint.text());
   // A server that took the ticket has already closed the login session
   // while spending it; this logout closes it on servers older than that.
   // It must never carry the new device token: logout revokes a device
   // token it is shown.
-  await fetch(baseUrl + "/api/logout", {
+  await fetchStamped(baseUrl + "/api/logout", {
     method: "POST", headers: withCookie,
   }).catch(() => { /* cookie session dies on its own if this misses */ });
   return { token: minted.token, id: minted.id };
@@ -3983,7 +3333,7 @@ export async function abandonMintGrant(baseUrl: string, grant: MintGrant):
     Promise<void> {
   let closed = false;
   if (grant.ticket)
-    closed = await fetch(baseUrl + "/api/devices/abandon", {
+    closed = await fetchStamped(baseUrl + "/api/devices/abandon", {
       method: "POST",
       headers: { "Content-Type": "application/json",
                  Accept: "application/json" },
@@ -3993,7 +3343,7 @@ export async function abandonMintGrant(baseUrl: string, grant: MintGrant):
   // the platform jar holds — a fresh sign-in's, mid-mint — so it is sent
   // bare only when the ticket did not already close the session.
   if (closed && !grant.cookie) return;
-  await fetch(baseUrl + "/api/logout", {
+  await fetchStamped(baseUrl + "/api/logout", {
     method: "POST", headers: grant.cookie ? { Cookie: grant.cookie } : {},
   }).catch(() => { /* the session expires on its own */ });
 }
@@ -4065,7 +3415,7 @@ export async function revokeDeviceToken(baseUrl: string, token: string):
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 5000);
   try {
-    const r = await fetch(baseUrl + "/api/logout", {
+    const r = await fetchStamped(baseUrl + "/api/logout", {
       method: "POST", signal: ctl.signal,
       headers: { Authorization: `Bearer ${token}` } });
     // a 401 means the server no longer knows the token: already revoked
@@ -4085,7 +3435,7 @@ export async function revokeDeviceToken(baseUrl: string, token: string):
 export async function passkeyLoginOptions(baseUrl: string): Promise<{
   challengeId: string; publicKey: Record<string, unknown>;
 }> {
-  const r = await fetch(baseUrl + "/api/login/passkey/options", {
+  const r = await fetchStamped(baseUrl + "/api/login/passkey/options", {
     method: "POST",
     headers: { "Content-Type": "application/json",
                Accept: "application/json" },
@@ -4108,7 +3458,7 @@ export async function passkeyLoginAndMintDevice(
   baseUrl: string, challengeId: string, credential: unknown,
   deviceName: string, platform: string, replaceDeviceId = "",
 ): Promise<{ token: string; id: string }> {
-  const login = await fetch(baseUrl + "/api/login/passkey", {
+  const login = await fetchStamped(baseUrl + "/api/login/passkey", {
     method: "POST",
     headers: { "Content-Type": "application/json",
                Accept: "application/json" },
@@ -4122,12 +3472,13 @@ export async function passkeyLoginAndMintDevice(
 /** A server is "an Oikonome instance" when its health door answers. */
 export async function probeServer(baseUrl: string): Promise<boolean> {
   try {
-    const r = await fetch(baseUrl + "/healthz",
+    const r = await fetchStamped(baseUrl + "/healthz",
                           { headers: { Accept: "application/json" } });
     if (!r.ok) return false;
     const body = await r.json();
     return body?.ok === true;
   } catch {
+    // no answer inside the read limit included: not a server to sign in to
     return false;
   }
 }

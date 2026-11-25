@@ -1,11 +1,13 @@
 """Import batches: tag every file import, list them, one-click rollback.
 Batch ownership rides in each row's raw JSONB:
 
-  * `_batches` — JSON ARRAY of every batch id that (re)imported the row.
-    ids are content-hashed, so re-importing an overlapping file UPSERTS the
-    same row; the new batch id is APPENDED (tag() merges against the rows
-    already in the table because upsert overwrites raw wholesale).
-  * `_batch`  — the latest batch id, kept for display.
+  * `_batches` — JSON ARRAY of the batches that own the row: the one that
+    added it, then each later import whose file held the same line. ids
+    are content-hashed, so re-importing an overlapping file UPSERTS the
+    same row and that import joins the owners (tag() merges against the
+    stored row because upsert overwrites raw wholesale). An EMPTY array is
+    a row no batch owns, and it stays empty.
+  * `_batch`  — the latest batch that wrote the row.
 
 Rollback removes the batch id from each row's array and only DELETEs rows
 whose array becomes empty — rolling back a re-import no longer destroys
@@ -25,6 +27,19 @@ import uuid
 # read sites below go through the read layer's shape guard.
 from ..web.data import _as_array, detach_pairs
 from . import card_number
+
+
+def _sole_owner(expr: str) -> str:
+    """SQL for the one batch that owns a stored `_batches` value, or NULL
+    when it names none or several — read as reimport.batch_owner_list
+    reads it: its DISTINCT non-empty STRING elements, so `[b, b]`,
+    `[b, 5]` and `[b, ""]` are `b`'s alone and anything not a list is
+    owned by nobody. Counting raw elements instead would keep, and then
+    orphan, a row the undone import alone owns."""
+    return (f"(SELECT CASE WHEN count(DISTINCT o.v #>> '{{}}') = 1"
+            f" THEN min(o.v #>> '{{}}') END"
+            f" FROM jsonb_array_elements({_as_array(expr)}) AS o(v)"
+            f" WHERE jsonb_typeof(o.v) = 'string' AND o.v #>> '{{}}' <> '')")
 
 
 def create(conn, source: str, account_id: str | None,
@@ -54,28 +69,56 @@ def tag(conn, txns: list, batch_id: str) -> list:
     """Stamp batch ownership into each normalized Transaction's raw.
 
     Called just before upsert_transactions, whose ON CONFLICT overwrites raw
-    wholesale — so the append-on-reimport merge happens HERE: any _batches
-    array already on the row (same content-hashed id from an earlier
-    overlapping import) is carried forward with this batch id appended."""
+    wholesale — so the merge happens HERE, against the row as stored:
+
+    - a line no row holds yet, or a row this import brings back into the
+      ledger (set aside, not retired): this batch ADDED it and owns it
+      alone, so undoing the batch takes back exactly what it said it
+      added;
+    - a stored row with owners: this batch JOINS them (once), so undoing
+      the first import leaves the row to the later one whose file also
+      holds the line, and the last owner's undo removes it;
+    - a stored row with NO owner (a feed's row, one stored before batches
+      or by an import without one): stays owned by nobody, through every
+      later import, so no undo ever deletes it.
+
+    Owners are read the one way every owner check reads them
+    (reimport.batch_owner_list). `_batch` is the latest import that wrote
+    the row."""
     from .base import STOOD_IN_KEY
+    from .reimport import batch_owner_list
     ids = [t.id for t in txns]
     prior: dict[str, list] = {}
+    back: set[str] = set()
     stood_in: dict[str, dict] = {}
     if ids:
         for r in conn.execute(
-                "SELECT id, raw->'_batches' AS batches, raw->>'_batch' AS latest,"
-                " raw->%s AS stood_in"
+                "SELECT id, jsonb_typeof(raw) = 'object' AND raw ? '_batches'"
+                " AS listed, raw->'_batches' AS batches,"
+                " raw->'_batch' AS latest, raw->%s AS stood_in,"
+                " removed <> 0 AND retired_at IS NULL AS comes_back"
                 " FROM transactions WHERE id = ANY(%s)",
                 (STOOD_IN_KEY, ids)).fetchall():
-            arr = r["batches"]
-            if not arr and r["latest"]:
-                arr = [r["latest"]]            # pre-array single tag
-            prior[r["id"]] = arr or []
+            seen = {"_batch": r["latest"]}
+            if r["listed"]:
+                seen["_batches"] = r["batches"]
+            prior[r["id"]] = batch_owner_list(seen)
+            if r["comes_back"]:
+                # upsert_transactions puts a set-aside row back in the
+                # ledger unless a decision retired it: for the person this
+                # import added it, and FileRowCount counts it as added
+                back.add(r["id"])
             if isinstance(r["stood_in"], dict):
                 stood_in[r["id"]] = r["stood_in"]
     for t in txns:
-        merged = [b for b in prior.get(t.id, []) if b != batch_id] + [batch_id]
-        t.raw = {**(t.raw or {}), "_batches": merged, "_batch": batch_id}
+        if t.id not in prior or t.id in back:
+            owners = [batch_id]
+        elif prior[t.id]:
+            owners = prior[t.id] + ([batch_id]
+                                    if batch_id not in prior[t.id] else [])
+        else:
+            owners = []
+        t.raw = {**(t.raw or {}), "_batches": owners, "_batch": batch_id}
         # a bank feed relies on this row (see base.STOOD_IN_KEY); a
         # re-import rewrites raw wholesale and must not drop that note
         if t.id in stood_in:
@@ -97,7 +140,12 @@ def recent(conn, limit: int = 10) -> list:
         (limit,)).fetchall()]
     for b in rows:
         b["annotations"] = 0
-    ids = [b["id"] for b in rows if (b["row_count"] or 0) > 0]
+    # `row_count` is what undoing the batch on its own would remove TODAY —
+    # the rows it is the last owner of — which is what the history's
+    # "Remove all N rows" asks about. The stored figure is what it added
+    # when it ran; a later import of the same lines joins their owners and
+    # an earlier one's undo hands rows on, so the two part ways.
+    ids = [b["id"] for b in rows]
     if not ids:
         return rows
     # ONE pass over the ledger for every listed batch (this runs on each
@@ -107,12 +155,14 @@ def recent(conn, limit: int = 10) -> list:
     counts = conn.execute(
         """WITH owned AS (
              SELECT t.id, t.category_override, t.entity_id,
-                    COALESCE(t.raw->'_batches'->>0, t.raw->>'_batch') AS bid
+                    CASE WHEN t.raw ? '_batches' THEN """ +
+        _sole_owner("t.raw->'_batches'") + """
+                         ELSE t.raw->>'_batch' END AS bid
                FROM transactions t
               WHERE (t.raw->>'_batch' = ANY(%s) AND NOT t.raw ? '_batches')
                  OR (t.raw->'_batches' ?| %s
-                     AND jsonb_array_length(""" +
-        _as_array("t.raw->'_batches'") + """) = 1))
+                     AND """ + _sole_owner("t.raw->'_batches'") +
+        """ = ANY(%s)))
            SELECT bid,
                   (SELECT count(*) FROM receipts r WHERE r.txn_id = o.id)
                 + (SELECT count(*) FROM transaction_notes n WHERE n.txn_id = o.id)
@@ -130,12 +180,15 @@ def recent(conn, limit: int = 10) -> list:
                                      WHERE q.txn_id = o.id) THEN 1 ELSE 0 END
                 + CASE WHEN o.category_override IS NOT NULL THEN 1 ELSE 0 END
                   AS n
-             FROM owned o""", (ids, ids)).fetchall()
+             FROM owned o""", (ids, ids, ids)).fetchall()
     per: dict[str, int] = {}
+    owned: dict[str, int] = {}
     for c in counts:
         per[c["bid"]] = per.get(c["bid"], 0) + int(c["n"] or 0)
+        owned[c["bid"]] = owned.get(c["bid"], 0) + 1
     for b in rows:
         b["annotations"] = per.get(b["id"], 0)
+        b["row_count"] = owned.get(b["id"], 0)
     return rows
 
 
@@ -453,8 +506,13 @@ def _rollback_locked(conn, batch_id: str, force_kept: bool = False,
                      ask_first: bool = False) -> RollbackResult:
     member = json.dumps([batch_id])
     warning = _overlap_warning(conn, batch_id)
+    # the rows this batch alone owns, read as reimport.batch_owner_list
+    # reads owners: a `_batches` list whose only owner is this batch, or no
+    # list at all and the single `_batch` tag naming it. An empty list or a
+    # non-list value is owned by nobody (`@>` matches only an array here,
+    # and the key is present), so no undo deletes such a row.
     doomed_sql = """(raw->'_batches' @> %s::jsonb
-                  AND jsonb_array_length(""" + _as_array("raw->'_batches'") + """) = 1)
+                  AND """ + _sole_owner("raw->'_batches'") + """ = %s)
               OR (raw->>'_batch' = %s AND NOT raw ? '_batches')"""
     from .base import kept_rows_note, log_sync, relied_on_by_feed
     from .reanchor import hold_pairing_lock
@@ -465,7 +523,7 @@ def _rollback_locked(conn, batch_id: str, force_kept: bool = False,
         hold_pairing_lock(conn)
         doomed = _lock_rows_and_pairs(conn, [r["id"] for r in conn.execute(
             "SELECT id FROM transactions WHERE " + doomed_sql,
-            (member, batch_id)).fetchall()])
+            (member, batch_id, batch_id)).fetchall()])
         if doomed and _archived_business_rows(conn, doomed):
             raise ArchivedBusinessRows()
         kept = relied_on_by_feed(conn, doomed,
@@ -483,7 +541,7 @@ def _rollback_locked(conn, batch_id: str, force_kept: bool = False,
         n = conn.execute(
             "DELETE FROM transactions WHERE (" + doomed_sql
             + ") AND NOT id = ANY(%s)",
-            (member, batch_id, list(kept))).rowcount
+            (member, batch_id, batch_id, list(kept))).rowcount
         named = kept - held
         if named:
             conn.execute(
@@ -511,3 +569,21 @@ def _rollback_locked(conn, batch_id: str, force_kept: bool = False,
                      error=f"batch {batch_id}: {note}")
             warning = f"{warning} {note}" if warning else note
     return RollbackResult(n, warning, len(kept), len(held))
+
+
+def older_imports_line(conn) -> str | None:
+    """The words under an import history that cannot undo every imported
+    account: accounts filled from files (the 'manual' item the importer
+    files them under) that no batch here imported — a restore, or an
+    import from before undo history existed. None when there are none."""
+    n = conn.execute(
+        """SELECT COUNT(*) AS n FROM accounts a
+             JOIN items i ON i.id = a.item_id
+            WHERE i.aggregator = 'manual' AND a.user_removed_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM import_batches b
+                               WHERE b.account_id = a.id)""").fetchone()["n"]
+    if not n:
+        return None
+    return (f"{n} account{'s' if n != 1 else ''} came from files before "
+            "undo history existed (a restore or an earlier import); remove "
+            f"{'one' if n != 1 else 'it'} from Accounts.")

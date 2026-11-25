@@ -3,12 +3,15 @@
 // daily verdict). Progress reads the same payload Today renders.
 // lives on the Budget page (owner-gated) — the plan's money and
 // the goals it funds belong on one page, not in Settings.
+import { Link } from "react-router";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { api, errText, mmdd, money, type SavingsGoal,
          type Settings as SettingsData } from "../api/client";
 import { saveSettings, SETTINGS_SAVES } from "../api/cache";
-import { parseMoneyDraft } from "../moneymath";
+import { isPlanOnlySavingsGoal, savedAmount, savedMergeBase } from "../moneymath";
+import { FailedLine } from "./Loaded";
+import Note from "./Note";
 
 export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
   data: SettingsData; onSaved: () => void;
@@ -36,18 +39,11 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
   rowsNow.current = rows;
   // mount-time server copy (save-time merge base) + the dirty signal
   // the Budget page's remount guard reads
-  const baseline = useRef<SavingsGoal[]>(data.savings_goals ?? []);
+  const baseline = useRef<string[]>(
+    (data.savings_goals ?? []).map((g) => g.name));
   const touch = () => onDirtyChange?.(true);
-  // blank is 0. Text that is not a number stops the save: sent on, NaN
-  // travels as JSON null and would be stored as $0 without a word.
-  const num = (v: string, what: string) => {
-    if (v.replace(/[$\s]/g, "") === "") return 0;
-    const n = parseMoneyDraft(v);
-    if (n === null)
-      throw new Error(`${what}: "${v.trim()}" is not an amount — `
-                      + "type it like 1,250.50.");
-    return n;
-  };
+  // blank is 0; text that is not an amount stops the save (savedAmount)
+  const num = savedAmount;
   // Match words with no account can never be measured: they match both
   // legs of a transfer and nothing says which side is the fund, so the
   // server refuses the shape. Mobile shares this predicate
@@ -70,7 +66,7 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
       // copy, goals added elsewhere since mount are carried through.
       const cur = await api.settings();
       const curG = cur.savings_goals ?? [];
-      const baseNames = new Set(baseline.current.map((g) => g.name));
+      const baseNames = new Set(baseline.current);
       const curByName = new Map(curG.map((g) => [g.name, g]));
       const out: SavingsGoal[] = [];
       for (const r of sent) {
@@ -96,18 +92,20 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
           out.push(g);                          // added elsewhere since mount
       // seeds ["settings"] with the returned view — the planner's Savings
       // row reads the same list
-      return saveSettings(qc, { savings_goals: out });
+      return saveSettings(qc, { savings_goals: out }, cur);
     },
     onSuccess: (v, sent) => {
       // the saved view is the new merge base: a goal added here and saved
       // is no longer "added elsewhere", so removing or renaming it in a
       // later save must not carry it back through
       const goals = v.savings_goals ?? [];
-      baseline.current = goals;
       // every edit makes a new rows array: the same array means nothing
       // was typed since the save began, and only then does the saved view
       // replace the rows — edits typed in flight stay, still unsaved
       const edited = rowsNow.current !== sent;
+      // mid-edit, only the names the sent rows held (see savedMergeBase)
+      baseline.current = savedMergeBase(goals.map((g) => g.name),
+        edited ? sent : undefined, baseline.current);
       if (!edited) setRows(goals.map(goalRow));
       setErr(null); if (!edited) onDirtyChange?.(false); onSaved();
     },
@@ -125,16 +123,38 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
       <h2>Savings goals{" "}
         <span className="mut" style={{ fontSize: 13, fontWeight: 400 }}>
           — trip fund, emergency fund; progress comes from real transfers</span></h2>
-      <p className="mut">A goal watches transfers on its account (add
-        match words to carve several goals out of one account). A goal
-        with no account is a plan only: it lowers the excess cash line
-        but shows no progress. The
-        monthly plan lowers the excess cash line and rides the cash forecast —
-        it never makes the daily verdict go over. A sweep goal contributes
-        at month end instead, and only what the month&apos;s surplus covers.</p>
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+      <p className="mut">A goal tracks transfers into its account; its
+        monthly plan comes out of excess cash.{" "}
+        <Link to="/help?topic=budget">How this works</Link></p>
+      {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
       {rows.map((r, i) => {
         const p = prog.get(r.name);
+        // the budget plan's own Savings line, with no account to measure
+        // it yet: its amount is set on the planner, and the one thing to
+        // choose here is the account it lands in — once chosen it is a
+        // goal like any other (unbound, it rides along untouched on a save)
+        if (isPlanOnlySavingsGoal(r) && !r.touched)
+          return (
+            <div key={i} className="mut" style={{ fontSize: 13,
+                  margin: ".5rem 0" }}>
+              <b style={{ color: "var(--ink)" }}>Savings</b> — the plan&apos;s
+              savings line{Number(r.monthly_plan) > 0
+                ? ` (${money(Number(r.monthly_plan))}/month)` : ""}, set on
+              the planner above. Pick the account it lands in to measure it.
+              {accts.data === undefined && accts.isError ? (
+                <FailedLine q={accts} what="the accounts" />
+              ) : (
+              <label style={{ display: "block", marginTop: ".3rem" }}>Account{" "}
+                <select value=""
+                        onChange={(e) => upd(i, { account_id: e.target.value })}>
+                  <option value="">no account (plan only)</option>
+                  {(accts.data?.accounts ?? [])
+                    .filter((a) => a.goal_destination)
+                    .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name}{a.mask ? ` ···${a.mask}` : ""}</option>
+                  ))}
+                </select></label>)}</div>);
         return (
           <div key={i} className="card" style={{ margin: ".5rem 0",
                 padding: "12px 14px" }}>
@@ -157,14 +177,26 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
                   <option value="monthly">every month (fixed plan)</option>
                   <option value="sweep">only when the month worked out (sweep)</option>
                 </select></label>
+              {/* an unread account list is not "no account": the failed
+                  line in the picker's place */}
+              {accts.data === undefined && accts.isError ? (
+                <label>Account
+                  <FailedLine q={accts} what="the accounts" /></label>
+              ) : (
               <label>Account
                 <select value={r.account_id}
                         onChange={(e) => upd(i, { account_id: e.target.value })}>
                   <option value="">no account (plan only)</option>
-                  {(accts.data?.accounts ?? []).map((a) => (
-                    <option key={a.id} value={a.id}>{a.name}</option>
+                  {/* open cash and investment accounts a transfer can
+                      reach (the server's goal_destination), with their
+                      last four; the one already chosen stays listed */}
+                  {(accts.data?.accounts ?? [])
+                    .filter((a) => a.goal_destination || a.id === r.account_id)
+                    .map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.name}{a.mask ? ` ···${a.mask}` : ""}</option>
                   ))}
-                </select></label>
+                </select></label>)}
               <label>Match words <span className="mut">(optional, comma-sep)</span>
                 {/* words only carve a goal out of an account; with no
                     account they stay editable only so existing ones can
@@ -177,15 +209,15 @@ export default function SavingsGoalsCard({ data, onSaved, onDirtyChange }: {
                        onChange={(e) => upd(i, { start_balance: e.target.value })} /></label>
             </div>
             {needsAccount(r) && (
-              <div className="note bad" style={{ marginTop: ".4rem" }}>
+              <Note tone="bad" style={{ marginTop: ".4rem" }}>
                 Match words need an account — pick the account the money
-                lands in.</div>
+                lands in.</Note>
             )}
             {p && p.pct != null && (
               <div className="mut" style={{ fontSize: 13, marginTop: ".4rem" }}>
                 {money(p.saved)} of {money(p.target)} ({p.pct}%)
                 {/* A sweep goal contributes in one lump at month end, so
-                    the trailing-90-day pace text reads "off pace" all
+                    the last-3-months pace text reads "off pace" all
                     month on a goal that is fine. Say what this goal's
                     month actually did instead — the Today line's wording,
                     per goal, since the pooled sentence there cannot tell

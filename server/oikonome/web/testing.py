@@ -65,7 +65,10 @@ def _submit_feedback(user: dict, message: str,
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         return feedback_mod.submit(conn, str(user["tenant_id"]), message, shot,
-                                   kind=kind, sender=user.get("email"))
+                                   kind=kind, sender=user.get("email"),
+                                   # the setup bundle and the app log are the
+                                   # owner's; anyone else's copy leaves them out
+                                   owner=user.get("role") == "owner")
     finally:
         conn.close()
 
@@ -123,19 +126,25 @@ async def testing_feedback_api(user: dict = Depends(_user()),
     # address (demoguard covers data doors but not this). Deny outright on
     # a demo instance.
     from . import demoguard
-    demoguard.deny(user)
-    conn = tenancy.tenant_connect(user["tenant_id"])
-    try:
-        enabled = _feedback_enabled(conn)
-    finally:
-        conn.close()
-    if not enabled:
+    from starlette.concurrency import run_in_threadpool
+    # the demo flag, the checkout, the read and the submit (a second
+    # connection, then mail) run off the event loop
+    await run_in_threadpool(demoguard.deny, user)
+
+    def _enabled():
+        conn = tenancy.tenant_connect(user["tenant_id"])
+        try:
+            return _feedback_enabled(conn)
+        finally:
+            conn.close()
+    if not await run_in_threadpool(_enabled):
         raise HTTPException(403, "feedback is turned off on this instance")
     try:
         shot = await _read_screenshot(screenshot)
     except ValueError as e:
         raise HTTPException(413, str(e))
-    r = _submit_feedback(user, message, shot, kind=kind.strip().lower())
+    r = await run_in_threadpool(
+        lambda: _submit_feedback(user, message, shot, kind=kind.strip().lower()))
     if r["delivery"] == "emailed":
         return {"number": r["number"], "delivery": "emailed"}
     return _zip_response(r)

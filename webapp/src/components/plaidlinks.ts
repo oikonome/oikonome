@@ -15,6 +15,9 @@ export type PendingLinkKind = "add" | "relink" | "fix";
 export type PendingLink = {
   token: string; kind: PendingLinkKind; itemId?: string;
   startedAt: number; cancelled: boolean;
+  /** the server's line while a several-bank session is still open:
+   *  the banks connected so far */
+  progress?: string;
 };
 export type LinkOutcome = { id: number; at: number; ok: boolean; text: string };
 
@@ -66,6 +69,13 @@ export function cancelPending(token: string): void {
   p.cancelled = true;
   emit();
   nudgePolls();
+}
+/** The banks a several-bank session has connected so far, on its row. */
+export function setPendingProgress(token: string, progress: string): void {
+  const p = pending.get(token);
+  if (!p || p.progress === progress) return;
+  p.progress = progress;
+  emit();
 }
 /** A session's answer: the row leaves, the outcome line stays a moment. */
 export function finishPending(token: string, outcome?: { ok: boolean;
@@ -135,5 +145,6 @@ export function pendingLine(p: PendingLink): string {
   const head = p.kind === "fix" ? "Finishing the sign-in at your bank…"
     : p.kind === "relink" ? "Relinking at your bank for more history…"
     : "Finish signing in at your bank…";
+  if (p.progress && !p.cancelled) return p.progress;
   return p.cancelled ? `${head} (closing)` : head;
 }

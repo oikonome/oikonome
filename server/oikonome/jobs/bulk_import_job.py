@@ -176,8 +176,8 @@ def status(conn, job_id) -> dict | None:
         row = {"index": r["file_id"], "name": r["filename"] or "",
                "state": r["state"]}
         res = as_dict(r["result"]) or {}
-        for k in ("ok", "imported", "error", "account_id", "warnings",
-                  "corrected", "skipped_older"):
+        for k in ("ok", "imported", "matched", "error", "account_id",
+                  "warnings", "corrected", "skipped_older"):
             if k in res:
                 row[k] = res[k]
         files.append(row)
@@ -773,6 +773,9 @@ def _run_one(work, tenant_id: str, decision: dict, name: str, data: bytes,
         warnings = [str(w) for w in (result.get("warnings") or [])
                     if w][:WARNINGS_PER_FILE]
         return {"ok": True, "imported": result.get("imported", 0),
+                # lines the ledger already held: a file that added nothing
+                # says so rather than reading as an empty import
+                "matched": int(result.get("matched") or 0),
                 "account_id": account_id,
                 "warnings": warnings,
                 "corrected": int(result.get("corrected") or 0),

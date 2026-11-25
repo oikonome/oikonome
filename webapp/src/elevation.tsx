@@ -2,6 +2,8 @@ import { createContext, useCallback, useContext, useEffect, useRef,
          useState, type ReactNode } from "react";
 import { api, errText, setElevator, type Elevation } from "./api/client";
 import { passkeysAvailable, passkeyTicket } from "./stepup";
+import Note from "./components/Note";
+import { useDialog } from "./components/useDialog";
 
 // Session elevation ("sudo mode"). Security-posture routes take no password
 // of their own: they answer 403 elevation_required, the
@@ -131,14 +133,11 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
     return () => { live = false; };
   }, [info, tries]);
 
-  // Escape is cancel, as the cancel button is, whatever the sheet shows
-  useEffect(() => {
-    const onEsc = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && !busy) onCancel();
-    };
-    window.addEventListener("keydown", onEsc);
-    return () => window.removeEventListener("keydown", onEsc);
-  }, [busy, onCancel]);
+  // A modal dialog: focus moves in and stays in, the page behind is
+  // inert, focus returns to the guarded control on close, and Escape is
+  // cancel, as the cancel button is, whatever the sheet shows
+  const sheet = useRef<HTMLDivElement | null>(null);
+  useDialog(sheet, { modal: true, onClose: () => { if (!busy) onCancel(); } });
 
   const passkey = !!info?.methods.includes("passkey");
   const hasPassword = !!info?.methods.includes("password");
@@ -191,6 +190,7 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
 
   return (
     <div role="dialog" aria-modal="true" aria-label="Confirm it's you"
+      ref={sheet} tabIndex={-1}
       style={{ position: "fixed", inset: 0, zIndex: 1100,
                background: "rgba(0,0,0,.55)", display: "flex",
                alignItems: "center", justifyContent: "center",
@@ -204,8 +204,8 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
             : "Changing security settings needs a fresh confirmation; after "
               + "this one, everything here just works for 10 minutes."}
         </p>
-        {err && <div className="note bad" style={{ marginBottom: ".7rem" }}
-                     onClick={() => setErr(null)}>{err}</div>}
+        {err && <Note tone="bad" style={{ marginBottom: ".7rem" }}
+                     onDismiss={() => setErr(null)}>{err}</Note>}
         {!info ? (
           <>
             <p className="mut">{loadFailed
@@ -238,9 +238,9 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
                 : "Passkeys need a secure (https) connection, which this "
                   + "isn't. "}
               {hasPassword && (
-                <a href="#" onClick={(e) => { e.preventDefault();
+                <button type="button" className="as-link" onClick={(e) => { e.preventDefault();
                   setErr(null); setAlt("password"); }}>
-                  Use password instead</a>
+                  Use password instead</button>
               )}
               {hasPassword && info.totp && " · "}
               {/* the recovery code is the proof of last resort: the whole
@@ -249,9 +249,9 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
                   when there is no password, it would strand anybody who has
                   both and has lost the key AND the authenticator. */}
               {(!hasPassword || info.totp) && (
-                <a href="#" onClick={(e) => { e.preventDefault();
+                <button type="button" className="as-link" onClick={(e) => { e.preventDefault();
                   setErr(null); setAlt("recovery"); }}>
-                  Use a recovery code instead</a>
+                  Use a recovery code instead</button>
               )}
             </p>
           </>
@@ -289,15 +289,15 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
             {(passkey && passkeysAvailable()) || hasPassword ? (
               <p className="mut" style={{ fontSize: 13, marginBottom: 0 }}>
                 {passkey && passkeysAvailable() && (
-                  <a href="#" onClick={(e) => { e.preventDefault();
+                  <button type="button" className="as-link" onClick={(e) => { e.preventDefault();
                     setErr(null); setAlt(null); }}>
-                    Back to the passkey</a>
+                    Back to the passkey</button>
                 )}
                 {passkey && passkeysAvailable() && hasPassword && " · "}
                 {hasPassword && (
-                  <a href="#" onClick={(e) => { e.preventDefault();
+                  <button type="button" className="as-link" onClick={(e) => { e.preventDefault();
                     setErr(null); setRecovery(""); setAlt("password"); }}>
-                    Use my authenticator instead</a>
+                    Use my authenticator instead</button>
                 )}
               </p>
             ) : null}
@@ -334,15 +334,15 @@ function ElevateSheet({ fresh, cached, onDone, onCancel }: {
             {((passkey && passkeysAvailable()) || info.totp) && (
               <p className="mut" style={{ fontSize: 13, marginBottom: 0 }}>
                 {passkey && passkeysAvailable() && (
-                  <a href="#" onClick={(e) => { e.preventDefault();
+                  <button type="button" className="as-link" onClick={(e) => { e.preventDefault();
                     setErr(null); setAlt(null); }}>
-                    Back to the passkey</a>
+                    Back to the passkey</button>
                 )}
                 {passkey && passkeysAvailable() && info.totp && " · "}
                 {info.totp && (
-                  <a href="#" onClick={(e) => { e.preventDefault();
+                  <button type="button" className="as-link" onClick={(e) => { e.preventDefault();
                     setErr(null); setCode(""); setAlt("recovery"); }}>
-                    Lost your authenticator? Use a recovery code</a>
+                    Lost your authenticator? Use a recovery code</button>
                 )}
               </p>
             )}

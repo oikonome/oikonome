@@ -18,6 +18,7 @@ import { WAITING_KEY, moreWaiting, receiptDateBounds, seedWaiting,
   from "../api/waiting";
 import { localYmd, receiptDetailsDraft } from "../moneymath";
 import { canEdit } from "../role";
+import SlipNote from "./SlipNote";
 
 /** The camera-or-file button that snaps a receipt with no transaction. */
 export function SnapReceiptButton({ label = "📷 Receipt" }:
@@ -112,7 +113,7 @@ function DetailsForm({ r, onDone }: { r: WaitingReceipt; onDone?: () => void }) 
   const bounds = receiptDateBounds(r.created_at);
   const submit = (e: React.FormEvent) => {
     e.preventDefault();
-    const d = receiptDetailsDraft(total, date, store);
+    const d = receiptDetailsDraft(total, date, store, r.merchant);
     if (!d.ok) { setErr(d.error); return; }
     if (bounds && (d.body.date < bounds.min || d.body.date > bounds.max)) {
       setErr(d.body.date > bounds.max
@@ -252,6 +253,11 @@ export default function WaitingReceipts() {
                 <div className="mut" style={{ fontSize: 12, marginTop: ".2rem" }}>
                   Was matched by hand — that charge was removed. Pick its
                   charge again.</div>)}
+              {/* which slip it is: a copy counted elsewhere says so, and a
+                  look-alike asks once (specs/receipts.md) */}
+              <SlipNote id={r.id} counts={r.counts ?? true}
+              twins={r.slip_twins ?? []}
+                suspected={r.suspected ?? []} mayAnswer={mayEdit} />
               {r.candidates.length > 0 && (
                 <div style={{ marginTop: ".35rem", display: "flex",
                               flexDirection: "column", gap: ".25rem" }}>

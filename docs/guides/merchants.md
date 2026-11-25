@@ -10,7 +10,10 @@ the bank prints without its apostrophe ("Juniper's Market" and "JUNIPERS
 MARKET" are one merchant), an initials brand stays whole ("Q&Z Market"
 keeps its ampersand, "J.T. Outfitters" reads "JT Outfitters"),
 accented letters fold to plain ones ("Café Northwind" and "CAFE
-NORTHWIND" are one merchant), and when that cleanup improves, bills and
+NORTHWIND" are one merchant), a short number that begins a brand name
+is part of the brand ("9 OAKS MARKET" and "9-Oaks Market" are one
+merchant, while a number of three or more digits is still read as a
+store number and dropped), and when that cleanup improves, bills and
 category rules attached to the old spelling move with it. If an improved
 cleanup splits one merchant into several, each part gets a copy of its
 bills, pending bill offers, category rules and 1099 contractor marks,
@@ -38,18 +41,29 @@ merchant as the ledger displays it, with:
   a kind chip when it is not a plain shop (marketplace, payment app);
   a chain outlet (one store of a warehouse club or a gas chain) says which brand it is an
   outlet of, and the brand's logo carries over;
-- how many transactions carry it and what they total, and how many of
-  its rows belong to a business entity;
+- how many transactions carry it and what they total, said with its
+  direction — "$1,250 spent", or "$600 received" for a merchant that
+  mostly pays you. A line that is mostly transfers and card or loan
+  payments (a card issuer's line, "Transfer from Checking") says "in
+  transfers and payments" ("mostly transfers and payments" when other
+  charges sit among them but most of the line's dollars are payments),
+  and a bank's interest line ("Interest paid", "Credit interest") says
+  "in interest" —
+  money moved or earned, not spent at a merchant — and how many of its
+  rows belong to a business entity;
 - the first and last time you paid it;
 - the **raw variants** underneath — the exact strings your bank sent.
   That list is usually the explanation for a merchant looking wrong.
 
 **Open a merchant** (tap its name) for everything the app knows about
 it: website, phone and merchant code when the bank connection resolved
-them; the category its rows carry and the rule that sets it; its
+them; the category its rows carry and, in words, the rule that files
+its new charges ("new charges go to Groceries (your rule)" — it can name
+a different category from the one its past rows carry); its
 activity span with a jump into Transactions; every source name; and
 **where** it has been seen — the places from the bank's per-transaction
-location, busiest first, each with a map link (a chain lists several; an
+location, busiest first (one town however the bank spells it), each
+with a map link (a chain lists several; an
 online merchant says no location came through).
 
 The list shows the most frequent merchants first; switch the order to
@@ -66,9 +80,29 @@ When the app thinks two spellings are one business it queues them under
 **Needs a look** at the top of the page, one line per pair with the
 reason. **details** opens three boxes that read as a sum — the new
 detection, the history it would join, and the merchant you would have
-after merging, each with its rows, total, dates and latest bank lines
-(a name opens that merchant). **Merge** joins them, **Not the same** keeps them
-apart for good, and nothing is merged unless you say so.
+after merging, each with its rows (every row the merge moves, refunds
+and payouts included), total, dates and latest bank lines (a name opens
+that merchant). The reasons are read from the ledger as it is when you
+open the list, so a side said to stop in a month has no later rows; a
+pair one of whose merchants holds no counted row right now (its rows
+withdrawn by the bank, or only on a hidden account) is left off the list
+until it has one again. Two merchants whose names agree on only one
+word are never offered on the strength of their charges alone — the
+same line of business in the same town, or a bank line that is only
+that word, is two shops that share a word, not one business. **Merge** joins them, **Not the same** keeps them
+apart for good, and nothing is merged unless you say so. A new batch of
+offers also raises one Alerts line, "N new merchant pairs look like one
+merchant", that links here. It counts the pairs that batch found; the
+offers list here counts every pair still waiting, so the two can differ. A pair is
+always offered as the smaller merchant joining the larger one — more
+charges first, and with equal charges the one you have used longer — so
+approving never renames a long history after a merchant that appeared
+this week. (One exception: a name the bank cut short gives way to the
+full name, whichever has more charges.) When more than one
+pair is a name the bank cut short (or the same name spelled another
+way), **Merge all N cut-off names** merges those pairs in one go, always
+keeping the full name; a pair whose names merely share a word reads
+*share a word — check the address* and is merged one at a time.
 
 The counts and totals are your personal ledger's. A merchant you only
 ever paid through a business entity still appears here — identity is one
@@ -112,6 +146,16 @@ a real business of that name still gets its own merchant the first time you
 visit it — and the charge itself is searchable by the line your statement
 shows, not by the name it was moved off.
 
+A statement you import can write the same payment with the bank's word for
+the kind of entry in front of the payee — `ACH Withdrawal ACME KITE
+SUPPLY` — where the live feed writes `ACME KITE SUPPLY`. That lead-in
+(**ACH Withdrawal**, **ACH Deposit**, **ACH Debit**, **ACH Credit**,
+**Direct Deposit**) is not part of the name: an imported row joins the
+merchant the feed's rows of the same line already have, so a merchant's
+totals include its imported months. Rows imported before this are moved
+by the nightly pass. A name you gave a merchant yourself is never
+changed by it.
+
 Pairs already split
 are merged by the nightly job, which converges up to 25 such pairs a night, keeping the
 better-sourced name — the one your bank connection identified, with its
@@ -130,6 +174,16 @@ with the city and country after the name). It does that only for a
 merchant whose every charge is still pending or is the posted form of a
 pending charge, and only when the earlier charges point at one older
 merchant whose name the new spelling plainly continues.
+
+And it folds back a merchant that was created on the day your data
+provider first attached its own identity to a charge from a shop you
+already had: the newcomer held that week's charges while every earlier
+one stayed under the merchant you know. New charges like that now stay
+with the merchant the bank's line already belongs to — when the line
+spells the provider's name for it and the line's earlier charges are all
+one merchant — and a newcomer made before this is merged into that older
+merchant, keeping the older name. It is left alone if you renamed either
+one, taught them different categories, or answered **Not the same**.
 
 To see or drive it by hand on a self-hosted install, run the app's own
 command inside its container: `docker compose exec -T app oikonome

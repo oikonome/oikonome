@@ -48,7 +48,9 @@ class WebSheet(unittest.TestCase):
         self.assertIn("setTries((n) => n + 1)", self._loading_branch())
 
     def test_escape_cancels(self):
-        self.assertRegex(self.src, r'e\.key === "Escape"[^\n]*onCancel\(\)')
+        # the dialog primitive turns Escape into its onClose
+        self.assertRegex(self.src, r'useDialog\(sheet, \{[^}]*onClose: \(\) => '
+                                   r'\{ if \(!busy\) onCancel\(\); \}')
 
 
 class PhoneSheet(unittest.TestCase):

@@ -13,10 +13,32 @@ The defaults come from your own data, not placeholders:
   **re-run wizard** on the page hero or Settings → wizards brings it
   back) is where the birthdate is set and saved — even **Skip** keeps
   one you have already typed. No birthdate set, age defaults to 45.
-- **Target spend $/yr** defaults to your household's actual
-  last-12-months spending (the product's spend definition — see the
-  concepts guide), rounded to the nearest $1,000. Too little history
-  to be meaningful and a generic fallback is used instead.
+- **Target spend $/yr** is the spend you saved in the wizard; without
+  one it is your household's actual last-12-months spending (the
+  product's spend definition — see the concepts guide), rounded to the
+  nearest $1,000. With too little history for that, the page asks what
+  you plan to spend a year and projects nothing until you answer — there
+  is no assumed spend.
+- **Saving per month** is the saving you saved in the wizard. With none
+  saved, it is what your ledger shows going into your retirement accounts
+  (401(k), 403(b), 457(b), IRA, Roth — workplace-plan contributions and
+  deposits) over the last 12 months, as a monthly average, rounded to
+  $50 and marked **from your last 12 months**. Money moved from one of
+  your retirement accounts into another (a Roth conversion, a rollover)
+  is not counted as saving; money moved in from checking, savings or a
+  brokerage is. Accounts with less than a year of history are averaged
+  over the time they cover. With neither, the projection counts no new
+  saving and the hero says **saving not set — add it**, which opens a
+  box that saves the answer.
+- Saving is split by how it is taxed: **tax-deferred** (the employer
+  box: 401(k), 403(b), a traditional IRA), **Roth** (Roth IRA, Roth
+  401(k)) and **taxable** (a brokerage). The ledger figure is split by
+  the account each deposit landed in. A line under the Assumptions line
+  lists each part, for example "$600/mo into tax-deferred accounts —
+  taxed when you take it out · $250/mo into Roth accounts — not taxed
+  when you take it out". If your saved answer has no Roth figure, no
+  Roth saving is counted; when your last 12 months show Roth deposits,
+  the page says so and points you to the walkthrough's saving step.
 - **SS at claim age** comes from the Social Security estimates you enter
   from your SSA statement: open **adjust ▾** on the Assumptions line (or
   click **no SSA statement** there) and fill **Social Security $/mo by
@@ -24,22 +46,31 @@ The defaults come from your own data, not placeholders:
   figure for, then **Save** (the phone app's Retirement screen has the
   same fields under its own **adjust ▾**; a viewer sees the page but not
   the fields). Nothing in the app computes a benefit for
-  you. The page picks the estimate for your exact chosen claim age; if
-  no estimate exists for that age (or none are entered), Social Security
-  is $0 — there is no interpolation between entered ages, so enter every
-  age you might claim at. The hero's **Assumptions** line tells you which
-  case you are in: **SS at 67 ($X/mo)** with the estimate for that age,
-  **$0/mo** when you have estimates but none for that age, and **(no SSA
-  statement)** when you have none at all.
+  you. The page uses the estimate for your chosen claim age; an age
+  between two entered ages takes the straight line between them, an age
+  outside them is the nearest one adjusted the way SSA adjusts a claim
+  (smaller for each month earlier, larger for each month later up to
+  70), and with none entered Social
+  Security is $0. The hero's **Assumptions** line tells you which case
+  you are in: **SS at 67 ($X/mo)** with the figure for that age, and
+  **(no SSA statement)** when you have none at all.
 
 Every other field on the page is a **what-if override**. The form sits
 behind **adjust ▾** on the Assumptions line — spend, return, inflation, plan-to
-age, SS claim age, stock %, employer and taxable saving per month, and
+age, SS claim age, stock %, employer, Roth and taxable saving per month, and
 the age to resume saving — and **Recalculate** reruns the model with
-your figures. Nothing you type in that form is saved; the wizard's own
-answers (spend, saving, market assumptions) likewise only pre-fill it for
-the visit, with the birthdate the one thing it stores. The Social Security
-amounts below it are the exception: **Save** keeps them for the household.
+your figures. Nothing else you type in that form is saved; the
+projection starts from your saved wizard answers each visit. The SS
+claim age is remembered with those answers, and **Save** keeps the
+Social Security amounts below it for the household.
+
+The wizard itself saves each step as you answer it, birthdate included,
+so closing the page, reloading it or opening it on another device picks
+up at the first question you have not answered, with your earlier
+answers filled in. Return and inflation may be negative: each takes any
+figure from −20% to 30%, the same range the projection uses. An answer
+outside its range is refused on its own step, which says the range and
+waits for a fix instead of moving on.
 
 ## The projection model
 
@@ -50,11 +81,16 @@ constant real amount per year.
 Your accounts are grouped into four tax buckets by type and name:
 **tax-deferred** (401a/401k/403b/457b, non-Roth IRAs including SEP and
 SIMPLE, Keogh, SARSEP, profit-sharing and Thrift Savings plans,
-pensions, anything the bank labels plainly "retirement", and
-"traditional" in the name), **Roth**, **taxable** (brokerage and
-crypto), and **cash** (bank accounts). Duplicate-source shadow accounts are excluded so nothing
-counts twice (see the accounts guide). Credit-card debt is netted out
-of the buckets up front, in the same order withdrawals draw.
+pensions, annuities, health savings accounts, RRSP/RRIF and similar
+Canadian and UK pre-tax plans, anything the bank labels plainly
+"retirement", and "traditional" in an investment account's name),
+**Roth** (including a TFSA), **taxable** (brokerage and crypto), and
+**cash** (bank accounts — except one whose name says IRA, such as a
+credit union's IRA share or IRA CD, which is tax-deferred, or Roth when
+the name also says Roth). Duplicate-source shadow accounts are excluded so nothing
+counts twice (see the accounts guide). Credit-card debt — the cards the
+Debt page lists, at its rates, without the accounts excluded there — is
+netted out of the buckets up front, in the same order withdrawals draw.
 
 Each simulated year:
 
@@ -71,9 +107,9 @@ Each simulated year:
   The IRS Uniform Lifetime Table forces a tax-deferred withdrawal each
   year, taxed as ordinary income; while you work it is reinvested
   taxable, and in retirement anything beyond that year's spending is.
-- Before retirement, from the **resume saving at age** you set, the
-  employer amount lands in tax-deferred and the taxable amount in
-  brokerage.
+- Before retirement, from the **resume at** age you set under *adjust ▾*, the
+  employer amount lands in tax-deferred, the Roth amount in Roth and the
+  taxable amount in brokerage.
 - After retirement, income arrives first — Social Security from your
   claim age (taxed as 85% ordinary income) and the year's RMD.
 - The rest of the year's spend is withdrawn **tax-smart**: cash →
@@ -82,19 +118,34 @@ Each simulated year:
   tax-deferred by an effective ordinary rate; cash and Roth spend
   dollar-for-dollar. All figures shown are after tax.
 
-A retirement age is **feasible** if the money lasts to your plan-to
-age. **Max sustainable spend** is found by binary search: the largest
-constant real spend that just barely survives. The per-age table runs
-from your current age to 72, and the earliest feasible row is the
-headline answer.
+The headline answer is the **history replay** (below): the earliest age
+whose plan lasts to your plan-to age in at least 9 of 10 past markets —
+"age 62 · lasts in 9 of 10 past markets". The same plan at your return
+assumption every single year is shown under it as **steady markets**,
+with its own earliest age. The two can disagree: a flat return is a
+gloomier summary of history than history itself for a stock-heavy plan.
 
-When no age in the table works, the headline says **not by 72** and, under
-it, what would get you back on track: the extra amount to save each month
-— starting now, on top of the contributions already in the plan, into
-taxable savings — that makes retiring at 67 work, and the smaller amount
-that makes 72 work. Each figure is rounded up to the next $10, so it is
+**Max sustainable spend** is found by binary search: the largest
+constant real spend that just barely survives steady markets. The
+per-age table runs from your current age to 72; its **Past markets**
+column (green from 9 in 10) carries the verdict, **Steady markets** says
+whether the steady plan lasts or when it runs out, and its **Max
+spend/yr** is green where it covers your target spend.
+
+When no age in the table lasts in 9 of 10 past markets, the headline says
+**not by 72** and, under it, the extra amount to save each month —
+starting now, on top of the saving already counted, into taxable savings
+— that makes retiring at 67 (and at 72) last in 9 of 10. Each figure is rounded up to the next $10, so it is
 one that really lasts. If you are already past an age, or no monthly
 amount is enough, that age is left out.
+
+The **Projected portfolio** chart is that plan: saving until the
+headline's age, then drawing your spend, to your plan-to age — the
+middle (median) of every past market, year by year, in today's dollars.
+
+**You have today** is your accounts net of card balances (the Cash row
+says how much it is net of); your home and other property are not
+counted.
 
 ## Replayed against history
 
@@ -106,16 +157,18 @@ order, taxes, and RMDs — against **every contiguous sequence of real
 annual returns since 1928** (S&P 500 with dividends and 10-year
 Treasuries, inflation-adjusted, blended by your stock %; sequences wrap
 around at the end of the record). The result is a plain fraction:
-survived N of 98 historical start years. The card also computes the
-spend level with **90% historical success** and the spend that
-**survived all of history**. The per-age table carries the same success
+"survived N of 98 historical sequences" — one per start year since 1928. The card also computes the
+spend level with **90% historical success** and **the most you could
+spend and survive every year since 1928**. The per-age table carries the same success
 % for each retirement age. Deterministic — no Monte Carlo.
 
 The **Stress test** scenarios override the real return for the first years *of
 retirement*: a −35% crash in year one, a crash with slow recovery
 (−20%, −10%, 0%), and a lost decade (0% real for 10 years). The table
-shows the earliest feasible age and max spend under each, and the
-"crash-proof spend" KPI is the worst of them.
+shows the earliest feasible age and max spend under each (red where it
+falls short of your target spend), and the hero's
+**the most you could spend and survive the worst stress scenario** is the
+lowest of them.
 
 ## Gotchas
 

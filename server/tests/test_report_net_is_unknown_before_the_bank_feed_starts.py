@@ -5,9 +5,10 @@ history reaches back to January. The months before the checking feed
 starts have unknown income, not $0: counting them as $0 would show each
 one's whole spend as a loss, and the report emails would add those losses
 into a year-to-date net and a yearly headline ("you lost money") that are
-not true. The Month lens hero, the Year lens cells, the monthly email's
-year-to-date tile and the yearly email's headline and year strip must all
-read the same rule.
+not true. The Month lens hero, the Year lens cells and totals, the monthly
+email's year-to-date tile and the yearly email's headline and year strip
+all read the same rule, by the month: a net sums the months that are
+measured and says "income incomplete" when some are not.
 """
 
 import datetime as dt
@@ -63,10 +64,23 @@ class NetBeforeTheBankFeedTests(unittest.TestCase):
         self.assertEqual(may["income"]["actual"], 0,
                          "a covered month with no deposits earned $0")
 
-    def test_the_monthly_email_year_to_date_is_unknown(self):
+    def test_the_monthly_email_year_to_date_counts_the_measured_months(self):
+        """May (the bill, no pay) and June (pay and groceries) are
+        measured: the tile is their net, never the four months before as
+        losses, and it says which months it counts."""
         _seed(self.conn, first_bank_month=5)
         _subject, plain, _html = lens_email.build_monthly(
             self.conn, dt.date(2026, 7, 1))
+        self.assertIn("Year to date net: +$950", plain)
+        self.assertIn("income incomplete — left over counts 2 of 6 months",
+                      plain)
+
+    def test_a_year_to_date_with_no_measured_month_has_no_net(self):
+        for m in range(1, 4):
+            add_txn(self.conn, dt.date(2026, m, 10), 1000.0, "HARBOR GROCER",
+                    primary="FOOD_AND_DRINK")
+        _subject, plain, _html = lens_email.build_monthly(
+            self.conn, dt.date(2026, 4, 1))
         self.assertIn("Year to date net: —", plain)
 
     def test_the_yearly_email_does_not_say_the_year_lost_money(self):
@@ -74,23 +88,29 @@ class NetBeforeTheBankFeedTests(unittest.TestCase):
         subject, plain, _html = lens_email.build_yearly(
             self.conn, dt.date(2027, 1, 1))
         self.assertNotIn("lost money", plain)
-        self.assertNotIn(": net", subject)
+        # the four unmeasured months' spend is not a loss: the net is the
+        # measured months', and the subject says it is partial
+        self.assertIn(": net +$950 (income incomplete)", subject)
         d = lenses.year_summary(self.conn, 2026, today=dt.date(2027, 1, 1),
                                 with_detail=True)
         strip = {yr["y"]: yr for yr in d["detail"]["years"]}
-        self.assertIsNone(strip[2026]["net"])
+        self.assertEqual((strip[2026]["net"], strip[2026]["incomplete"]),
+                         (950.0, True))
 
     def test_the_year_totals_do_not_count_uncovered_months_as_a_loss(self):
-        """The Year page's totals read the cells' rule: a year whose bank
-        feed starts mid-year has no known income, saved or savings rate,
-        or `saved` would be the covered months' income against all twelve
-        months' spend — a loss the cells and the yearly email deny."""
+        """A year whose bank feed starts in May: income, saved and the
+        rate count May on — never the four months before as a loss — and
+        the totals say so (specs/counted-figures.md, "one rule")."""
         _seed(self.conn, first_bank_month=5)
         y = lenses.year_summary(self.conn, 2026, today=dt.date(2027, 1, 1))
         t = y["totals"]
-        self.assertIsNone(t["income"])
-        self.assertIsNone(t["saved"])
-        self.assertIsNone(t["rate"])
+        self.assertEqual(t["income"], 3000.0)
+        self.assertEqual(t["saved"], 950.0)
+        self.assertEqual(t["rate"], 31.7)
+        self.assertEqual((t["saved_months_known"], t["saved_months_total"]),
+                         (8, 12))
+        self.assertEqual(t["incomplete_text"],
+                         "income incomplete — left over counts 8 of 12 months")
         # what went out is still known: six grocery months and the bill
         self.assertEqual(t["spend"], 6 * 1000 + 50)
 

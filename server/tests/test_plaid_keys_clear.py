@@ -167,7 +167,7 @@ class PlaidKeysClearTests(unittest.TestCase):
         self._plaid_item("it1", "access-token-stale", archived=True)
         seen = []
         with self._remove_item_probe(seen), \
-                mock.patch("oikonome.web.api.plaid_validate",
+                mock.patch("oikonome.web.api_accounts.plaid_validate",
                            return_value={"env": "sandbox"}):
             r = self.client.post("/api/accounts/plaid/keys", json={
                 "password": "correct-horse-battery",
@@ -196,7 +196,8 @@ class PlaidKeysClearTests(unittest.TestCase):
         a bank that lands after the list is taken — Plaid answering slowly
         for the stale one — keeps its token, and the keys stay."""
         from oikonome.sync import plaid as plaid_mod
-        from oikonome.web import api
+        # the module the key-clearing door looks the list up in
+        from oikonome.web import api_accounts as api
         self._plaid_item("it1", "access-token-stale", archived=True)
         real = api._plaid_straggler_ids
 

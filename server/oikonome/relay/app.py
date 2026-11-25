@@ -159,7 +159,12 @@ def _key_identity(request: Request) -> str | None:
 # past the weekly report keeps sending "weekly" — refusing it would drop
 # that household's pushes until it upgrades. The instance-side allowlist
 # (notify/push_native.py EVENTS) may be narrower than this; never wider.
-EVENTS = frozenset({"daily", "weekly", "monthly", "yearly", "alert", "test"})
+#
+# An event this relay does not know is refused, whole batch, with exactly
+# 400 {"detail": "unknown event"}: an instance newer than its relay keys a
+# fallback on that answer (push_native.send_security), so keep it.
+EVENTS = frozenset({"daily", "weekly", "monthly", "yearly", "alert",
+                    "security", "test"})
 
 MAX_BATCH = 500
 MAX_TOKEN_LEN = 4096

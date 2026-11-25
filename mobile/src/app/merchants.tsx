@@ -6,21 +6,23 @@
 // queue above the list, one line each, the evidence and both sides behind "details".
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
-import { memo, useCallback, useEffect, useMemo, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card } from "../components/ui";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, Note } from "../components/ui";
 import { errText, MerchantCatalog, MergeProposal, MergeSideFacts } from "../lib/api";
 import { removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { useDemo, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
-import { catalogLimit, catLabel, looksUnnamed, MERCHANT_FILTERS, MERCHANT_ORDERS,
-         serverOrder, sortMerchants } from "../lib/pure";
+import { disclosure } from "../lib/a11y";
+import { catalogLimit, catLabel, MERCHANT_FILTERS, MERCHANT_ORDERS, signedMoney,
+         serverOrder, EMPTY_LINES, failureStatus } from "../lib/pure";
 import type { MerchantFilter, MerchantOrder } from "../lib/pure";
 import MerchantAvatar from "../components/merchant-avatar";
+import { fieldA11y } from "../components/field";
 
 type CatalogRow = MerchantCatalog["merchants"][number];
 
@@ -30,6 +32,9 @@ type CatalogRow = MerchantCatalog["merchants"][number];
 // the array only for an older server that doesn't send it.
 const variantCount = (m: { variants: string[]; variant_count?: number }) =>
   m.variant_count ?? m.variants.length;
+
+// merchants the catalog shows before "Show all" (web: Merchants.tsx)
+const MERCHANTS_SHORT = 25;
 
 export default function Merchants() {
   const { client } = useSession();
@@ -45,7 +50,11 @@ export default function Merchants() {
   }, [qText]);
   const [order, setOrder] = useState<MerchantOrder>("count");
   const [flt, setFlt] = useState<MerchantFilter>("all");
+  const [done, setDone] = useState<string | null>(null);
   const [recentOpen, setRecentOpen] = useState(false);
+  // the catalog opens on its first few (as on the web); a search shows
+  // every hit
+  const [allRows, setAllRows] = useState(false);
 
   // the server caps the catalog; the long tail is reachable through search
   const limit = catalogLimit(order, flt);
@@ -79,14 +88,18 @@ export default function Merchants() {
       removeFromList<MerchantCatalog, MerchantCatalog["recent"][number]>(
         qc, key, "recent", (r) => r.id === id);
       invalidate();
+      setDone("Change undone.");
     },
     onError: (e) => Alert.alert("Couldn't undo", errText(e)),
   });
   const decide = useMutation({
-    mutationFn: ({ pid, action }: { pid: string; action: "approve" | "reject" }) =>
-      client!.merchantMerge(pid, action),
+    mutationFn: ({ pid, action, into_id }:
+        { pid: string; action: "approve" | "reject"; into_id: string }) =>
+      client!.merchantMerge(pid, action, into_id),
     onSuccess: (_r, v) => {
       removeFromList<MerchantCatalog, MergeProposal>(qc, key, "merges", (x) => x.id === v.pid);
+      // the web's toast words
+      setDone(v.action === "approve" ? "Merged." : "Kept apart.");
       if (v.action === "approve") invalidate();
       else {
         // rejecting the last offer empties the queue too, and with it
@@ -95,25 +108,48 @@ export default function Merchants() {
         qc.invalidateQueries({ queryKey: ["today"], refetchType: "none" });
       }
     },
-    onError: (e) => Alert.alert("Couldn't decide", errText(e)),
+    onError: (e) => {
+      // a sync turned the offer since it was listed: nothing merged, and
+      // the list comes back with the offer as it now stands (web: the same)
+      if (failureStatus(e) === 409) {
+        qc.invalidateQueries({ queryKey: ["merchants"] });
+        Alert.alert("This suggestion changed", "Showing it again.");
+        return;
+      }
+      Alert.alert("Couldn't decide", errText(e));
+    },
   });
   // "merge all" walks the queue one decision at a time: each is its own
-  // journal entry, so a wrong one is undone alone
+  // journal entry, so a wrong one is undone alone. An earlier approve can
+  // settle a later offer or re-point it into a pair that only shares a
+  // word; the server answers that 409 and the batch skips it, leaving it
+  // for the refetched list to show on its own (web: Merchants.tsx).
   const decideAll = useMutation({
-    mutationFn: async (pids: string[]) => {
-      let n = 0;
-      for (const pid of pids) { await client!.merchantMerge(pid, "approve"); n += 1; }
-      return n;
+    mutationFn: async (offers: { id: string; into_id: string }[]) => {
+      let n = 0, skipped = 0;
+      for (const o of offers) {
+        try { await client!.merchantMerge(o.id, "approve", o.into_id, true); n += 1; }
+        catch (e) {
+          if (failureStatus(e) !== 409) throw e;
+          skipped += 1;
+        }
+      }
+      return { n, skipped };
     },
-    onSuccess: (n) => { invalidate(); Alert.alert("Merged", `${n} pair${n === 1 ? "" : "s"}.`); },
+    onSuccess: ({ n, skipped }) => {
+      invalidate();
+      Alert.alert("Merged", `${n} pair${n === 1 ? "" : "s"}.`
+        + (skipped ? ` ${skipped} changed on the way — check ${skipped === 1 ? "it" : "them"} in the list.` : ""));
+    },
     onError: (e) => { invalidate(); Alert.alert("Stopped", errText(e)); },
   });
   const openRow = useCallback((display: string) =>
     router.push({ pathname: "/merchant", params: { display } } as never), [router]);
 
-  const rows = useMemo(
-    () => sortMerchants(query.data?.merchants ?? [], order, flt, new Date()),
-    [query.data, order, flt]);
+  // the server filters and sorts (the household's own month for "seen
+  // this month", its own test for "unnamed"); the list is printed in the
+  // order it came, as on the web
+  const rows = query.data?.merchants ?? [];
   const recent = query.data?.recent ?? [];
   const merges = query.data?.merges ?? [];
   const canEdit = !viewer && !demo;
@@ -123,19 +159,20 @@ export default function Merchants() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
-      <StaleBanner query={query} />
+      <StaleLine query={query} />
       <Text style={s.mut}>
         Every name your ledger shows. Open one to see its source strings,
         where it has been seen, and to rename or merge it.
       </Text>
-      <TextInput style={s.search} value={qText} onChangeText={setQText}
+      <TextInput {...fieldA11y("Search merchants")}
+                 style={s.search} value={qText} onChangeText={setQText}
                  placeholder="search merchants…" placeholderTextColor={C.mut}
                  autoCapitalize="none" autoCorrect={false} />
       {/* the web's sort select, in the app's segmented idiom */}
       <ScrollView horizontal showsHorizontalScrollIndicator={false}
                   contentContainerStyle={s.sortRow}>
         {MERCHANT_ORDERS.map(([v, label]) => (
-          <Pressable key={v} style={[s.seg, order === v && s.segOn]}
+          <Pressable accessibilityRole="button" key={v} style={[s.seg, order === v && s.segOn]}
                      onPress={() => setOrder(v)}>
             <Text style={{ color: order === v ? C.text : C.mut, fontSize: 13,
                            fontWeight: "600" }}>{label}</Text>
@@ -144,29 +181,40 @@ export default function Merchants() {
       </ScrollView>
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
         {MERCHANT_FILTERS.map(([v, label]) => (
-          <Pressable key={v} style={[s.chip, flt === v && s.chipOn]} onPress={() => setFlt(v)}>
+          <Pressable accessibilityRole="button"
+                     key={v} style={[s.chip, flt === v && s.chipOn]} onPress={() => setFlt(v)}>
             <Text style={{ color: flt === v ? C.accent : C.mut, fontSize: 12 }}>{label}</Text>
           </Pressable>
         ))}
       </View>
       {!viewer && demo && (
         <Text style={{ color: C.warn, fontSize: 12, textAlign: "center" }}>
-          Renames are locked on the demo — the login is shared, so a change
-          would follow the next visitor. Everything else is free to explore.
+          Not available on the demo instance — synthetic data only.
         </Text>
       )}
+      {/* what the last undo or decision did (the web's toast); tap to
+          dismiss */}
+      {done ? (
+        <Note style={{ color: C.good, fontSize: 12, textAlign: "center" }}
+              onPress={() => setDone(null)}>{done}</Note>) : null}
 
       {merges.length > 0 && (
         <NeedsALook merges={merges} canEdit={canEdit}
                     busy={decide.isPending || decideAll.isPending}
-                    onDecide={(pid, action) => decide.mutate({ pid, action })}
-                    onMergeAll={() => decideAll.mutate(merges.map((p) => p.id))}
+                    onDecide={(pid, action) => decide.mutate({
+                      pid, action,
+                      into_id: merges.find((p) => p.id === pid)?.into_id ?? "" })}
+                    onMergeAll={() => decideAll.mutate(
+                      merges.filter((p) => p.bulk)
+                        .map((p) => ({ id: p.id, into_id: p.into_id })))}
                     onOpen={openRow} />
       )}
 
       {recent.length > 0 && (
         <Card>
           <Pressable onPress={() => setRecentOpen((v) => !v)}
+                     {...disclosure(recentOpen, `Recent changes, ${recent.length} `
+                       + `change${recent.length === 1 ? "" : "s"} · undo here`)}
                      style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
             <Text style={s.small}>{recentOpen ? "▾" : "▸"}</Text>
             <Text style={s.name}>Recent changes</Text>
@@ -177,12 +225,15 @@ export default function Merchants() {
             <View key={r.id} style={s.recent}>
               <View style={{ flex: 1 }}>
                 <Text style={s.body} numberOfLines={2}>
-                  <Text style={s.mut}>{r.raw_merchant}</Text>
-                  {"  →  "}{r.to_canonical}
+                  {/* older-server path: stands in for `label` / `line` */}
+                  {r.label !== undefined ? r.label
+                    : `${r.raw_merchant}  →  ${r.to_canonical}`}
                 </Text>
                 <Text style={s.small}>
                   {mmddyy(r.at)}
-                  {r.from_canonical ? ` · was ${r.from_canonical}` : ""}
+                  {r.line ? ` · ${r.line}`
+                    : r.label === undefined && r.from_canonical
+                      ? ` · was ${r.from_canonical}` : ""}
                 </Text>
               </View>
               {canEdit && (
@@ -199,25 +250,35 @@ export default function Merchants() {
       {query.isPending && <Text style={s.mut}>Loading…</Text>}
       {/* a failed fetch is not an empty catalog — say so, and offer the
           retry, instead of claiming nothing matched */}
-      {query.isError && (
-        <Text style={[s.mut, { color: C.bad }]} onPress={() => query.refetch()}>
-          Couldn't load merchants: {errText(query.error)} — tap to retry.
-        </Text>
-      )}
-      {rows.length === 0 && !query.isPending && !query.isError && (
-        <Text style={s.mut}>No merchants match that.</Text>
+      {query.data === undefined && query.isError && (
+        <FailedLine q={query} what="merchants" />)}
+      {/* "no match" only from a list that answered */}
+      {rows.length === 0 && query.data !== undefined && (
+        <Text style={s.mut}>{q || flt !== "all" ? EMPTY_LINES.filtered
+                                                : EMPTY_LINES.merchants}</Text>
       )}
 
       {rows.length > 0 && (
         <Card style={{ paddingVertical: 2 }}>
-          {rows.map((m) => <MerchantRow key={m.display} m={m} onOpen={openRow} />)}
+          {(allRows || q ? rows : rows.slice(0, MERCHANTS_SHORT))
+            .map((m) => <MerchantRow key={m.display} m={m} onOpen={openRow} />)}
         </Card>
+      )}
+      {!q && rows.length > MERCHANTS_SHORT && (
+        <Pressable accessibilityRole="button"
+                   accessibilityState={{ expanded: allRows }}
+                   onPress={() => setAllRows(!allRows)}>
+          <Text style={{ color: C.accent, fontSize: 13 }}>
+            {allRows ? "Show fewer"
+              : `Show all ${rows.length.toLocaleString()} merchants`}
+          </Text>
+        </Pressable>
       )}
 
       {/* capped is judged on what the server sent, before the filter: a
           filter over a capped window can come back short or empty while
           the merchants it wants sit past the cap */}
-      {(query.data?.merchants.length ?? 0) >= limit && !q && (
+      {(query.data?.merchants.length ?? 0) >= limit && !q && allRows && (
         <Text style={s.mut}>
           Showing the {limit} most frequent — search to find any merchant.
         </Text>
@@ -232,7 +293,7 @@ const MerchantRow = memo(function MerchantRow({ m, onOpen }: {
   m: CatalogRow; onOpen: (display: string) => void;
 }) {
   return (
-    <Pressable style={s.row} onPress={() => onOpen(m.display)}>
+    <Pressable accessibilityRole="button" style={s.row} onPress={() => onOpen(m.display)}>
       <MerchantAvatar name={m.display} logo={m.logo} size={28} />
       <View style={{ flex: 1 }}>
         <Text style={s.name} numberOfLines={1}>
@@ -242,10 +303,13 @@ const MerchantRow = memo(function MerchantRow({ m, onOpen }: {
           {m.parent ? <Text style={s.small}>  outlet of {m.parent}</Text> : null}
         </Text>
         <Text style={s.small} numberOfLines={1}>
-          {m.rows} row{m.rows === 1 ? "" : "s"} · {money(m.total, false)} ·{" "}
+          {/* older-server path: stands in for `total_label` */}
+          {m.rows.toLocaleString()} row{m.rows === 1 ? "" : "s"} · {m.total_label !== undefined ? m.total_label : money(m.total, false)} ·{" "}
           {mmddyy(m.first)} – {mmddyy(m.last)}
           {variantCount(m) > 1 ? ` · ${variantCount(m)} source names` : ""}
-          {(m.business_rows ?? 0) > 0 ? ` · ${m.business_rows} business` : ""}
+          {(m.business_rows ?? 0) > 0
+            ? ` · ${m.business_rows} business row${m.business_rows === 1 ? "" : "s"}`
+            : ""}
         </Text>
       </View>
       <Text style={s.small}>›</Text>
@@ -263,6 +327,9 @@ function NeedsALook({ merges, canEdit, busy, onDecide, onMergeAll, onOpen }: {
 }) {
   const [why, setWhy] = useState<string | null>(null);
   const n = merges.length;
+  // "Merge all" covers only the offers where one name is the other cut
+  // short (the server's `bulk`), as on the web
+  const nBulk = merges.filter((p) => p.bulk).length;
   return (
     <Card>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
@@ -270,9 +337,10 @@ function NeedsALook({ merges, canEdit, busy, onDecide, onMergeAll, onOpen }: {
           Needs a look
           <Text style={s.small}>  {n} pair{n === 1 ? "" : "s"} look{n === 1 ? "s" : ""} like one merchant</Text>
         </Text>
-        {canEdit && n > 1 && (
+        {canEdit && nBulk > 1 && (
           <Text style={[s.action, busy && { opacity: 0.5 }]}
-                onPress={() => !busy && onMergeAll()}>Merge all {n}</Text>
+                onPress={() => !busy && onMergeAll()}>
+            Merge all {nBulk} cut-off names</Text>
         )}
       </View>
       <Text style={s.small}>
@@ -290,6 +358,8 @@ function NeedsALook({ merges, canEdit, busy, onDecide, onMergeAll, onOpen }: {
             <Text style={s.mut}> · {p.into_facts?.rows ?? p.into_rows ?? "?"}</Text>
           </Text>
           <Text style={s.small}>
+            {p.caution ? (
+              <Text style={{ color: C.warn }}>{p.caution} · </Text>) : null}
             {p.signals[0]}{"  "}
             <Text style={s.link} onPress={() => setWhy(why === p.id ? null : p.id)}>
               {why === p.id ? "less" : "details"}</Text>
@@ -341,7 +411,7 @@ function OfferSide({ tag, tone, name, facts, samples, onOpen }: {
       {facts ? (
         <>
           <Text style={s.small}>
-            {facts.rows} row{facts.rows === 1 ? "" : "s"} · {money(facts.total, false)} ·{" "}
+            {facts.rows.toLocaleString()} row{facts.rows === 1 ? "" : "s"} · {money(facts.total, false)} ·{" "}
             {facts.first === facts.last
               ? mmddyy(facts.first) : `${mmddyy(facts.first)} – ${mmddyy(facts.last)}`}
           </Text>
@@ -368,23 +438,34 @@ function OfferSide({ tag, tone, name, facts, samples, onOpen }: {
 }
 
 /** What approving makes: one merchant under the surviving name, holding
- *  both sides' rows. The sums are the two boxes above it, added. */
+ *  both sides' rows. The figures are the server's (`merged`): it adds the
+ *  two boxes above and signs the change, so nothing is summed here (web:
+ *  Merchants.tsx OfferMerged). */
 function OfferMerged({ p }: { p: MergeProposal }) {
   const f = p.from_facts, i = p.into_facts;
-  const dates = [f?.first, f?.last, i?.first, i?.last].filter(Boolean).sort() as string[];
+  // older-server path: stands in for `merged` (the two boxes added, the
+  // change signed — never "+-$50")
+  const m = p.merged !== undefined ? p.merged : (f && i ? (() => {
+    const dates = [f.first, f.last, i.first, i.last].filter(Boolean)
+      .sort() as string[];
+    return { rows: f.rows + i.rows, rows_delta: `+${f.rows}`,
+             total: f.total + i.total,
+             total_delta: signedMoney(f.total, (n) => money(n, false), true),
+             first: dates[0] ?? null, last: dates[dates.length - 1] ?? null };
+  })() : null);
   return (
     <View style={[s.box, { borderColor: C.good }]}>
       <Text style={[s.tag, { color: C.good }]}>After merge</Text>
       <Text style={[s.body, { fontWeight: "600" }]}>{p.into}</Text>
-      {f && i ? (
+      {m ? (
         <>
           <Text style={s.small}>
-            {f.rows + i.rows} rows <Text style={s.delta}>+{f.rows}</Text> ·{" "}
-            {money(f.total + i.total, false)} <Text style={s.delta}>+{money(f.total, false)}</Text>
+            {m.rows.toLocaleString()} rows <Text style={s.delta}>{m.rows_delta}</Text> ·{" "}
+            {money(m.total, false)} <Text style={s.delta}>{m.total_delta}</Text>
           </Text>
           <Text style={s.small}>
-            {mmddyy(dates[0])} – {mmddyy(dates[dates.length - 1])}
-            {i.category ? ` · ${catLabel(i.category)}` : ""}
+            {m.first && m.last ? `${mmddyy(m.first)} – ${mmddyy(m.last)}` : ""}
+            {i?.category ? ` · ${catLabel(i.category)}` : ""}
           </Text>
         </>
       ) : null}
@@ -399,7 +480,7 @@ function OfferMerged({ p }: { p: MergeProposal }) {
 
 const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
-  search: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
+  search: { backgroundColor: C.card, borderColor: C.field, borderWidth: 1,
             borderRadius: 10, color: C.text, fontSize: 15,
             paddingHorizontal: 12, paddingVertical: 9 },
   mut: { color: C.mut, fontSize: 13 },

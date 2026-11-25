@@ -861,7 +861,7 @@ def history(conn, limit: int = HISTORY_PAGE, before: str | None = None,
         "asked_by": r["asked_by"],
         "question": r["question"],
         "answer": r["answer"],
-        "blocks": r["blocks"] or [],
+        "blocks": _blocks.with_ring_figures(r["blocks"] or []),
         "tools_used": list(r["tools_used"] or []),
     } for r in rows[:limit]]
     nxt = ({"before": turns[-1]["asked_at"], "before_id": turns[-1]["id"]}

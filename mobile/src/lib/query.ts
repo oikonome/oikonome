@@ -12,7 +12,9 @@ import { Platform } from "react-native";
 import { MMKV } from "react-native-mmkv";
 
 import { bindEpochSignal } from "./api";
+import { bindConnection, resetConnection } from "./connection";
 import { resetLaunch } from "./launch";
+import { householdDay, keptOffline, retryRead, retryReadDelay } from "./pure";
 import { AppQueryClient } from "./shown";
 import { DEVICE_ONLY } from "./storage";
 
@@ -37,9 +39,18 @@ export const queryClient = new AppQueryClient({
   defaultOptions: { queries: {
     staleTime: 60_000,
     gcTime: GC_TIME,
-    retry: 1,
+    // the web's rule (retryRead, pure.ts): only a failure that can heal —
+    // no answer, a 5xx, a 408 — is asked again, up to three times with
+    // backoff. A 403 or a 429 is the server's answer; a 429 retried counts
+    // as another strike toward the address ban.
+    retry: retryRead,
+    retryDelay: retryReadDelay,
   } },
 });
+
+// every fetch it settles tells the offline gate whether the phone reached
+// its server (connection.ts; the write buttons read it)
+bindConnection(queryClient);
 
 // ---- the encrypted disk copy ----
 // The ledger, accounts, net worth and emails must not sit in a plain
@@ -135,36 +146,33 @@ const storage = {
 // polled, searched or paged-through data that a week of gcTime would
 // otherwise accumulate into a multi-megabyte blob written every second
 // while a sync runs.
-const OFFLINE_KEYS = new Set(["today", "bills", "accounts", "alerts", "me",
-                              "settings", "onboarding", "connections",
-                              "calendar", "categories", "report", "holdings",
-                              "account-links", "assistant-status", "reimburse"]);
 export const persistOptions = {
   persister: undefined as unknown as ReturnType<typeof createAsyncStoragePersister>,
   buster: PERSIST_BUSTER,
   maxAge: GC_TIME,
   dehydrateOptions: {
+    // which reads: keptOffline (pure.ts) — each tab's landing view, the
+    // Month and Year lenses for the current month and year, and Help.
+    // "Current" is the household's day, the one those screens open on.
     shouldDehydrateQuery: (q: { queryKey: readonly unknown[];
                                 state: { status: string } }) =>
       q.state.status === "success"
-      && (OFFLINE_KEYS.has(String(q.queryKey[0]))
-          // the month a person lands on, not every month or search
-          // they paged through
-          || (q.queryKey[0] === "transactions" && q.queryKey.length > 1
-              && isLandingPage(q.queryKey[1]))),
+      && keptOffline(q.queryKey, offlineDay()),
   },
 };
 
-/** the Transactions tab's opening page: the current month, no search,
- *  no bucket — the shape `transactions.tsx` builds before anyone types
- *  or pages back (every month browsed with ‹ › matches the filter-free
- *  shape too, and a week of them is not the offline layer) */
-function isLandingPage(params: unknown): boolean {
-  if (!params || typeof params !== "object") return false;
-  const p = params as Record<string, unknown>;
-  if (p.q || p.page || p.bucket || p.acct || p.cat) return false;
-  const now = new Date();
-  return Number(p.y) === now.getFullYear() && Number(p.m) === now.getMonth() + 1;
+// the household's day, worked out at most once a minute: the filter runs
+// for every query on every persist
+let dayAt = 0;
+let day = new Date();
+function offlineDay(): Date {
+  const t = Date.now();
+  if (t - dayAt > 60_000) {
+    day = householdDay(new Date(t),
+      queryClient.getQueryData<{ timezone?: string }>(["me"])?.timezone);
+    dayAt = t;
+  }
+  return day;
 }
 
 export const persister = createAsyncStoragePersister({
@@ -213,6 +221,7 @@ export async function wipeQueryCache(): Promise<void> {
   abortEpoch();
   resetLaunch();   // the next household on this launch gets its own home
   queryClient.clear();
+  resetConnection();   // the next server starts with no verdict on its reach
   try { await persister.removeClient(); } catch { /* best effort */ }
   try { await AsyncStorage.removeItem(PERSIST_KEY); } catch { /* best effort */ }
 }

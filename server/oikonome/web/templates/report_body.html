@@ -69,6 +69,9 @@
     </tr>
   </table>
   {% endfor %}
+  {% if ctx.year_strip_legend %}
+  <div class="sub" style="font-size:12px;margin-top:6px;">{{ ctx.year_strip_legend }}</div>
+  {% endif %}
   {% endif %}
   <div class="sub" style="margin-top:.8rem;padding-top:.6rem;border-top:1px solid var(--line);">{{ ctx.variable_line | safe }}</div>
   {% for note in ctx.notes %}<div class="sub warn" style="margin-top:.35rem;">{{ note }}</div>{% endfor %}
@@ -85,7 +88,7 @@
   <div class="sub" style="font-size:12px;margin-bottom:6px;">{{ ctx.bars_intro }}</div>
   <table cellpadding="0" cellspacing="0" width="100%" role="presentation" style="border-collapse:collapse;">
     {% for r in ctx.rows %}
-    <tr><td style="padding:10px 0 0;border:none;font-weight:700;">{{ r.label }}</td><td class="num {{ r.actual_tone }}" style="padding:10px 0 0;border:none;white-space:nowrap;">{{ r.actual_text }}</td><td class="num sub" style="padding:10px 0 0 8px;border:none;white-space:nowrap;">of {{ r.plan_text }}</td></tr>
+    <tr><td style="padding:10px 0 0;border:none;font-weight:700;">{{ r.label }}</td><td class="num {{ r.actual_tone }}" style="padding:10px 0 0;border:none;white-space:nowrap;">{% if not r.words_only %}{{ r.actual_text }}{% endif %}</td><td class="num sub" style="padding:10px 0 0 8px;border:none;white-space:nowrap;">{% if not r.words_only %}of {{ r.plan_text }}{% endif %}</td></tr>
     <tr>
       <td colspan="3" style="padding:0;border:none;">
         {{ bar(r.frac, r.bar) }}
@@ -107,7 +110,7 @@
   <img src="{{ ctx.cat_pie }}" alt="Spending by category" width="100%" style="display:block;width:100%;max-width:720px;height:auto;border:0;border-radius:8px;">
   {% else %}
   <table>
-    {% for c in ctx.cats %}<tr><td>{{ c.label }}</td><td class="num" style="white-space:nowrap;">{{ c.pct }}%</td><td class="num" style="white-space:nowrap;">{{ c.amount_text }}</td></tr>{% endfor %}
+    {% for c in ctx.cats %}<tr><td>{{ c.label|cat }}</td><td class="num" style="white-space:nowrap;">{{ c.pct }}%</td><td class="num" style="white-space:nowrap;">{{ c.amount_text }}</td></tr>{% endfor %}
   </table>
   {% endif %}
 </div>

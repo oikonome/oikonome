@@ -83,19 +83,27 @@ class _Base:
     def test_cash_flow_years_before_the_feed_are_unknown(self):
         cf = reporting.compute_cashflow(self.conn, TODAY)
         rows = {r[0]: r for r in cf["savings_by_year"]}
+        # 2022's only bank rows are the ignored account's: no month known,
+        # so no income figure and no saved figure
         self.assertEqual(rows["2022"], ["2022", None, 10800.0, None, None])
-        self.assertIsNone(rows["2026"][1], "2026 is covered from June only")
-        self.assertIsNone(rows["2026"][3])
+        # 2026 is covered from June: out over every month, saved and the
+        # rate over the covered ones (specs/counted-figures.md, "one
+        # rule") — never the uncovered months' spend as a loss
+        self.assertEqual(rows["2026"],
+                         ["2026", 16000.0, 8100.0, 12400.0, 77.5])
+        self.assertEqual(cf["savings_by_year_notes"]["2026"],
+                         "income incomplete — left over counts 5 of 10 months")
+        self.assertEqual(cf["savings_by_year_months"]["2026"], [5, 10])
         self.assertNotIn("2022", cf["monthly_by_year"])
 
-    def test_a_window_starts_at_the_first_counted_month(self):
+    def test_months_before_the_first_counted_one_are_marked(self):
+        """The ignored account's rows never make a month known: every month
+        before the counted feed's first is marked incomplete."""
         fb = reporting.flow_breakdown(self.conn, TODAY, "1y")
-        self.assertTrue(fb["income_clipped"])
-        self.assertEqual(fb["from"], "2026-06-01")
+        self.assertEqual(fb["from"], "2025-10-01")
+        self.assertEqual(fb["incomplete_months"][-1], "2026-05")
+        self.assertNotIn("2026-06", fb["incomplete_months"])
         self.assertEqual(fb["in"]["total"], 16000.0)
-        self.assertEqual(fb["out"]["total"], 3600.0)
-        self.assertEqual(fb["saved"], 12400.0)
-        self.assertEqual(fb["rate"], 77.5)
 
     def test_the_lenses_read_the_same_months_as_unknown(self):
         y = lenses.year_summary(self.conn, 2022, today=TODAY)

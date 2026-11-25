@@ -9,7 +9,7 @@ import { api, errText, mmdd, money as money$, type BillsData, type BillsHistoryD
          catLabel, promptCategoryName, proposalSuperseded, toast } from "../api/client";
 import { invalidateRollups, patchQueries, patchQuery,
          removeFromList } from "../api/cache";
-import { RANGES, RangePicker, type Range } from "../components/RangePicker";
+import { RANGES, RangePicker, rangeCaption, type Range } from "../components/RangePicker";
 import MerchantAvatar from "../components/MerchantAvatar";
 import TxnTable from "../components/TxnTable";
 import { SIMPLE_CADENCES } from "./Bills";
@@ -18,6 +18,11 @@ import { CUSTOM_UNITS, cadenceChoices, cadenceWords, customCadence, customMax }
   from "../cadence";
 import { TWICE_A_MONTH, cadenceFields, cadencePick, onSeveralDays, severalDaysWords,
          withSeveralDays } from "../monthdays";
+import PageSkeleton from "../components/PageSkeleton";
+import { FailedLine } from "../components/Loaded";
+import EmptyState from "../components/EmptyState";
+import { EMPTY_LINES } from "../moneymath";
+import Note from "../components/Note";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 
@@ -39,14 +44,30 @@ export default function RecurringHistory() {
   const [sp] = useSearchParams();
   const payee = sp.get("payee") ?? "";
   const qc = useQueryClient();
-  // the transaction list's window; the lifetime card is lifetime either way
-  const [span, setSpan] = useState<Range>("all");
+  // the transaction list's window; the lifetime card is lifetime either way.
+  // A link may name the window it was read in (?window=, the Spending tab's
+  // merchant rows); anything else opens on the whole history.
+  const linked = sp.get("window") as Range | null;
+  const [span, setSpan] = useState<Range>(
+    linked && RANGES.includes(linked) ? linked : "all");
   const histKey = ["bills-history", payee, span];
   const q = useQuery({
     queryKey: histKey,
     queryFn: () => api.billsHistory(payee, span),
     enabled: !!payee,
+    // a new range of the same bill keeps the page (the list dimmed) until
+    // it answers; another bill's page never stands in
+    placeholderData: (prev, prevQ) =>
+      prevQ?.queryKey[1] === payee ? prev : undefined,
   });
+  // The last answer for this bill: a range that fails keeps the page, its
+  // range picker included, with the failed line where the list sits. The
+  // lifetime card is lifetime either way, so it stands.
+  const [lastGood, setLastGood] = useState<{ payee: string;
+                                             d: BillsHistoryData }>();
+  if (q.data && !q.isPlaceholderData
+      && (lastGood?.d !== q.data || lastGood.payee !== payee))
+    setLastGood({ payee, d: q.data });
   // hint dismiss/restore, proposal act and add-as-bill are editing
   // writes — viewers keep the whole history read view
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
@@ -118,10 +139,21 @@ export default function RecurringHistory() {
   const deciding = (pid: string) =>
     proposal.isPending && proposal.variables?.pid === pid;
 
-  if (!payee) return <div className="note bad">No payee given.</div>;
-  if (q.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
-  if (q.isLoadingError) return <div className="note bad">Couldn't load: {String(q.error)}</div>;
-  const d: BillsHistoryData = q.data;
+  // reached without a bill named (a hand-typed address, a stale bookmark):
+  // not an error to report, just nothing chosen yet
+  if (!payee) return (
+    <div className="card">
+      <h2>Bill history</h2>
+      <EmptyState title="Pick a bill on Bills & Income." to="/bills"
+                  action="Bills & Income" />
+    </div>);
+  const kept = lastGood?.payee === payee ? lastGood.d : undefined;
+  if (q.isPending && !kept) return <PageSkeleton />;
+  if (q.data === undefined && !kept)
+    return <FailedLine q={q} what="this bill's history" />;
+  const d: BillsHistoryData = q.data ?? kept!;
+  // the transaction list answers the range on view, or says it failed
+  const rangeFailed = q.data === undefined && q.isError;
   const bill = d.bill;
   const fit = d.fit;
   const cadLabel = (v: string) =>
@@ -132,6 +164,10 @@ export default function RecurringHistory() {
   return (
     <>
       <h1>History — {d.payee}</h1>
+      {/* the server's words for what this page lists (an older server
+          sends none, and none is printed) */}
+      {d.scope_line && <p className="sub" style={{ margin: "-.4rem 0 .6rem" }}>
+        {d.scope_line}</p>}
       <div className="card" style={{ marginTop: 0 }}>
         <h2><MerchantAvatar name={d.payee} logo={d.logo} size={26}
                             style={{ marginRight: 8 }} />{d.payee}{" "}
@@ -162,13 +198,16 @@ export default function RecurringHistory() {
             <strong>Ledger says:</strong> {fit.label}
             {bill && mayEdit && (
               <>
-                <Link className="btn" style={{ marginLeft: ".6rem" }}
+                {/* offered only where the ledger's values differ from the
+                    bill's (the server's fit_diverges) — equal values would
+                    open the editor to change nothing */}
+                {d.health?.fit_diverges && <Link className="btn" style={{ marginLeft: ".6rem" }}
                       to={`/bills?edit=${encodeURIComponent(d.payee)}` +
                           `&pamt=${fit.amount}&pcad=${encodeURIComponent(fit.cadence)}` +
                           `&pdue=${fit.next_due || ""}` +
                           (onSeveralDays(fit.by_month_day)
                             ? `&pdays=${fit.by_month_day.join(",")}` : "")}>
-                  edit with these values</Link>
+                  edit with these values</Link>}
                 {d.hint_dismissed ? (
                   <>
                     <span className="pill m" style={{ marginLeft: ".6rem" }}
@@ -259,9 +298,18 @@ export default function RecurringHistory() {
         </h2>
         {/* same renderer as the Transactions page — full recategorize /
             reimb / biz / receipt affordances, no drift */}
-        {d.txns.length > 0
-          ? <TxnTable rows={d.txns} />
-          : <p className="mut">No ledger transactions match this payee.</p>}
+        {rangeFailed
+          ? <FailedLine q={q} what={`this bill's transactions (${
+              rangeCaption(span)})`} />
+          : <div style={q.isPlaceholderData ? { opacity: 0.55 } : undefined}>
+              {d.txns.length > 0
+                ? <TxnTable rows={d.txns} />
+                // a narrow range with nothing in it is the range's
+                // emptiness, not the bill's
+                : <p className="mut">{span === "all"
+                    ? "No ledger transactions match this payee."
+                    : EMPTY_LINES.range}</p>}
+            </div>}
       </div>
 
       {/* monthly totals BELOW the ledger */}
@@ -389,7 +437,10 @@ function MergeInto({ payee, inUse }: { payee: string; inUse?: boolean }) {
                 <span className="mut" style={{ fontSize: 11 }}> · {o.rows}</span>
               </button>
             ))}
-            {pickQ && !cands.isPending && options.length === 0 && (
+            {/* "no match" only from a search that answered */}
+            {pickQ && cands.isError && (
+              <FailedLine q={cands} what="the merchants" />)}
+            {pickQ && cands.isSuccess && options.length === 0 && (
               <span className="sub">No merchant matches that.</span>
             )}
           </div>
@@ -471,9 +522,9 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
           onSubmit={(e) => { e.preventDefault(); add.mutate(); }}>
       <strong>{d.inflow ? "Add as recurring income:"
                         : "Add as recurring bill:"}</strong>
-      $<input type="number" step="0.01" required style={{ width: "7rem" }}
+      $<input aria-label="Amount" type="number" step="0.01" required style={{ width: "7rem" }}
               value={amount} onChange={(e) => setAmount(e.target.value)} />
-      <select value={cadence} onChange={(e) => setCadence(e.target.value)}>
+      <select aria-label="How often" value={cadence} onChange={(e) => setCadence(e.target.value)}>
         {/* a ledger suggestion may be an unusual cadence not in the short
             list — keep it selectable/visible rather than silently
             mis-showing, and still there after another option is tried */}
@@ -485,16 +536,18 @@ function AddAsBill({ d, onDone }: { d: BillsHistoryData; onDone: () => void }) {
         <option value="CUSTOM">Custom interval…</option>
       </select>
       {cadence === "CUSTOM" && (
-        <span>every <input type="number" min="1" max={customMax(customUnit)} style={{ width: "3.5rem" }}
+        <span>every <input aria-label="Every how many"
+                           type="number" min="1" max={customMax(customUnit)} style={{ width: "3.5rem" }}
                value={customN} onChange={(e) => setCustomN(e.target.value)} />
-          <select value={customUnit}
+          <select aria-label="Interval unit" value={customUnit}
                   onChange={(e) => setCustomUnit(e.target.value)}>
             {CUSTOM_UNITS.map(([v, label]) => (
               <option key={v} value={v}>{label}</option>
             ))}
           </select></span>
       )}
-      <input type="date" value={nextDue} onChange={(e) => setNextDue(e.target.value)} />
+      <input aria-label="Next due date"
+             type="date" value={nextDue} onChange={(e) => setNextDue(e.target.value)} />
       <button className="pri" disabled={add.isPending}>add</button>
       {d.fit ? (
         <button type="button" onClick={suggest}
@@ -692,7 +745,7 @@ function MerchantCategory({ payee, current, onDone }: {
           <button style={{ marginLeft: ".5rem" }} disabled={busy} onClick={doUndo}>Undo</button>
         </div>
       )}
-      {err && <div className="note bad" style={{ marginTop: ".5rem" }}>{err}</div>}
+      {err && <Note tone="bad" style={{ marginTop: ".5rem" }}>{err}</Note>}
     </div>
   );
 }

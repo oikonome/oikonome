@@ -173,10 +173,10 @@ class PacketContentTests(unittest.TestCase):
         p = continuity.gather(self.conn, members=[], today=TODAY)
         mort = next(d for d in p["debts"] if d["name"] == "Home Loan")
         self.assertEqual(mort["payment_reported"], 2100.0)
-        self.assertEqual(mort["min_payment"], 1438.93)
+        self.assertEqual(mort["min_payment"], 1437.5)
         text = " ".join(_pdf_text(continuity.render_pdf(p)).split())
         self.assertIn("$2,100.00 incl. escrow", text)
-        self.assertIn("(P&I $1,438.93)", text)
+        self.assertIn("(P&I $1,437.50)", text)
         self.assertIn("escrow included", text)
 
     def test_a_name_longer_than_a_page_still_prints_whole(self):
@@ -279,7 +279,8 @@ class PacketDoorTests(unittest.TestCase):
         self.assertEqual(self.viewer.post(
             "/api/continuity/email",
             json={"to": self.email, "password": MEMBER_PW}).status_code, 403)
-        # reading the fields is household truth, like every other page
+        # it may ask, and is told a note exists without its text
+        # (test_continuity_note_is_read_only_by_the_owner)
         self.assertEqual(self.viewer.get("/api/continuity").status_code, 200)
 
     def test_the_note_and_the_name_round_trip(self):

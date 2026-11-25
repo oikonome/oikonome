@@ -10,15 +10,18 @@ import { Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View,
 import PullRefresh from "../components/pull-refresh";
 
 import Sparkline from "../components/sparkline";
-import StaleBanner from "../components/stale-banner";
-import { Card, H, HelpLink, KV, Pill } from "../components/ui";
+import { FailedLine, NoAccountsLine, StaleLine, useNoAccounts }
+  from "../components/loaded";
+import { Card, H, HelpLink, KV, Pill, Skeleton, Note } from "../components/ui";
 import { errText, whatIfRefusal, type DebtMethod, type DebtPlan, type DebtPlanSave,
-         type DebtRow, type DebtSchedule } from "../lib/api";
-import { interestSaved, moneyParam, monthYear, rebaseFields, rebaseKeyed,
-         span } from "../lib/pure";
+         type DebtRow } from "../lib/api";
+import { moneyParam, monthYear, parseMoneyDraft, rebaseFields, rebaseKeyed,
+         failLine, span } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
+import SegmentedControl from "../components/segmented-control";
+import { fieldA11y } from "../components/field";
 
 const m$ = (n: number) => money(n, false);
 // whether a schedule ends inside the fifty-year walk; one that does not
@@ -33,6 +36,12 @@ const NAMES: Record<DebtMethod, string> =
   { avalanche: "Avalanche", snowball: "Snowball" };
 const OTHER: Record<DebtMethod, DebtMethod> =
   { avalanche: "snowball", snowball: "avalanche" };
+// where the walked minimum came from (web: MIN_FROM in pages/Debt.tsx); an
+// older server sends only min_source
+const MIN_FROM: Record<NonNullable<DebtRow["min_basis"]>, string> = {
+  you: "yours", issuer: "issuer", estimate: "estimate",
+  ledger: "from your payments",
+};
 
 type Draft = Record<string, { apr: string; min_payment: string; skip: boolean }>;
 type PlanFields = { method: DebtMethod; extra_monthly: number | string };
@@ -66,6 +75,7 @@ export default function Debt() {
   const [draft, setDraft] = useState<Draft | null>(null);
   // the overrides as they were when the first box was edited
   const [opened, setOpened] = useState<Draft | null>(null);
+  const noAccounts = useNoAccounts();
   const [err, setErr] = useState<string | null>(null);
   const query = useQuery({
     queryKey: ["debt-plan", params],
@@ -114,7 +124,7 @@ export default function Debt() {
   const r: DebtPlan | undefined = query.data ?? lastGood;
   const whatIfErr = query.isError && !query.data
     ? whatIfRefusal(query.error)
-      ?? "Couldn't reach the server — pull down to retry."
+      ?? failLine(query.error, "the debt plan", "phone").text
     : null;
   const method = r?.method ?? "avalanche";
   const extraStr = extra ?? String(r?.extra_monthly ?? 0);
@@ -130,9 +140,13 @@ export default function Debt() {
     setDraft({ ...d, [id]: { ...d[id], ...patch } });
   };
   const persist = () => r && save.mutate({
-    // extraQ is the typed amount as a plain number, so "1,000" compares
-    // equal to the stored 1000
-    plan: { method, extra_monthly: Number(extraQ) },
+    // the typed amount as a plain number, so "1,000" compares equal to the
+    // stored 1000; a blank box is no extra (as on the web), and text that
+    // is not an amount goes out as typed so the server's refusal names it
+    // — never as 0, never as a null that would clear the saved extra
+    plan: { method,
+            extra_monthly: extraStr.replace(/[$\s]/g, "") === "" ? 0
+              : parseMoneyDraft(extraStr) ?? extraStr },
     planBase: { method: r.saved.method, extra_monthly: r.saved.extra_monthly },
     mine: d, base: opened ?? d,
   });
@@ -142,18 +156,22 @@ export default function Debt() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
-      <StaleBanner query={query} />
-      {query.isPending && !r && <Text style={s.center}>Loading…</Text>}
+      <StaleLine query={query} />
+      {query.isPending && !r && <Skeleton />}
       {query.isError && !r && (
-        <Text style={[s.center, { color: C.bad }]}>
-          Couldn&apos;t reach the server — pull down to retry.
-        </Text>
+        <FailedLine q={query} what="the debt plan" />
       )}
-      {r && r.debts.length === 0 && (
+      {/* with nothing linked "Nothing owed" reads as a true zero */}
+      {r && r.debts.length === 0 && noAccounts && <Card><NoAccountsLine /></Card>}
+      {r && r.debts.length === 0 && !noAccounts && (
         <Card>
-          <Text style={[s.big, { color: C.good }]}>Nothing owed</Text>
+          <Text style={[s.big, { color: C.good }]}>
+            {(r.paid_in_full ?? []).length ? "Nothing to pay off" : "Nothing owed"}
+          </Text>
           <Text style={s.mut}>
-            No card or loan carries a balance. A debt on an account the
+            {(r.paid_in_full ?? []).length
+              ? "Every card is paid in full each month, so none of it costs interest."
+              : "No card or loan carries a balance."} A debt on an account the
             Accounts page excludes stays out of the plan too.
           </Text>
         </Card>
@@ -161,11 +179,16 @@ export default function Debt() {
       {r && r.debts.length > 0 && (() => {
         const plan = r.plan, alt = r.alt, base = r.minimums;
         const live = r.debts.filter((x) => !x.skip);
-        const owed = live.reduce((sum, x) => sum + x.balance, 0);
+        // the server's figures (web: pages/Debt.tsx): what the plan starts
+        // from, and which debts it walks at a typical rate or an
+        // estimated minimum
+        const owed = plan.starting;
+        const guessed = live.filter((x) => x.estimated === true).length;
+        const savedVsMin = r.saves_vs_minimums ?? null;
+        const altMore = r.alt_extra_interest ?? null;
         const byId = Object.fromEntries(plan.debts.map((x) => [x.id, x]));
         const ordered = [...r.debts].sort((a, b) =>
           (byId[a.id]?.order ?? 999) - (byId[b.id]?.order ?? 999));
-        const saved = (x: DebtSchedule) => interestSaved(base, x);
         return (
           <>
             <Card>
@@ -175,7 +198,7 @@ export default function Debt() {
                   Debt-free — {NAMES[method].toLowerCase()}
                   {r.extra_monthly > 0
                     ? `, ${m$(r.extra_monthly)}/mo extra`
-                    : ", minimums only rolled"}
+                    : ", no extra — each paid-off debt's minimum moves to the next"}
                 </Text>
                 {unsaved ? <Pill text="unsaved what-if" tone="warn" /> : null}
               </View>
@@ -198,13 +221,25 @@ export default function Debt() {
                   </Text>
                 </Text>
               )}
+              {guessed > 0 ? (
+                <Text style={[s.mut, { marginTop: 4 }]}>
+                  Estimated: {guessed === 1 ? "1 debt is" : `${guessed} debts are`}
+                  {" "}walked at a typical rate or an estimated minimum
+                  {viewer ? "."
+                    : " — add the APR and minimum below for an exact date."}
+                </Text>
+              ) : null}
               <KV k="Paying monthly" v={m$(plan.monthly)} />
               <Text style={s.mut}>every minimum + {m$(plan.extra)} extra</Text>
               {finishes(plan) ? (<>
-              <KV k="Interest to pay" v={m$(plan.total_interest)} />
-              <Text style={[s.mut, saved(plan) > 0 && { color: C.good }]}>
-                {saved(plan) > 0
-                  ? `saves ${m$(saved(plan))} vs minimums only`
+              <KV k={r.estimated ? "Interest to pay (estimated)" : "Interest to pay"}
+                  v={m$(plan.total_interest)} />
+              <Text style={[s.mut, savedVsMin !== null && savedVsMin > 0
+                              && { color: C.good }]}>
+                {savedVsMin !== null && savedVsMin > 0
+                  ? (r.extra_monthly > 0
+                    ? `saves ${m$(savedVsMin)} vs minimums only`
+                    : `saves ${m$(savedVsMin)} by moving each paid-off minimum on`)
                   : base.debt_free
                     ? `minimums only: ${m$(base.total_interest)}`
                     : "minimums only never finish"}
@@ -223,37 +258,31 @@ export default function Debt() {
                 </Text>
               ) : (
               <Text style={[s.mut,
-                            alt.total_interest <= plan.total_interest
+                            altMore !== null && altMore <= 0
                               && { color: C.good }]}>
                 {m$(alt.total_interest)} interest
-                {alt.total_interest !== plan.total_interest
-                  ? (alt.total_interest > plan.total_interest
-                    ? ` — ${m$(alt.total_interest - plan.total_interest)} more`
-                    : ` — ${m$(plan.total_interest - alt.total_interest)} less`)
+                {altMore !== null && altMore !== 0
+                  ? (altMore > 0
+                    ? ` — ${m$(altMore)} more`
+                    : ` — ${m$(-altMore)} less`)
                   : ""}
               </Text>)}
 
               <View style={{ backgroundColor: C.hover, borderRadius: 8,
                              padding: 10, marginTop: 8, gap: 8 }}>
-                <View style={{ flexDirection: "row", gap: 6 }}>
-                  {(["avalanche", "snowball"] as DebtMethod[]).map((m) => (
-                    <Pressable key={m} onPress={() => pick(m)}
-                               style={[s.seg, method === m && s.segOn]}>
-                      <Text style={[s.segText,
-                                    method === m && { color: C.text }]}>
-                        {NAMES[m]}
-                      </Text>
-                    </Pressable>
-                  ))}
-                </View>
+                <SegmentedControl label="Payoff method" value={method}
+                  onChange={pick}
+                  options={(["avalanche", "snowball"] as DebtMethod[]).map(
+                    (m) => ({ value: m, label: NAMES[m] }))} />
                 <View style={{ flexDirection: "row", gap: 8,
                                alignItems: "flex-end" }}>
                   <View style={{ width: 110 }}>
                     <Text style={{ color: C.mut, fontSize: 10 }}>extra $/mo</Text>
-                    <TextInput style={s.input} keyboardType="numeric"
+                    <TextInput {...fieldA11y("Extra $/mo")} style={s.input} keyboardType="numeric"
                                value={extraStr} onChangeText={setExtra} />
                   </View>
-                  <Pressable style={[s.btn, query.isFetching && { opacity: 0.5 }]}
+                  <Pressable accessibilityRole="button"
+                             style={[s.btn, query.isFetching && { opacity: 0.5 }]}
                              disabled={query.isFetching}
                              onPress={() => setParams({ method, extra: extraQ })}>
                     <Text style={s.btnText}>
@@ -261,7 +290,7 @@ export default function Debt() {
                     </Text>
                   </Pressable>
                   {!viewer && (
-                    <Pressable style={[s.btn, s.btnAlt,
+                    <Pressable accessibilityRole="button" style={[s.btn, s.btnAlt,
                                        (save.isPending || !unsaved) && { opacity: 0.5 }]}
                                disabled={save.isPending || !unsaved}
                                onPress={persist}>
@@ -281,7 +310,7 @@ export default function Debt() {
                 {whatIfErr
                   ? <Text style={[s.mut, { color: C.bad }]}>{whatIfErr}</Text>
                   : null}
-                {err ? <Text style={[s.mut, { color: C.bad }]}>{err}</Text> : null}
+                {err ? <Note bad style={[s.mut, { color: C.bad }]}>{err}</Note> : null}
               </View>
             </Card>
 
@@ -290,12 +319,14 @@ export default function Debt() {
                 <H>
                   Balance owed{" "}
                   <Text style={[s.mut, { fontWeight: "400" }]}>
-                    — {NAMES[method].toLowerCase()} vs{" "}
-                    {NAMES[OTHER[method]].toLowerCase()}, same money
+                    — {r.alt_same_path
+                      ? `${NAMES[method].toLowerCase()} and ${NAMES[OTHER[method]].toLowerCase()} pay these debts down the same way`
+                      : `${NAMES[method].toLowerCase()} vs ${NAMES[OTHER[method]].toLowerCase()}, same money`}
                   </Text>
                 </H>
                 <Sparkline width={width - 24 - 28} data={plan.series}
-                           second={alt.series}
+                           subject={`Balance owed, ${NAMES[method].toLowerCase()}`}
+                           second={r.alt_same_path ? undefined : alt.series}
                            legend={[NAMES[method], NAMES[OTHER[method]]]} />
               </Card>
             )}
@@ -321,6 +352,7 @@ export default function Debt() {
                                    gap: 6, marginLeft: 24 }}>
                       <Text style={[s.mut, { flex: 1 }]}>
                         {x.institution ? `${x.institution} · ` : ""}{x.kind}
+                        {x.origin === "hand_entered" ? " · entered on Net Worth" : ""}
                       </Text>
                       {x.skip ? <Pill text="left out" />
                         : p?.paid_off ? <Pill text={monthYear(p.paid_off)} tone="good" />
@@ -335,27 +367,29 @@ export default function Debt() {
                       <View style={{ width: 90 }}>
                         <Text style={{ color: C.mut, fontSize: 10 }}>
                           APR % · {x.apr_source === "you" ? "yours"
-                            : x.apr_source === "issuer" ? "issuer" : "unknown"}
+                            : x.apr_source === "issuer" ? "issuer"
+                            : x.rate_needed ? (viewer ? "rate not given yet"
+                                               : "rate needed — type it once")
+                            : viewer ? "est. — typical rate" : "est. — add yours"}
                         </Text>
                         {viewer
                           ? <Text style={s.val}>{x.apr.toFixed(2)}</Text>
-                          : <TextInput style={s.input} keyboardType="decimal-pad"
-                                       placeholder={x.apr_issuer != null
-                                         ? x.apr_issuer.toFixed(2) : "0"}
+                          : <TextInput {...fieldA11y(`${x.name} APR %`)}
+                                       style={s.input} keyboardType="decimal-pad"
+                                       placeholder={x.apr_default?.toFixed(2)}
                                        placeholderTextColor={C.mut}
                                        value={row?.apr ?? ""}
                                        onChangeText={(v) => setRow(x.id, { apr: v })} />}
                       </View>
                       <View style={{ width: 100 }}>
                         <Text style={{ color: C.mut, fontSize: 10 }}>
-                          Min $/mo · {x.min_source === "you" ? "yours"
-                            : x.min_source === "issuer" ? "issuer" : "estimate"}
+                          Min $/mo · {MIN_FROM[x.min_basis ?? x.min_source]}
                         </Text>
                         {viewer
                           ? <Text style={s.val}>{m$(x.min_payment)}</Text>
-                          : <TextInput style={s.input} keyboardType="numeric"
-                                       placeholder={String(Math.round(
-                                         x.min_issuer ?? x.min_payment))}
+                          : <TextInput {...fieldA11y(`${x.name} minimum $/mo`)}
+                                       style={s.input} keyboardType="numeric"
+                                       placeholder={x.min_default?.toFixed(2)}
                                        placeholderTextColor={C.mut}
                                        value={row?.min_payment ?? ""}
                                        onChangeText={(v) =>
@@ -372,6 +406,7 @@ export default function Debt() {
                         <View style={{ alignItems: "center" }}>
                           <Text style={{ color: C.mut, fontSize: 10 }}>skip</Text>
                           <Switch value={row?.skip ?? false}
+                                  accessibilityLabel={`Leave ${x.name} out of the plan`}
                                   onValueChange={(v) => setRow(x.id, { skip: v })}
                                   trackColor={{ true: C.accent }} />
                         </View>
@@ -381,13 +416,8 @@ export default function Debt() {
                 );
               })}
               <Text style={[s.mut, { marginTop: 8 }]}>
-                Rates and minimums come from the bank where it reports them,
-                else from what you type here; an estimate is a month&apos;s
-                interest plus 1% of a card&apos;s balance, at least 2% and $25, a
-                five-year payment for a
-                loan, thirty years for a mortgage — correct it and save.
-                Minimums are held flat for the whole walk, and interest
-                accrues monthly at APR ÷ 12.
+                Rates and minimums are the bank&apos;s where it reports
+                them, yours where you type them, otherwise an estimate.
                 {!viewer && draft !== null
                   ? " Changes here apply when you save the plan." : ""}
               </Text>
@@ -395,6 +425,34 @@ export default function Debt() {
           </>
         );
       })()}
+      {r && (r.paid_in_full ?? []).length > 0 && (
+        // cards cleared every statement: the server leaves them out of the
+        // plan (web: PaidInFull in pages/Debt.tsx)
+        <Card>
+          <H>
+            Paid in full monthly{" "}
+            <Text style={[s.mut, { fontWeight: "400" }]}>
+              — no interest, so not in the plan
+            </Text>
+          </H>
+          {(r.paid_in_full ?? []).map((c) => (
+            <View key={c.id} style={[s.debt, { flexDirection: "row", gap: 6 }]}>
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: C.text, fontSize: 14 }}>
+                  {c.name}
+                  {c.mask ? <Text style={s.mut}> ···{c.mask}</Text> : null}
+                </Text>
+                <Text style={s.mut}>
+                  {c.basis === "issuer" && c.statement_balance !== null
+                    ? `last statement ${m$(c.statement_balance)} paid in full`
+                    : "your payments clear it each month"}
+                </Text>
+              </View>
+              <Text style={s.num}>{m$(c.balance)}</Text>
+            </View>
+          ))}
+        </Card>
+      )}
       <HelpLink topic="debt" />
     </ScrollView>
   );
@@ -406,18 +464,14 @@ const s = StyleSheet.create({
   mut: { color: C.mut, fontSize: 12, lineHeight: 17 },
   big: { color: C.text, fontSize: 26, fontWeight: "700",
          marginVertical: 4 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 13,
            paddingHorizontal: 8, paddingVertical: 6 },
   val: { color: C.text, fontSize: 13, paddingVertical: 6 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8 },
   btnAlt: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1 },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },
-  seg: { borderColor: C.border, borderWidth: 1, borderRadius: 999,
-         paddingHorizontal: 12, paddingVertical: 5 },
-  segOn: { backgroundColor: C.accent, borderColor: C.accent },
-  segText: { color: C.mut, fontSize: 13, fontWeight: "600" },
   debt: { borderTopColor: C.border, borderTopWidth: StyleSheet.hairlineWidth,
           paddingVertical: 8, gap: 2 },
   num: { color: C.text, fontSize: 13, textAlign: "right",

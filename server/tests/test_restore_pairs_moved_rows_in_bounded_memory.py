@@ -113,7 +113,7 @@ class MovedRowPairingIsBounded(unittest.TestCase):
         self.addCleanup(setattr, restore, "_MOVED_ROWS_FLOOR", old)
         # one repeated line: kilobytes on the wire, any number of rows
         body = HEADER + "tx1,chk,2026-01-01,1,alpha bravo charlie,\n" * 5_000
-        with self.assertRaises(ValueError) as e:
+        with self.assertRaises(restore._ArchiveRefused) as e:
             self._plan(_zip({"transactions.csv": body}))
         self.assertIn("transactions.csv", str(e.exception))
         # and through the restore door, before any row lands

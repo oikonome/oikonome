@@ -33,7 +33,7 @@ class SeedCountsCategorizedMechanicsTextTests(unittest.TestCase):
 
     def test_categorized_loan_payment_and_debit_purchase_are_seeded(self):
         add_txn(self.conn, _last_month(5), 350.0,
-                "DEPT OF LEARNING DES:STUDENT LN",
+                "NORTHWIND LENDING STUDENT LN 0042",
                 primary="LOAN_PAYMENTS",
                 detailed="LOAN_PAYMENTS_STUDENT_LOAN_PAYMENT")
         add_txn(self.conn, _last_month(9), 80.0,
@@ -43,7 +43,7 @@ class SeedCountsCategorizedMechanicsTextTests(unittest.TestCase):
 
     def test_the_verdict_counts_the_same_rows_the_seed_does(self):
         when = TODAY.replace(day=3)
-        add_txn(self.conn, when, 350.0, "DEPT OF LEARNING DES:STUDENT LN",
+        add_txn(self.conn, when, 350.0, "NORTHWIND LENDING STUDENT LN 0042",
                 primary="LOAN_PAYMENTS",
                 detailed="LOAN_PAYMENTS_STUDENT_LOAN_PAYMENT")
         add_txn(self.conn, when, 80.0, "POS WITHDRAWAL EXAMPLE GROCER")
@@ -52,7 +52,7 @@ class SeedCountsCategorizedMechanicsTextTests(unittest.TestCase):
 
     def test_uncategorized_loan_payment_text_stays_in_the_seed(self):
         add_txn(self.conn, _last_month(5), 350.0,
-                "DEPT OF LEARNING DES:STUDENT LN", primary=None)
+                "NORTHWIND LENDING STUDENT LN 0042", primary=None)
         seed = budget._seed_config(self.conn, today=TODAY)
         self.assertEqual(seed["other_monthly"], 450.0)
 

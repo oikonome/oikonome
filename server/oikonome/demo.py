@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 
 import datetime as dt
+import json
 import math
 import random
 import secrets
@@ -1075,7 +1076,19 @@ def _rebuild_household(admin, tid: str, g: _Gen, rng: random.Random,
     names, ordered = _household_tables(admin)
     conn = tenancy.tenant_connect(tid)
     try:
-        with conn.transaction():
+        # bill_write, not a plain transaction: the rebuild saves bills in
+        # this one transaction, and a bill write needs the household's
+        # bill-claim lock taken before any other lock (erasure.py)
+        with bills.bill_write(conn):
+            # the household locks the rebuild's writes ask for later (its
+            # receipts and pairings, its merchants, its bills) come before
+            # the settings row read below, in the order every writer takes
+            # them (erasure.py): asked for after the row, a visitor's edit
+            # holding one of them and waiting for the settings row would
+            # close a cycle with the rebuild
+            from .web.bulk_import import hold_ledger_write_locks
+            hold_ledger_write_locks(conn)
+            bills.lock_active_bills(conn)
             # read under the row lock, in the transaction that wipes and
             # rewrites it, so a choice changed while the rebuild runs is
             # either carried or waits; never silently undone
@@ -1264,6 +1277,17 @@ def _write(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
             (y, wages, round(wages * 0.96, 2), round(wages * 0.82, 2),
              round(wages * rng.uniform(0.16, 0.21), 2), wages, wages,
              round(min(wages, 168_600), 2), wages))
+        # the primary earner's W-2 for each finished year (it arrives the
+        # next January): what the business's self-employment tax nets
+        if y < today.year:
+            box3 = round(wages, 2)
+            conn.execute(
+                """INSERT INTO income_documents (id, year, form, owner,
+                       payer, primary_amount, amounts)
+                   VALUES (%s,%s,'W-2','primary','Acme Manufacturing',
+                           %s,%s)""",
+                (y, y, round(wages * 0.94, 2), json.dumps(
+                    {"1": round(wages * 0.94, 2), "3": box3, "5": box3})))
 
     _receipts(conn, g, rng, today)
     _business(conn, g, rng, today)
@@ -1311,7 +1335,10 @@ def _business(conn, g: _Gen, rng: random.Random, today: dt.date) -> None:
         conn, name=BIZ_NAME, structure="single_member_llc", state=BIZ_STATE,
         formation_date=formed - dt.timedelta(days=21),
         business_start_date=formed,
-        ein=BIZ_EIN, registered_agent=BIZ_AGENT, fiscal_year_end="12-31")
+        ein=BIZ_EIN, registered_agent=BIZ_AGENT, fiscal_year_end="12-31",
+        # the demo cannot save a setting, and its W-2s are the primary
+        # earner's: set, so the tax line reads as a set business does
+        owner="primary")
     eid = ent["id"]
     conn.execute(
         """INSERT INTO entity_membership (entity_id, member_name,
@@ -1449,27 +1476,29 @@ def _configure(conn, g: _Gen, rng: random.Random, today: dt.date,
         ("CloudSafe Backup", 5.99, 25),
         ("NewsWire Daily", 12.99, 3),
     ]
-    for payee, amount, day in monthly_bills:
-        due = _clamp_day(today if today.day < day else next_m, day)
-        bills.save_bill(conn, payee=payee, amount=round(amount, 2),
-                            frequency="MONTHLY", interval=1,
-                            next_due=due, source="demo",
-                            last_seen=today - dt.timedelta(days=20),
-                            merchant=payee)
-    bills.save_bill(conn, payee="AutoShield Insurance",
-                        amount=recent("AutoShield Insurance", 620),
-                        frequency="MONTHLY", interval=6,
-                        next_due=_clamp_day(today + dt.timedelta(days=60), 12),
-                        source="demo", merchant="AutoShield Insurance",
-                        last_seen=today - dt.timedelta(days=100))
-    # income series (biweekly paychecks)
-    net = round(g.gross(today.year) * g.take_home_ratio / 26, 2)
-    bills.save_bill(conn, payee="Acme Manufacturing Payroll", amount=net,
-                        frequency="WEEKLY", interval=2,
-                        next_due=today + dt.timedelta(days=(4 - today.weekday()) % 7 + 7),
-                        source="demo", income=True,
-                        merchant="Acme Manufacturing",
-                        last_seen=today - dt.timedelta(days=7))
+    # one ledger read for every seeded bill's start, not one per bill
+    with bills.starts_filled_once(conn):
+        for payee, amount, day in monthly_bills:
+            due = _clamp_day(today if today.day < day else next_m, day)
+            bills.save_bill(conn, payee=payee, amount=round(amount, 2),
+                                frequency="MONTHLY", interval=1,
+                                next_due=due, source="demo",
+                                last_seen=today - dt.timedelta(days=20),
+                                merchant=payee)
+        bills.save_bill(conn, payee="AutoShield Insurance",
+                            amount=recent("AutoShield Insurance", 620),
+                            frequency="MONTHLY", interval=6,
+                            next_due=_clamp_day(today + dt.timedelta(days=60), 12),
+                            source="demo", merchant="AutoShield Insurance",
+                            last_seen=today - dt.timedelta(days=100))
+        # income series (biweekly paychecks)
+        net = round(g.gross(today.year) * g.take_home_ratio / 26, 2)
+        bills.save_bill(conn, payee="Acme Manufacturing Payroll", amount=net,
+                            frequency="WEEKLY", interval=2,
+                            next_due=today + dt.timedelta(days=(4 - today.weekday()) % 7 + 7),
+                            source="demo", income=True,
+                            merchant="Acme Manufacturing",
+                            last_seen=today - dt.timedelta(days=7))
 
     # the real recurring detector, on the seeded ledger: PixelCloud (unbilled
     # by design) becomes a genuine pending proposal, and any amount drifts
@@ -1562,6 +1591,7 @@ def _configure(conn, g: _Gen, rng: random.Random, today: dt.date,
             "food_monthly": g.food_m,
             "other_monthly": g.other_m,
             "budgeted_income_monthly": round(g.take_home_m(today.year) / 10) * 10,
+            "budgets_saved_by_user": True,
             "checking_account_id": "demo-chk",
             "manual_assets": manual_assets,
             "birthdate": f"{g.birth_year}-06-15",
@@ -1686,7 +1716,7 @@ def _alert_history(conn, rng: random.Random, today: dt.date) -> None:
     d1 = today - dt.timedelta(days=r.randint(300, 340))
     hist("anomaly", "warn",
          f"Possible double charge: FiberLink Internet $70.00 ×2 "
-         f"({d1:%m/%d} + {d1 + dt.timedelta(days=1):%m/%d})",
+         f"({d1:%m/%d/%y} + {d1 + dt.timedelta(days=1):%m/%d/%y})",
          (today - d1).days, span=4, dismissed=1)
     hotel = round(r.uniform(380, 720), 2)
     hist("anomaly", "warn",
@@ -1702,13 +1732,13 @@ def _alert_history(conn, rng: random.Random, today: dt.date) -> None:
     d2 = today - dt.timedelta(days=r.randint(70, 110))
     hist("transfer", "info",
          f"Major investment transfer this month: ${xfer:,.0f} on "
-         f"{d2:%m/%d} — treated as a one-time asset purchase, not counted "
+         f"{d2:%m/%d/%y} — treated as a one-time asset purchase, not counted "
          f"in the shortfall metric.", (today - d2).days, span=8)
     prev = round(r.uniform(120, 320), 2)
     d3 = today - dt.timedelta(days=r.randint(230, 270))
     hist("reimb", "info",
          f"1 charge awaiting reimbursement (${prev:,.0f}, oldest "
-         f"{d3:%m/%d}) — match on the Reimburse page when the check "
+         f"{d3:%m/%d/%y}) — match on the Reimburse page when the check "
          f"arrives.", (today - d3).days, span=18)
     hist("proposals", "info",
          "2 proposed recurring changes awaiting review on the Bills "

@@ -256,6 +256,10 @@ category, limit, page), `spending` (months), `bills` (days), `alerts`,
 `net_worth` (months). Each is exactly one GET against the table above —
 there is nothing the server can do that the token cannot.
 
+An assistant that connects over HTTP instead of running a local command
+can use the instance's own MCP endpoint, with the same read token: see
+[mcp-endpoint.md](mcp-endpoint.md).
+
 ## What these doors never carry
 
 No credentials (aggregator tokens, SMTP passwords, API keys), no other

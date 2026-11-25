@@ -10,11 +10,11 @@ import { flushSync } from "react-dom";
 import { Link, useNavigate } from "react-router";
 import ReceiptPanel from "./ReceiptPanel";
 import SplitPanel from "./SplitPanel";
-import { api, BULK_CHUNK, BULK_MAX, errText, mmdd, money as money$, type Entity, type Txn, catLabel, promptCategoryName } from "../api/client";
+import { api, BULK_CHUNK, BULK_MAX, errText, mmdd, money as money$, type Entity, type Txn, catKey, catLabel, isMovedMoney, promptCategoryName, rowCategoryLabel } from "../api/client";
 import { invalidateRollups, patchQueries } from "../api/cache";
 import MerchantAvatar from "./MerchantAvatar";
 import { isViewer } from "../role";
-import { rowSpend, spendPickerGroups } from "../moneymath";
+import { spendPickerGroups } from "../moneymath";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 // ---- day dividers -------------------------------------------------------
@@ -30,10 +30,10 @@ const money = (v: number | null | undefined) => money$(v, true);  // cents on tr
 // with the verdict, the daily email and the Business worksheet — three
 // surfaces that all already exclude exactly these.
 //
-// Each row's share of spending is rowSpend (moneymath.ts): the verdict's
-// own figure, never the amount column.
-const daySpend = (group: Txn[]) =>
-  group.reduce((sum, t) => sum + rowSpend(t), 0);
+// The figure is the server's (`day_spend`, keyed by ISO date): the whole
+// day's spending over every row of that day in the result, by the rule
+// each row's spend_amount follows. A day "show more" or a page boundary
+// has cut still reads its whole total; the table adds nothing up.
 
 // "Thu · Aug 13". The weekday is the reason this exists — MM/DD never says
 // whether an expensive day was a Saturday, and the row's own date column
@@ -92,7 +92,7 @@ export function NoteEditor({ txnId, initial, onDone }:
         <span className="sub" style={{ color: "var(--amber)" }}>
           Not available on the demo instance — synthetic data only.</span>
       )}
-      <textarea value={text} autoFocus rows={2} disabled={demo}
+      <textarea aria-label="Note" value={text} autoFocus rows={2} disabled={demo}
         placeholder="Add a note — anything you want to remember about this transaction"
         style={{ width: "100%", resize: "vertical", fontSize: 13 }}
         onChange={(e) => setText(e.target.value)}
@@ -149,6 +149,7 @@ type RowProps = {
   onBiz: (id: string, on: boolean) => void;
   onRetire: (id: string) => void;
   onNoteDone: (id: string, note?: string) => void;
+  onPayee: (t: Txn) => void;
 };
 
 /** Everything the aggregator knows about the row, plus WHY it has the
@@ -191,7 +192,7 @@ function TxnDetail({ t }: { t: Txn }) {
       )}
       {t.category_why && (
         <div className="txn-why">
-          <b>{catLabel(t.category)}</b> — {t.category_why}
+          <b>{rowCategoryLabel(t)}</b> — {t.category_why}
           {t.override_is_fee && t.override_bill ? (
             <> · a fee that rides with <b>{t.override_bill}</b>, counted
               with that bill</>) : null}
@@ -205,11 +206,57 @@ function TxnDetail({ t }: { t: Txn }) {
 const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
   saving, bizPending, canRetire, retiring, menuOpen, noteOpen, receiptOpen,
   splitOpen, activeEntities, catGroups, splitCatGroups, knownCats, onArm, onPick, onRecat,
-  onMenu, onNote, onReceipt, onSplit, onBiz, onRetire, onNoteDone }: RowProps) {
-  const tcat = catLabel(t.category || "");
-  const xfer = tcat.includes("TRANSFER") ||
-    (tcat.includes("LOAN PAYMENTS") && t.amount < 0);
+  onMenu, onNote, onReceipt, onSplit, onBiz, onRetire, onNoteDone,
+  onPayee }: RowProps) {
+  const xfer = isMovedMoney(t.category, t.amount, t.category_detailed);
   const expandCols = (showAccount ? 6 : 5) + (viewer ? 0 : 1);
+  const pills = (<>
+    {/* a bill's matcher counts this row. A bare ⟳ glyph is too easy
+        to miss next to the pill-styled pend/reimb/biz badges, so this
+        is a matching blue pill. Unmatched spend rows keep the quiet
+        add-as-bill shortcut into the prefilled history form. */}
+    {t.recurring_bill ? (
+      <Link to={`/bills/history?payee=${encodeURIComponent(t.recurring_bill)}`}
+            className="pill b"
+            title={`Counts toward the recurring bill "${t.recurring_bill}"`}
+            aria-label={`Counts toward the recurring bill "${t.recurring_bill}"`}
+            style={{ marginLeft: 6, textDecoration: "none" }}>⟳ recurring</Link>
+    ) : null}
+    {t.pending ? <span className="pill m" style={{ marginLeft: 6 }}>pend</span> : null}
+    {t.reimb ? <span className="pill g" style={{ marginLeft: 6 }}>reimb</span> : null}
+    {t.reimb_flag ? <span className="pill a"
+        style={{ marginLeft: 6 }}
+        title="flagged as reimbursement expected — the category is unchanged and it still counts as spend until the deposit is matched">
+        awaiting reimbursement</span> : null}
+    {/* biz is STATE on the row for everyone; the toggle lives in the
+        ⋯ strip. A pill only owners could see would be information
+        hidden behind a permission. */}
+    {t.biz_flag ? <span className="pill b"
+        style={{ marginLeft: 6 }}
+        title="business expense (Schedule C tag)">biz</span> : null}
+    {/* the row IS a business's money — its account belongs to the
+        entity — as opposed to biz above, a household charge tagged
+        as a business expense. Named, so two businesses read apart. */}
+    {/* what the bank knows: the check number, the payment app in
+        front of the merchant, and an online channel (in-store is the
+        default and shows nothing) — read from the row's own columns */}
+    {t.check_number ? <span className="pill m" style={{ marginLeft: 6 }}
+        title="check number">#{t.check_number}</span> : null}
+    {/* a written check counted as spending under Checks with nobody yet
+        saying whom it paid: asked once, the answer becomes its note */}
+    {t.needs_payee && !viewer ? <button type="button" className="pill a"
+        style={{ marginLeft: 6, cursor: "pointer" }}
+        title="say whom this check paid, so it can be categorised"
+        onClick={() => onPayee(t)}>who was this to?</button> : null}
+    {t.payment_processor ? <span className="pill m" style={{ marginLeft: 6 }}
+        title={`paid through ${t.payment_processor}`}>via {t.payment_processor}</span> : null}
+    {t.payment_channel === "online" ? <span className="pill m" style={{ marginLeft: 6 }}
+        title="an online purchase">online</span> : null}
+    {t.entity ? <Link to="/business" className="pill e"
+        style={{ marginLeft: 6, textDecoration: "none" }}
+        title={`${t.entity}'s account${t.account ? ` — ${t.account}` : ""}; managed on Business`}
+        aria-label={`${t.entity} business account`}>{t.entity}</Link> : null}
+  </>);
   return (
     <>
     <tr className={picked ? "picked" : undefined}>
@@ -228,51 +275,19 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
                         style={{ marginRight: 7 }} />
         <Link to={`/bills/history?payee=${encodeURIComponent(t.payee)}`}
               title="full history for this merchant">{t.payee}</Link>
+        {/* whom a check paid, read off its image — the bank's line only
+            says "CHECK PAID" */}
+        {t.check_payee ? <span className="mut"> · to {t.check_payee}</span> : null}
         {/* "AMAZON.COM" ×40 in a month tells you nothing; the order
             summary does. Same render as the daily email's recent
             table, so the two read alike. */}
         {t.item_summary && (
-          <span className="mut"> — <i>{t.item_summary}</i></span>
+          <span className="mut txn-sum"> — <i>{t.item_summary}</i></span>
         )}
-        {/* a bill's matcher counts this row. A bare ⟳ glyph is too easy
-            to miss next to the pill-styled pend/reimb/biz badges, so this
-            is a matching blue pill. Unmatched spend rows keep the quiet
-            add-as-bill shortcut into the prefilled history form. */}
-        {t.recurring_bill ? (
-          <Link to={`/bills/history?payee=${encodeURIComponent(t.recurring_bill)}`}
-                className="pill b"
-                title={`Counts toward the recurring bill "${t.recurring_bill}"`}
-                aria-label={`Counts toward the recurring bill "${t.recurring_bill}"`}
-                style={{ marginLeft: 6, textDecoration: "none" }}>⟳ recurring</Link>
-        ) : null}
-        {t.pending ? <span className="pill m" style={{ marginLeft: 6 }}>pend</span> : null}
-        {t.reimb ? <span className="pill g" style={{ marginLeft: 6 }}>reimb</span> : null}
-        {t.reimb_flag ? <span className="pill a"
-            style={{ marginLeft: 6 }}
-            title="flagged as reimbursement expected — the category is unchanged and it still counts as spend until the deposit is matched">
-            awaiting reimbursement</span> : null}
-        {/* biz is STATE on the row for everyone; the toggle lives in the
-            ⋯ strip. A pill only owners could see would be information
-            hidden behind a permission. */}
-        {t.biz_flag ? <span className="pill b"
-            style={{ marginLeft: 6 }}
-            title="business expense (Schedule C tag)">biz</span> : null}
-        {/* the row IS a business's money — its account belongs to the
-            entity — as opposed to biz above, a household charge tagged
-            as a business expense. Named, so two businesses read apart. */}
-        {/* what the bank knows: the check number, the payment app in
-            front of the merchant, and an online channel (in-store is the
-            default and shows nothing) — read from the row's own columns */}
-        {t.check_number ? <span className="pill m" style={{ marginLeft: 6 }}
-            title="check number">#{t.check_number}</span> : null}
-        {t.payment_processor ? <span className="pill m" style={{ marginLeft: 6 }}
-            title={`paid through ${t.payment_processor}`}>via {t.payment_processor}</span> : null}
-        {t.payment_channel === "online" ? <span className="pill m" style={{ marginLeft: 6 }}
-            title="an online purchase">online</span> : null}
-        {t.entity ? <Link to="/business" className="pill e"
-            style={{ marginLeft: 6, textDecoration: "none" }}
-            title={`${t.entity}'s account${t.account ? ` — ${t.account}` : ""}; managed on Business`}
-            aria-label={`${t.entity} business account`}>{t.entity}</Link> : null}
+        {/* the row's state pills: after the name on a wide screen; on a
+            phone they join the category chip's line (index.css), so the
+            name line is not wrapped twice by them */}
+        <span className="txn-pills-wide">{pills}</span>
         {t.note && !noteOpen && (
           <div className="mut" title="note — click 📝 to edit"
             style={{ fontSize: 11, fontStyle: "italic",
@@ -326,17 +341,17 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
           </span>
         ) : viewer ? (
           <span style={{ fontSize: 12, color: "var(--mut)" }}>
-            {catLabel(t.category)}</span>
+            {rowCategoryLabel(t)}</span>
         ) : (<>
         <select value="" title="recategorize (permanent override)"
                 className="cat-chip"
-                aria-label={`category: ${catLabel(t.category)} — change`}
+                aria-label={`category: ${rowCategoryLabel(t)} — change`}
                 onPointerDown={() => onArm(t.id)}
                 onFocus={() => onArm(t.id)}
                 disabled={saving}
                 onChange={(e) => e.target.value && onRecat(t.id, e.target.value)}>
           <option value="">
-            {saving ? "saving…" : catLabel(t.category)}</option>
+            {saving ? "saving…" : rowCategoryLabel(t)}</option>
           {/* everything below the visible label mounts on first contact
               (the arming pattern) — a collapsed select needs only the
               option that labels it, and a page can carry hundreds of
@@ -372,6 +387,7 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
                   onClick={() => onRecat(t.id, "__clear__")}>↺</button>
         ) : null}
         </>)}
+        <span className="txn-pills-narrow">{pills}</span>
       </td>
       {showAccount && (
         <td className="mut hide-m hide-t c-acct" title={t.account ?? ""}
@@ -435,7 +451,9 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
           )}
           {!viewer && (
           <button onClick={() => onRecat(t.id,
-            t.reimb_flag ? "__unflag__" : "__flag__")}>
+            t.reimb_flag ? "__unflag__" : "__flag__")}
+            title={t.reimb_flag ? undefined
+              : "the category stays; it counts as spend until the deposit is matched"}>
             ⚑ {t.reimb_flag
               ? "not awaiting reimbursement"
               : "expect reimbursement"}</button>
@@ -454,10 +472,6 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
             title="the bank has left this authorization pending for over two weeks — drop the row from the ledger"
             onClick={() => onRetire(t.id)}>
             Remove stuck pending</button>
-          )}
-          {!viewer && (
-          <span className="sub" style={{ marginLeft: "auto" }}>
-            the category stays; it counts as spend until matched</span>
           )}
         </div>
       </td></tr>
@@ -487,8 +501,11 @@ const Row = memo(function Row({ t, viewer, showAccount, picked, armed,
 // month/search/filter queries resolving; when the rows prop hasn't
 // changed, none of that needs to touch this subtree.
 export default memo(function TxnTable({ rows, showAccount = true,
-  dayGroups = false }: {
+  dayGroups = false, daySpend }: {
   rows: Txn[]; showAccount?: boolean;
+  // the server's whole-day spending per ISO date (TxnPage.day_spend); a
+  // day it does not name prints its count alone
+  daySpend?: Readonly<Record<string, number>>;
   // Day dividers are OFF unless asked for. This table also draws Today's
   // recent pane, a merchant's bill history and the Business worksheet —
   // short lists where a header per day is chrome, not structure. It also
@@ -579,7 +596,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
   const dayHeads = useMemo(() => {
     if (!dayGroups) return null;
     const heads = new Map<string,
-      { label: string; count: number; spent: number }>();
+      { label: string; count: number; spent: number | undefined }>();
     let start = 0;
     for (let i = 0; i <= rows.length; i++) {
       if (i < rows.length
@@ -588,11 +605,14 @@ export default memo(function TxnTable({ rows, showAccount = true,
       const group = rows.slice(start, i);
       if (group.length)
         heads.set(group[0].id, { label: dayLabel(group[0].date),
-                                 count: group.length, spent: daySpend(group) });
+                                 count: group.length,
+                                 // the server's figure for the whole day; a
+                                 // day it sent none for prints no figure
+                                 spent: daySpend?.[group[0].date.slice(0, 10)] });
       start = i;
     }
     return heads;
-  }, [dayGroups, rows]);
+  }, [dayGroups, rows, daySpend]);
   const [receiptFor, setReceiptFor] = useState<string | null>(null);
   const [splitFor, setSplitFor] = useState<string | null>(null);
   const [noteFor, setNoteFor] = useState<string | null>(null);
@@ -625,7 +645,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
     onMutate: () => ({ ids: new Set(sel) }),
     onSuccess: (r, v, ctx) => {
       const patch: Partial<Txn> | null =
-        v.action === "category" && v.category ? { category: catLabel(v.category) }
+        v.action === "category" && v.category ? { category: catKey(v.category) }
         : v.action === "biz_on" ? { biz_flag: true }
         : v.action === "biz_off" ? { biz_flag: false }
         : v.action === "reimb_flag" ? { reimb_flag: true }
@@ -733,8 +753,10 @@ export default memo(function TxnTable({ rows, showAccount = true,
   // toast below. The select itself is always value="" (the row shows the
   // server category), so there's no optimistic state to roll back.
   const recatM = useMutation({
+    // four doors answer four shapes; only success matters here
     mutationFn: ({ id, category, scope }:
-                 { id: string; category: string; scope?: "one" | "all" }) => {
+                 { id: string; category: string; scope?: "one" | "all" })
+        : Promise<unknown> => {
       if (category === "__flag__") return api.reimbFlag(id);
       // a co-pay or insurance claim is partial from the moment it's
       // flagged, not after a trip to the Reimburse page
@@ -755,7 +777,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
       // a reset goes back to whatever the sources say, which only the
       // server knows — that one waits for the refetch
       else if (v.category !== "__clear__")
-        patchRows((t) => t.id === v.id, { category: catLabel(v.category) });
+        patchRows((t) => t.id === v.id, { category: catKey(v.category) });
       qc.invalidateQueries({ queryKey: ["txns"] });
       qc.invalidateQueries({ queryKey: ["today"] });
       qc.invalidateQueries({ queryKey: ["bills-history"] });
@@ -918,6 +940,28 @@ export default memo(function TxnTable({ rows, showAccount = true,
     if (note !== undefined) patchRows((t) => t.id === id, { note });
   }, [patchRows]);
 
+  // A check's payee, asked once: the answer is written as its note and
+  // may file it under the payee's category, so the figures refetch
+  const onPayee = useCallback((t: Txn) => {
+    const payee = window.prompt(
+      `Who was check${t.check_number ? ` #${t.check_number}` : ""} to?`)?.trim();
+    if (!payee) return;
+    // the server takes up to 120 characters; say so before sending
+    if (payee.length > 120) {
+      window.dispatchEvent(new CustomEvent("oiko-toast",
+        { detail: "Keep the payee to 120 characters or fewer." }));
+      return;
+    }
+    api.checkPayee(t.id, payee).then((r) => {
+      patchRows((x) => x.id === t.id, { note: r.note, needs_payee: false });
+      invalidate();
+      window.dispatchEvent(new CustomEvent("oiko-toast", { detail: r.category
+        ? `Filed under ${catLabel(r.category)}.`
+        : "Saved as the check's note." }));
+    }, (e) => window.dispatchEvent(new CustomEvent("oiko-toast",
+      { detail: errText(e) })));
+  }, [patchRows, invalidate]);
+
   // The prompt renders UNDER the row it concerns, not above the table: a
   // note pinned to the table top is off screen from row 300 of a long
   // ledger (and on desktop it would slide under the fixed top bar), so
@@ -984,7 +1028,7 @@ export default memo(function TxnTable({ rows, showAccount = true,
             “Just this one” changes only this row and creates no rule.
             {demo
               ? " “All” is not available on the demo instance — synthetic data only."
-              : " “All” teaches the merchant and shows up under Settings → Categorization."}
+              : " “All” teaches the merchant and shows up on the Rules page."}
           </div>
         )}
       </div>
@@ -1037,8 +1081,9 @@ export default memo(function TxnTable({ rows, showAccount = true,
       </div>
     )}
     {/*.txn-table + per-td c-* classes let index.css restack each
-        row into a two-line card grid at <=620px (desktop unchanged) */}
-    <table className="txn-table">
+        row into a two-line card grid at <=620px (desktop unchanged);
+        .dayg drops the per-row date there, which the day band states */}
+    <table className={dayGroups ? "txn-table dayg" : "txn-table"}>
       <thead><tr>
         {!viewer && (
         <th className="c-pick" style={{ width: "1%" }}>
@@ -1077,8 +1122,8 @@ export default memo(function TxnTable({ rows, showAccount = true,
                       what this table excludes */}
                   <span className="dayhead-r">
                     {head.count} transaction{head.count === 1 ? "" : "s"}
-                    {head.spent > 0 && (
-                      <> · <b>{money(-head.spent)}</b> spent</>)}
+                    {head.spent !== undefined && head.spent > 0 && (
+                      <> · <b>{money$(head.spent)}</b> spent</>)}
                   </span>
                 </div>
               </td>
@@ -1099,7 +1144,8 @@ export default memo(function TxnTable({ rows, showAccount = true,
                onArm={arm} onPick={toggleOne} onRecat={recat}
                onMenu={onMenu} onNote={onNote} onReceipt={onReceipt}
                onSplit={onSplit}
-               onBiz={onBiz} onRetire={onRetire} onNoteDone={onNoteDone} />
+               onBiz={onBiz} onRetire={onRetire} onNoteDone={onNoteDone}
+               onPayee={onPayee} />
           {scopeAsk?.id === t.id && (
             <tr className="tr-expand" data-scope-ask>
               <td className="c-expand"

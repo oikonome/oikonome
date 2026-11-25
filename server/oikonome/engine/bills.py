@@ -13,6 +13,8 @@ and leaves an `auto` audit row.
 """
 
 import calendar
+import contextlib
+import contextvars
 import datetime as dt
 import hashlib
 import logging
@@ -23,6 +25,19 @@ from .. import localtime
 from ..sync import card_number
 from . import budget, merchant_dedup
 from .compat import as_date, as_dict, jsonb
+
+
+def stored_date(v) -> dt.date | None:
+    """A date read from a stored row (raw dueOn, lastDueOn, a floor): one
+    that does not read as a date — written by hand, or by an install from
+    before restore validated them — is no date, never an error that takes
+    the Bills screen or a nightly pass down."""
+    if not v:
+        return None
+    try:
+        return as_date(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +60,11 @@ TWICE_MONTHLY = (15, "MONTHLY", 1)
 TWICE_MONTHLY_MIN_HITS = 6    # three months: fewer cannot tell it from 14 days
 TWICE_MONTHLY_DAY_TOL = 3     # a payday moved off a weekend or a holiday
 
+# one readable order for every read of the bills a pass walks: the bill set
+# up first, then by name, then its stable id — never the order the table
+# happens to return (specs/today-figures.md, "Row order")
+_BILL_ORDER = "ORDER BY created_on NULLS FIRST, lower(payee), uid"
+
 LOOKBACK_MONTHS = 48          # ledger window for detection
 
 
@@ -64,6 +84,7 @@ ENV_MAD_FRAC = 0.30           # monthly-total stability bound
 DRIFT_MIN = 1.0               # $ change that triggers an amount update
 PHASE_TOL = 2                 # days the due-date anchor may sit off the real
                               # draft phase before health reads 'misdated'
+ONE_TIME_EARLY_DAYS = 10      # a one-time deposit may land this far ahead of its date
 GRACE_DAYS = 60               # hand-edited amounts are drift-immune this long
 
 
@@ -183,7 +204,8 @@ def _derive_merchant(conn, amount: float, *, match_tokens: set | None = None,
             # time, so a canonical rename here would produce a key that
             # nothing in the feed contains.
             """SELECT COALESCE(merchant_name,'') m, COALESCE(name,'') n, amount
-               FROM transactions WHERE removed=0 AND amount>0 AND date>=%s""",
+               FROM transactions WHERE removed=0 AND amount>0 AND date>=%s
+               ORDER BY date, id""",
             (since,)).fetchall():
         if alias is not None:
             ok = alias in f"{r['m']} {r['n']}".lower()
@@ -209,7 +231,7 @@ def backfill_merchants(conn, aliases: dict | None = None,
     n = 0
     for r in conn.execute(
             "SELECT id, payee, amount, merchant, raw FROM bills "
-            "WHERE active=1 AND amount<0").fetchall():
+            f"WHERE active=1 AND amount<0 {_BILL_ORDER}").fetchall():
         payee = r["payee"] or ""
         # Envelope merchants are a deliberate user config (a monthly pool),
         # not an occurrence-amount finder — the derivation (which filters to
@@ -283,6 +305,34 @@ def fee_total(raw: dict | None) -> float:
     return round(sum(c["amount"] for c in companions_of(raw)), 2)
 
 
+def amount_with_fees(amount: float, raw: dict | None) -> float:
+    """What one payment of the bill charges: its amount plus the fees that
+    ride with it, to the cent — the figure a bill row prints beside
+    "incl. $X fee" (specs/shown-figures.md)."""
+    return round(amount + fee_total(raw), 2)
+
+
+def row_amount(amount: float, raw: dict | None,
+               verdict: dict | None) -> float:
+    """The figure a Bills row prints beside its name — the ONE decision,
+    sent as the row's `amount_with_fees`.
+
+    A bill prints what one payment charges (amount_with_fees). An income
+    series prints the most recent deposit matched to it, to the cent
+    (`last_match_amount` of its health verdict, _bill_health), because that
+    is the figure Transactions shows for the same paycheck; with no matched
+    deposit yet it prints its planned amount. Printing only: the planned
+    amount stays the row's `amount`, and every plan figure reads that
+    (specs/shown-figures.md)."""
+    if (amount or 0) > 0:
+        got = (verdict or {}).get("last_match_amount")
+        if isinstance(got, (int, float)) and not isinstance(got, bool) \
+                and got > 0:
+            return round(float(got), 2)
+        return round(float(amount), 2)
+    return amount_with_fees(abs(amount or 0), raw)
+
+
 def companion_matches(c: dict, text_tokens: set, amount: float) -> bool:
     """Does a ledger row look like this companion — its words present, its
     amount within a fee-sized tolerance (50¢ or 25%)."""
@@ -339,6 +389,18 @@ def lock_active_bills(conn) -> None:
     conn.execute(
         "SELECT pg_advisory_xact_lock(hashtext('bills-active'), hashtext("
         "    coalesce(current_setting('app.tenant_id', true), '')))")
+
+
+# The raw keys save_bill decides on every save: each is set, carried or
+# cleared below by the save's own rule. Every other key on the bill is
+# carried forward untouched.
+_SAVE_OWNS = frozenset((
+    "source", "bill_type", "dueOn", "envelope_months", "lastDueOn",
+    "recurrence", "lock_amount", budget.SCHEDULED_SINCE_KEY, "archived_by",
+    "archive_withdrew", "amount_set_on", "amount_history", "show_today",
+    "match_category", "txn_category", "companions", "manual_edited_at",
+    "merchant_refs", "merchant_names", "merchant_pinned", "merchant_offered",
+    "merchant_merges"))
 
 
 def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
@@ -398,7 +460,10 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
         raise ValueError("bill amount must be positive dollars")
     if cadence_too_long(frequency, interval):
         raise ValueError("bill cadence is longer than twenty years")
+    own_claims = _claims_first(conn)
     with conn.transaction():
+        if own_claims:
+            hold_bill_claims(conn)
         lock_active_bills(conn)
         # Read-modify-write under the row lock: the new raw carries values
         # forward from the old one (lock_amount, anchors, companions), so two
@@ -433,7 +498,7 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
         # the bill out of the monthly plan and the Today card, and nothing
         # ever recomputes a null due date.
         if next_due_d is None and prev_raw.get("dueOn"):
-            next_due_d = as_date(prev_raw.get("dueOn"))
+            next_due_d = stored_date(prev_raw.get("dueOn"))
         if bill_type == "envelope":
             # `interval` is the pool's length in months — 1 (the classic
             # monthly pool) or 12 (an annual pool for lumpy yearly costs). `amount`
@@ -473,15 +538,26 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
                                   or next_due_d)
             elif recurrence["frequency"] == "YEARLY" and next_due_d:
                 recurrence["byMonth"] = [next_due_d.month]
-        raw = {"source": source, "bill_type": bill_type,
+        # The new raw starts from the old one less the keys this save
+        # decides (_SAVE_OWNS), so a key some other writer keeps on the bill
+        # (a merge's undo notes, a newer build's field, a restore's) is never
+        # dropped by an edit that knew nothing of it.
+        raw = {k: v for k, v in prev_raw.items() if k not in _SAVE_OWNS}
+        raw |= {"source": source, "bill_type": bill_type,
                "dueOn": next_due_d.isoformat() if next_due_d else None,
                **({"envelope_months": env_months} if bill_type == "envelope" else {}),
                # lastDueOn=None floors a brand-new series at its first due date;
                # detected series pass their last observed hit
-               "lastDueOn": (as_date(last_seen).isoformat() if last_seen else None),
+               "lastDueOn": (stored_date(last_seen).isoformat()
+                             if stored_date(last_seen) else None),
                "recurrence": recurrence}
         if prev_raw.get("lock_amount"):
             raw["lock_amount"] = True
+        # the first day the bill counts as part of the schedule: an edit
+        # never moves it (filled below for a bill that has none)
+        if budget.scheduled_since(prev_raw, None) is not None:
+            raw[budget.SCHEDULED_SINCE_KEY] = prev_raw[
+                budget.SCHEDULED_SINCE_KEY]
         # an edit to an archived bill leaves it archived (the upsert keeps
         # `active`), so it keeps the marks saying who archived it and which
         # offers that withdrew; reviving it is lifting the archive
@@ -496,7 +572,8 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
         prev_amt = abs(other["amount"] or 0) if other is not None else None
         if prev_amt is None or abs(prev_amt - abs(amount or 0)) > 0.005 \
                 or not prev_raw.get("amount_set_on"):
-            raw["amount_set_on"] = (as_date(last_seen).isoformat() if last_seen
+            raw["amount_set_on"] = (stored_date(last_seen).isoformat()
+                                    if stored_date(last_seen)
                                     else today.isoformat())
         else:
             raw["amount_set_on"] = prev_raw["amount_set_on"]
@@ -560,12 +637,16 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
             # that settles neither must not drop the mark — the upsert
             # rebuilds raw, and losing it would put the bill back on text
             raw["merchant_offered"] = True
+        if merchants is None and prev_raw.get("merchant_merges"):
+            # the notes a merge's undo reads: only the person's own list
+            # (merchants given) answers them, never an amount or date edit
+            raw["merchant_merges"] = prev_raw["merchant_merges"]
         raw.update(ident)
         conn.execute(
             """INSERT INTO bills (id, type, payee, amount, frequency,
                    monthly_amount, due_on, category, account_id, is_completed,
-                   active, synced_at, raw, merchant)
-               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,0,1,now(),%s,%s)
+                   active, synced_at, raw, merchant, created_on)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NULL,0,1,now(),%s,%s,%s)
                ON CONFLICT (tenant_id, id) DO UPDATE SET
                    type=EXCLUDED.type, payee=EXCLUDED.payee,
                    amount=EXCLUDED.amount, frequency=EXCLUDED.frequency,
@@ -577,10 +658,135 @@ def save_bill(conn, *, payee: str, amount: float, bill_type: str = "occurrence",
             (_slug(payee), "INCOME" if income else "BILL", payee, amount,
              _alias(frequency, interval) if bill_type != "envelope" else "ENVELOPE",
              monthly, next_due_d, category, jsonb(raw), prev_merchant,
-             bool(revive), bool(revive)))
+             # the household's day the bill was set up; an edit keeps it
+             # (the update leaves the column alone)
+             today, bool(revive), bool(revive)))
         if revive:
             _release_withdrawn(conn, prev_raw)
+        if not income and budget.scheduled_since(raw, None) is None:
+            # a new bill starts at its earliest payment in the ledger; with none yet it reads as starting at its first
+            # due date until the nightly finds one. Inside a batch
+            # (starts_filled_once) the batch fills every start in one
+            # ledger read when it ends.
+            held = _HELD_STARTS.get()
+            if held is not None and held[0] is conn:
+                held[1].append(payee)
+            else:
+                _fill_starts_best_effort(conn, [payee], today)
         return _slug(payee)
+
+
+# the batch of saves whose starts are filled once, at its end
+# (starts_filled_once): (the connection, the payees saved)
+_HELD_STARTS: contextvars.ContextVar = contextvars.ContextVar(
+    "bill_starts_held", default=None)
+
+
+def _fill_starts_best_effort(conn, payees, today=None) -> None:
+    """The saves stand whatever the ledger read does."""
+    try:
+        with conn.transaction():
+            fill_scheduled_since(conn, payees=payees, today=today)
+    except Exception:                                  # noqa: BLE001
+        log.warning("scheduled_since for saved bills failed", exc_info=True)
+
+
+@contextlib.contextmanager
+def starts_filled_once(conn):
+    """Many saves on `conn` (the setup wizard's approve-all, the demo seed)
+    fill their new bills' starts in ONE ledger read when the block ends,
+    instead of one full-ledger read per bill. A save alone fills its own
+    start as before. A failed block fills nothing: the nightly does. A
+    block inside another on the same connection is part of it."""
+    outer = _HELD_STARTS.get()
+    if outer is not None and outer[0] is conn:
+        yield
+        return
+    payees: list[str] = []
+    token = _HELD_STARTS.set((conn, payees))
+    try:
+        yield
+    finally:
+        _HELD_STARTS.reset(token)
+    if payees:
+        _fill_starts_best_effort(conn, list(dict.fromkeys(payees)))
+
+
+def fill_scheduled_since(conn, payees: list[str] | None = None, *,
+                         today: dt.date | None = None) -> int:
+    """Store `scheduled_since` (budget.SCHEDULED_SINCE_KEY) on active
+    spending bills and envelopes: the day of each one's earliest payment
+    in the ledger (budget.schedule_first_payments — the matchers
+    month_status pays bills by).
+
+    The nightly (`payees` None) reads every such bill again, in one ledger
+    read for all of them, and a start only ever moves EARLIER: history
+    that arrives after the bill was saved (a bank's historical backfill, a
+    statement import, another institution linked) pulls it back, and
+    nothing moves it later. A value that does not read as a date is
+    replaced. A bill never paid is left without one, so a later night
+    finds its run once the history has arrived; meanwhile it reads as
+    starting at its first due date (budget.scheduled_since's floor).
+
+    With `payees` (save_bill, a batch of saves) only those of them that
+    have no start yet are read; an edit keeps the stored start. Returns
+    how many bills it wrote (specs/honest-figures.md, "Months before any
+    bill are unsplit")."""
+    key = budget.SCHEDULED_SINCE_KEY
+    stored: dict[str, dt.date | None] = {}
+    for r in conn.execute(
+            "SELECT payee, raw FROM bills WHERE amount < 0 AND active = 1"
+            ).fetchall():
+        raw = as_dict(r["raw"])
+        have = budget.scheduled_since(raw, None)
+        if have is None and raw.get(key) is not None:
+            log.warning("bill %r: scheduled_since %r does not read as a "
+                        "date; reading it again from the ledger",
+                        r["payee"], raw.get(key))
+        if payees is None or (have is None and r["payee"] in payees):
+            stored[r["payee"] or ""] = have
+    if not stored:
+        return 0
+    cfg = budget.load_config(conn)
+    excluded = budget.excluded_account_ids(cfg)
+    first = budget.ledger_start(conn, excluded)
+    if first is None:
+        return 0
+    today = today or localtime.household_day(conn)
+    # the nightly matches every bill together, as month_status does, so a
+    # charge two bills could claim goes where the month would put it; a
+    # save matches only its own bills, which keeps a person's Save to one
+    # ledger read
+    occ_bills = budget._recurring_bills_load(
+        conn, cfg.get("occurrence_caps"), None, False)
+    envelopes = budget._envelope_bills_load(conn, None)
+    if payees is not None:
+        occ_bills = [b for b in occ_bills if b["payee"] in stored]
+        envelopes = [e for e in envelopes if e["payee"] in stored]
+        if not occ_bills and not envelopes:
+            return 0
+    rows = budget._spend_rows(conn, first, today + dt.timedelta(days=1),
+                              excluded=excluded, slim=True)
+    starts = budget.schedule_first_payments(rows, occ_bills, envelopes, today)
+    written = 0
+    for payee in sorted(stored):
+        since = starts.get(payee)
+        have = stored[payee]
+        if since is None or (have is not None and since >= have):
+            continue
+        # re-checked in the statement: a start another writer stored in
+        # the meantime is replaced only by an earlier one
+        written += conn.execute(
+            """UPDATE bills SET raw = COALESCE(raw, '{}'::jsonb)
+                      || jsonb_build_object(%s::text, %s::text)
+                WHERE payee = %s AND amount < 0 AND active = 1
+                  AND CASE WHEN jsonb_typeof(raw -> %s) = 'string'
+                            AND pg_input_is_valid(raw ->> %s, 'date')
+                           THEN (raw ->> %s)::date > %s::date
+                           ELSE true END""",
+            (key, since.isoformat(), payee, key, key, key,
+             since.isoformat())).rowcount
+    return written
 
 
 # The household settings that name a bill by its payee string: the
@@ -633,10 +839,20 @@ def rename_bill(conn, old: str, new: str) -> int:
     transaction: a rename either takes all of them or none. Renaming is a
     display change, so nothing that was actionable before it may stop being
     actionable after it."""
+    own_claims = _claims_first(conn)
     if conn.execute("SELECT 1 FROM bills WHERE (payee=%s OR id=%s) AND payee!=%s",
                     (new, _slug(new), old)).fetchone():
         return 0
     with conn.transaction():
+        if own_claims:
+            hold_bill_claims(conn)
+        # The bill-ceiling lock before the settings row this rename takes
+        # last: the save that follows a rename in the same transaction
+        # (the bill editor's Save) asks for the ceiling lock, and a restore
+        # holds the ceiling lock while it waits for the settings row, so a
+        # rename that held the row first and then waited for the ceiling
+        # closed a cycle with it and Postgres killed one of the two.
+        lock_active_bills(conn)
         # Lock order matches apply_proposal — its proposal row first, then
         # the bill (the attach branch locks its host): a rename taking the
         # bill first and then touching the same pending proposals could
@@ -987,8 +1203,10 @@ def restore_bill(conn, payee: str) -> int:
 
     A restored bill claims charges again, so it takes the household's
     bill-claim lock first, as an add does, then the ceiling lock."""
+    own_claims = _claims_first(conn)
     with conn.transaction():
-        hold_bill_claims(conn)
+        if own_claims:
+            hold_bill_claims(conn)
         lock_active_bills(conn)
         b = conn.execute("SELECT raw, active FROM bills WHERE payee=%s "
                          "FOR UPDATE", (payee,)).fetchone()
@@ -1470,8 +1688,8 @@ def reconcile_bill_merchants(conn, today: dt.date | None = None) -> dict:
     today = today or localtime.household_day(conn)
     stats = {"bootstrapped": 0, "proposed_merchant": 0}
     rows = conn.execute(
-        "SELECT id, payee, merchant, amount, raw FROM bills WHERE active = 1"
-    ).fetchall()
+        "SELECT id, payee, merchant, amount, raw FROM bills WHERE active = 1 "
+        + _BILL_ORDER).fetchall()
     if not rows:
         return stats
     found = budget.bill_displays(conn, rows, today)
@@ -1831,11 +2049,213 @@ def get_bill(conn, payee: str):
 # ---- proposals ----------------------------------------------------------
 
 
-def pending_proposals(conn) -> list[dict]:
-    return conn.execute(
+# the offers that change a bill the household has, named by its payee
+_BILL_NAMED_KINDS = ("remove", "frequency_change", "amount_change",
+                     "type_change", "amount_drift")
+# the offers that join something to a bill, named in evidence.bill_payee
+_HOST_NAMED_KINDS = ("attach", "merchant")
+# a cadence's length in days, for the lapse rule (the longest month)
+_CYCLE_UNIT_DAYS = {"DAILY": 1, "WEEKLY": 7, "MONTHLY": 31, "YEARLY": 366}
+
+
+def card_payment_offer(payee: str | None, evidence: dict | None) -> bool:
+    """An offer to add a spending bill for what is a credit-card payment.
+    The card machinery already pays card debt, and the card's purchases
+    are already spending, so such a bill would count the same money twice.
+    Read by the bill rule (budget._card_pay_bill) and by the charges'
+    own category."""
+    ev = evidence or {}
+    if ev.get("income"):
+        return False
+    if budget._card_pay_bill({"payee": payee or ""}):
+        return True
+    cat = str(ev.get("category") or "").upper().replace(" ", "_")
+    return cat.startswith("LOAN_PAYMENTS_CREDIT_CARD")
+
+
+def offer_cycle_days(p, ev: dict) -> int | None:
+    """One cycle of an offer's cadence, in days: the detector's measured
+    cycle when it recorded one, else the cadence's own length. A cycle
+    longer than any bill may repeat on (MAX_CYCLE_DAYS — a restored or
+    hand-edited row) is no cycle."""
+    c = ev.get("cycle_days")
+    if isinstance(c, int) and not isinstance(c, bool) and c > 0:
+        return c if c <= MAX_CYCLE_DAYS else None
+    unit = _CYCLE_UNIT_DAYS.get((p["frequency"] or "").upper())
+    if unit is None:
+        return None
+    iv = p["interval"] if isinstance(p["interval"], int) and p["interval"] > 0 else 1
+    return unit * iv if unit * iv <= MAX_CYCLE_DAYS else None
+
+
+def offer_lapsed(p, ev: dict, today: dt.date) -> bool:
+    """An unanswered offer to add a bill whose expected date is a full
+    cycle past. Detection refreshes a standing offer's next date every
+    night its series is still charging (_insert_proposal), so a date that
+    far behind means no charge came: the series stopped, or it now bills
+    at another price and has an offer of its own."""
+    if p["kind"] != "add" or not p["next_due"]:
+        return False
+    cycle = offer_cycle_days(p, ev)
+    if cycle is None:
+        return False
+    try:
+        return today > as_date(p["next_due"]) + dt.timedelta(days=cycle)
+    except (OverflowError, ValueError):
+        # a date no lapse can be measured from: the offer stays listed
+        return False
+
+
+def _twin_key(p, ev: dict) -> tuple:
+    """Offers to add one series: same direction, same merchant key."""
+    income = bool(ev.get("income"))
+    key = _offer_key(p["payee"] or "", income) or (p["payee"] or "").casefold()
+    return (income, key)
+
+
+def pending_proposals(conn, today: dt.date | None = None) -> list[dict]:
+    """The offers a person is shown — the one list the Bills page, its
+    history page, approve-all, the mail and the Today count read.
+
+    An offer is left out (never deleted: it simply waits unanswered) when
+    it could not be acted on as written or has gone stale:
+      - an offer about a bill (remove it, change its cadence or amount)
+        whose bill is no longer an active one — archived, renamed, never
+        a bill at that name;
+      - an offer to add a fee or a merchant to a bill that is not active;
+      - an offer to add a credit-card payment as a bill
+        (card_payment_offer);
+      - an offer to add a bill whose expected date is a full cycle past
+        (offer_lapsed).
+      - an offer to add a spending bill an active bill already covers
+        (approving it would be withdrawn as already tracked).
+    Several offers to add one series (the same merchant at several
+    amounts) are shown as the one with the latest expected date
+    (_twin_key). Turning it down turns down its twins (apply_proposal);
+    approving it makes a bill that covers them."""
+    rows = conn.execute(
         """SELECT * FROM bill_proposals WHERE status = 'pending'
            ORDER BY CASE kind WHEN 'add' THEN 0 WHEN 'remove' THEN 1 ELSE 2 END,
                     ABS(amount) DESC""").fetchall()
+    if not rows:
+        return rows
+    if today is None:
+        today = localtime.now_local(budget.load_config(conn)).date()
+    active = conn.execute(
+        "SELECT payee, merchant, amount FROM bills WHERE active = 1").fetchall()
+    live = {r["payee"] for r in active}
+    # the keys an active spending bill already claims: an offer to add one
+    # of them would be withdrawn as already tracked when approved
+    # (_apply_approved), so it is not listed (the nightly retires it)
+    covered = _cover_keys([r for r in active if (r["amount"] or 0) <= 0])
+    kept, best = [], {}
+    for p in rows:
+        ev = as_dict(p["evidence"]) or {}
+        if p["kind"] in _BILL_NAMED_KINDS and p["payee"] not in live:
+            continue
+        if p["kind"] in _HOST_NAMED_KINDS and ev.get("bill_payee") not in live:
+            continue
+        if p["kind"] == "add":
+            if card_payment_offer(p["payee"], ev) or offer_lapsed(p, ev, today):
+                continue
+            if not ev.get("income") \
+                    and budget._key_token(p["payee"] or "") in covered:
+                continue
+            k = _twin_key(p, ev)
+            rank = (as_date(p["next_due"]) if p["next_due"] else dt.date.min,
+                    int(ev.get("hits") or 0)
+                    if isinstance(ev.get("hits"), int) else 0,
+                    abs(p["amount"] or 0))
+            if k in best and best[k][0] >= rank:
+                continue
+            best[k] = (rank, p["id"])
+        kept.append(p)
+    winners = {pid for _, pid in best.values()}
+    return [p for p in kept if p["kind"] != "add" or p["id"] in winners]
+
+
+# what approving an offer does, in the words both clients print
+_CHANGE_WORDS = {"remove": "stop tracking", "attach": "fee",
+                 "merchant": "add merchant", "amount_change": "amount change",
+                 "amount_drift": "amount change",
+                 "frequency_change": "cadence change",
+                 "type_change": "type change"}
+# the advisory tag (llm_categorize.PROPOSAL_TAGS) said as what it means
+_TAG_WORDS = {"subscription": "looks like a subscription",
+              "bill": "looks like a bill",
+              "habit": "looks like everyday spending, not a bill",
+              "one-off streak": "looks like a few one-off charges, not a bill"}
+
+
+def offer_words(p, ev: dict) -> dict:
+    """An offer's words, written once for the web and the phone:
+
+    - change_text: what approving it does ("new bill", "new income",
+      "new envelope", "stop tracking", "fee", "add merchant", …);
+    - tag_text: the advisory tag in plain words, or None;
+    - cadence_text: the offer's cadence ("every 2 weeks", "twice a month
+      (1st and 15th)"), "varies month to month" for an envelope, or None
+      for an offer about something that has no cadence of its own (a fee,
+      a merchant, an offer to stop tracking a bill)."""
+    from .activity import _cadence_words
+    kind = p["kind"] or ""
+    envelope = p["bill_type"] == "envelope"
+    if kind == "add":
+        change = ("new income" if ev.get("income")
+                  else "new envelope" if envelope else "new bill")
+    else:
+        change = _CHANGE_WORDS.get(kind, kind.replace("_", " "))
+    if kind in ("remove", "attach", "merchant"):
+        cadence = None
+    elif envelope:
+        cadence = "varies month to month"
+    elif p["frequency"]:
+        cadence = _cadence_words(p["frequency"], p["interval"], offer_days(p))
+    else:
+        cadence = None
+    return {"change_text": change,
+            "tag_text": _TAG_WORDS.get((p["llm_tag"] or "").strip().lower()),
+            "cadence_text": cadence}
+
+
+def offer_upcoming_due(p, today: dt.date) -> dt.date | None:
+    """When an offer's next charge is expected, never a day already past:
+    the finder's date rolled forward by the offer's cadence to the first
+    occurrence on or after `today`. None for an offer with no date of its
+    own — a fee, a merchant, an offer to stop tracking, an envelope (it
+    pools by month) — and for a one-time offer whose date has gone by.
+    Both clients print it as the row's "next" date."""
+    kind = p["kind"] or ""
+    if kind in ("remove", "attach", "merchant") \
+            or p["bill_type"] == "envelope" or not p["next_due"]:
+        return None
+    try:
+        due = as_date(p["next_due"])
+    except (TypeError, ValueError):
+        return None
+    if due is None or due >= today:
+        return due
+    if not p["frequency"]:
+        return None
+    days = offer_days(p)
+    rec = {"frequency": p["frequency"], "interval": p["interval"] or 1,
+           **({"byMonthDay": days} if days else {})}
+    try:
+        return _next_occurrence(rec, due, today)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def proposal_twins(conn, p) -> list[str]:
+    """The other pending offers to add the same series as offer `p`."""
+    if p["kind"] != "add":
+        return []
+    key = _twin_key(p, as_dict(p["evidence"]) or {})
+    return [r["id"] for r in conn.execute(
+        "SELECT id, payee, evidence FROM bill_proposals "
+        "WHERE status = 'pending' AND kind = 'add' AND id <> %s",
+        (p["id"],)).fetchall()
+        if _twin_key(r, as_dict(r["evidence"]) or {}) == key]
 
 
 def merchant_offer_summary(conn, p) -> str:
@@ -1932,18 +2352,44 @@ def _insert_proposal(conn, *, pid, kind, payee, amount, bill_type="occurrence",
     # twenty years; one is never filed that could not be approved
     if frequency and cadence_too_long(frequency, interval):
         return False
+    # a card payment is never offered as a bill (card_payment_offer)
+    if kind == "add" and card_payment_offer(payee, evidence):
+        return False
     payee, evidence = _offer_text(kind, payee, evidence)
     now = dt.datetime.now(dt.timezone.utc)
-    cur = conn.execute(
+    # An offer to add a series that is still pending takes the series'
+    # new next date and evidence each time the pass finds it again: its
+    # date then stays current while the series charges, and goes a cycle
+    # stale only once it stops (offer_lapsed). True only for a new row.
+    #
+    # The pass runs in one long transaction, so the refresh takes a row
+    # lock only when something changed, and skips an offer a person is
+    # deciding right now (the next pass refreshes it): ON CONFLICT DO
+    # UPDATE would lock every re-found offer, matched or not, and hold
+    # Approve / "Not a bill" on it until the whole pass committed.
+    due, ev = as_date(next_due), jsonb(evidence or {})
+    row = conn.execute(
         """INSERT INTO bill_proposals
                (id, kind, bill_type, payee, amount, frequency, interval, next_due,
                 evidence, status, created_at, decided_at)
            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-           ON CONFLICT (tenant_id, id) DO NOTHING""",
+           ON CONFLICT (tenant_id, id) DO NOTHING
+           RETURNING id""",
         (pid, kind, bill_type, payee, amount, frequency, interval,
-         as_date(next_due), jsonb(evidence or {}), status, now,
-         now if status == "auto" else None))
-    return cur.rowcount > 0
+         due, ev, status, now, now if status == "auto" else None)).fetchone()
+    if row:
+        return True
+    if kind == "add":
+        conn.execute(
+            """UPDATE bill_proposals SET next_due = %s, evidence = %s
+               WHERE id = (SELECT id FROM bill_proposals
+                           WHERE id = %s AND status = 'pending'
+                             AND kind = 'add'
+                             AND (next_due IS DISTINCT FROM %s
+                                  OR evidence IS DISTINCT FROM %s)
+                           FOR UPDATE SKIP LOCKED)""",
+            (due, ev, pid, due, ev))
+    return False
 
 
 # Plaid stream frequency → our (frequency, interval). SEMI_MONTHLY has no
@@ -2039,6 +2485,67 @@ def propose_from_plaid_streams(conn, streams: list[dict],
     return stats
 
 
+CLAIM_LOCK = "oikonome:bill-claims:{}"
+
+# Does THIS session hold the household's bill-claim lock? One read of
+# pg_locks narrowed to this backend; a held advisory lock shows once
+# whatever its count, its bigint key (hashtext's signed int4 widened) split
+# into classid (high half, all ones for a negative hash) and objid (low).
+_CLAIMS_HELD_SQL = """SELECT EXISTS (
+    SELECT 1 FROM pg_locks l,
+           (SELECT hashtext('oikonome:bill-claims:' || coalesce(
+                current_setting('app.tenant_id', true), ''))::bigint AS h) k
+     WHERE l.locktype = 'advisory' AND l.granted
+       AND l.pid = pg_backend_pid() AND l.objsubid = 1
+       AND l.classid = ((k.h >> 32) & 4294967295)::oid
+       AND l.objid = (k.h & 4294967295)::oid) AS held"""
+
+
+def _claims_first(conn) -> bool:
+    """Called first thing by save_bill, rename_bill and restore_bill, so a
+    door that forgets the claim lock fails in every test that runs it
+    instead of racing in production. Returns True when the writer must
+    take the lock itself.
+
+    - No transaction open (every tenant connection is autocommit): the
+      caller holds no row lock yet, so the writer's own transaction takes
+      the claim lock as its first statement and the order is right by
+      construction. Seeding paths and the tests' fixtures write this way.
+    - A transaction open that holds the claim lock: nothing to do.
+    - A transaction open WITHOUT it: refused. Taking it now, after
+      whatever the caller already locked, would invert the lock order
+      (erasure.py), so the caller must open its transaction with
+      bill_write instead."""
+    from psycopg.pq import TransactionStatus
+    if conn.info.transaction_status == TransactionStatus.IDLE:
+        return True
+    if not conn.execute(_CLAIMS_HELD_SQL).fetchone()["held"]:
+        raise RuntimeError(
+            "a bill write inside a transaction that does not hold the "
+            "household's bill-claim lock; open it with bills.bill_write")
+    return False
+
+
+@contextlib.contextmanager
+def bill_write(conn):
+    """The one way into a transaction that adds a bill, renames one,
+    brings one back or changes what it claims: opens the transaction and
+    takes the household's bill-claim lock as its first waited-on lock;
+    the ceiling lock follows inside the writer.
+
+    Nested inside a transaction that already holds the claim lock it is a
+    savepoint and free. Nested inside one that does NOT, it is refused as
+    the writers refuse: taking the lock that late is the inversion the
+    guard exists to stop, and a savepoint would only hide it. The lock is
+    transaction-scoped, so it goes with the outermost commit or rollback;
+    there is nothing to release."""
+    own = _claims_first(conn)
+    with conn.transaction():
+        if own:
+            hold_bill_claims(conn)
+        yield conn
+
+
 def hold_bill_claims(conn) -> None:
     """Inside the caller's transaction: wait until no other approval in
     the household is between its check for a bill already claiming these
@@ -2059,10 +2566,10 @@ def hold_bill_claims(conn) -> None:
         raise RuntimeError("the bill-claim lock needs a household "
                            "connection")
     conn.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
-                 ("oikonome:bill-claims:" + tid,))
+                 (CLAIM_LOCK.format(tid),))
 
 
-def apply_proposal(conn, pid: str, action: str) -> dict:
+def apply_proposal(conn, pid: str, action: str, roll: bool = True) -> dict:
     """action = approve | reject. Approving mutates the recurring table.
 
     The status read and the act on it are one transaction over a LOCKED
@@ -2075,25 +2582,30 @@ def apply_proposal(conn, pid: str, action: str) -> dict:
     here rather than in each door (the app, approve-all, the form page,
     the email button), so none of them can forget to."""
     with conn.transaction():
-        if action == "approve":
-            # every door (the app, the form page, the email button) gets
-            # the claim lock here, before the row lock, as _decide_proposal
-            # takes it
-            hold_bill_claims(conn)
+        # every door (the app, the form page, the email button) gets the
+        # claim lock here, before the row lock, as _decide_proposal takes
+        # it. A reject takes it too: it answers the offer's twins, and an
+        # approval of one of them must commit before the reject reads
+        # which twins are still pending, or it would overwrite that answer
+        hold_bill_claims(conn)
         p = conn.execute(
             "SELECT * FROM bill_proposals WHERE id = %s FOR UPDATE",
             (pid,)).fetchone()
         if not p or p["status"] not in ("pending",):
             return {"error": "unknown or already-decided proposal"}
         if action == "reject":
+            # the list shows one offer per series, so "not a bill" answers
+            # the series: its twins at other amounts go with it
             conn.execute("UPDATE bill_proposals SET status='rejected', "
-                         "decided_at=now() WHERE id=%s", (pid,))
+                         "decided_at=now() WHERE id = ANY(%s) "
+                         "AND status = 'pending'",
+                         ([pid] + proposal_twins(conn, p),))
             r = {"rejected": p["payee"]}
         elif action != "approve":
             return {"error": f"unknown action {action!r}"}
         else:
             try:
-                r = _apply_approved(conn, p, as_dict(p["evidence"]))
+                r = _apply_approved(conn, p, as_dict(p["evidence"]), roll)
             except ValueError as e:  # slug collision / bad amount
                 # Deliberately swallowed, not raised: the proposal must
                 # survive as pending so it can be fixed and re-approved.
@@ -2118,7 +2630,9 @@ def proposal_superseded(conn, pid: str) -> bool:
 
 
 def settle_proposals_alert(conn) -> bool:
-    """Retire the 'proposals' alert once no offer is pending. Without this
+    """Retire the 'proposals' alert once no offer is listed
+    (pending_proposals: an unlisted one waits where no page shows it, and
+    the alert counts the list). Without this
     the alert stays lit until the next Today build rewrites the snapshot,
     and the person who just worked the queue comes back to find it still
     asking. Best effort, in its own savepoint: the decision has already
@@ -2126,8 +2640,7 @@ def settle_proposals_alert(conn) -> bool:
     from . import alerts
     try:
         with conn.transaction():
-            if conn.execute("SELECT 1 FROM bill_proposals "
-                            "WHERE status = 'pending' LIMIT 1").fetchone():
+            if pending_proposals(conn):
                 return False
             return alerts.retire(conn, "proposals") > 0
     except Exception as e:                                 # noqa: BLE001
@@ -2242,7 +2755,16 @@ def due_off_rule(prev_raw: dict, frequency, interval, given,
             "another cadence.")
 
 
-def _apply_approved(conn, p, ev) -> dict:
+def roll_passed_due(conn, payee: str) -> None:
+    """Move one bill's due date on to its series' next occurrence when the
+    date it holds has already passed — what the nightly roll would do
+    tonight, done at the moment the bill is created."""
+    import collections
+    _advance_due_dates(conn, localtime.household_day(conn),
+                       collections.Counter(), payee=payee)
+
+
+def _apply_approved(conn, p, ev, roll: bool = True) -> dict:
     note = None
     if p["kind"] == "add":
         # An offer made before the person added the bill themselves (the
@@ -2276,6 +2798,14 @@ def _apply_approved(conn, p, ev) -> dict:
                   # approving an offer to add the bill is the explicit ask
                   # for it, even when an archived bill of that name exists
                   revive=True)
+        # The offer dated its next charge when it was written, from charges
+        # that may be weeks old. Approved after that date has passed, the
+        # bill would open "overdue" for a day it was not yet a bill; the
+        # nightly roll would move it on tonight, so it is moved on now.
+        # A caller about to change the cadence rolls afterwards, on the
+        # cadence the bill ends up with.
+        if roll:
+            roll_passed_due(conn, p["payee"])
     elif p["kind"] == "remove":
         # retired by detection's own offer — not a decision about the
         # merchant (_declined_bills), so it silences nothing
@@ -2448,7 +2978,7 @@ def _apply_approved(conn, p, ev) -> dict:
                             "month — the pin stays")
         # never earlier than the bill's own due date: an offer without a
         # recorded starting date must not undo a roll the nightly made
-        next_due = as_date(p["next_due"]) if p["next_due"] else None
+        next_due = stored_date(p["next_due"])
         if bill["due_on"] and (next_due is None or next_due < bill["due_on"]):
             next_due = bill["due_on"]
         # manual_touch=False: approving a machine proposal is not a hand-edit
@@ -2526,7 +3056,8 @@ def _ledger_rows(conn, today: dt.date, *, include_pending: bool = False,
                   -- entity's recurring charges would read as personal bills.
                   {budget.PERSONAL_ONLY_SQL}
                   {narrow}
-                  AND t.date >= %s AND t.date <= %s""",
+                  AND t.date >= %s AND t.date <= %s
+                ORDER BY t.date, t.id""",
             (bool(include_pending), shadows, *narrow_p, since, today)).fetchall():
         text = budget.match_text(r["payee"], r["name"])
         out.append({"date": as_date(r["date"]), "amount": r["amount"],
@@ -2777,9 +3308,11 @@ def run_single_flight(conn, today: dt.date | None = None, *,
         raise RuntimeError("bill detection needs a household connection")
     key = DETECT_LOCK.format(tid)
     if wait:
-        conn.execute("SELECT pg_advisory_lock(hashtext(%s))", (key,))
-    elif not conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-                          (key,)).fetchone()["ok"]:
+        tenancy.take_lock(conn, "SELECT pg_advisory_lock(hashtext(%s))",
+                          (key,))
+    elif not tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (key,))["ok"]:
         return None
     try:
         return run(conn, today, propose=propose)
@@ -2824,7 +3357,9 @@ def run(conn, today: dt.date | None = None, *, propose: bool = True) -> dict:
                                   FROM tenant_settings s
                                  WHERE jsonb_typeof(s.config->'disabled_bills')
                                        = 'array'), false) AS budget_disabled
-                 FROM bills b WHERE b.active = 1""").fetchall()
+                 FROM bills b WHERE b.active = 1
+                ORDER BY b.created_on NULLS FIRST, lower(b.payee), b.uid"""
+        ).fetchall()
         stats["superseded"] += _supersede_covered_offers(conn, bills)
         # A bill the household ARCHIVED is a decision about its series.
         # archive_bill withdraws the standing offer where the button is
@@ -2852,7 +3387,7 @@ def run(conn, today: dt.date | None = None, *, propose: bool = True) -> dict:
         # inside _propose_income.
         active_keys = set(_cover_keys(conn.execute(
             "SELECT payee, merchant FROM bills WHERE active = 1 "
-            "AND COALESCE(amount, 0) <= 0").fetchall()))
+            "AND COALESCE(amount, 0) <= 0 " + _BILL_ORDER).fetchall()))
         if propose:
             # ...and none is filed after: otherwise the morning after
             # archiving a subscription the pass finds the same charges and
@@ -2959,12 +3494,14 @@ def _scan_months(rec: dict) -> int:
     return max(14, budget._cycle_days(rec) // 30 + 3)
 
 
-def _advance_due_dates(conn, today, stats):
+def _advance_due_dates(conn, today, stats, payee: str | None = None):
     """Roll each bill's due_on forward to the next projected occurrence once
     it passes (the page's 'Next due' column and the email's 'due within 7
-    days' section read due_on directly)."""
+    days' section read due_on directly). `payee` rolls that one bill."""
     for b in conn.execute(
-            "SELECT id, due_on, raw FROM bills WHERE active = 1").fetchall():
+            "SELECT id, due_on, raw FROM bills WHERE active = 1 "
+            "AND (%s::text IS NULL OR payee = %s) " + _BILL_ORDER,
+            (payee, payee)).fetchall():
         raw = as_dict(b["raw"])
         rec = raw.get("recurrence") or {}
         # One bill whose stored date or cycle is out of range (written
@@ -3061,7 +3598,9 @@ def advance_received_income(conn, today: dt.date | None = None) -> int:
             b["merchant"], budget._key_token(b["payee"] or ""),
             ids.get(b["payee"] or ""))
         tol = budget.bill_tolerance(float(b["amount"]))
-        floor = as_date(raw.get("lastDueOn")) if raw.get("lastDueOn") else None
+        # a stored floor that does not read as a date (a row written before
+        # restore learned to drop one) is no floor, never a night lost
+        floor = stored_date(raw.get("lastDueOn"))
         received = False
         for r in budget._inflow_rows(conn, due - dt.timedelta(days=window),
                                      min(today, due + dt.timedelta(days=window))
@@ -3120,8 +3659,8 @@ def _companion_context(conn, groups):
     holds — the charges a fee would ride beside."""
     covered, hosts = [], []
     for b in conn.execute(
-            "SELECT payee, amount, raw FROM bills WHERE active=1 AND amount<0"
-    ).fetchall():
+            "SELECT payee, amount, raw FROM bills WHERE active=1 AND amount<0 "
+            + _BILL_ORDER).fetchall():
         raw = as_dict(b["raw"])
         if raw.get("bill_type") == "envelope":
             continue
@@ -3395,7 +3934,8 @@ def _propose_income(conn, today, stats, declined=()):
                      -- A dual-source account would propose a doubled
                      -- paycheck the user could approve as real
                      AND NOT (t.account_id = ANY(%s))
-                     AND t.date >= %s""", (shadows, since)).fetchall()]
+                     AND t.date >= %s
+                   ORDER BY t.date, t.id""", (shadows, since)).fetchall()]
     # deposits an income series the household archived claims are that
     # series: declined, not forgotten (only its own rule — an employer
     # sharing a word, or one whose series detection retired, is news).
@@ -3469,6 +4009,8 @@ def _propose_income(conn, today, stats, declined=()):
             if (len(run_dates) < MIN_HITS
                     or (today - run_dates[-1]).days > max_age):
                 return None
+            if _gaps_hold_same_day_stream(cyc, run_dates, events):
+                return None
             on_cycle = set(run_dates)
             recent_hits = sum(1 for e in core
                               if e["date"] >= recent_cut
@@ -3506,6 +4048,114 @@ def _propose_income(conn, today, stats, declined=()):
             stats["proposed_income"] = stats.get("proposed_income", 0) + 1
 
 
+def _day_apart(a: dt.date, b: dt.date) -> int:
+    """Days from `a` to the nearest date on b's day of the month (a month's
+    last day where it is shorter), looked for in a's own month and the two
+    beside it: the 30th of a 31-day month and the 2nd are three apart, the
+    26th of January and the 1st are six."""
+    best = 31
+    for k in (-1, 0, 1):
+        y, m = divmod(a.year * 12 + a.month - 1 + k, 12)
+        day = min(b.day, calendar.monthrange(y, m + 1)[1])
+        best = min(best, abs((a - dt.date(y, m + 1, day)).days))
+    return best
+
+
+def _gaps_hold_same_day_stream(cyc, run_dates: list[dt.date],
+                               events: list[dict]) -> bool:
+    """Every gap of a run on a cycle of whole months longer than one holds
+    another deposit on the run's OWN day of the month (within the payday
+    tolerance the twice-a-month fit allows, TWICE_MONTHLY_DAY_TOL). Then
+    the run and those deposits are one finer same-day stream — a payer who
+    sends one deposit a month at varying sizes, every other one of which
+    happens to sit near the latest one's size — and the longer cycle is
+    an artefact of the amount band, not a paycheck: offered, it would plan
+    a check every other month that never comes and take the payer's key.
+    Deposits on another day in the gaps (a commission on the 20th beside a
+    salary on the 1st, one-offs) are another stream and keep the run."""
+    if cyc[1] not in ("MONTHLY", "YEARLY") or cyc[0] <= 31 \
+            or cyc == TWICE_MONTHLY or len(run_dates) < 2:
+        return False
+    on_cycle = set(run_dates)
+    for a, b in zip(run_dates, run_dates[1:]):
+        if not any(a < e["date"] < b and e["date"] not in on_cycle
+                   and min(_day_apart(e["date"], a), _day_apart(e["date"], b))
+                   <= TWICE_MONTHLY_DAY_TOL
+                   for e in events):
+            return False
+    return True
+
+
+def _regular_amounts(amounts) -> bool:
+    """Every amount sits inside detection's band (DETECT_TOL) of their
+    median. A cadence is a check of about one size on about the same days:
+    a monthly paycheck and a few mid-month bonuses of unrelated sizes land
+    on two days a month, but the second day is no payday, and the wide
+    band a known paycheck accepts (half to twice its amount, so a raise
+    still reads) lets those bonuses in. Day regularity alone
+    (_twice_monthly_days) cannot tell them apart; the amounts can."""
+    if not amounts:
+        return False
+    med = statistics.median(amounts)
+    tol = DETECT_TOL(med)
+    return all(abs(a - med) <= tol for a in amounts)
+
+
+def _payday_slots(cyc, run_dates: list[dt.date]) -> list[int]:
+    """Which payday of the cycle each date of a fitted run belongs to: for a
+    twice-a-month fit, the day of the month it lands nearest (0 or 1, the
+    nearest payday searched in its own month and the two beside it, so a
+    check moved across a month end stays with its payday); for every 14
+    days, alternate checks. Any other cycle has one payday."""
+    if cyc == TWICE_MONTHLY:
+        days = _twice_monthly_days(run_dates)
+        if days:
+            def nearest_slot(d):
+                best = None
+                for dm in (-1, 0, 1):
+                    y, m = d.year, d.month + dm
+                    y, m = (y - 1, 12) if m < 1 else (y + 1, 1) if m > 12 \
+                        else (y, m)
+                    last = calendar.monthrange(y, m)[1]
+                    for slot, day in enumerate(days):
+                        p = dt.date(y, m, last if day == -1
+                                    else min(day, last))
+                        off = abs((p - d).days)
+                        if best is None or off < best[0]:
+                            best = (off, slot)
+                return best[1]
+            return [nearest_slot(d) for d in run_dates]
+    if cyc[0] == 14:
+        return [i % 2 for i in range(len(run_dates))]
+    return [0] * len(run_dates)
+
+
+def _regular_per_payday(cyc, run_dates: list[dt.date],
+                        matched: list[dict]) -> bool:
+    """Each payday of the fitted run carries checks of one size
+    (_regular_amounts), judged payday by payday. Pooled, an employer that
+    takes its deductions from one of two checks a month (a large check on
+    the 1st, a smaller one on the 15th) would read as irregular and never
+    be offered its real cadence; per payday it is two regular checks,
+    while a paycheck on the 1st beside mid-month bonuses of unrelated
+    sizes still is not — its mid-month payday is irregular."""
+    groups = _payday_amounts(cyc, run_dates, matched)
+    return bool(groups) and all(_regular_amounts(g) for g in groups)
+
+
+def _payday_amounts(cyc, run_dates: list[dt.date],
+                    matched: list[dict]) -> list[list[float]]:
+    """The fitted run's amounts grouped by payday (_payday_slots), each
+    group oldest first."""
+    by_date: dict[dt.date, list[float]] = {}
+    for e in matched:
+        by_date.setdefault(e["date"], []).append(e["amount"])
+    groups: dict[int, list[float]] = {}
+    for d, slot in zip(run_dates, _payday_slots(cyc, run_dates)):
+        groups.setdefault(slot, []).extend(by_date.get(d, []))
+    return list(groups.values())
+
+
 def _offer_changed_cadence(conn, b, key, payee, cycle, matched, today, stats,
                            *, only_twice_monthly=False):
     """Offer a new cadence when a bill's recent `matched` events fit another.
@@ -3529,10 +4179,19 @@ def _offer_changed_cadence(conn, b, key, payee, cycle, matched, today, stats,
     moved = is_move(cyc[0])
     if only_twice_monthly and not moved:
         return
+    if moved and not _regular_per_payday(cyc, run_dates, matched):
+        return
     if (len(run_dates) >= 4
             and (moved or abs(cyc[0] - cycle) > 0.25 * cycle)
             and (today - run_dates[-1]).days <= cyc[0] * 1.5):
         med = statistics.median(e["amount"] for e in matched[-3:])
+        if moved:
+            # one amount pays on every payday of the new rule, so it is the
+            # mean of each payday's recent check: two unequal checks a
+            # month (2,400 and 1,300) come to what lands, not twice the
+            # larger one
+            groups = _payday_amounts(cyc, run_dates, matched)
+            med = statistics.mean(statistics.median(g[-3:]) for g in groups)
         ev = _cycle_to_proposal(cyc, run_dates, med, matched)
         ev["old_cycle_days"] = cycle
         pid = _sig("freq", key, cyc[0], cycle)
@@ -3689,7 +4348,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
 
         if not rec.get("frequency"):
             # one-time bill: propose removal 60 days after its due date passes
-            due = as_date(raw.get("dueOn"))
+            due = stored_date(raw.get("dueOn"))
             if due and (today - due).days > 60:
                 pid = _sig("remove", key, "onetime", due.isoformat())
                 if _propose_for(conn, b, pid=pid, kind="remove", payee=payee,
@@ -3729,10 +4388,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
         if (cycle and raw.get("dueOn") and events
                 and not raw.get("lock_amount")
                 and not in_manual_grace(raw, today)):
-            try:
-                occ = as_date(raw["dueOn"])
-            except (ValueError, TypeError):
-                occ = None
+            occ = stored_date(raw["dueOn"])
             window = max(3, min(budget.PREPAY_MATCH_DAYS, cycle // 2))
             while occ is not None and occ > today + dt.timedelta(days=window):
                 occ -= dt.timedelta(days=cycle)
@@ -3765,11 +4421,7 @@ def _maintain_bills(conn, bills, rows, today, stats):
         # raw is JSON that a restore ZIP can hand us verbatim: a malformed
         # stamp is treated as a missing one (no gate), never a crash of the
         # nightly pass
-        try:
-            set_on = (as_date(raw.get("amount_set_on"))
-                      if raw.get("amount_set_on") else None)
-        except (ValueError, TypeError):
-            set_on = None
+        set_on = stored_date(raw.get("amount_set_on"))
         since_set = ([e for e in amt_matched if e["date"] > set_on]
                      if set_on else amt_matched)
         if (len(amt_matched) >= 3 and since_set and not raw.get("lock_amount")
@@ -3832,7 +4484,23 @@ def _income_rows(conn, today: dt.date, *, excluded: list | None = None,
         return memo[key]
     hit = getattr(conn, "memo_get", lambda k: None)(key)
     if hit is None:
-        hit = _income_rows_query(conn, today, excluded)
+        # one read serves the day and the day before it (the forecast's
+        # learned facts read the ledger as of yesterday): the scan reaches
+        # a day further back, and each day takes its own two years of it
+        wide_key = budget._memo_key("income_rows_wide", sorted(excluded))
+        wide = (memo.get(wide_key) if memo is not None else None) or \
+            getattr(conn, "memo_get", lambda k: None)(wide_key)
+        floor = today - dt.timedelta(days=730)
+        if wide is None or wide[0] > floor:
+            wide = (floor - dt.timedelta(days=1),
+                    _income_rows_query(conn, today + dt.timedelta(days=1),
+                                       excluded, reach_days=732))
+            if memo is not None:
+                memo[wide_key] = wide
+            if hasattr(conn, "memo_put"):
+                conn.memo_put(wide_key, wide, *budget._LEDGER_TABLES,
+                              "business_entity", "entity_membership")
+        hit = [r for r in wide[1] if r["date"] >= floor]
         if hasattr(conn, "memo_put"):
             conn.memo_put(key, hit, *budget._LEDGER_TABLES,
                           "business_entity", "entity_membership")
@@ -3841,10 +4509,12 @@ def _income_rows(conn, today: dt.date, *, excluded: list | None = None,
     return hit
 
 
-def _income_rows_query(conn, today: dt.date, excluded: list) -> list[dict]:
-    """_income_rows' one scan of the ledger."""
+def _income_rows_query(conn, today: dt.date, excluded: list, *,
+                       reach_days: int = 730) -> list[dict]:
+    """_income_rows' one scan of the ledger: deposits from `reach_days`
+    before `today` on."""
     from . import links
-    since = today - dt.timedelta(days=730)
+    since = today - dt.timedelta(days=reach_days)
     shadows = links.shadow_ids(conn) + list(excluded)
     out = []
     for r in conn.execute(
@@ -3863,7 +4533,7 @@ def _income_rows_query(conn, today: dt.date, excluded: list) -> list[dict]:
                  AND t.date >= %s"""
             # an entity's deposits are business income, not the
             # owner's paycheck series
-            + budget.PERSONAL_ONLY_SQL,
+            + budget.PERSONAL_ONLY_SQL + " ORDER BY t.date, t.id",
             (shadows, since)).fetchall():
         text = budget.match_text(r["payee"], r["name"])
         out.append({"date": as_date(r["date"]), "amount": -r["amount"],
@@ -3917,8 +4587,11 @@ def ledger_fit(events: list[dict], today: dt.date) -> dict | None:
         monthly = round(statistics.median(totals), 2)
         return {"kind": "envelope", "amount": monthly, "cadence": "ENVELOPE:1",
                 "next_due": "", "short": f"~${monthly:,.0f}/mo",
-                "label": f"~${monthly:,.2f}/month across "
-                f"{min(counts)}–{max(counts)} charges (no clean cycle → envelope)"}
+                "label": f"~${monthly:,.2f}/month, "
+                + (f"{min(counts)} charge{'' if min(counts) == 1 else 's'}"
+                   if min(counts) == max(counts)
+                   else f"{min(counts)}–{max(counts)} charges")
+                + " a month (no clean cycle → envelope)"}
     return None
 
 
@@ -4047,7 +4720,10 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date,
         if not events:
             health = "off-ledger"
         else:
-            live = {_month_key(today), _complete_months(today, 1)[0]}
+            # judged over the envelope's own period: a yearly pool used
+            # once a year has not missed a cycle two months later
+            live = {_month_key(today),
+                    *_complete_months(today, budget.envelope_months(raw))}
             health = "ok" if any(_month_key(e["date"]) in live for e in events) else "stale"
         return {"health": health, "last_match": last, "fit": fit,
                 "matched": len(events), "fit_diverges": False,
@@ -4071,16 +4747,25 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date,
     paid = (amt_matched if is_income else
             [e for e in events if budget.amount_fits(bands, e["amount"], e["date"])])
     last = paid[-1]["date"] if paid else None
+    # what that last payment was, to the cent: an income row prints it
+    # (row_amount)
+    last_amount = round(paid[-1]["amount"], 2) if paid else None
 
     if not rec.get("frequency"):          # one-time scheduled bill
-        due = as_date(raw.get("dueOn"))
+        due = stored_date(raw.get("dueOn"))
         if paid or (due and due >= today):
             health = "ok"
         elif due and (today - due).days > 30:
             health = "stale"
         else:
             health = "off-ledger" if not events else "ok"
+        # A one-time row prints a deposit only when it is the occurrence
+        # itself: an earlier, similar deposit from the same payer (last
+        # year's refund) is not what this row is waiting for.
+        its_own = bool(paid and due and
+                       as_date(paid[-1]["date"]) >= due - dt.timedelta(days=ONE_TIME_EARLY_DAYS))
         return {"health": health, "last_match": last, "fit": fit,
+                "last_match_amount": last_amount if its_own else None,
                 "matched": len(amt_matched),
                 "cycle_days": None,
                 "suggestion": _suggest(health, fit, None,
@@ -4123,6 +4808,7 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date,
         else:
             health = "ok"
     return {"health": health, "last_match": last, "fit": fit,
+            "last_match_amount": last_amount,
             "matched": len(amt_matched),
             # the date of the withdrawn charge behind a "withdrawn" verdict;
             # last_match stays the last LIVE charge
@@ -4138,6 +4824,14 @@ def _bill_health(b, raw: dict, events: list[dict], today: dt.date,
                                    if events else None, today),
             "fit_diverges": (not is_income
                              and _fit_suggests_change(raw, fit, bill_amt))}
+
+
+def _category_envelope(b) -> bool:
+    """A spending envelope whose pool its category's rows fill."""
+    raw = as_dict(b["raw"])
+    return bool(raw.get("bill_type") == "envelope"
+                and raw.get("match_category") and b["category"]
+                and (b["amount"] or 0) <= 0)
 
 
 def analyze_bills(conn, today: dt.date | None = None, *,
@@ -4166,7 +4860,10 @@ def analyze_bills(conn, today: dt.date | None = None, *,
     # nothing else, and a text bill tokenises a row the first time it
     # looks at it, once for the whole schedule.
     spend_bills = [b for b in rows if (b["amount"] or 0) <= 0]
-    spend_by_id = all(ids.get(b["payee"] or "") is not None for b in spend_bills)
+    # a category envelope reads its category's rows too, which no
+    # merchant narrowing would load
+    spend_by_id = all(ids.get(b["payee"] or "") is not None
+                      and not _category_envelope(b) for b in spend_bills)
     spend_ids = (sorted({i for b in spend_bills
                          for i in (ids.get(b["payee"] or "") or ())})
                  if spend_by_id else None)
@@ -4233,6 +4930,16 @@ def analyze_bills(conn, today: dt.date | None = None, *,
                     r["tokens"] = budget._tokens(r["text"])
                 if match(r["text"], r["tokens"], r["merchant_id"]):
                     matched.append(r)
+        if _category_envelope(b):
+            # a category pool is filled by its category's rows as well as
+            # its merchants' (budget._envelope_bills, match_cat): a pool
+            # they fill is on the ledger
+            cat = budget._cat_norm(b["category"])
+            have = {id(r) for r in matched}
+            matched = sorted(matched + [
+                r for r in universe if id(r) not in have
+                and budget._cat_norm(r["category"]) == cat],
+                key=lambda r: r["date"])
         if claimed_by and (b["amount"] or 0) > 0:
             # an income series the claim does not plan (an income
             # envelope, a series with no schedule) still leaves the
@@ -4346,12 +5053,10 @@ def _history_match_sql(is_bill: bool, bill_merchant: str | None,
     return frag, list(params)
 
 
-# the site-wide timeframe vocabulary, as the history page's transaction
-# list bounds it: months back from today for the open windows, None for
-# all. "cur" (this month so far) and "1m" (the last complete month) are
-# calendar months, cut in merchant_history itself.
-HISTORY_WINDOWS = {"cur": 1, "1m": 1, "3m": 3, "6m": 6, "1y": 12, "3y": 36,
-                   "5y": 60, "all": None}
+# the site-wide timeframe keys the history page's transaction list takes.
+# The days each covers are reporting.ledger_ranges' (merchant_history), the
+# same days a Cash Flow figure for the key is read over.
+HISTORY_WINDOWS = ("cur", "1m", "3m", "6m", "1y", "3y", "5y", "all")
 
 
 def merchant_history(conn, payee: str, today: dt.date | None = None,
@@ -4360,22 +5065,30 @@ def merchant_history(conn, payee: str, today: dt.date | None = None,
     """Everything a merchant-history page needs: matched transactions,
     monthly totals, lifetime aggregate, and the ledger fit.
 
-    The transaction list is bounded by `months` back from today (None =
-    the whole ledger), or, when `window` names one of HISTORY_WINDOWS, by
-    that window: "cur" is this month from the 1st, "1m" the last complete
-    month closed on its last day, the rest months back as before. The
-    lifetime aggregate is lifetime whatever the window."""
+    The transaction list is bounded one of two ways. `window`, a key of
+    HISTORY_WINDOWS (the site-wide timeframes), is bounded by the ledger's
+    own ranges — `reporting.ledger_ranges`, the days Cash Flow's figures
+    and the Transactions range buttons cover: "cur" is this month to
+    today, every other key complete months ending with last month, "all"
+    the whole ledger — so the rows listed for a timeframe are the ones a
+    figure for it was read over (specs/ledger-figures.md). An unknown key
+    reads as all. Without a `window`, `months` counts back from today
+    (None = the whole ledger): the mode of a caller that wants recent
+    history rather than a named timeframe. The lifetime aggregate is
+    lifetime either way."""
     today = today or localtime.household_day(conn)
     until: dt.date | None = None
     if window is not None:
-        months = HISTORY_WINDOWS.get(window)      # unknown reads as all
-    if window == "cur":
-        since = today.replace(day=1)
-    elif window == "1m":
-        until = today.replace(day=1)
-        since = (until - dt.timedelta(days=1)).replace(day=1)
+        from . import reporting
+        span = (reporting.ledger_ranges(conn, today).get(window)
+                if window in HISTORY_WINDOWS else None)
+        if span and span["start"]:
+            since = dt.date.fromisoformat(span["start"])
+            until = dt.date.fromisoformat(span["end"]) + dt.timedelta(days=1)
+        else:
+            since = dt.date(1900, 1, 1)
     else:
-        # months=None is the whole ledger: the page's "All" window
+        # months=None is the whole ledger
         since = (dt.date(1900, 1, 1) if months is None
                  else today - dt.timedelta(days=months * 31))
     row = conn.execute(

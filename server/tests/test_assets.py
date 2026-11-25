@@ -60,7 +60,8 @@ class ManualAssetsApiTests(unittest.TestCase):
              "monthly_delta": "x" * 100000, "extra": {"a": [1, 2]}}]})
         self.assertEqual(r.status_code, 200, r.text)
         got = self._get()[0]
-        self.assertEqual(sorted(got), ["as_of", "kind", "name", "value"])
+        self.assertEqual(sorted(got),
+                         ["acquired_on", "as_of", "kind", "name", "value"])
         self.assertEqual(got["value"], 18000)
 
     def test_provided_as_of_is_kept(self):
@@ -69,6 +70,32 @@ class ManualAssetsApiTests(unittest.TestCase):
              "as_of": "2026-01-15"}]})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(self._get()[0]["as_of"], "2026-01-15")
+
+    def test_a_value_edit_keeps_the_day_it_was_acquired(self):
+        today = dt.date.today().isoformat()
+        r = self.client.post("/api/settings", json={"manual_assets": [
+            {"name": "Lake House", "kind": "property", "value": 210000,
+             "acquired_on": "2019-04-12"},
+            {"name": "Van", "kind": "vehicle", "value": 9000}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        got = {a["name"]: a for a in self._get()}
+        self.assertEqual(got["Lake House"]["acquired_on"], "2019-04-12")
+        self.assertEqual(got["Van"]["acquired_on"], today)    # new: today
+        # a value edit sends as_of cleared and, from an older client, no
+        # acquired_on at all: the stored one stays
+        r = self.client.post("/api/settings", json={"manual_assets": [
+            {"name": "Lake House", "kind": "property", "value": 224000,
+             "as_of": None},
+            {"name": "Van", "kind": "vehicle", "value": 8500, "as_of": None,
+             "acquired_on": None}]})
+        self.assertEqual(r.status_code, 200, r.text)
+        got = {a["name"]: a for a in self._get()}
+        self.assertEqual(got["Lake House"]["acquired_on"], "2019-04-12")
+        self.assertEqual(got["Lake House"]["as_of"], today)
+        self.assertEqual(got["Van"]["acquired_on"], today)
+        self.assertEqual(self.client.post("/api/settings", json={
+            "manual_assets": [{"name": "Van", "kind": "vehicle", "value": 1,
+                               "acquired_on": "soon"}]}).status_code, 400)
 
     def test_bad_shapes_are_400(self):
         self.assertEqual(self.client.post(

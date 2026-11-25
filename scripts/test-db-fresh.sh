@@ -19,7 +19,7 @@ set -uo pipefail
 
 [ "${OIKONOME_TEST_KEEP_DB:-}" = "1" ] && exit 0
 
-DB="${OIKONOME_TEST_DB:-oikonome_test}"
+DB="${OIKONOME_TEST_DB:-oikonome_test}"; DB="${DB,,}"   # Postgres lowercases an unquoted CREATE DATABASE
 ADMIN="${OIKONOME_TEST_ADMIN_DSN:-postgresql://postgres:devpass@127.0.0.1:5433}"
 PY=server/.venv/bin/python
 [ -x "$PY" ] || PY=python3

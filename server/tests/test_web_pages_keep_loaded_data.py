@@ -44,7 +44,11 @@ class WebPagesKeepLoadedData(unittest.TestCase):
             p = _SRC / rel
             if not p.exists():
                 self.skipTest(f"{rel} not present")
-            self.assertIn(".isLoadingError", p.read_text(), rel)
+            # a first load with nothing to show: isLoadingError, or the
+            # same test written as "no data" after the pending branch
+            src = p.read_text()
+            self.assertTrue(".isLoadingError" in src
+                            or ".data === undefined" in src, rel)
 
 
 if __name__ == "__main__":

@@ -33,10 +33,13 @@ class WithdrawnFrontedTests(unittest.TestCase):
         self.assertEqual(base.mark_removed(self.conn, [self.charge]), 1)
 
     def _age(self, days):
+        """The feed withdrew the charge `days` ago: its stamp, and the time
+        it left the ledger, which the wait counts from."""
         self.conn.execute(
             "UPDATE transactions SET raw = raw || jsonb_build_object("
-            "%s::text, now() - make_interval(days => %s)) WHERE id = %s",
-            (budget.FEED_REMOVED_KEY, days, self.charge))
+            "%s::text, now() - make_interval(days => %s)),"
+            " removed_at = now() - make_interval(days => %s) WHERE id = %s",
+            (budget.FEED_REMOVED_KEY, days, days, self.charge))
 
     def _movements(self):
         return self.conn.execute(

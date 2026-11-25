@@ -6,26 +6,35 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View,
          useWindowDimensions } from "react-native";
+import { useRouter } from "expo-router";
 import PullRefresh from "../components/pull-refresh";
 
 import Sparkline from "../components/sparkline";
-import StaleBanner from "../components/stale-banner";
-import { Card, H, HelpLink, KV } from "../components/ui";
-import { errText, ManualAsset, PLRow } from "../lib/api";
+import { FailedLine, NoAccountsLine, StaleLine, useNoAccounts }
+  from "../components/loaded";
+import { Card, H, HelpLink, KV, Skeleton, Note } from "../components/ui";
+import { errText, ManualAsset, PLRow, RingFigures } from "../lib/api";
 import { SETTINGS_SAVES, saveSettings } from "../lib/cache";
-import { monthChange } from "../lib/networth-pure";
-import { RANGE_LABEL, rangeCaption, TREND_RANGES, trendWindow,
+import { overTimeWindow } from "../lib/networth-pure";
+import { changeWords, DEFAULT_TREND_RANGE, overCaption, signedPct,
          type TrendRange } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
-import { C, money } from "../lib/theme";
-import { catLabel, nameKeys, parseMoneyDraft, rebaseNamedSave }
-  from "../lib/pure";
+import { C, mmddyy, money } from "../lib/theme";
+import { catLabel, nameKeys, ownedSinceIso, parseMoneyDraft,
+         rebaseNamedSave } from "../lib/pure";
+import { RangePicker } from "../components/segmented-control";
+import { fieldA11y } from "../components/field";
 
 const m$ = (n: number) => money(n, false);
+// a change's colour: "unchanged" is plain (changeWords)
+const toneColor = (v: number) => {
+  const t = changeWords(v, m$).tone;
+  return t === "pos" ? C.good : t === "neg" ? C.bad : C.mut;
+};
 const plTxt = (v: number) => `${v >= 0 ? "+" : "−"}${m$(Math.abs(v))}`;
 const pctTxt = (p: number | null | undefined) =>
-  p != null ? `${p >= 0 ? "+" : ""}${p.toFixed(1)}%` : "—";
+  p != null ? signedPct(p) : "—";
 
 function PLLine({ name, invested, value, pl, pct, indent }: {
   name: string; invested?: number; value: number; pl: number;
@@ -48,8 +57,53 @@ function PLLine({ name, invested, value, pl, pct, indent }: {
   );
 }
 
+/** A breakdown list (the web Donut's legend): the drawn rows with their
+ *  shares, the owed rows, and the net when anything is owed — all the
+ *  server's `shown` figures, whole dollars adding up as shown and shares
+ *  adding up to 100. An older server sends no `shown`: the rows are then
+ *  rounded one by one and carry no share; none is worked out here. */
+function Breakdown({ title, rows, ring }: {
+  title: string; rows: [string, number][]; ring?: RingFigures;
+}) {
+  const shown = ring?.shown;
+  // older-server path: stands in for `rings.*.shown` (the raw rows)
+  const drawn = shown
+    ? shown.rows.filter((r) => r.share !== null)
+        .map((r) => [r.label, r.dollars, r.share] as const)
+    : rows.filter(([, v]) => v > 0).map(([n, v]) => [n, v, null] as const);
+  // older-server path: stands in for `rings.*.shown` (the raw rows)
+  const owed = shown
+    ? shown.rows.filter((r) => r.owed).map((r) => [r.label, r.dollars] as const)
+    : rows.filter(([, v]) => v < 0);
+  // older-server path: stands in for `rings.*.shown.net`
+  const net = shown ? shown.net : ring?.net;
+  return (
+    <Card>
+      <H>{title}</H>
+      {/* the web ring's centre figure: what is owned, named "Assets" when
+          owed rows follow it, else "Total" (the server's shown.owned) */}
+      {shown && (
+        <KV k={owed.length ? "Assets" : "Total"} v={m$(shown.owned)} />)}
+      {/* keyed by position: two rows can share a label (an unnamed
+          connection's "Other" beside an institution named "Other") */}
+      {drawn.map(([name, v, p], i) => (
+        <KV key={i} k={p !== null ? `${name} · ${p}%` : name} v={m$(v)} />
+      ))}
+      {/* the web legend's words for a row the ring cannot draw */}
+      {owed.map(([name, v], i) => (
+        <KV key={`owed-${i}`} k={`${name} · owed · not drawn`} v={m$(v)}
+            tone="bad" />
+      ))}
+      {owed.length > 0 && net !== undefined && (
+        <KV k="Net" v={m$(net)} />
+      )}
+    </Card>
+  );
+}
+
 export default function NetWorth() {
   const { client } = useSession();
+  const router = useRouter();
   const { width } = useWindowDimensions();
   const query = useQuery({
     queryKey: ["report", "networth"],
@@ -61,124 +115,136 @@ export default function NetWorth() {
     queryFn: () => client!.reportFees(),
     enabled: !!client,
   });
-  const d = query.data;
-  const fullTrend = d?.trend ?? [];
-  // timeframe toggles — same ranges, math and semantics as the web's
-  // NetWorth trend card (trendWindow lives in pure.ts, runner-tested)
-  const [range, setRange] = useState<TrendRange>("all");
-  const w = trendWindow(fullTrend, range);
+  const read = query.data;
+  // nothing linked and nothing entered by hand: the way to start, not a
+  // "$0" total (the web's rule)
+  const noAccounts = useNoAccounts();
+  const nothingYet = noAccounts && !!read && read.property_items.length === 0;
+  const d = nothingYet ? undefined : read;
+  // Over time charts the same total as the headline — `full_trend`,
+  // property included — over the server's window for the timeframe
+  const fullTrend = d?.full_trend ?? [];
+  // the site-wide default window (specs/timeframes.md: default 1y)
+  const [range, setRange] = useState<TrendRange>(DEFAULT_TREND_RANGE);
+  const w = overTimeWindow(d?.trend_windows, range, fullTrend.length);
   const sliced = fullTrend.slice(w.start, w.end + 1);
-  const eu = d?.trend_estimated_until !== undefined
-    && d.trend_estimated_until - w.start > 0
-    ? d.trend_estimated_until - w.start : undefined;
-  // the hero's change is on the total's own base (property included);
-  // the financial-only change sits on the Financial accounts line
-  const delta = monthChange(d?.full_trend);
-  const finDelta = monthChange(d?.trend);
-  const mortgage = (d?.property_items ?? [])
-    .filter((p) => p.kind === "mortgage")
-    .reduce((t, p) => t + p.value, 0);
+  const est = d?.full_trend_estimated_until;
+  const eu = est !== undefined && est - w.start > 0 ? est - w.start : undefined;
+  // the hero's and the tiles' changes, server-decided (an older server
+  // sends none, and none is shown)
+  const delta = d?.month_change ?? null;
+  const finDelta = d?.financial_month_change ?? null;
+  const propDelta = d?.property_month_change ?? null;
+  // what is owed cannot be a share of what is owned: listed after the
+  const mortgage = d?.mortgage_payoff ?? null;
   const rc = d?.retirement_combined;
   const rtot = rc?.total;
-  // share percentages beside each slice — the web's donut labels;
-  // non-positive rows drop out of the shares like the web's Donut
-  const withPct = (rows: [string, number][]) => {
-    const pos = rows.filter(([, v]) => v > 0);
-    const total = pos.reduce((t, [, v]) => t + v, 0) || 1;
-    return pos.map(([n, v]) =>
-      [n, v, Math.round((100 * v) / total)] as [string, number, number]);
-  };
-
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
-      <StaleBanner query={query} />
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      <StaleLine query={query} />
+      {query.isPending && <Skeleton />}
+      {/* a failed first read says so: blank, the screen read as broken */}
+      {d === undefined && query.isError && (
+        <FailedLine q={query} what="net worth" />)}
+      {nothingYet && <Card><NoAccountsLine /></Card>}
       {d && (
         <Card>
           <Text style={s.mut}>Total net worth</Text>
           <Text style={s.big}>
             {m$(d.full_total)}
             {delta !== null && (
-              <Text style={{ fontSize: 14,
-                             color: delta >= 0 ? C.good : C.bad }}>
-                {"  "}{plTxt(delta)} this month
+              <Text style={{ fontSize: 14, color: toneColor(delta) }}>
+                {"  "}{changeWords(delta, m$).text} this month
               </Text>
             )}
           </Text>
+          {/* what that change is made of, and money withdrawn that no
+              linked account has received — the server's two lines, as
+              sent (an older server sends neither) */}
+          {d.month_change_text ? (
+            <Text style={s.mut}>{d.month_change_text}</Text>) : null}
+          {d.month_withdrawn_text ? (
+            <Text style={s.mut}>{d.month_withdrawn_text}</Text>) : null}
           <KV k="Financial accounts" v={m$(d.current_total)} />
           <Text style={s.mut}>
             cash + investments − card debt · live
+            {/* the web tile's link to the payoff plan */}
+            {" · "}
+            <Text style={{ color: C.accent }} accessibilityRole="link"
+                  onPress={() => router.push("/debt")}>payoff plan</Text>
             {finDelta !== null && (
-              <Text style={{ color: finDelta >= 0 ? C.good : C.bad }}>
-                {" · "}{plTxt(finDelta)} this month
+              <Text style={{ color: toneColor(finDelta) }}>
+                {" · "}{changeWords(finDelta, m$).text} this month
               </Text>
             )}
           </Text>
           <KV k="Property & vehicles, net" v={m$(d.property_net)} />
           <Text style={s.mut}>
-            after {m$(Math.abs(mortgage))} mortgage payoff
+            {mortgage !== null ? `after ${m$(mortgage)} mortgage payoff` : ""}
+            {/* a typed-in balance says how old it is (the server's words;
+                an older server sends none) */}
+            {mortgage !== null && d.mortgage_entered_text
+              ? ` · ${d.mortgage_entered_text}` : ""}
+            {propDelta !== null && Math.abs(propDelta) >= 0.5 && (
+              <Text style={{ color: toneColor(propDelta) }}>
+                {" · "}{changeWords(propDelta, m$).text} this month
+              </Text>
+            )}
           </Text>
         </Card>
       )}
-      {fullTrend.length > 1 && (
+      {/* shown from the first balance on, as on the web: a household
+          with one day says so below rather than losing the card */}
+      {d && (
         <Card>
           <H>Over time</H>
-          <View style={{ flexDirection: "row", gap: 6, marginBottom: 8,
-                         alignItems: "center", flexWrap: "wrap" }}>
-            {TREND_RANGES.map((r) => {
-              // a range longer than the history equals All — one view,
-              // one button (mirrors the web's disabled state)
-              const dead = r !== "all" && trendWindow(fullTrend, r).full;
-              return (
-                <Pressable key={r} disabled={dead}
-                    onPress={() => setRange(r)}
-                    style={{ paddingVertical: 3, paddingHorizontal: 9,
-                             borderRadius: 999, borderWidth: 1,
-                             opacity: dead ? 0.35 : 1,
-                             borderColor: range === r ? C.accent : C.border,
-                             backgroundColor: range === r
-                               ? C.accent + "22" : "transparent" }}>
-                  <Text style={{ fontSize: 12,
-                                 color: range === r ? C.accent : C.mut }}>
-                    {RANGE_LABEL[r]}</Text>
-                </Pressable>
-              );
-            })}
-          </View>
+          <RangePicker value={range} onChange={setRange}
+            dead={(r) => overTimeWindow(d?.trend_windows, r,
+                                        fullTrend.length).full}
+            style={{ marginBottom: 8 }} />
           {w.gain !== null && (
             <Text style={{ fontSize: 12, marginBottom: 6,
                            color: w.gain >= 0 ? C.good : C.bad }}>
               {plTxt(w.gain)}
               {w.pct !== null
-                ? ` · ${w.pct >= 0 ? "+" : ""}${w.pct.toFixed(1)}%` : ""}
+                ? ` · ${signedPct(w.pct)}` : ""}
               <Text style={{ color: C.mut }}>
-                {"  over "}{rangeCaption(range)}</Text>
+                {"  "}{overCaption(range)}
+                {/* no percent to give the base: the server says where
+                    the gain is measured from (the web's words) */}
+                {w.from_text ? ` · ${w.from_text}` : ""}</Text>
             </Text>
+          )}
+          {/* the server's words when the window crosses a typed-in
+              property: the gain above is then the financial accounts' */}
+          {!!w.note && (
+            <Text style={{ fontSize: 11, marginBottom: 6, color: C.mut }}>
+              {w.note}</Text>
           )}
           {/* the reconstructed prefix draws dashed — an estimate must
               not look like a measurement (the web's estimatedUntil) */}
-          <Sparkline width={width - 24 - 28} data={sliced}
-                     dashUntil={eu} />
+          {sliced.length < 2 ? (
+            // a household linked today has one balance and no history yet
+            <Text style={s.mut}>
+              {sliced.length ? `${m$(sliced[0][1])} today. ` : ""}
+              The line starts once a second day&apos;s balance is in.
+            </Text>
+          ) : (
+            <Sparkline width={width - 24 - 28} data={sliced}
+                       subject="Net worth"
+                       dashUntil={eu} />)}
         </Card>
       )}
       {d && d.by_asset_class.length > 0 && (
-        <Card>
-          <H>By asset class</H>
-          {withPct(d.by_asset_class).map(([name, v, p]) => (
-            <KV key={name} k={`${name} · ${p}%`} v={m$(v)} />
-          ))}
-        </Card>
+        <Breakdown title="By asset class" rows={d.by_asset_class}
+                   ring={d.rings?.by_asset_class} />
       )}
       {d && d.by_institution.length > 0 && (
-        <Card>
-          <H>By institution</H>
-          {withPct(d.by_institution).map(([name, v, p]) => (
-            <KV key={name} k={`${name} · ${p}%`} v={m$(v)} />
-          ))}
-        </Card>
+        <Breakdown title="By institution" rows={d.by_institution}
+                   ring={d.rings?.by_institution} />
       )}
 
       {rtot && rc?.groups && (
@@ -195,15 +261,18 @@ export default function NetWorth() {
             <Text style={{ marginLeft: "auto", fontWeight: "700",
                            color: rtot.pl >= 0 ? C.good : C.bad,
                            fontSize: 14 }}>
-              {plTxt(rtot.pl)} · {pctTxt(rtot.pct)}
+              {plTxt(rtot.pl)}
+              {/* no return to give is no " · —" (the web's header) */}
+              {rtot.pct !== null && rtot.pct !== undefined
+                ? ` · ${signedPct(rtot.pct)}` : ""}
             </Text>
           </View>
           <View style={s.plRow}>
             <Text style={[s.mut, { flex: 1 }]}> </Text>
             <Text style={s.plHead}>Invested</Text>
-            <Text style={s.plHead}>Value</Text>
+            <Text style={s.plHead}>Value now</Text>
             <Text style={s.plHead}>P/L</Text>
-            <Text style={[s.plHead, { width: 52 }]}>Ret.</Text>
+            <Text style={[s.plHead, { width: 52 }]}>Return</Text>
           </View>
           {rc.groups.map((g) => (
             <View key={g.provider}>
@@ -211,7 +280,7 @@ export default function NetWorth() {
                       value={g.value} pl={g.pl} pct={g.pct} />
               {g.accounts.map((a) => (
                 <PLLine key={a.name} name={a.name}
-                        invested={a.invested ?? 0} value={a.value}
+                        invested={a.invested} value={a.value}
                         pl={a.pl} pct={a.pct} indent />
               ))}
             </View>
@@ -220,6 +289,10 @@ export default function NetWorth() {
             <PLLine name="Total" invested={rtot.invested}
                     value={rtot.value} pl={rtot.pl} pct={rtot.pct} />
           </View>
+          {rc.pl_note ? (
+            <Text style={[s.mut, { fontSize: 12, marginTop: 6 }]}>
+              {rc.pl_note}</Text>
+          ) : null}
         </Card>
       )}
 
@@ -232,11 +305,12 @@ export default function NetWorth() {
             </Text>
           </H>
           <View style={s.plRow}>
-            <Text style={s.cbHead}>Cash in</Text>
+            {/* the web table's column names */}
+            <Text style={s.cbHead}>Cash in (bank)</Text>
             <Text style={s.cbHead}>Cash out</Text>
-            <Text style={s.cbHead}>Value</Text>
+            <Text style={s.cbHead}>Value now</Text>
             <Text style={s.cbHead}>P/L</Text>
-            <Text style={[s.cbHead, s.cbPct]}>Ret.</Text>
+            <Text style={[s.cbHead, s.cbPct]}>Return</Text>
           </View>
           {d!.coinbase_pl.map((c) => (
             <View key={c.name}
@@ -250,8 +324,8 @@ export default function NetWorth() {
             <Text style={[s.plName, { marginTop: 6 }]} numberOfLines={1}>
               {c.name}</Text>
             <View style={[s.plRow, { borderTopWidth: 0 }]}>
-              <Text style={s.cbNum}>{m$(c.cash_in ?? 0)}</Text>
-              <Text style={s.cbNum}>{m$(c.cash_out ?? 0)}</Text>
+              <Text style={s.cbNum}>{m$(c.cash_in)}</Text>
+              <Text style={s.cbNum}>{m$(c.cash_out)}</Text>
               <Text style={s.cbNum}>{m$(c.value)}</Text>
               <Text style={[s.cbNum,
                              { color: c.pl >= 0 ? C.good : C.bad }]}>
@@ -260,7 +334,7 @@ export default function NetWorth() {
               <Text style={[s.cbNum, s.cbPct, {
                              color: c.pl >= 0 ? C.good : C.bad }]}>
                 {c.pct != null
-                  ? `${c.pct >= 0 ? "+" : ""}${c.pct.toFixed(0)}%` : "—"}
+                  ? signedPct(c.pct) : "—"}
               </Text>
             </View>
             </View>
@@ -268,6 +342,14 @@ export default function NetWorth() {
         </Card>
       )}
 
+      {/* a failed read keeps the card's place: gone, it read as never
+          charged */}
+      {fees.data === undefined && fees.isError && (
+        <Card>
+          <H>Investment fees</H>
+          <FailedLine q={fees} what="the investment fees" />
+        </Card>
+      )}
       {fees.data && fees.data.by_platform.length > 0 && (
         <Card>
           <H>
@@ -279,8 +361,14 @@ export default function NetWorth() {
           <Text style={{ color: C.bad, fontSize: 20, fontWeight: "700" }}>
             {m$(fees.data.total)}
           </Text>
-          {fees.data.by_platform.map(([inst, amt, n]) => (
-            <KV key={inst} k={inst} v={`${m$(amt)} · ${n}`} tone="mut" />
+          {/* a connection with no institution name is sent as null */}
+          {/* the count in the server's words ("40 charges", "5 years,
+              estimated"); an older server sends none and none is shown */}
+          {fees.data.by_platform.map(([inst, amt], i) => (
+            <KV key={inst ?? ""} k={inst ?? ""}
+                v={`${m$(amt)}${fees.data!.platform_counts?.[i]
+                  ? ` · ${fees.data!.platform_counts[i]}` : ""}`}
+                tone="mut" />
           ))}
           {/* labeled like the web's own card — a year and a platform
               must not read identically */}
@@ -290,13 +378,16 @@ export default function NetWorth() {
               Fees by year
             </Text>
           )}
-          {[...fees.data.by_year].reverse().slice(0, 20).map(([y, v]) => (
+          {/* every year, as the web's bars */}
+          {[...fees.data.by_year].reverse().map(([y, v]) => (
             <KV key={y} k={String(y)} v={m$(v)} tone="mut" />
           ))}
         </Card>
       )}
 
-      {d && d.property_items.length > 0 && (
+      {/* the card stands with no items too, as the web's: a viewer sees
+          its title rather than an empty box */}
+      {d && (
         <Card>
           <H>Property, vehicles &amp; mortgage</H>
           {d.property_items.map((p) => (
@@ -307,17 +398,28 @@ export default function NetWorth() {
               {p.source ? (
                 <Text style={[s.mut, { marginTop: -2 }]}>{p.source}</Text>
               ) : null}
+              {/* a typed-in loan balance carries its age, toned as a
+                  warning once it asks for an update (the web's line) */}
+              {p.entered_text ? (
+                <Text style={[s.mut, p.update_due ? { color: C.warn } : null]}>
+                  {p.entered_text}</Text>
+              ) : null}
             </View>
           ))}
           <ManualAssets />
         </Card>
       )}
-      {d && d.property_items.length === 0 && <Card><ManualAssets /></Card>}
       {/* the caveat stands at the page foot even when the trend card
           can't render — a thin-history tenant needs it most (web rule) */}
       {d && (
         <Text style={[s.mut, { marginHorizontal: 12, marginTop: 8 }]}>
-          {d._built_at ? `Reports cached ${d._built_at} · ` : ""}
+          {d._built_at
+            // built on this request — nothing is cached
+            ? `Figures as of ${
+                /^\d{4}-\d\d-\d\dT\d\d:\d\d/.test(d._built_at)
+                  ? `${mmddyy(d._built_at)} ${d._built_at.slice(11, 16)}`
+                  : d._built_at} · `
+            : ""}
           history before the first recorded balance is reconstructed
           from holdings × historical prices, with transfers netted out
         </Text>
@@ -327,7 +429,8 @@ export default function NetWorth() {
   );
 }
 
-// manual_assets editor — add/edit/delete; editing a value clears as_of
+// manual_assets editor — add/edit/delete; "Owned since" (acquired_on) is
+// the month an item enters the trend; editing a value clears as_of
 // so the server stamps today
 function ManualAssets() {
   const { client } = useSession();
@@ -342,12 +445,16 @@ function ManualAssets() {
   // pressed (absent: added here). `sent` is the row's place in the list
   // the last Save wrote, and `lastSent` that list: when its reply is lost
   // the next Save checks whether it landed, so nothing goes in twice.
-  type Row = ManualAsset & { draft?: string; orig?: string; sent?: number };
+  // `since` is the "Owned since" TEXT while it is typed, read at save
+  type Row = ManualAsset & { draft?: string; since?: string; orig?: string;
+                             sent?: number };
   type Edited = ManualAsset & { orig?: string; sent?: number };
   const [rows, setRows] = useState<Row[] | null>(null);
   const [opened, setOpened] = useState<ManualAsset[]>([]);
   const lastSent = useRef<ManualAsset[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // the row whose value stopped the save: its field is marked, as the web's
+  const [errAt, setErrAt] = useState<number | null>(null);
   const save = useMutation({
     scope: SETTINGS_SAVES,
     // The server replaces the whole list, and this one is a copy from
@@ -357,8 +464,11 @@ function ManualAssets() {
     // The reply seeds ["settings"], so "Edit assets" right after Save
     // opens on the list just written.
     mutationFn: async ({ edited, at }: { edited: Edited[]; at: number[] }) => {
-      const live = ((await client!.settingsFull()).manual_assets as
-        ManualAsset[] | null) ?? [];
+      // the read the merge is built on is also the basis the save names
+      // the list's version from: a save another device lands after it is
+      // refused and merged again, never overwritten
+      const view = await client!.settingsFull();
+      const live = (view.manual_assets as ManualAsset[] | null) ?? [];
       const r = rebaseNamedSave(edited, opened, live, lastSent.current);
       lastSent.current = r.list;
       setOpened(r.baseline);
@@ -368,7 +478,7 @@ function ManualAssets() {
         const k = r.rows[n];
         return k ? [{ ...row, ...k }] : [];
       }));
-      return saveSettings(qc, client!, { manual_assets: r.list });
+      return saveSettings(qc, client!, { manual_assets: r.list }, view);
     },
     onSuccess: () => {
       setErr(null); setRows(null);
@@ -382,7 +492,8 @@ function ManualAssets() {
     (settings.data.manual_assets as ManualAsset[] | null) ?? [];
   if (rows === null) {
     return (
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 8 }]}
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 8 }]}
                  onPress={() => {
                    const keys = nameKeys(saved);
                    setOpened(saved);
@@ -401,15 +512,25 @@ function ManualAssets() {
   // settle every typed value; one that is not a number stops the save
   // and says which row, rather than going out as NaN (sent as null → $0)
   const submit = () => {
+    setErrAt(null);
     const out: Edited[] = [];
     const at: number[] = [];
-    for (const [j, { draft, ...r }] of rows.entries()) {
+    for (const [j, { draft, since, ...r }] of rows.entries()) {
       if (!r.name.trim()) continue;
       at.push(j);
+      if (since !== undefined) {
+        const got = ownedSinceIso(since);
+        if ("error" in got) {
+          setErr(`${r.name.trim()}: ${got.error}`);
+          return;
+        }
+        r.acquired_on = got.iso || null;
+      }
       if (draft === undefined) { out.push(r); continue; }
       const v = draft.trim() === "" ? 0 : parseMoneyDraft(draft);
       if (v === null) {
         setErr(`${r.name.trim()}: the value is not a number`);
+        setErrAt(j);
         return;
       }
       out.push({ ...r, value: v });
@@ -420,18 +541,18 @@ function ManualAssets() {
   return (
     <View style={{ marginTop: 8, gap: 8 }}>
       {err ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setErr(null)}>{err}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setErr(null)}>{err}</Note>
       ) : null}
       {rows.map((r, i) => (
         <View key={i} style={{ borderColor: C.border, borderWidth: 1,
                                borderRadius: 8, padding: 10, gap: 6 }}>
-          <TextInput style={s.input} placeholder="Home"
+          <TextInput {...fieldA11y("Asset name")} style={s.input} placeholder="Home"
                      placeholderTextColor={C.mut} value={r.name}
                      onChangeText={(v) => upd(i, { name: v })} />
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
             {KINDS.map((k) => (
-              <Pressable key={k}
+              <Pressable accessibilityRole="button" key={k}
                          style={[s.chip, (r.kind ?? "other") === k
                            && s.chipOn]}
                          onPress={() => upd(i, { kind: k })}>
@@ -442,33 +563,47 @@ function ManualAssets() {
               </Pressable>
             ))}
           </View>
-          <TextInput style={s.input} placeholder="value ($)"
+          <TextInput {...fieldA11y(`${r.name || "Asset"} value ($)`,
+                                   errAt === i ? err : null)}
+                     style={[s.input, errAt === i && { borderColor: C.bad }]}
+                     placeholder="value ($)"
                      placeholderTextColor={C.mut}
                      keyboardType="numbers-and-punctuation"
                      value={r.draft ?? String(r.value)}
                      onChangeText={(v) => upd(i, { draft: v,
                                                    as_of: null })} />
+          {/* the month the item enters the trend; a value edit never
+              moves it, and left blank the server keeps the stored date
+              (a new item: today) */}
+          <TextInput {...fieldA11y(`${r.name || "Asset"} owned since (YYYY-MM-DD)`)}
+                     style={s.input} placeholder="owned since (YYYY-MM-DD)"
+                     placeholderTextColor={C.mut}
+                     keyboardType="numbers-and-punctuation"
+                     value={r.since ?? (r.acquired_on ?? "")}
+                     onChangeText={(v) => upd(i, { since: v })} />
           <Text style={{ color: C.bad, fontSize: 12 }}
-                onPress={() => setRows(rows.filter((_, j) => j !== i))}>
+                onPress={() => { setRows(rows.filter((_, j) => j !== i));
+                                 setErrAt(null); }}>
             Remove
           </Text>
         </View>
       ))}
       <View style={{ flexDirection: "row", gap: 8 }}>
-        <Pressable style={[s.btn, s.btnQuiet]}
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                    onPress={() => setRows([...rows,
                      { name: "", kind: "property", value: 0 }])}>
           <Text style={[s.btnText, { color: C.mut }]}>Add asset</Text>
         </Pressable>
-        <Pressable style={[s.btn, save.isPending && { opacity: 0.5 }]}
+        <Pressable accessibilityRole="button" style={[s.btn, save.isPending && { opacity: 0.5 }]}
                    disabled={save.isPending}
                    onPress={submit}>
           <Text style={s.btnText}>
             {save.isPending ? "saving…" : "Save assets"}
           </Text>
         </Pressable>
-        <Pressable style={[s.btn, s.btnQuiet]}
-                   onPress={() => { setRows(null); setErr(null); }}>
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
+                   onPress={() => { setRows(null); setErr(null);
+                                    setErrAt(null); }}>
           <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
         </Pressable>
       </View>
@@ -496,11 +631,11 @@ const s = StyleSheet.create({
   cbHead: { color: C.mut, fontSize: 10, flex: 1, minWidth: 0,
             textAlign: "right" },
   cbPct: { flex: 0.7 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 7 },
   chip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,

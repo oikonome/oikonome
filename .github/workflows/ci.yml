@@ -33,7 +33,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.14" }
-      - run: pip install ./server
+      # the committed resolution, hash-checked: the versions the image runs
+      - run: pip install --require-hashes -r server/requirements.txt
+      - run: pip install --no-deps ./server
+      # the suite's test-only tools, hashed and resolved against the pins above
+      - run: pip install --require-hashes --no-deps -r server/requirements-test.txt
       # Security + correctness lint (ruff: bandit S rules + pyflakes F).
       # Runs BEFORE the database steps so it still reports if the postgres
       # service fails to initialize in the runner.
@@ -60,6 +64,9 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "22", cache: npm, cache-dependency-path: webapp/package-lock.json }
       - run: npm ci --prefix webapp && npm run build --prefix webapp
+      # The typecheck and the build accept a hook declared below an early
+      # return; only the linter refuses it, in the web client and the phone.
+      - run: make lint
       # Both steps run from server/, the same way `make test` does: the
       # suite reads sibling sources by path and the package by name.
       - run: python -m oikonome.db.migrate

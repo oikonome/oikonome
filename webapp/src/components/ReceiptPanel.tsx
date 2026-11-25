@@ -7,6 +7,8 @@ import { forgetParseStart, parseStalled, rankWaiting, useMatchReceipt,
          useUnmatchReceipt, useWaitingReceipts, waitingMatches }
   from "../api/waiting";
 import { isViewer } from "../role";
+import { FailedLine, StaleLine } from "./Loaded";
+import SlipNote from "./SlipNote";
 
 // receipts on a transaction — upload, parsed line items, retry,
 // delete. Budget math untouched; this is documentation.
@@ -137,11 +139,16 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
             }} />
         </label>
         </>)}
+        {/* what reading an image gives — said only where this instance
+            can read one (ai_available); where it cannot, each unread
+            receipt below says so with the way to set it up */}
+        {waiting.data?.ai_available && (
         <span className="mut" style={{ fontSize: 12 }}>receipts parse
-          into line items when an LLM is configured (Settings) —
-          items then match the search above and group on the{" "}
+          into line items — items then match the search above and group
+          on the{" "}
           <Link to="/items">Receipts page</Link>. Check images parse into
           payee, amount, and memo instead.</span>
+        )}
       </div>
       {upload.isError && <p style={{ color: "var(--red)" }}>{errText(upload.error)}</p>}
       {!viewer && ranked.length > 0 && (
@@ -176,6 +183,9 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
       {match.isError && <p style={{ color: "var(--red)" }}>{errText(match.error)}</p>}
       {del.isError && <p style={{ color: "var(--red)" }}>{errText(del.error)}</p>}
       {parse.isError && <p style={{ color: "var(--red)" }}>{errText(parse.error)}</p>}
+      {/* a failed read is not "no receipts": it says so in their place */}
+      <StaleLine query={q} />
+      {q.data === undefined && q.isError && <FailedLine q={q} what="receipts" />}
       {(q.data?.receipts ?? []).map((r) => (
         <div key={r.id} style={{ marginTop: ".6rem", borderTop:
               "1px solid var(--line)", paddingTop: ".5rem" }}>
@@ -261,8 +271,10 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
                 reading the receipt with the vision model — up to a minute
                 or two on CPU. This updates by itself, and it's safe to
                 navigate away: parsing finishes on the server, and the
-                line items will be here when you come back. Queued LLM
-                work shows under Settings → System health.</div>
+                line items will be here when you come back.
+                {/* System health is the self-hosted instance's own page */}
+                {!me.data?.hosted && " Queued LLM work shows under "
+                  + "Settings → System health."}</div>
             </div>)}
           {r.kind === "check" && r.status === "parsed" && r.parsed && (
             <div style={{ fontSize: 13, marginTop: ".35rem" }}>
@@ -279,6 +291,17 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
                   check amount differs from this transaction's amount —
                   the transaction is unchanged</div>)}
             </div>)}
+          {/* what the server counted (specs/receipts.md): a copy of a slip
+              counted on another receipt lists its lines greyed, a look-alike
+              asks the person once, and lines that miss the charge say so */}
+          <SlipNote id={r.id} counts={r.counts ?? true}
+              twins={r.slip_twins ?? []}
+            suspected={r.suspected ?? []} mayAnswer={!viewer} />
+          {r.lines_gap !== null && (
+            <div className="mut" style={{ fontSize: 12, marginTop: ".35rem" }}>
+              the lines come to ${Math.abs(r.lines_gap).toFixed(2)}{" "}
+              {r.lines_gap > 0 ? "less" : "more"} than the charge — a
+              discount, fee or line the reading missed</div>)}
           {r.items.length > 0 && (
             <table style={{ fontSize: 13, marginTop: ".4rem" }}>
               <tbody>
@@ -290,6 +313,20 @@ export default function ReceiptPanel({ txnId }: { txnId: string }) {
                       {it.tag ? <span className="pill m"
                           style={{ marginLeft: 6 }}>{it.tag}</span> : null}
                     </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          {(r.listed_items ?? []).length > 0 && (
+            <table className="mut" style={{ fontSize: 13, marginTop: ".4rem",
+                                             opacity: .6 }}>
+              <tbody>
+                {(r.listed_items ?? []).map((it) => (
+                  <tr key={it.line}>
+                    <td className="num">${it.amount.toFixed(2)}</td>
+                    <td className="num">{it.qty ?? ""}</td>
+                    <td>{it.description}</td>
                   </tr>
                 ))}
               </tbody>

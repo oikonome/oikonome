@@ -6,7 +6,7 @@ stays in spend — but in the loan-payments bucket. Left to a categorizer
 that reads only the servicer's name, a decade of loan payments is filed
 under "services" or "utilities". Two failure modes are pinned here:
 
- * the raw line carries the words ("DES:STD LN PMT") and the merchant
+ * the raw line carries the words ("STD LN PMT") and the merchant
    does not — an importer cleaned it to the bare servicer name, so the
    display-name screen alone never sees them;
  * a card-payment line spelled "CC PAYMENT".
@@ -26,7 +26,7 @@ from .util import make_db
 class FlowMatchTests(unittest.TestCase):
     def test_student_loan_line(self):
         self.assertEqual(
-            merchant_seed.flow_match("NORTHWIND DES:STD LN PMT ID:CX1234"),
+            merchant_seed.flow_match("NORTHWIND STD LN PMT REF 0042"),
             ("LOAN_PAYMENTS", "LOAN_PAYMENTS_STUDENT_LOAN_PAYMENT"))
         self.assertEqual(
             merchant_seed.flow_match("Withdrawal from NORTHWIND STUDENT LOAN"),
@@ -68,7 +68,7 @@ class FlowClassifyRawLineTests(unittest.TestCase):
                     primary="GENERAL_SERVICES", raw={})
         self.conn.execute(
             "UPDATE transactions SET name=%s WHERE id='l1'",
-            ("NORTHWIND DES:STD LN PMT ID:CX1234",))
+            ("NORTHWIND STD LN PMT REF 0042",))
         # the servicer's name alone had been filed as services by a model
         cache(self.conn, "Northwind", "GENERAL_SERVICES")
         stats = {}

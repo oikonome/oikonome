@@ -216,7 +216,8 @@ class SecurityBucketsAreTheLastToBeForgotten(unittest.TestCase):
         code actually writes."""
         self.assertEqual(
             security._PROTECTED_NS,
-            frozenset({"login-fail", "stepup-fail", "strike", "banhist",
+            frozenset({"login-fail", "stepup-fail", "lock-level", "lock-day",
+                       "strike", "banhist",
                        "risk-ip", "risk-acct", "risk-site", "otp-verify"}))
 
 

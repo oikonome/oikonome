@@ -20,7 +20,8 @@ from oikonome.db import tenancy
 from oikonome.engine import forecast
 from oikonome.web import report, todayview
 
-from .util import _ensure_db, add_txn, make_db, seed_accounts, write_config
+from .util import (_ensure_db, add_bill, add_txn, make_db, seed_accounts,
+                   write_config)
 
 TODAY = dt.date.today()
 
@@ -87,6 +88,10 @@ class NoCheckingAccountTests(unittest.TestCase):
         self.conn.execute("UPDATE accounts SET balance_current=1250 "
                           "WHERE id='card'")
         add_txn(self.conn, TODAY, 40.0, "KROGER")
+        # a scheduled paycheck: without one the notice asks for it
+        add_bill(self.conn, "Northwind Payroll", 900.0, income=True,
+                 frequency="WEEKLY", interval=2,
+                 next_due=TODAY + dt.timedelta(days=9))
         st = report.gather(self.conn, TODAY)
         self.assertFalse(st["runway"]["no_checking"])
         self.assertFalse(forecast.build(self.conn, today=TODAY)["no_checking"])

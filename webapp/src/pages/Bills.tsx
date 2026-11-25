@@ -6,14 +6,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { createContext, Fragment, useContext, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
-import { api, errText, mmdd, money as money$, toast, type Bill, type BillsData, type Settings, catLabel, proposalSuperseded } from "../api/client";
+import { api, errText, mmdd, money as money$, toast, type Bill, type BillsData, type CalendarData, type Settings, catLabel, proposalSuperseded } from "../api/client";
 import { patchList, patchQuery, removeFromList, SETTINGS_SAVES, saveSettings } from "../api/cache";
 import { canEdit, isOwner } from "../role";
-import { householdDay, scanAlreadyRunning, SCAN_RUNNING_RETRY_MS } from "../moneymath";
+import { FailedLine, StaleLine } from "../components/Loaded";
+import { approveAllWords, EMPTY_LINES, householdDay,
+         scanAlreadyRunning, SCAN_RUNNING_RETRY_MS } from "../moneymath";
+import EmptyState from "../components/EmptyState";
 import { ADD_CADENCES, CUSTOM_UNITS, cadenceChoices, customCadence, customMax }
   from "../cadence";
 import { TWICE_A_MONTH, cadenceFields, cadencePick, onSeveralDays, withSeveralDays }
   from "../monthdays";
+import Note from "../components/Note";
+import { scrollBehavior } from "../motion";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 // ---- stepping back through the months ----
@@ -66,45 +71,12 @@ interface Row extends Bill {
   cadenceLabel: string;
 }
 
-// cycle bar: how far through the billing cycle the row is — fills as the
-// due date approaches, in the envelopes' own visual language
-const DAY = 86_400_000;
-// "due today" / "1 day late" count from the household's day (/api/me
-// timezone), the day the server, Today and the mail judge a due date by
-const ZoneCtx = createContext<string | undefined>(undefined);
-const daysUntil = (isoDate: string, zone?: string) => {
-  const today = householdDay(new Date(), zone);
-  return Math.round((new Date(isoDate + "T00:00:00").getTime() - today.getTime()) / DAY);
-};
-const cycleDays = (cad: string) => {
-  const [freq, n] = cad.split(":");
-  const iv = parseInt(n, 10) || 1;
-  const per = freq === "DAILY" ? 1 : freq === "WEEKLY" ? 7
-    : freq === "MONTHLY" ? 30.44 : freq === "YEARLY" ? 365.25 : 0;
-  return per * iv;
-};
-// The bills list serves a human cadence label ("monthly", "every 2 weeks")
-// beside the FREQ:interval select value; when a row arrives without the
-// value, parse the label back into one so the cycle bar can still size
-// itself. (GROUPS names are display headings; matching against them misses
-// daily and any interval the heading list doesn't enumerate.)
-const LABEL_UNITS: Record<string, string> = {
-  da: "DAILY", week: "WEEKLY", month: "MONTHLY", year: "YEARLY" };
-const SIMPLE_LABEL_CADENCE: Record<string, string> = {
-  daily: "DAILY:1", weekly: "WEEKLY:1", monthly: "MONTHLY:1", yearly: "YEARLY:1" };
-const cadenceFromLabel = (label: string): string => {
-  const m = /^every (\d+) (da|week|month|year)/.exec(label);
-  return m ? `${LABEL_UNITS[m[2]]}:${m[1]}` : SIMPLE_LABEL_CADENCE[label] ?? "";
-};
-const dueText = (n: number, income?: boolean) =>
-  n === 0 ? (income ? "today" : "due today")
-  : n === 1 ? (income ? "tomorrow" : "due tomorrow")
-  : n === -1 ? "1 day late"
-  : n < 0 ? `${-n} days late`
-  : `in ${n} days`;
-// the cycle bar turns amber this close to the due date (the words beside
-// it say the number; the colour says "soon" from across the room)
-const SOON_DAYS = 3;
+// The row's due date, countdown, its colour and the cycle bar's fill are
+// the server's (api_bills.due_words), counted from the household's day —
+// the day the server, Today and the mail judge a due date by. The cycle
+// bar fills as the due date approaches, in the envelopes' own language.
+// the server refuses a fee's words past this length (POST /api/bills/save)
+const FEE_WORDS_MAX = 80;
 
 const hpill = (h: string | null,
                seen?: { date: string; amount: number } | null,
@@ -155,7 +127,12 @@ function NightlyFinderSwitch() {
   // flipping a box that only answers 403
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   // absent or null means on — only an explicit false stops it
-  const on = s.data ? s.data.bill_detection_auto !== false : true;
+  // An unread setting is neither on nor off: nothing while it loads, the
+  // failed line when it failed — never a box that reads "on" by default.
+  if (s.data === undefined)
+    return s.isError ? <FailedLine q={s} what="the nightly search setting" />
+      : null;
+  const on = s.data.bill_detection_auto !== false;
   if (!isOwner(me))
     return !s.data ? null : (
       <div className="sub" style={{ fontSize: 12, marginTop: ".45rem" }}>
@@ -172,10 +149,12 @@ function NightlyFinderSwitch() {
                onChange={(e) => save.mutate(e.target.checked)} />
         Look for new bills and paychecks every night
       </label>
+      {/* what "off" means is said only while it is off */}
+      {s.data && !on && (
       <div className="sub" style={{ fontSize: 12, marginTop: ".1rem" }}>
         Off: the nightly search proposes nothing new; drift, due dates and
         change/stopped offers for your existing bills still run, and Find
-        bills &amp; income always works.</div>
+        bills &amp; income always works.</div>)}
     </div>
   );
 }
@@ -218,7 +197,7 @@ export default function Bills({ autoDetect = false }:
                                      act: () => void } | null>(null);
   const jumpToRow = (payee: string) => {
     const el = document.getElementById(`bill-${payee}`);
-    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    el?.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
     el?.animate([{ backgroundColor: "rgba(96,165,250,.28)" },
                  { backgroundColor: "transparent" }], { duration: 1800 });
   };
@@ -234,7 +213,7 @@ export default function Bills({ autoDetect = false }:
     const el = document.getElementById(`bill-${edit}`);
     if (!el) return;
     scrolledTo.current = edit;
-    el.scrollIntoView({ behavior: "smooth", block: "center" });
+    el.scrollIntoView({ behavior: scrollBehavior(), block: "center" });
   }, [edit, bills.length]);
   // the rows behind the "need attention" count (same rule the server uses).
   // A disabled bill shows no health pill and no dismiss control, so jumping
@@ -300,10 +279,7 @@ export default function Bills({ autoDetect = false }:
   const approveAll = useMutation({
     mutationFn: api.billsApproveAll,
     onSuccess: (r) => {
-      toast((r.failed.length
-        ? `Approved ${r.approved}; ${r.failed.length} could not be applied `
-          + `and stayed pending (${r.failed.map((f) => f.error).join("; ")})`
-        : `Approved all ${r.approved} proposal${r.approved === 1 ? "" : "s"}`)
+      toast(approveAllWords(r)
         // an approve that cleared a pin says so, per bill
         + (r.notes?.length
           ? ` — ${r.notes.map((n) => `${n.payee}: ${n.note}`).join("; ")}` : ""));
@@ -474,10 +450,35 @@ export default function Bills({ autoDetect = false }:
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoDetect, q.isSuccess]);
 
+  const shownYm = isPast ? month : curYm;
+  // step back through the months: the per-bill paid/received below are the
+  // month on view, as it ended; the schedule stays live. The stepper stays
+  // on screen while a month loads and when it fails, so the month that
+  // failed is one click from the one before it.
+  const stepper = !autoDetect && (
+    <div className="sub" style={{ display: "flex", gap: ".5rem", alignItems: "center",
+                                  flexWrap: "wrap", margin: "-.4rem 0 .8rem" }}>
+      <button aria-label="Previous month"
+              onClick={() => setMonth(shiftYm(shownYm, -1))}>‹</button>
+      <b style={{ color: "var(--ink)" }}>{ymLabel(shownYm)}</b>
+      <button aria-label="Next month" disabled={!isPast}
+              onClick={() => setMonth(shiftYm(shownYm, 1))}>›</button>
+      {isPast ? (
+        <>
+          <button onClick={() => setMonth(curYm)}>This month</button>
+          <span>· how the month ended: paid and received per bill. Edits change the live schedule.</span>
+        </>
+      ) : null}
+    </div>
+  );
+  const title = <h1>Bills &amp; Income</h1>;
   if (q.isPending)
-    return <div className="centered"><span className="mut">loading…</span></div>;
-  if (q.isLoadingError)
-    return <div className="card">Couldn't load bills: {String(q.error)}</div>;
+    return (<>{title}{stepper}
+      <div className="centered"><span className="mut">loading…</span></div></>);
+  if (q.data === undefined)
+    return (<>{title}{stepper}
+      <FailedLine q={q} what={isPast ? `bills for ${ymLabel(shownYm)}`
+                                     : "bills"} /></>);
 
   const { proposals, archived, cadences } = q.data;
   const rows: Row[] = bills.map((b) => ({ ...b, cadenceLabel: b.cadence }));
@@ -528,59 +529,36 @@ export default function Bills({ autoDetect = false }:
                pdue: sp.get("pdue") ?? "", pdays: sp.get("pdays") ?? "" },
     cadences,
   };
-  const shownYm = isPast ? month : curYm;
   return (
-    <ZoneCtx.Provider value={me.data?.timezone}>
+    <>
     <PastMonthCtx.Provider value={isPast ? ymLabel(month) : null}>
-      <h1>{autoDetect ? "Bills & Income" : "Bills"}</h1>
-      {/* step back through the months: the per-bill paid/received below
-          are the month on view, as it ended; the schedule stays live */}
-      {!autoDetect && (
-        <div className="sub" style={{ display: "flex", gap: ".5rem", alignItems: "center",
-                                      flexWrap: "wrap", margin: "-.4rem 0 .8rem" }}>
-          <button aria-label="Previous month"
-                  onClick={() => setMonth(shiftYm(shownYm, -1))}>‹</button>
-          <b style={{ color: "var(--ink)" }}>{ymLabel(shownYm)}</b>
-          <button aria-label="Next month" disabled={!isPast}
-                  onClick={() => setMonth(shiftYm(shownYm, 1))}>›</button>
-          {isPast ? (
-            <>
-              <button onClick={() => setMonth(curYm)}>This month</button>
-              <span>· how the month ended: paid and received per bill. Edits change the live schedule.</span>
-            </>
-          ) : <span>· this month so far</span>}
-        </div>
-      )}
-      {/* HERO: what the schedule costs, which is otherwise a sum of a
-          dozen cadence groups done by eye. Both figures are the budget's own
-          evened-out monthly load, so this page and the Budget flow line
-          cannot disagree about the same bills. */}
+      {title}
+      {stepper}
+      {/* a failed refetch says the bills below are from before it (the
+          phone's line) */}
+      <StaleLine query={q} />
+      {/* HERO: the month in the plan's own terms — Bills, Income and what
+          is left after them — as the server words them (bills_hero), so
+          this page, Budget and Today say the same thing about the same
+          month. Nothing here is added up on the page. */}
       {!autoDetect && (
       <div className="card" style={{ marginTop: 0 }}>
         <div style={{ display: "flex", gap: "1rem", alignItems: "baseline",
                       flexWrap: "wrap" }}>
-          {totals && (
-            <span style={{ fontSize: "1.5rem", fontWeight: 700,
-                           letterSpacing: "-.01em" }}>
-              {money(totals.bills_monthly)}
-              <span className="sub" style={{ fontWeight: 400 }}>/mo bills</span>
-              {" · "}
-              <span className="pos"
-                    title={totals.income_basis === "actual"
-                      ? `what your income actually brought in, averaged over the last ${totals.income_months ?? 12} months of deposits`
-                      : "the schedule's rate — the current check annualised; the average of what landed takes over once three months have"}>
-                {money(totals.income_monthly)}</span>
-              <span className="sub" style={{ fontWeight: 400 }}>/mo income</span>
-              {" · "}
-              {/* the difference is what the variable budget and savings
-                  actually have to work with — the number the two figures
-                  beside it exist to produce */}
-              <span className={totals.income_monthly - totals.bills_monthly
-                                 >= 0 ? "pos" : "neg"}>
-                {money(totals.income_monthly - totals.bills_monthly)}</span>
-              <span className="sub" style={{ fontWeight: 400 }}>
-                /mo left for spending &amp; savings</span>
-            </span>
+          {/* the page's figures as labelled tiles, the way Net Worth
+              states its own: a sentence of figures has to be read, a row
+              of tiles is scanned */}
+          {totals?.hero && totals.hero.length > 0 && (
+            <div className={"grid herotiles cols" + Math.min(4, Math.max(2, totals.hero.length))}
+                 style={{ flex: "1 1 100%", marginTop: 0, gap: ".6rem" }}>
+              {totals.hero.map((t) => (
+                <div key={t.key} className="tile">
+                  <div className="sub">{t.label}</div>
+                  <div className={"kpi sm " + t.tone}>{money$(t.amount)}</div>
+                  <div className="sub">{t.note}</div>
+                </div>
+              ))}
+            </div>
           )}
           <span style={{ marginLeft: "auto", display: "flex", gap: ".5rem",
                          flexWrap: "wrap" }}>
@@ -606,10 +584,9 @@ export default function Bills({ autoDetect = false }:
         <div className="sub" style={{ marginTop: ".2rem", display: "flex",
                                       gap: ".9rem", flexWrap: "wrap",
                                       alignItems: "center" }}>
-          {totals && totals.week_count > 0 && (
-            <span>next 7 days: <b style={{ color: "var(--ink)" }}>
-              {money(totals.week_total)}</b> across {totals.week_count}{" "}
-              bill{totals.week_count === 1 ? "" : "s"}</span>
+          {totals?.week_text && (
+            <span>Next 7 days: <b style={{ color: "var(--ink)" }}>
+              {totals.week_text}</b></span>
           )}
           {proposals.length > 0 && (
             <a href="#proposals" style={{ textDecoration: "none" }}>
@@ -653,15 +630,15 @@ export default function Bills({ autoDetect = false }:
           </div>
         )}
         {undo && (
-          <div className="note" style={{ marginTop: ".4rem" }}>
+          <Note style={{ marginTop: ".4rem" }}>
             {undo.label}{" "}
             <button className="linklike" style={LINKLIKE}
                     disabled={toggle.isPending || acceptAmount.isPending}
                     onClick={() => { undo.act(); setUndo(null); }}>
               Undo</button>{" "}
-            <button className="linklike" style={LINKLIKE}
+            <button className="linklike" style={LINKLIKE} aria-label="Dismiss"
                     onClick={() => setUndo(null)}>✕</button>
-          </div>
+          </Note>
         )}
       </div>
       )}
@@ -699,7 +676,8 @@ export default function Bills({ autoDetect = false }:
             {mayEdit && proposals.length > 1 && (
               <button className="pri" style={{ alignSelf: "center" }}
                       disabled={approveAll.isPending || act.isPending}
-                      onClick={() => approveAll.mutate()}>
+                      onClick={() => approveAll.mutate(
+                        proposals.map((p) => p.id))}>
                 {approveAll.isPending ? "approving…"
                   : `Approve all ${proposals.length}`}
               </button>
@@ -711,22 +689,19 @@ export default function Bills({ autoDetect = false }:
             <thead>
               <tr><th>Change</th><th>Payee</th><th className="num">Amount</th>
                   <th>Cadence</th>
-                  <th className="hide-m">Evidence</th><th></th></tr>
+                  <th className="hide-m">Evidence</th>
+                    <th><span className="sr-only">Actions</span></th></tr>
             </thead>
             <tbody>
               {proposals.map((p) => (
                 <tr key={p.id}>
                   <td className="c-kind" style={{ whiteSpace: "nowrap" }}>
-                    <span className={"pill " + (p.kind === "remove" ? "r" : p.kind === "add" ? "g" : "a")}>
-                      {p.kind === "attach" ? "fee"
-                        : p.kind === "merchant" ? "add merchant" : catLabel(p.kind)}</span>
-                    {/* income proposals (paychecks) flagged distinctly */}
-                    {p.income && <>{" "}<span className="pill g"
-                      title="detected income / paycheck">income</span></>}
-                    {p.bill_type === "envelope" && <>{" "}<span className="pill m">envelope</span></>}
-                    {/* the LLM tag is one short word; it belongs beside the
-                        kind it qualifies */}
-                    {p.llm_tag && <>{" "}<span className="pill m">{p.llm_tag}</span></>}
+                    {/* the server's words for what approving does ("new
+                        bill", "stop tracking"); an older server sends none
+                        and the row shows no pill rather than composing one */}
+                    {p.change_text && (
+                      <span className={"pill " + (p.kind === "remove" ? "r" : p.kind === "add" ? "g" : "a")}>
+                        {p.change_text}</span>)}
                   </td>
                   <td className="c-payee"
                       style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -741,18 +716,15 @@ export default function Bills({ autoDetect = false }:
                   </td>
                   <td className="num c-amt">{money(p.amount)}</td>
                   <td className="mut c-cad">
-                    {p.bill_type === "envelope" ? "~/mo pooled"
-                      : p.frequency
-                        ? <>{onSeveralDays(p.by_month_day) ? p.cadence
-                              : p.frequency.toLowerCase()}
-                            {!onSeveralDays(p.by_month_day) && (p.interval ?? 1) > 1
-                              ? ` ×${p.interval}` : ""}
-                            {p.next_due ? ` · next ${mmdd(p.next_due)}` : ""}</>
-                        : p.cadence}
+                    {/* the server's next date, never one already past */}
+                    {[p.cadence_text, p.upcoming_due ? `next ${mmdd(p.upcoming_due)}` : null]
+                      .filter(Boolean).join(" · ")}
                   </td>
-                  <td className="mut hide-m c-ev" title={p.summary}
+                  <td className="mut hide-m c-ev"
+                      title={[p.tag_text, p.summary].filter(Boolean).join(" · ")}
                       style={{ maxWidth: "22rem", overflow: "hidden", textOverflow: "ellipsis",
-                               whiteSpace: "nowrap" }}>{p.summary}</td>
+                               whiteSpace: "nowrap" }}>
+                    {[p.tag_text, p.summary].filter(Boolean).join(" · ")}</td>
                   <td className="c-act" style={{ whiteSpace: "nowrap" }}>
                     {mayEdit && (<>
                     <button className="pri"
@@ -783,9 +755,6 @@ export default function Bills({ autoDetect = false }:
           <h2>Bills</h2>
           <BillTable groups={groupsOf(ordered, false)} isEnv={false}
                      edit={edit} mayEdit={mayEdit} {...rowHandlers} />
-          <div className="sub" style={{ marginTop: ".5rem" }}>
-            A healthy bill carries no status pill — a quiet row <b>is</b> the ✓.
-          </div>
         </div>
       )}
       {groupsOf(ordered, true).length > 0 && (
@@ -801,17 +770,20 @@ export default function Bills({ autoDetect = false }:
           NOT in the setup wizard: it pushes the step's Continue bar below
           the fold right after Approve all; the Bills page itself keeps it,
           and Archived follows it directly */}
-      {bills.length > 0 && !autoDetect && <UpcomingCalendar />}
+      {bills.length > 0 && !autoDetect && (isPast
+        ? (q.data.month_calendar
+            ? <MonthCalendar ym={month} days={q.data.month_calendar} /> : null)
+        : <UpcomingCalendar />)}
 
       {archived && archived.length > 0 && (
-        <details className="card">
-          <summary style={{ cursor: "pointer", color: "var(--mut)" }}>
+        <details className="card disclosure">
+          <summary className="mut">
             Archived — {archived.length} removed bill{archived.length > 1 ? "s" : ""} (history kept)
           </summary>
           {/* .bills-arch + c-*: restacked at <=620px like the live groups */}
           <table className="bills-arch" style={{ marginTop: ".6rem" }}>
             <thead><tr><th>Bill</th><th className="num">Amount</th><th>Cadence</th>
-              <th>Archived</th><th></th></tr></thead>
+              <th>Archived</th><th><span className="sr-only">Actions</span></th></tr></thead>
             <tbody>
               {archived.map((a) => (
                 <tr key={a.payee}>
@@ -844,13 +816,15 @@ export default function Bills({ autoDetect = false }:
 
       {bills.length === 0 && proposals.length === 0 && (
         <div className="card">
-          <p>No recurring bills yet. Import or connect your bank, then hit
-            <b> Find recurring bills</b> — the finder proposes everything it
-            can prove from your ledger.</p>
+          {/* the action is the button's own name, and only for those who
+              may run it (a viewer has none) */}
+          <EmptyState title={EMPTY_LINES.bills}
+            action={mayEdit && !detect.isPending ? EMPTY_LINES.billsAction : undefined}
+            onAction={() => detect.mutate()} />
         </div>
       )}
     </PastMonthCtx.Provider>
-    </ZoneCtx.Provider>
+    </>
   );
 }
 
@@ -905,13 +879,13 @@ function BillTableInner({ past, groups, isEnv, income, edit, mayEdit, onEdit, on
       <thead>
         {isEnv ? (
           <tr><th>Envelope</th><th className="num">Pool</th><th>Used</th>
-            <th>Status</th><th></th></tr>
+            <th>Status</th><th><span className="sr-only">Actions</span></th></tr>
         ) : (
           <tr><th>{income ? "Source" : "Bill"}</th>
             <th className="num">Amount</th>
             <th>{past ? "Due" : income ? "Next expected" : "Next due"}</th>
             <th>Cycle</th>
-            <th>Status</th><th></th></tr>
+            <th>Status</th><th><span className="sr-only">Actions</span></th></tr>
         )}
       </thead>
       <tbody>
@@ -961,26 +935,20 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
   const { disabled } = b;
   // the row knows its own pool — no need to thread the group's shape down
   const isAnnualEnv = isEnv && b.period_months === 12;
-  // cycle position from the row's cadence value (the label is the fallback)
-  const cadVal = b.cadence_value || cadenceFromLabel(b.cadenceLabel);
-  // a past month has no countdown: its occurrences were paid, missed, or
+  // the cycle position is the server's (cycle_frac, from the row's
+  // cadence value); a past month has no countdown: its occurrences were paid, missed, or
   // not due, and the cycle bar has nothing to measure
   const past = useContext(PastMonthCtx);
-  const zone = useContext(ZoneCtx);
-  const daysTo = !past && !isEnv && b.due_on ? daysUntil(b.due_on, zone) : null;
-  const cyc = onSeveralDays(b.by_month_day)
-    ? cycleDays("MONTHLY:1") / b.by_month_day.length : cycleDays(cadVal);
   const settled = b.occurrences > 0 && b.paid >= b.occurrences;
   const missed = !!past && !settled && b.occurrences > 0;
-  const overdue = !settled && daysTo !== null && daysTo < 0;
+  const overdue = b.due_tone === "late" || b.due_tone === "withdrawn";
   // a missed bill whose charge the bank feed withdrew: still unpaid, but a
   // warning to check rather than a missed payment — amber, not red
-  const withdrawn = overdue && !!b.withdrawn_on;
+  const withdrawn = b.due_tone === "withdrawn";
   const withdrawnNote = withdrawn
     ? `charge withdrawn by the bank feed (${mmdd(b.withdrawn_on)})` : undefined;
-  const soon = !settled && daysTo !== null && daysTo >= 0 && daysTo <= SOON_DAYS;
-  const frac = daysTo === null || cyc <= 0 ? 0
-    : Math.min(1, Math.max(0, 1 - daysTo / cyc));
+  const soon = b.due_tone === "soon";
+  const frac = b.cycle_frac ?? 0;
   return (
     <>
       {/* .billrow(.env) + c-* cell names anchor the <=620px grid restack in
@@ -992,7 +960,8 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
             style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           <Link to={`/bills/history?payee=${encodeURIComponent(b.payee)}`}>
             {b.payee}</Link></td>
-        <td className="num c-amt">{money(b.amount + (b.fee_total || 0))}
+        {/* the server's sum of the bill and its fees (amount_with_fees) */}
+        <td className="num c-amt">{money(b.amount_with_fees)}
           {b.fee_total ? (
             <span className="mut" style={{ fontSize: 11, marginLeft: 4 }}
                   title={b.companions.map((c) =>
@@ -1004,36 +973,41 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
           // the pool is stated once in Amount; this cell shows PROGRESS
           // against it, in the money map's language, instead of repeating
           // "$412 of $600" beside a column that already said $600
+          // — the bar's fill is the server's `period_frac` (the phone draws
+          // the same one); a server without it draws no bar
           <td className="c-used">
-            <span className="envbar" title={`${money(b.period_used ?? b.used ?? 0)} of ${money(b.amount)}`}>
-              <i className={(b.overflow ?? 0) > 0.005 ? "over" : ""}
-                 style={{ width: `${Math.min(100, b.amount > 0
-                   ? (100 * (b.period_used ?? b.used ?? 0)) / b.amount : 0)}%` }} />
-            </span>
+            {b.period_frac != null && (
+              <span className="envbar"
+                    title={b.pool_text
+                      ?? `${money(b.period_used)} of ${money(b.pool)}`}>
+                <i className={(b.overflow ?? 0) > 0.005 ? "over" : ""}
+                   style={{ width: `${100 * b.period_frac}%` }} />
+              </span>
+            )}
           </td>
         ) : (
           <td className="mut c-due" style={{ whiteSpace: "nowrap" }}>
             {past
               ? (b.next_unpaid ? mmdd(b.next_unpaid) : "\u00b7")
-              : b.due_on ? mmdd(b.due_on) : "\u00b7"}</td>
+              : b.due_label ?? "\u00b7"}</td>
         )}
         {!isEnv && (
           // the bar says where you are in the cycle; the words beside it say
           // what the right edge IS — "in 12 days", "due today", "3 days late"
           // — in the bar's own colour, because the bar alone is not
-          // intuitive. Amber inside SOON_DAYS, red once overdue.
+          // intuitive. Amber when soon, red once overdue (the server's due_tone).
           <td className="c-cycle">
             <span className="cycle-cell">
               <span className="envbar"
-                    title={daysTo === null ? undefined
+                    title={b.cycle_frac == null ? undefined
                       : `${Math.round(frac * 100)}% through the cycle`}>
                 <i className={withdrawn ? "soon" : overdue ? "over" : soon ? "soon" : ""}
                    style={{ width: `${frac * 100}%` }} />
               </span>
-              {daysTo !== null && !settled ? (
+              {b.due_text ? (
                 <span className={`cycle-words ${withdrawn ? "a" : overdue ? "r" : soon ? "a" : "g"}`}
                       title={withdrawnNote}>
-                  {dueText(daysTo, b.income)}</span>
+                  {b.due_text}</span>
               ) : null}
             </span>
           </td>
@@ -1044,7 +1018,9 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
             bill wanting a decision says anything. "off-ledger" is not a
             fault (cash and manual bills live there), so it lives in the
             edit expander. */}
-        <td className="c-state" style={{ whiteSpace: "nowrap", overflow: "hidden" }}>
+        {/* the status wraps rather than clip: a paid count with its last
+            and next dates was cut off mid-word at desktop width */}
+        <td className="c-state">
           {disabled ? <span className="pill m">disabled</span>
             : past && !isEnv && !settled ? (
               // the month on view is over: paid, missed, or never due
@@ -1056,31 +1032,40 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
             ) : isEnv ? (
               (b.overflow ?? 0) > 0.005
                 ? <span className="pill r">over +{money(b.overflow!)}</span>
-                : (b.period_left ?? b.amount - (b.used ?? 0)) <= b.amount * 0.001
-                  ? <span className="pill a">full</span>
+                // what is left of the pool is the server's (period_left)
+                : b.period_left == null ? null
+                : b.period_left <= b.amount * 0.001
+                  // the pool is spent: "used up", not "full" (which read
+                  // as a pool still holding its money)
+                  ? <span className="pill a">used up{isAnnualEnv ? " this year" : ""}</span>
                   : <span className="sub">
-                      {money(b.period_left ?? b.amount - (b.used ?? 0))} left
+                      {money(b.period_left)} left
                       {isAnnualEnv ? " this year" : ""}</span>
             ) : b.income
               ? (settled
-                  ? <span className="sub">received ✓{b.paid > 1
-                      ? ` \u00d7${b.paid}` : ""}</span>
-                  : daysTo !== null
+                  // the server's words: "received 05/15", "2 of 2 received"
+                  ? <span className="sub">{b.paid_text}</span>
+                  : b.due_text
                     // the Cycle column already says this on desktop; the
                     // copy here is for phone width, where Cycle is hidden
-                    ? <span className="sub cycle-dup">{dueText(daysTo, true)}</span>
+                    ? <>{b.paid_text && <span className="sub">{b.paid_text} </span>}
+                        <span className="sub cycle-dup">{b.due_text}</span></>
                     // dateless but unsettled must still say so \u2014 a blank
                     // status cell is reserved for "nothing to decide"
                     : <span className="pill m"
                         title="expected, but no date on file">awaiting</span>)
             : settled
-              ? <span className="sub">paid ✓</span>
+              // the server's words: "paid 05/03 · next 06/03" when the
+              // date beside it is already next month's, "2 of 2 paid"
+              ? <span className="sub">{b.paid_text}</span>
               : withdrawn
                 ? <span className="pill a" title={withdrawnNote}>withdrawn</span>
               : overdue
                 ? <span className="pill r">overdue</span>
-                : daysTo !== null
-                  ? <span className="sub cycle-dup">{dueText(daysTo)}</span>
+                : b.due_text
+                  // a bill due twice that is half paid says "1 of 2 paid"
+                  ? <>{b.paid_text && <span className="sub">{b.paid_text} </span>}
+                      <span className="sub cycle-dup">{b.due_text}</span></>
                   // same rule for bills: unpaid with no due date is a state,
                   // not silence
                   : <span className="pill m"
@@ -1100,6 +1085,7 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
               {" "}{hpill(b.health, b.last_seen)}
               {mayEdit && (
               <button title="dismiss this flag — it returns only if the problem changes"
+                      aria-label="Dismiss this flag"
                       style={FLAGBTN} disabled={hintBusy}
                       onClick={() => onHint(b.payee, "dismiss", "health")}>✕</button>
               )}
@@ -1145,6 +1131,7 @@ function BillRows({ b, isEnv, cols, editing, mayEdit, onEdit,
                 💡</Link>
               {mayEdit && (
               <button title="dismiss this hint — it returns only if the ledger fit changes"
+                      aria-label="Dismiss this hint"
                       style={FLAGBTN} disabled={hintBusy}
                       onClick={() => onHint(b.payee, "dismiss", "fit")}>✕</button>
               )}
@@ -1243,7 +1230,7 @@ function AddBillForm({ onCancel, onSaved }:
               e.preventDefault();
               if (payee.trim() && amount) save.mutate(false);
             }}>
-        <input type="text" required list="known-merchants"
+        <input aria-label="Merchant" type="text" required list="known-merchants"
                placeholder="merchant — pick a known one or type a new name"
                title="pick an existing merchant so this bill matches its past + future transactions"
                value={payee} style={{ width: "18rem" }}
@@ -1253,10 +1240,10 @@ function AddBillForm({ onCancel, onSaved }:
             <option key={m} value={m} />
           ))}
         </datalist>
-        <label className="mut">$ <input type="number" step="0.01" min="0"
+        <label className="mut">$ <input aria-label="Amount" type="number" step="0.01" min="0"
                required placeholder="0.00" value={amount} style={{ width: "7rem" }}
                onChange={(e) => setAmount(e.target.value)} /></label>
-        <select value={mode} onChange={(e) => setMode(e.target.value)}>
+        <select aria-label="How often" value={mode} onChange={(e) => setMode(e.target.value)}>
           {SIMPLE_CADENCES.map(([v, label]) => (
             <option key={v} value={v}>{label}</option>
           ))}
@@ -1283,7 +1270,7 @@ function AddBillForm({ onCancel, onSaved }:
                    onChange={(e) => setCategory(e.target.value)} />
             <datalist id="add-bill-categories">
               {(cats.data?.categories ?? []).map((c) => (
-                <option key={c} value={c} />
+                <option key={c} value={c} label={catLabel(c)} />
               ))}
             </datalist>
           </label>
@@ -1394,13 +1381,14 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
         <form style={{ display: "flex", gap: ".5rem", alignItems: "center",
                        flexWrap: "wrap", padding: ".2rem 0" }}
               onSubmit={(e) => { e.preventDefault(); save.mutate(); }}>
-          <input type="text" required value={payee} style={{ width: "16rem" }}
+          <input aria-label="Merchant" type="text" required value={payee} style={{ width: "16rem" }}
                  title="renaming changes ledger matching (first significant word of the name)"
                  onChange={(e) => setPayee(e.target.value)} />
-          <label className="mut">$ <input type="number" step="0.01" min="0"
+          <label className="mut">$ <input aria-label="Amount" type="number" step="0.01" min="0"
                  value={amount} style={{ width: "6.5rem" }}
                  onChange={(e) => setAmount(e.target.value)} /></label>
-          <select value={cadence} onChange={(e) => setCadence(e.target.value)}>
+          <select aria-label="How often"
+                  value={cadence} onChange={(e) => setCadence(e.target.value)}>
             {/* the bill's saved interval (and a ledger-fit prefill) stay
                 pickable even when the server's standard list lacks them */}
             {withSeveralDays(cadenceChoices(cadences, [d.cadence_value, prefill.pcad]),
@@ -1436,7 +1424,7 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
               </label>
               <datalist id="bill-categories">
                 {(cats.data?.categories ?? []).map((c) => (
-                  <option key={c} value={c} />
+                  <option key={c} value={c} label={catLabel(c)} />
                 ))}
               </datalist>
               <label className="mut"
@@ -1444,7 +1432,13 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
                 <input type="checkbox" checked={matchCat && !!category.trim()}
                        disabled={!category.trim()}
                        onChange={(e) => setMatchCat(e.target.checked)} />
-                {" "}count all {category.trim() || "category"} spending
+                {" "}count all {category.trim() ? catLabel(category.trim()) : "category"} spending
+                {/* the envelope's own charges carry another category: say
+                    so, so the box is not ticked on a guess */}
+                {d.charges_category && category.trim()
+                  && catLabel(d.charges_category) !== catLabel(category.trim()) && (
+                  <span className="sub"> — its charges this month are{" "}
+                    {catLabel(d.charges_category)}</span>)}
               </label>
             </>
           )}
@@ -1463,13 +1457,15 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
               <span key={m} className="pill m" style={{ marginLeft: ".35rem" }}>
                 {m}{" "}
                 <button type="button" className="linklike" title="remove"
+                        aria-label={`Remove ${m}`}
                         onClick={() => setMerchants(merchants.filter((x) => x !== m))}>
                   ×</button>
               </span>
             ))}
             {merchants.length < 20 && (
               <>
-                <input type="text" list="bill-merchants" value={newMerchant}
+                <input aria-label="Add a merchant"
+                       type="text" list="bill-merchants" value={newMerchant}
                        placeholder="add a merchant"
                        style={{ width: "12rem", marginLeft: ".35rem" }}
                        onChange={(e) => setNewMerchant(e.target.value)}
@@ -1493,16 +1489,20 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
               {fees.map((f, i) => (
                 <div key={i} style={{ display: "flex", gap: ".35rem",
                                       alignItems: "center", marginTop: ".25rem" }}>
-                  <input value={f.tokens} placeholder="words on the charge"
+                  <input aria-label={`Fee ${i + 1}: words on the charge`}
+                         value={f.tokens} placeholder="words on the charge"
+                         maxLength={FEE_WORDS_MAX}
                          style={{ width: "12rem" }}
                          onChange={(e) => setFees(fees.map((x, j) =>
                            j === i ? { ...x, tokens: e.target.value } : x))} />
-                  <input value={f.amount} placeholder="$" inputMode="decimal"
+                  <input aria-label={`Fee ${i + 1}: amount`}
+                         value={f.amount} placeholder="$" inputMode="decimal"
                          style={{ width: "4.5rem" }}
                          onChange={(e) => setFees(fees.map((x, j) =>
                            j === i ? { ...x, amount: e.target.value } : x))} />
                   <span>within</span>
-                  <input value={f.window_days} inputMode="numeric"
+                  <input aria-label={`Fee ${i + 1}: within how many days`}
+                         value={f.window_days} inputMode="numeric"
                          style={{ width: "2.5rem" }}
                          onChange={(e) => setFees(fees.map((x, j) =>
                            j === i ? { ...x, window_days: e.target.value } : x))} />
@@ -1566,6 +1566,8 @@ function EditRow({ d, cadences, cols, prefill, togglePending, pendingDelete,
   );
 }
 
+type CalDay = CalendarData["calendar"][number];
+
 function UpcomingCalendar() {
   const q = useQuery({ queryKey: ["calendar"], queryFn: () => api.calendar(35) });
   // a fetch that never resolves would render as nothing at all — the
@@ -1574,79 +1576,149 @@ function UpcomingCalendar() {
     return (
       <div className="card">
         <h2>Next five weeks</h2>
-        {q.isPending ? <p className="mut">loading…</p> : (
-          <p className="mut">Couldn't load the calendar —{" "}
-            <button className="linklike" style={LINKLIKE}
-                    onClick={() => q.refetch()}>retry</button>
-          </p>
-        )}
+        {q.isPending ? <p className="mut">loading…</p>
+          : <FailedLine q={q} what="the calendar" />}
       </div>
     );
   }
-  const byDate = new Map(q.data.calendar.map((d) => [d.date, d]));
-
-  // 5 ISO weeks starting Monday of the current week
-  const start = new Date(q.data.start + "T00:00:00");
-  const monday = new Date(start);
-  monday.setDate(start.getDate() - ((start.getDay() + 6) % 7));
-  const cells: Date[] = Array.from({ length: 35 }, (_, i) => {
-    const d = new Date(monday);
-    d.setDate(monday.getDate() + i);
-    return d;
-  });
-  const iso = (d: Date) =>
-    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   // browser-local today. The server's start is the HOUSEHOLD's day, not
   // UTC-today — UTC would highlight tomorrow for a US evening user — and
   // the device clock still wins for a travelling user. Events before
   // local-today stay dimmed either way.
-  const todayIso = iso(new Date());
+  const todayIso = isoDay(new Date());
+  const twoWeeks = new Date();
+  twoWeeks.setDate(twoWeeks.getDate() + 13);
+  return <CalendarGrid title="Next five weeks" startIso={q.data.start}
+                       weeks={5} days={q.data.calendar} todayIso={todayIso}
+                       agendaTitle="The next two weeks"
+                       agendaFrom={todayIso} agendaTo={isoDay(twoWeeks)} />;
+}
 
-  // The grid IS the agenda: each day carries its total and labels, and
+/** A closed month's calendar: the bills it paid on the days they were
+ *  paid, the paychecks it received, and the bills it left unpaid on their
+ *  due days — from the Bills reply for that month, nothing added here. */
+function MonthCalendar({ ym, days }: { ym: string; days: CalDay[] }) {
+  const first = new Date(ym + "-01T00:00:00");
+  const last = new Date(first.getFullYear(), first.getMonth() + 1, 0);
+  const lead = (first.getDay() + 6) % 7;
+  const weeks = Math.ceil((lead + last.getDate()) / 7);
+  return <CalendarGrid title={ymLabel(ym)} startIso={ym + "-01"}
+                       weeks={weeks} days={days} todayIso={null}
+                       inMonth={ym} agendaTitle={`${ymLabel(ym)}, day by day`}
+                       agendaFrom={ym + "-01"} agendaTo={isoDay(last)} />;
+}
+
+const isoDay = (d: Date) =>
+  `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+
+function CalendarGrid({ title, startIso, weeks, days, todayIso, inMonth,
+                        agendaTitle, agendaFrom, agendaTo }: {
+  title: string; startIso: string; weeks: number; days: CalDay[];
+  /** null: a closed month — no day is "today" and none is dimmed */
+  todayIso: string | null;
+  /** a month's grid: the padding days of its neighbours stay empty */
+  inMonth?: string;
+  agendaTitle: string; agendaFrom: string; agendaTo: string;
+}) {
+  const byDate = new Map(days.map((d) => [d.date, d]));
+  // whole ISO weeks starting Monday of the start's week
+  const start = new Date(startIso + "T00:00:00");
+  const monday = new Date(start);
+  monday.setDate(start.getDate() - ((start.getDay() + 6) % 7));
+  const cells: Date[] = Array.from({ length: weeks * 7 }, (_, i) => {
+    const d = new Date(monday);
+    d.setDate(monday.getDate() + i);
+    return d;
+  });
+
+  // The grid IS the agenda: each day carries its figures and labels, and
   // the full list sits in the cell's tooltip. Per-date cards below it
   // would repeat the same events in a second shape and push the Archived
-  // table off the bottom of the page.
+  // table off the bottom of the page — on a wide screen. At phone width a
+  // seventh of the screen holds four letters of a payee, which named
+  // nothing, so there the cells carry only the day's figures and a short
+  // list names what is due (index.css shows one or the other).
+  const soon = cells.map(isoDay).filter((k) => k >= agendaFrom
+    && k <= agendaTo && (byDate.get(k)?.events.length ?? 0) > 0);
+  const WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
   return (
     <div className="card">
-      <h2>Next five weeks</h2>
+      <h2>{title}</h2>
       <div className="cal-grid">
         {["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].map((d) => (
           <div key={d} className="cal-head">{d}</div>
         ))}
         {cells.map((d) => {
-          const key = iso(d);
-          const day = byDate.get(key);
-          const past = key < todayIso;
+          const key = isoDay(d);
+          const outside = !!inMonth && key.slice(0, 7) !== inMonth;
+          const day = outside ? undefined : byDate.get(key);
+          const past = todayIso !== null && key < todayIso;
+          const show = !!day && !past;
           return (
             <div key={key}
                  className={"cal-cell" + (key === todayIso ? " today" : "") +
-                            (past ? " past" : "")}
+                            (past || outside ? " past" : "")}
                  title={day?.events.map((e) =>
-                   `${e.label} ${money(Math.abs(e.amount))}`).join("\n")}>
+                   `${e.label} ${e.amount > 0 ? "+" : "−"}${money(Math.abs(e.amount))}`).join("\n")}>
               <span className="cal-day">{d.getDate()}</span>
-              {day && !past && (
-                <span className={"cal-amt " + (day.total > 0 ? "in" : "out")}>
-                  {money(Math.abs(day.total))}
-                </span>
-              )}
-              {day && !past && day.events.slice(0, 2).map((e, i) => (
-                <span key={i} className="cal-label">{e.label}</span>
+              {/* a day's in and out, each with its sign, never netted: a
+                  paycheck and a bill on one day are two facts, and a net
+                  hid the bill behind the paycheck. Whole dollars — a cell
+                  is a seventh of the page (the hover keeps the cents) */}
+              {show && day.came_in > 0 && (
+                <span className="cal-amt in">+{money$(day.came_in)}</span>)}
+              {show && day.went_out > 0 && (
+                <span className="cal-amt out">−{money$(day.went_out)}</span>)}
+              {/* the name and what its figure is on lines of their own:
+                  joined, a narrow cell cut "full balance" mid-word */}
+              {show && day.events.slice(0, 2).map((e, i) => (
+                <span key={i} className="cal-label">{e.name}
+                  {e.note && <span className="cal-note">{e.note}</span>}</span>
               ))}
-              {day && !past && day.events.length > 2 && (
-                <span className="cal-label mut">+{day.events.length - 2} more</span>
+              {show && day.events.length > 2 && (
+                <span className="cal-label mut">+{day.events.length - 2}<span className="hide-m"> more</span></span>
               )}
             </div>
           );
         })}
       </div>
+      {soon.length > 0 && (
+        <div className="cal-agenda">
+          <div className="sub" style={{ margin: ".8rem 0 .3rem" }}>
+            {agendaTitle}</div>
+          {soon.map((k) => {
+            const day = byDate.get(k)!;
+            const d = new Date(k + "T00:00:00");
+            return (
+              <div key={k} className="cal-ag-day">
+                <span className="cal-ag-date">
+                  {WD[d.getDay()]} {d.getDate()}</span>
+                <div className="cal-ag-evs">
+                  {day.events.map((e, i) => (
+                    <div key={i} className="cal-ag-ev">
+                      <span className="cal-ag-name">{e.name}
+                        {e.note && <span className="cal-note">{e.note}</span>}</span>
+                      {/* a bill on a card moves no checking that day:
+                          greyed, as the Today timeline greys it */}
+                      <span className={"num " + (e.amount > 0 ? "pos"
+                                                 : e.kind === "on_card" ? "mut" : "")}>
+                        {e.amount > 0 ? "+" : ""}{money(Math.abs(e.amount))}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
 
 // One line of the triage queue: severity dot, the story the ledger tells,
-// and the ONE action the server's evidence supports. The story is built
-// from fields the row already carries (last_match, cycle_days, last_seen,
-// suggestion) — the client never invents an action or a number.
+// and the ONE action the server's evidence supports. The story is the
+// server's (attention_text, api_bills.attention_words) — the client never
+// invents an action, a date or a number.
 function AttentionLine({ b, mayEdit, busy, onJump, onAccept, onDisable,
                          onDismiss }: {
   b: Bill; mayEdit: boolean; busy: boolean; onJump: () => void;
@@ -1654,41 +1726,19 @@ function AttentionLine({ b, mayEdit, busy, onJump, onAccept, onDisable,
   onDismiss: () => void;
 }) {
   const s = b.suggestion;
-  const plusDays = (iso: string, d: number) => {
-    const t = new Date(iso + "T00:00:00Z");
-    t.setUTCDate(t.getUTCDate() + d);
-    return t.toISOString().slice(0, 10);
-  };
-  // the stale verdict is judged on ANY charge from the merchant, so the
-  // story's "nothing since" must be the newest one — an off-amount charge
-  // newer than the last exact match is still activity
-  const lastSeen = b.last_seen?.date
-    && (!b.last_match || b.last_seen.date > b.last_match)
-    ? b.last_seen.date : b.last_match;
-  const story =
-    b.health === "stale"
-      ? `missed its${lastSeen && b.cycle_days
-          ? ` ~${mmdd(plusDays(lastSeen, b.cycle_days))}` : ""} cycle — ` +
-        (lastSeen ? `nothing since ${mmdd(lastSeen)}`
-                  : "no matching charge on record")
-    : b.health === "mismatch"
-      ? (s?.action === "accept_amount" && s.amount !== undefined
-          ? `charges now run ${money(s.amount)}, bill says ${money(b.amount)}`
-          : `charges near ${b.last_seen ? money(b.last_seen.amount) : "?"}` +
-            `${b.last_seen ? ` on ${mmdd(b.last_seen.date)}` : ""}, ` +
-            `bill says ${money(b.amount)} — amounts vary`)
-    : b.health === "drifting"
-      ? "amount wandering — auto-corrects tonight"
-      : "payments match, but the due-date anchor is off the real draft day";
+  const story = b.attention_text ?? "";
   return (
-    <div style={{ display: "flex", gap: ".7rem", alignItems: "center",
+    <div style={{ display: "flex", gap: ".4rem .7rem", alignItems: "center",
                   padding: ".45rem .7rem",
+                  // at a phone width the buttons drop under the sentence
+                  // instead of squeezing it into a column of two words
+                  flexWrap: "wrap", justifyContent: "flex-end",
                   borderBottom: "1px solid var(--line)", fontSize: 13 }}>
       <span style={{ width: 8, height: 8, borderRadius: "50%", flex: "none",
                      background: b.health === "stale"
                        ? "var(--bad, #f85149)" : "var(--warn, #d29922)" }} />
       <button className="linklike" onClick={onJump}
-              style={{ ...LINKLIKE, flex: 1, textAlign: "left",
+              style={{ ...LINKLIKE, flex: "1 1 13rem", textAlign: "left",
                        fontSize: 13 }}>
         <b>{b.payee}</b> {story}
       </button>

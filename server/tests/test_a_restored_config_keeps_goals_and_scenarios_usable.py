@@ -113,7 +113,8 @@ class ARestoredConfigStaysReadable(unittest.TestCase):
         self._pages_read_it(cfg)
 
     def test_an_asset_keeps_only_what_the_settings_door_stores(self):
-        # the Settings save keeps name, kind, value and as-of; a crafted
+        # the Settings save keeps name, kind, value, as-of and the day it
+        # was acquired (an archive without one: its as-of); a crafted
         # archive's other keys, of any size, must not ride into settings
         cfg, _ = self._restore({"manual_assets": [
             {"name": "Home", "kind": "property", "value": 250000,
@@ -121,7 +122,7 @@ class ARestoredConfigStaysReadable(unittest.TestCase):
              "rate": float("nan"), "monthly_delta": [1] * 1000}]})
         self.assertEqual(cfg["manual_assets"], [
             {"name": "Home", "kind": "property", "value": 250000.0,
-             "as_of": "2026-01-01"}])
+             "as_of": "2026-01-01", "acquired_on": "2026-01-01"}])
         self._pages_read_it(cfg)
 
     def test_a_non_finite_number_in_an_unchecked_key_never_aborts(self):

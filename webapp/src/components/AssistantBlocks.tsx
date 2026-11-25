@@ -8,12 +8,20 @@
 import { useState } from "react";
 import { money } from "../api/client";
 import { parseRich } from "../richtext";
+import { chartSentence, stepPoint } from "../chartsummary";
 
 export interface SeriesSpec { name: string; values: number[] }
+/** what a ring prints, the server's (assistant_blocks.ring_figures): the
+ *  centre total and each drawn part's whole dollars and share, adding up
+ *  to the total and to 100 */
+export interface RingShown {
+  total: number;
+  rows: { label: string; dollars: number; share: number | null }[];
+}
 export type AnswerBlock =
   | { kind: "text"; text: string }
   | { kind: "bar" | "line" | "pie"; title: string; labels: string[];
-      series: SeriesSpec[] }
+      series: SeriesSpec[]; shown?: RingShown | null }
   | { kind: "table"; title: string; columns: string[];
       rows: (string | number)[][] };
 
@@ -44,9 +52,10 @@ export default function AssistantBlocks({ blocks }: { blocks: AnswerBlock[] }) {
             <DataTable columns={b.columns} rows={b.rows} />
           </Figure>;
         return <Figure key={i} title={b.title}>
-          {b.kind === "bar" && <BarChart labels={b.labels} series={b.series} />}
-          {b.kind === "line" && <LineChart labels={b.labels} series={b.series} />}
-          {b.kind === "pie" && <PieChart labels={b.labels} series={b.series} />}
+          {b.kind === "bar" && <BarChart title={b.title} labels={b.labels} series={b.series} />}
+          {b.kind === "line" && <LineChart title={b.title} labels={b.labels} series={b.series} />}
+          {b.kind === "pie" && <PieChart labels={b.labels} series={b.series}
+                                         shown={b.shown} />}
           {b.kind !== "pie" && b.series.length > 1 && <Legend series={b.series} />}
           <Numbers labels={b.labels} series={b.series} />
         </Figure>;
@@ -105,8 +114,8 @@ function Numbers({ labels, series }: { labels: string[]; series: SeriesSpec[] })
   const [open, setOpen] = useState(false);
   return (
     <div style={{ marginTop: ".4rem" }}>
-      <button style={{ fontSize: 12 }} onClick={() => setOpen((o) => !o)}>
-        {open ? "hide numbers" : "show numbers"}
+      <button style={{ fontSize: 12 }} aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+        {open ? "Hide numbers" : "Show numbers"}
       </button>
       {open && (
         <DataTable columns={["", ...series.map((s) => s.name)]}
@@ -135,13 +144,42 @@ function DataTable({ columns, rows, fmt = plain }: {
   );
 }
 
+/** What a chart says to a screen reader and how the keyboard walks it:
+ *  the sentence (picks from the drawn values, chartsummary.ts), arrow
+ *  keys moving the same tooltip the mouse does, and the live line that
+ *  reads where they landed. */
+function useChartWords(title: string, labels: string[], series: SeriesSpec[],
+                       hover: number | null, setHover: (i: number | null) => void) {
+  const [spoken, setSpoken] = useState("");
+  const named = series.map((s) => ({
+    name: s.name, points: labels.map((l, i) => [l, s.values[i]] as const) }));
+  const svg = {
+    role: "img", tabIndex: 0,
+    "aria-label": chartSentence(title || series[0]?.name || "Chart", named, (v) => money(v))
+      + " Arrow keys read each point.",
+    onKeyDown: (e: React.KeyboardEvent) => {
+      const i = stepPoint(e.key, hover, labels.length);
+      if (i === null) return;
+      e.preventDefault();
+      setHover(i);
+      setSpoken(`${labels[i]}: ` + series.map((s) => (series.length > 1 ? `${s.name} ` : "")
+        + money(s.values[i])).join(", "));
+    },
+    onBlur: () => setHover(null),
+  };
+  const live = <span className="sr-only" aria-live="polite">{spoken}</span>;
+  return { svg, live };
+}
+
 function ticks(values: number[]) {
   const ymin = Math.min(0, ...values), ymax = Math.max(0, ...values);
   return { ymin, ymax, span: ymax - ymin || 1 };
 }
 
-function BarChart({ labels, series }: { labels: string[]; series: SeriesSpec[] }) {
+function BarChart({ title, labels, series }: { title: string; labels: string[];
+                                               series: SeriesSpec[] }) {
   const [hover, setHover] = useState<number | null>(null);
+  const words = useChartWords(title, labels, series, hover, setHover);
   const W = 720, H = 240, padL = 58, padR = 10, padT = 14, padB = 34;
   const iw = W - padL - padR, ih = H - padT - padB;
   const n = labels.length, k = series.length;
@@ -152,7 +190,8 @@ function BarChart({ labels, series }: { labels: string[]; series: SeriesSpec[] }
   const y0 = Y(0);
   const every = n <= 24 ? 1 : Math.max(1, Math.floor(n / 12));
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", marginTop: 6 }}
+    <>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", marginTop: 6 }} {...words.svg}
          onMouseLeave={() => setHover(null)}>
       {[ymax, (ymax + ymin) / 2, ymin].map((v, i) => (
         <g key={i}>
@@ -202,11 +241,15 @@ function BarChart({ labels, series }: { labels: string[]; series: SeriesSpec[] }
         </g>
       )}
     </svg>
+    {words.live}
+    </>
   );
 }
 
-function LineChart({ labels, series }: { labels: string[]; series: SeriesSpec[] }) {
+function LineChart({ title, labels, series }: { title: string; labels: string[];
+                                                series: SeriesSpec[] }) {
   const [hover, setHover] = useState<number | null>(null);
+  const words = useChartWords(title, labels, series, hover, setHover);
   const W = 720, H = 240, padL = 58, padR = 10, padT = 14, padB = 26;
   const iw = W - padL - padR, ih = H - padT - padB;
   const n = labels.length;
@@ -220,7 +263,8 @@ function LineChart({ labels, series }: { labels: string[]; series: SeriesSpec[] 
     setHover(Math.max(0, Math.min(n - 1, Math.round(((fx - padL) / iw) * (n - 1)))));
   };
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", marginTop: 6 }}
+    <>
+    <svg viewBox={`0 0 ${W} ${H}`} style={{ width: "100%", marginTop: 6 }} {...words.svg}
          onMouseMove={onMove} onMouseLeave={() => setHover(null)}>
       {[ymax, (ymax + ymin) / 2, ymin].map((v, i) => (
         <g key={i}>
@@ -257,43 +301,51 @@ function LineChart({ labels, series }: { labels: string[]; series: SeriesSpec[] 
         </g>
       )}
     </svg>
+    {words.live}
+    </>
   );
 }
 
 /** parts of a whole as a ring, the legend carrying value and share — a
  *  ring with the total in the middle, as the emailed reports draw it */
-function PieChart({ labels, series }: { labels: string[]; series: SeriesSpec[] }) {
+function PieChart({ labels, series, shown }: { labels: string[]; series: SeriesSpec[];
+                                               shown?: RingShown | null }) {
   const vals = series[0].values;
   const segs = labels.map((l, i) => [l, vals[i]] as const).filter(([, v]) => v > 0);
-  const total = segs.reduce((a, [, v]) => a + v, 0) || 1;
+  // the arcs' geometry only; what the ring prints is the server's `shown`
+  const whole = segs.reduce((a, [, v]) => a + v, 0) || 1;
   const size = 180, r = size / 2 - 14, cx = size / 2, cy = size / 2, sw = 26;
   const circ = 2 * Math.PI * r;
   let off = 0;
   return (
     <div style={{ display: "flex", gap: "1.2rem", alignItems: "center", flexWrap: "wrap", marginTop: 6 }}>
-      <svg viewBox={`0 0 ${size} ${size}`} width={size} height={size}>
+      {/* the legend reads every part; the centre total is said first */}
+      {shown && <span className="sr-only">Total {money(shown.total)}</span>}
+      <svg viewBox={`0 0 ${size} ${size}`} width={size} height={size} aria-hidden="true">
         {segs.map(([l, v], i) => {
-          const dash = (v / total) * circ;
+          const dash = (v / whole) * circ;
           const el = (
             <circle key={i} cx={cx} cy={cy} r={r} fill="none"
                     stroke={PALETTE[i % PALETTE.length]} strokeWidth={sw}
                     strokeDasharray={`${dash} ${circ - dash}`} strokeDashoffset={-off}
                     transform={`rotate(-90 ${cx} ${cy})`}>
-              <title>{`${l}: ${money(v)}`}</title>
+              <title>{shown ? `${l}: ${money(shown.rows[i].dollars)}` : l}</title>
             </circle>
           );
           off += dash;
           return el;
         })}
-        <text x={cx} y={cy - 2} textAnchor="middle" fontSize="17" fontWeight={600} fill="var(--ink)">{money(total)}</text>
-        <text x={cx} y={cy + 16} textAnchor="middle" fontSize="11" fill="var(--mut)">total</text>
+        {shown && <>
+          <text x={cx} y={cy - 2} textAnchor="middle" fontSize="17" fontWeight={600} fill="var(--ink)">{money(shown.total)}</text>
+          <text x={cx} y={cy + 16} textAnchor="middle" fontSize="11" fill="var(--mut)">total</text>
+        </>}
       </svg>
       <div style={{ fontSize: 13 }}>
-        {segs.map(([l, v], i) => (
+        {(shown?.rows ?? []).map((row, i) => (
           <div key={i} style={{ display: "flex", alignItems: "center", gap: 8, margin: "3px 0" }}>
             <span style={{ width: 10, height: 10, borderRadius: 3, background: PALETTE[i % PALETTE.length] }} />
-            {l} <b>{money(v)}</b>
-            <span className="mut">{Math.round((v / total) * 100)}%</span>
+            {row.label} <b>{money(row.dollars)}</b>
+            {row.share !== null && <span className="mut">{row.share}%</span>}
           </div>
         ))}
       </div>

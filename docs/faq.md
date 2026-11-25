@@ -18,7 +18,7 @@ so the two questions have one answer.
 The verdict watches **variable spending only** — your Food and
 Everything-else budgets, prorated to the day of the month. Bills never
 push it OVER or UNDER; they live in the plan and the cash forecast
-instead. OVER means variable spending is ahead of pace, nothing else.
+instead. OVER means variable spending is more than planned by today, nothing else.
 
 **My checking balance reads $0 (or is just wrong).**
 File imports don't carry balances, so a file-only account starts at $0.
@@ -43,13 +43,13 @@ SMS (a short form; verify your phone number first), push notification
 and your server opts in to mobile push (`OIKONOME_PUSH_RELAY_URL`),
 signed-in phones are tickled on the same push preference. Each person
 can turn the household's push off for their own devices (the **Push**
-card under Email & Push; the owner sets it per person on the Users
+card under Email & Push; the owner sets it per person on the Household
 roster) — notices about their own login still arrive. The daily email itself has
 two shapes, chosen on the daily row's **email face** picker: **summary**
 sends just the verdict pane — the one number, its category chips, and
 any pinned bills — while **detail** sends the full report with the
 per-category rows. This is the email's own setting, independent of the
-Today page's summary/detail toggle: what lands in your inbox and what
+Today page's **View** switch (Summary / Detail): what lands in your inbox and what
 the page opens to are separate preferences. SMS needs the instance to
 have Twilio credentials configured. **Push needs HTTPS**: browsers only
 allow notifications on a secure origin, so a self-hosted instance reached
@@ -118,9 +118,10 @@ On Cash Flow every range but This month holds complete months only — in
 September, **3m** is June through August — so a part-month never sits
 beside whole ones; the window applies to every section of the page (the
 flow picture, spending and income), and the comparison reads against the
-equal window before it. The ledger's range buttons and the Net Worth
-trend keep the month in progress instead (**3m** in September runs from
-July 1 to today), because they show what is there now.
+equal window before it. The Transactions range buttons cover the same
+complete months, so their out · in · net matches Cash Flow's. The Net
+Worth trend keeps the month in progress instead (**3m** in September runs
+from July 1 to today), because it shows what is there now.
 
 **Why am I asked whether two merchants are the same?**
 Card terminals and banks spell a business several ways: cut at 13 or 20
@@ -135,8 +136,8 @@ from that one charge is set aside, and a real business of that name still
 gets a merchant of its own when you actually visit it.
 When the app sees spellings that look like one
 business it queues them under **Needs a look** at the top of the
-**Merchants** page, one line per pair with the reason ("cut at
-13 characters, a terminal's limit"); **details** shows both merchants'
+**Merchants** page, one line per pair with the reason ("cut short at
+13 characters, a card terminal's limit"); **details** shows both merchants'
 rows, totals and latest bank lines beside what the merged one would hold. A quiet line on the Today page, the
 daily email and the bell says how many a night's run found; it comes back
 only when a later run finds more, not as you work through the list. You
@@ -144,7 +145,10 @@ choose:
 **Merge** joins them, as if you had renamed one to the other, and shows
 under Recent changes where you can undo it; **Not the same** keeps them
 apart and the pair is never offered again. Nothing is merged unless you
-say so.
+say so. **Merge all N cut-off names** takes only the pairs where one name
+is the other cut short (or spelled another way), keeping the full name;
+a pair that merely shares a word says *check the address* and waits for
+you one at a time.
 
 **How do I rename a merchant, or merge two?**
 Open the merchant on the **Merchants** page (web: it opens beside the
@@ -264,8 +268,9 @@ changed bill amount, a resized envelope) never rewrite a finished
 month's report card. Months from
 before you set a budget have no snapshot to judge against, so they show
 **net** — income minus spending, a cash-flow fact rather than a budget
-verdict. A closed month opened on the Month page without a snapshot says
-so: it's compared against your current budget, applied retroactively.
+verdict. The Month page agrees: such a month reads *no budget then* and
+shows what came in, what went out and the difference, with none of
+today's bills written into it.
 If you'd rather those months carry verdicts, the Budget page's **Budget
 history** card can apply your current budget to them — an explicit
 choice, and the history labels those months "backfilled".
@@ -283,9 +288,11 @@ can be split — a refund, a transfer or a card payment stays one row. See the
 transactions guide.
 
 **Who changed this category (or bill, or note)?**
-Settings → Users → **Activity** on the web, More → **Activity** in the
+Settings → Household → **Activity** on the web, More → **Activity** in the
 app: every hand-made change in the household, with the person and the
-time. What the app does on its own (syncs, the categorizer) is not listed.
+time. What the app does on its own (syncs, the categorizer) is not listed;
+a change made by a script token or an operator's maintenance pass is listed
+as that script.
 
 **Can I get my numbers into Home Assistant, Grafana or an AI assistant?**
 Yes — Settings → Integrations. Webhooks push events out, `/metrics` and
@@ -314,15 +321,27 @@ before it removes the folder, so backups outlive the install.
 A full restore runs in the background: drop the ZIP on the Import page and
 it reports progress while it merges, table by table. A large archive —
 tens of thousands of transactions — takes a few minutes, and it keeps
-going if you close the page. Two things you may see when it finishes:
+going if you close the page. While it merges, a change you make to that
+household (an edit, a save in Settings) may answer *"another change to
+this account is in progress — try again in a moment"* after a few
+seconds; nothing was written, so make it again once the restore is done.
+Two things you may see when it finishes:
 
-* *"1 AI backend dropped — not reachable from this instance"*, or the same
-  for a mail server. Endpoints in an export point at the machine it came
+* *"1 AI backend(s) dropped — not reachable from this instance: …"*, or
+  *"the mail server (smtp_host) was dropped — not reachable from this
+  instance"*. Endpoints in an export point at the machine it came
   from — a model running on your own network, a local mail relay — and
   those addresses mean nothing anywhere else, so they're left out rather
   than restored broken. Anything routed through one falls back to this
   instance's default; re-point it under Settings if you want something
   else. Nothing else in the archive is affected.
+* *An AI endpoint or mail relay with no key or password.* An export never
+  carries those secrets, so a restore keeps the ones already stored here
+  — but only for the same destination. When the archive names a
+  different address for an AI endpoint or the mail relay, the stored key
+  or mail password is not carried over to it; the owner types it again
+  under Settings. A restore that changes where the AI work is sent also
+  sends the owner a security notice.
 * *"N already present"*. Restoring the same archive twice is safe: rows
   the account already has are skipped, not duplicated, and the summary
   counts them separately from what actually landed.
@@ -334,6 +353,14 @@ going if you close the page. Two things you may see when it finishes:
 **I'm locked out and never set up email.**
 Run `./oikonome.sh reset-password` on the host — it prints a one-time
 reset link, no SMTP needed. The troubleshooting doc has the details.
+
+**I got a security notice that someone failed to confirm it was me.**
+A signed-in browser or device on your account kept giving the wrong
+password, sign-in code or passkey when a sensitive change asked it to
+confirm, so that browser or device can no longer confirm for a while. It
+arrives once for the lock, at most once a day, like the notice about
+wrong sign-in codes. If it was not you, reset your password from the
+sign-in page straight away.
 
 **The daily email isn't arriving.**
 Check **Settings → Email & Push** first: each recipient is listed with whether
@@ -348,9 +375,12 @@ the sign-in address does not change until that button is pressed: the card
 shows the new address as waiting for confirmation, and **Withdraw** calls
 the change off.
 
-If nothing is flagged, delivery itself may not be set up: Doctor → Email
-shows whether it is. **Self-hosted:** delivery (SMTP) lives under Settings
-→ Email or in `docker/.env`. **On an instance an operator runs for other
+If nothing is flagged, delivery itself may not be set up: the schedule
+in Settings → Email & Push then reads **nobody receiving it** beside the
+hour, and System health's daily email row names the reason (for example,
+no mail relay configured) (see Troubleshooting, "the schedule says nobody receiving
+it"). **Self-hosted:** delivery (SMTP) lives under Settings
+→ Email & Push (the mail relay card) or in `docker/.env`. **On an instance an operator runs for other
 people:** the operator's own mail server sends it — there is nothing for
 you to configure, and the SMTP fields are not shown. Either
 way the send hour is in Settings → Email & Push — until you pick one, the daily
@@ -367,7 +397,7 @@ Adding an address invites it — it doesn't sign anyone up. When you save,
 that person is emailed once, explaining what the daily summary is, who
 added them, and when it arrives; nothing else is sent to them until they
 open that link and accept. Until they do, their row in **Settings →
-Email** says *invite sent*. Once they accept it says *invite accepted*
+Email & Push** says *invite sent*. Once they accept it says *invite accepted*
 and the summary starts the next morning.
 
 This is on purpose: the daily email carries your real balances and
@@ -381,7 +411,7 @@ the sign-in page?**
 A self-hosted instance is claimed once, through its setup link, and stays
 one household — so it does not take signups, and the page says so by
 sending you to sign-in. What you want is the invite under **Settings →
-Users**: that gives the other person their own login, their
+Household**: that gives the other person their own login, their
 own password and second factor, on *this* household's accounts and
 history. They can mute their own copy of the daily email, and remove
 their own login later, without touching anything of yours. A household
@@ -445,6 +475,10 @@ only. The owner sets anyone's row; everyone else sets their own under
 **Daily email**. A column is dimmed while the household doesn't send that
 kind at all, and an address that has unsubscribed gets nothing whatever
 its boxes say. Sign-in and security emails always go to the account.
+Two people changing the email schedule at once on two devices both keep
+their change: the second save is laid over the first. Only if the
+schedule moves again during that does the card say *"Changed on another
+device. Reloaded the latest; make your change again."*
 
 **Why does the daily email have no merchant logos in it?**
 On purpose: nothing in the email is fetched from the web. An image loaded
@@ -498,7 +532,7 @@ accounts, file imports, and collector scripts never count. A self-hosted
 instance has no cap.
 
 **How do I undo an import?**
-Import → Recent imports → roll back. Every import is batch-tagged and
+Import → Recent imports → **undo** on the import's row. Every import is batch-tagged and
 reversible, including bulk runs.
 
 **My import left out older rows — why?**
@@ -580,7 +614,7 @@ today / daily rate" tiles on Today and the heart of the daily email.
 The Today guide has the full math.
 
 **What is "Excess cash"?**
-The plan's leftover: income − average bills − budgets − savings plan.
+The plan's leftover: income − average bills − budgets − every fixed savings goal's monthly plan.
 It stays in checking (the forecast shows it piling up) and is not extra
 spending headroom in the verdict. Setting Savings to an explicit $0 is
 remembered — the field won't refill itself.
@@ -606,6 +640,53 @@ rest elsewhere. A split you edit or remove yourself wins, and the
 receipt leaves it alone. A receipt you attach or snap yourself explains
 the charge (and drives the tag-based expense report) without
 re-bucketing it. See the transactions guide, "Splits from a receipt".
+
+**Why does a receipt line say "may be counted twice"?**
+Another counted receipt reads the same store, day and total. That is
+either a second photo of one slip or two real purchases (two coffees at
+one cafe for one price), and the app never guesses which: both count
+until you open either receipt and choose **Same receipt** or **Two
+purchases**. The answer is kept and never asked again. The same file
+attached twice is different: it is one receipt, counted once, with no
+question (its other copy says *not counted*). See the receipts guide,
+"One slip, counted once".
+
+**Why does removing a tax document ask me to confirm it's me again?**
+Removing an earnings record, or any document that covers more than one
+year, takes every figure it gave across all those years, so it asks for
+the same step-up as other sensitive changes (your password, or a live
+code when a second factor is on). A single-year return or W-2 is removed
+after the plain confirm, which says what moves. Either way the document
+stays listed for 30 days with **put back**, which asks nothing. See the
+Tax documents guide.
+
+**Why does a stored tax document's file name show "…" and four digits?**
+Payroll and tax software often names a W-2 or a return after a Social
+Security number or an employer's EIN. The app keeps only the last four
+digits of either, as it does for a card number: a file named
+`w2 123-45-6789.pdf` is listed as `w2 …6789.pdf`. The cut is made when
+the file is stored, when the list is shown (so a name kept whole by an
+older version is shown cut), in the export and on restore.
+
+**Why does Cash Flow say "Fixed counts the bills you track today"?**
+Fixed spending is the charges your current bills matched. On a long
+window, months from before most of those bills began had fewer bills to
+match, so more of their spending lands in variable; the line counts how
+many of the window's months are like that. Months from before your very
+first bill are not split at all and are drawn as **Before any bill**.
+See the Cash Flow guide.
+
+**My phone shows less than the web, or says "This server can't list a
+figure's rows".**
+The phone app can be newer than the server it talks to. Where an older
+server does not send a figure, the phone leaves it out rather than
+working it out its own way, and a Spending figure it cannot open is
+plain text (a link from an older server shows the month instead). The
+web is always served by its own server, so it never lags. Upgrading the
+server fills the gaps; nothing is lost meanwhile. The reverse also holds:
+an older app approving a merchant merge offer that was turned around
+since it was first offered is refused with *update the app to approve
+it, or open the merchant and use Merge into*, never merged the other way.
 
 **A bill's amount changed and I didn't touch it.**
 Amount drift auto-applies: when a bill settles at a new real amount
@@ -659,3 +740,14 @@ App Store page opens. **Later** waits a day before asking again. A build
 that did not come from the store (a sideload, an emulator) is never
 asked.
 
+
+## Does the phone app work offline?
+
+For reading, yes: the app keeps an encrypted copy of the last answer for
+each tab's landing screen (Today, Bills, Accounts and the like), this
+month's Month lens, this year's Year lens and Help. Offline it shows
+that copy under a line saying it is not current. Anything that would
+change data — a save, an approve, a split — is greyed out with
+*"You're offline."* beside it rather than failing after you press it.
+The app notices it is back online by itself, and asks the screen in
+front of you again.

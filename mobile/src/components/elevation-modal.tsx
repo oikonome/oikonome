@@ -23,6 +23,9 @@ import { elevationProof, oneTimeCodeDigits, oneTimeCodeSentence,
 import { useSession } from "../lib/session";
 import { stepupTicket } from "../lib/stepup";
 import { C } from "../lib/theme";
+import { Note } from "./ui";
+import { fieldA11y } from "./field";
+import { useSheetAnimation } from "../lib/a11y";
 
 // the web's error → sentence map for the same door
 function explain(e: unknown): string {
@@ -47,6 +50,7 @@ function explain(e: unknown): string {
 }
 
 export default function ElevationModal() {
+  const sheetAnim = useSheetAnimation();
   const { client } = useSession();
   const [prompt, setPrompt] = useState<ElevationPrompt | null>(null);
   // the prompt on screen, readable outside render (the controller calls
@@ -173,7 +177,7 @@ export default function ElevationModal() {
     prove(prompt, proof);
   };
   return (
-    <Modal visible animationType="slide" transparent
+    <Modal visible animationType={sheetAnim} transparent
            onRequestClose={() => finish(prompt, false)}>
       <KeyboardAvoidingView style={s.wrap}
                             behavior={Platform.OS === "ios" ? "padding"
@@ -197,12 +201,12 @@ export default function ElevationModal() {
             )
           ) : form === "password" ? (
             <>
-              <TextInput style={s.input} placeholder="your password"
+              <TextInput {...fieldA11y("Your password")} style={s.input} placeholder="your password"
                          placeholderTextColor={C.mut} secureTextEntry
                          autoFocus value={pw} onChangeText={setPw}
                          onSubmitEditing={status?.totp ? undefined : submit} />
               {status?.totp && (
-                <TextInput style={s.input}
+                <TextInput {...fieldA11y("6-digit code from your authenticator")} style={s.input}
                            placeholder="6-digit code from your authenticator"
                            placeholderTextColor={C.mut}
                            keyboardType="number-pad"
@@ -238,33 +242,35 @@ export default function ElevationModal() {
                   elevate door documents, and the reason a bare code is
                   refused there with password_required */}
               {recoveryWithPassword && (
-                <TextInput style={s.input} placeholder="your password"
+                <TextInput {...fieldA11y("Your password")}
+                           style={s.input} placeholder="your password"
                            placeholderTextColor={C.mut} secureTextEntry
                            autoFocus value={pw} onChangeText={setPw} />
               )}
               {/* no maxLength: a recovery code is five dash-separated
                   groups, not six digits */}
-              <TextInput style={s.input} placeholder="recovery code"
+              <TextInput {...fieldA11y("Recovery code")} style={s.input} placeholder="recovery code"
                          placeholderTextColor={C.mut} autoCapitalize="none"
                          autoCorrect={false} value={rc} onChangeText={setRc}
                          onSubmitEditing={submit} />
             </>
           )}
           {err && (
-            <Text style={{ color: C.bad, fontSize: 12 }}
-                  onPress={() => setErr(null)}>{err}</Text>
+            <Note bad style={{ color: C.bad, fontSize: 12 }}
+                  onPress={() => setErr(null)}>{err}</Note>
           )}
           <View style={{ flexDirection: "row", gap: 8, marginTop: 4,
                          alignItems: "center" }}>
             {!form && loadFailed && (
-              <Pressable style={s.btn}
+              <Pressable accessibilityRole="button" style={s.btn}
                          onPress={() => { setErr(null); setLoadFailed(false);
                                           setTries((n) => n + 1); }}>
                 <Text style={s.btnText}>Retry</Text>
               </Pressable>
             )}
             {form && (
-              <Pressable style={[s.btn, (!ready || busy) && { opacity: 0.5 }]}
+              <Pressable accessibilityRole="button"
+                         style={[s.btn, (!ready || busy) && { opacity: 0.5 }]}
                          disabled={!ready || busy} onPress={submit}>
                 <Text style={s.btnText}>
                   {busy ? "confirming…" : "Confirm"}
@@ -272,7 +278,8 @@ export default function ElevationModal() {
               </Pressable>
             )}
             {form === "recovery" && passkeyAccount && canPasskey && (
-              <Pressable style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
+              <Pressable accessibilityRole="button"
+                         style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
                          disabled={busy} onPress={() => passkey(prompt)}>
                 <Text style={[s.btnText, { color: C.accent }]}>
                   Use passkey
@@ -280,7 +287,8 @@ export default function ElevationModal() {
               </Pressable>
             )}
             {form === "recovery" && passwordToo && (
-              <Pressable style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
+              <Pressable accessibilityRole="button"
+                         style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
                          disabled={busy}
                          onPress={() => { setErr(null); setRc("");
                                           setForm("password"); }}>
@@ -295,7 +303,8 @@ export default function ElevationModal() {
                 leave a password+TOTP account unable to confirm at all —
                 and elevation guards the export and the account delete. */}
             {form === "password" && status?.totp && (
-              <Pressable style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
+              <Pressable accessibilityRole="button"
+                         style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
                          disabled={busy}
                          onPress={() => { setErr(null); setCode("");
                                           setForm("recovery"); }}>
@@ -304,7 +313,7 @@ export default function ElevationModal() {
                 </Text>
               </Pressable>
             )}
-            <Pressable style={[s.btn, s.btnQuiet]}
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                        onPress={() => finish(prompt, false)}>
               <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
             </Pressable>
@@ -323,10 +332,10 @@ const s = StyleSheet.create({
            gap: 10 },
   title: { color: C.text, fontSize: 16, fontWeight: "700" },
   mut: { color: C.mut, fontSize: 12, lineHeight: 17 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 16, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

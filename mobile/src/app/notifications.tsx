@@ -7,12 +7,14 @@ import { Linking, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput,
 import PullRefresh from "../components/pull-refresh";
 import { VerifyEmailCard } from "../components/verify-email-card";
 
-import { Card, H, SharedLock } from "../components/ui";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, H, SharedLock, Skeleton, Note } from "../components/ui";
 import { errText, Client, EmailSchedule, Me, SettingsView } from "../lib/api";
-import { patchList, patchQuery, seedSettings, SETTINGS_SAVES } from "../lib/cache";
+import { patchList, patchQuery, saveSettings, seedSettings, SETTINGS_SAVES } from "../lib/cache";
 import { useSession } from "../lib/session";
 import { ext } from "../ext";
 import { C, mmddyy } from "../lib/theme";
+import { checkbox } from "../lib/a11y";
 import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, localDayOf, looksLikeMailbox,
          NEED_BASE_URL, oneTimeCodeDigits, prefOn, recipientDuplicate, recipientEditBody, resendHeld,
          withPref }
@@ -21,6 +23,7 @@ import { CADENCES, cadenceOf, rebaseSched, storedSched }
   from "../lib/schedule";
 import { useOwner, useSharedLock } from "../lib/viewer";
 import { deviceZone, knownZones, zoneLabel } from "../lib/zone";
+import { fieldA11y } from "../components/field";
 
 // the web's cadence row names — a report card is not just "Monthly"
 const CADENCE_TITLE: Record<string, string> = {
@@ -42,6 +45,14 @@ export default function Notifications() {
     queryKey: ["settings"],
     queryFn: () => client!.settingsFull(),
     select: (v) => (v.email_schedule as EmailSchedule | null) ?? null,
+    enabled: !!client,
+  });
+  // who each saved cadence actually reaches (the server's notify/reach):
+  // "nobody receiving it" in amber, as on the web
+  const reachQ = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => client!.settingsFull(),
+    select: (v) => v.email_reach ?? null,
     enabled: !!client,
   });
   // a channel toggle that saves but can never deliver is a lie — gate
@@ -115,9 +126,12 @@ export default function Notifications() {
   const save = useMutation({
     mutationFn: async (v: { mine: EmailSchedule; base: EmailSchedule;
                             cad: (typeof CADENCES)[number] }) => {
-      const live = (await client!.settingsSchedule()) ?? {};
+      // the full view, not the schedule alone: its list_versions are what
+      // the save is checked against (saveSettings)
+      const cur = await client!.settingsFull();
+      const live = (cur.email_schedule as EmailSchedule | null) ?? {};
       const sent = rebaseSched(v.mine, v.base, live, v.cad);
-      const r = await client!.settingsSaveSchedule(sent);
+      const r = await saveSettings(qc, client!, { email_schedule: sent }, cur);
       return { r, stored: storedSched(r, sent) };
     },
     scope: SETTINGS_SAVES,
@@ -166,7 +180,12 @@ export default function Notifications() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      {query.isPending && <Skeleton />}
+      {/* the schedule is one read: a failed one says so where it sits, and
+          kept answers carry the stale line */}
+      <StaleLine query={query} />
+      {query.data === undefined && query.isError && (
+        <FailedLine q={query} what="the email schedule" />)}
       {/* hosted mail goes to confirmed addresses only — the way to a
           fresh link sits with the schedule it holds up, from day one */}
       <VerifyEmailCard me={me.data}
@@ -192,17 +211,18 @@ export default function Notifications() {
           <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap",
                          marginTop: 6 }}>
             {device && device !== effective && (
-              <Pressable style={s.btn} disabled={saveZone.isPending}
+              <Pressable accessibilityRole="button" style={s.btn} disabled={saveZone.isPending}
                          onPress={() => saveZone.mutate(device)}>
                 <Text style={s.btnText}>
                   use this phone&apos;s ({zoneLabel(device)})</Text>
               </Pressable>
             )}
-            <Pressable style={s.btn} onPress={() => setZonesOpen((o) => !o)}>
+            <Pressable accessibilityRole="button"
+                       style={s.btn} onPress={() => setZonesOpen((o) => !o)}>
               <Text style={s.btnText}>{zonesOpen ? "close" : "change…"}</Text>
             </Pressable>
             {household ? (
-              <Pressable style={s.btn} disabled={saveZone.isPending}
+              <Pressable accessibilityRole="button" style={s.btn} disabled={saveZone.isPending}
                          onPress={() => saveZone.mutate("")}>
                 <Text style={s.btnText}>follow the instance</Text>
               </Pressable>
@@ -212,7 +232,7 @@ export default function Notifications() {
             <ScrollView style={{ maxHeight: 260, marginTop: 8 }}
                         nestedScrollEnabled>
               {knownZones([household, instanceZone, device]).map((z) => (
-                <Pressable key={z} onPress={() => saveZone.mutate(z)}
+                <Pressable accessibilityRole="button" key={z} onPress={() => saveZone.mutate(z)}
                            style={{ paddingVertical: 6 }}>
                   <Text style={{ color: z === effective ? C.text : C.mut,
                                  fontSize: 13,
@@ -230,10 +250,10 @@ export default function Notifications() {
         // the web's resting-state sentence: when · the channels that
         // actually reach you, or "off"
         const when = cad === "daily"
-          ? `every day at ${hourLabel(c.hour ?? 7)}`
+          ? `every day at ${hourLabel(c.hour)}`
           : cad === "monthly"
-            ? `on the 1st at ${hourLabel(c.hour ?? 7)}`
-            : `on Jan 1 at ${hourLabel(c.hour ?? 7)}`;
+            ? `on the 1st at ${hourLabel(c.hour)}`
+            : `on Jan 1 at ${hourLabel(c.hour)}`;
         const chans = [
           c.on ? (cad === "daily" && c.summary
             ? "email (summary)" : "email") : null,
@@ -252,6 +272,9 @@ export default function Notifications() {
             </View>
             <Text style={{ color: C.mut, fontSize: 12 }}>
               {chans ? `${when} · ${chans}` : "off"}
+              {reachQ.data?.[cad].warn ? (
+                <Text style={{ color: C.warn }}> · nobody receiving it</Text>
+              ) : null}
             </Text>
             {open && (
               <>
@@ -261,10 +284,10 @@ export default function Notifications() {
                 <View style={{ flexDirection: "row", flexWrap: "wrap",
                                gap: 6, paddingVertical: 4 }}>
                   {Array.from({ length: 24 }, (_, h) => h).map((h) => (
-                    <Pressable key={h}
-                      style={[s.day, (c.hour ?? 7) === h && s.dayOn]}
+                    <Pressable accessibilityRole="button" key={h}
+                      style={[s.day, c.hour === h && s.dayOn]}
                       onPress={() => upd(cad, { hour: h })}>
-                      <Text style={{ color: (c.hour ?? 7) === h
+                      <Text style={{ color: c.hour === h
                                        ? C.text : C.mut, fontSize: 11 }}>
                         {hourLabel(h)}
                       </Text>
@@ -274,6 +297,7 @@ export default function Notifications() {
                 <View style={s.row}>
                   <Text style={s.lbl}>Email</Text>
                   <Switch value={!!c.on}
+                          accessibilityLabel={`${CADENCE_TITLE[cad]} by email`}
                           onValueChange={(on) => upd(cad, { on })}
                           trackColor={{ true: C.accent, false: C.hover }}
                           thumbColor={C.text} />
@@ -284,12 +308,13 @@ export default function Notifications() {
                 <View style={s.row}>
                   <Text style={s.lbl}>Push to phones</Text>
                   <Switch value={!!c.push} disabled={!pushOk && !c.push}
+                          accessibilityLabel={`${CADENCE_TITLE[cad]} as a push to phones`}
                           onValueChange={(push) => upd(cad, { push })}
                           trackColor={{ true: C.accent, false: C.hover }}
                           thumbColor={C.text} />
                 </View>
                 </SharedLock>
-                {!pushOk && !pushLock && (
+                {!pushOk && !pushLock && notify.data !== undefined && (
                   <Text style={s.gateHint}>
                     push needs a signed-in phone with notifications
                     allowed
@@ -345,12 +370,15 @@ export default function Notifications() {
                 <View style={s.row}>
                   <Text style={s.lbl}>SMS</Text>
                   <Switch value={!!c.sms} disabled={!smsOk && !c.sms}
+                          accessibilityLabel={`${CADENCE_TITLE[cad]} by SMS`}
                           onValueChange={(sms) => upd(cad, { sms })}
                           trackColor={{ true: C.accent, false: C.hover }}
                           thumbColor={C.text} />
                 </View>
                 </SharedLock>
-                {!smsOk && !smsLock && (
+                {/* why SMS is off, only from a read that answered: an
+                    unread setup is not "isn't configured" */}
+                {!smsOk && !smsLock && notify.data !== undefined && (
                   <Text style={s.gateHint}>
                     {!notify.data?.sms_available
                       ? "SMS isn't configured on this server"
@@ -518,6 +546,8 @@ function RecipientsCard() {
                                  opacity: isMuted ? 0.6 : 1 }]}>
             <Text style={{ fontSize: 16,
                            color: isMuted ? C.mut : C.accent }}
+                  accessibilityRole="checkbox" accessibilityLabel={`Send to ${email}`}
+                  accessibilityState={{ checked: !isMuted }}
                   onPress={() => setMuted(email, !isMuted)}>
               {isMuted ? "☐" : "☑"}
             </Text>
@@ -568,13 +598,14 @@ function RecipientsCard() {
         <Text style={[s.gateHint, { textAlign: "left" }]}>{lockAdd}</Text>
       ) : (<>
       <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
-        <TextInput style={[s.hour, { flex: 1, textAlign: "left" }]}
+        <TextInput {...fieldA11y("Add an email address")}
+                   style={[s.hour, { flex: 1, textAlign: "left" }]}
                    placeholder="partner@example.com"
                    placeholderTextColor={C.mut} autoCapitalize="none"
                    keyboardType="email-address"
                    value={draft} onChangeText={setDraft}
                    onSubmitEditing={add} />
-        <Pressable style={[s.btn, !draft.trim() && { opacity: 0.5 }]}
+        <Pressable accessibilityRole="button" style={[s.btn, !draft.trim() && { opacity: 0.5 }]}
                    disabled={!draft.trim()} onPress={add}>
           <Text style={s.btnText}>Add</Text>
         </Pressable>
@@ -590,8 +621,8 @@ function RecipientsCard() {
         </Text>
       ) : null}
       {err ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setErr(null)}>{err}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setErr(null)}>{err}</Note>
       ) : null}
       <Text style={[s.gateHint, { textAlign: "left" }]}>
         Adding someone emails them an invitation right away — they
@@ -662,18 +693,24 @@ function EmailPrefsCard({ sending }: {
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                          marginTop: 4 }}>
             {EMAIL_KINDS.map((k) => {
-              const on = !r.muted && prefOn(r.prefs, k);
+              // a kind the household does not send reads as off for
+              // everyone; each person's choice returns when it is on
               const off = kindOffNote(k, sending);
+              const on = !r.muted && !off && prefOn(r.prefs, k);
               return (
-                <Pressable key={k} disabled={!!r.muted}
+                <Pressable key={k} disabled={!!r.muted || !!off}
+                  accessibilityRole="checkbox"
                   accessibilityLabel={`${r.email} receives ${
                     EMAIL_KIND_LABEL[k].toLowerCase()} email`}
-                  accessibilityState={{ checked: on, disabled: !!r.muted }}
+                  accessibilityState={{ checked: on,
+                                        disabled: !!r.muted || !!off }}
                   style={[s.day, on && s.dayOn, off ? { opacity: 0.5 } : null]}
                   onPress={() => save.mutate({ email: r.email, kind: k,
                                                on: !on })}>
                   <Text style={{ color: on ? C.text : C.mut, fontSize: 12 }}>
                     {on ? "☑" : "☐"} {EMAIL_KIND_LABEL[k]}
+                    {off ? (k === "daily" ? " · email off" : " · report off")
+                         : ""}
                   </Text>
                 </Pressable>
               );
@@ -681,16 +718,9 @@ function EmailPrefsCard({ sending }: {
           </View>
         </View>
       ))}
-      {EMAIL_KINDS.map((k) => kindOffNote(k, sending)).filter(Boolean)
-        .length ? (
-        <Text style={[s.gateHint, { textAlign: "left" }]}>
-          {EMAIL_KINDS.map((k) => kindOffNote(k, sending)).filter(Boolean)
-            .join(" · ")}
-        </Text>
-      ) : null}
       {err ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setErr(null)}>{err}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setErr(null)}>{err}</Note>
       ) : null}
     </Card>
   );
@@ -733,7 +763,7 @@ function PhoneCard() {
   // number may be a phone the owner doesn't recognise, and it must not stay
   // on the card until some other number is verified
   const removeBtn = (
-    <Pressable style={[s.btn, { backgroundColor: C.hover },
+    <Pressable accessibilityRole="button" style={[s.btn, { backgroundColor: C.hover },
                        busy === "remove" && { opacity: 0.5 }]}
                disabled={busy !== null}
                onPress={() => { setBusy("remove");
@@ -765,6 +795,9 @@ function PhoneCard() {
           in the environment).
         </Text>
       );
+    // a failed read is not "not configured": it says so where the card sits
+    if (notify.isError)
+      return <FailedLine q={notify} what="the text and push setup" />;
     return null;
   }
   return (
@@ -777,7 +810,7 @@ function PhoneCard() {
             <Text style={{ color: C.good, fontSize: 12 }}>verified</Text>
           </Text>
           <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
-            <Pressable style={[s.btn, (testing || !!pushLock)
+            <Pressable accessibilityRole="button" style={[s.btn, (testing || !!pushLock)
                                          && { opacity: 0.5 }]}
                        disabled={testing || !!pushLock}
                        onPress={() => { setTesting(true);
@@ -815,6 +848,12 @@ function PhoneCard() {
           ) : null}
           <Pressable style={{ flexDirection: "row", gap: 8,
                               alignItems: "flex-start" }}
+                     {...checkbox(consent, "Yes, text me my budget verdict. I agree "
+                       + "to receive recurring automated texts from Oikonome "
+                       + "telling me whether I am on budget, on the schedule I set "
+                       + "above — about one message a day, up to ~30/month. Msg & "
+                       + "data rates may apply. Reply STOP to cancel or HELP for "
+                       + "help.")}
                      onPress={() => setConsent((x) => !x)}>
             <Text style={{ color: consent ? C.accent : C.mut,
                            fontSize: 16 }}>
@@ -855,12 +894,13 @@ function PhoneCard() {
             We never sell or share your phone number.
           </Text>
           <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
-            <TextInput style={[s.hour, { flex: 1, textAlign: "left" }]}
+            <TextInput {...fieldA11y("Phone number")}
+                       style={[s.hour, { flex: 1, textAlign: "left" }]}
                        placeholder="+12175551234"
                        placeholderTextColor={C.mut}
                        keyboardType="phone-pad"
                        value={phone} onChangeText={setPhone} />
-            <Pressable style={[s.btn,
+            <Pressable accessibilityRole="button" style={[s.btn,
                          (!phone.trim() || !consent || busy !== null)
                            && { opacity: 0.5 }]}
                        disabled={!phone.trim() || !consent || busy !== null}
@@ -881,13 +921,14 @@ function PhoneCard() {
           </View>
           {n.phone_pending && (
             <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
-              <TextInput style={[s.hour, { flex: 1, textAlign: "left" }]}
+              <TextInput {...fieldA11y("6-digit code")}
+                         style={[s.hour, { flex: 1, textAlign: "left" }]}
                          placeholder="6-digit code"
                          placeholderTextColor={C.mut}
                          keyboardType="number-pad"
                          value={code}
                          onChangeText={(t) => setCode(oneTimeCodeDigits(t))} />
-              <Pressable style={[s.btn,
+              <Pressable accessibilityRole="button" style={[s.btn,
                            (!code || busy !== null) && { opacity: 0.5 }]}
                          disabled={!code || busy !== null}
                          onPress={() => { setBusy("verify");
@@ -908,9 +949,10 @@ function PhoneCard() {
         </SharedLock>
       )}
       {msg ? (
-        <Text style={{ color: msg.endsWith(".") && !msg.includes(":")
+        <Note bad={!(msg.endsWith(".") && !msg.includes(":"))}
+              style={{ color: msg.endsWith(".") && !msg.includes(":")
                          ? C.good : C.bad, fontSize: 12, marginTop: 6 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
     </Card>
   );
@@ -930,7 +972,8 @@ function SendNowCard() {
         toggle is off; SMS/push don&apos;t fire and the scheduled send
         still happens
       </Text>
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                    busy && { opacity: 0.5 }]}
                  disabled={busy || !!sendLock}
                  onPress={() => { setBusy(true);
@@ -944,9 +987,10 @@ function SendNowCard() {
         </Text>
       </Pressable>
       {msg ? (
-        <Text style={{ color: msg.startsWith("Sent") ? C.good : C.bad,
+        <Note bad={!(msg.startsWith("Sent"))}
+              style={{ color: msg.startsWith("Sent") ? C.good : C.bad,
                        fontSize: 12, marginTop: 6 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
     </Card>
   );
@@ -958,17 +1002,17 @@ const s = StyleSheet.create({
   row: { flexDirection: "row", alignItems: "center",
          justifyContent: "space-between", paddingVertical: 4 },
   lbl: { color: C.mut, fontSize: 14 },
-  hour: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  hour: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
           borderRadius: 8, color: C.text, fontSize: 14, minWidth: 56,
           paddingHorizontal: 10, paddingVertical: 6, textAlign: "center" },
-  save: { backgroundColor: C.accent, borderRadius: 10, marginHorizontal: 12,
+  save: { backgroundColor: C.btn, borderRadius: 10, marginHorizontal: 12,
           marginTop: 8, paddingVertical: 12, alignItems: "center" },
   day: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
          borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
   dayOn: { borderColor: C.accent, backgroundColor: C.hover },
   gateHint: { color: C.mut, fontSize: 11, textAlign: "right",
               marginTop: -2 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8 },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },
 });

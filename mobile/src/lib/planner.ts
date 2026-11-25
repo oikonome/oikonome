@@ -14,53 +14,34 @@ export function plannerUnallocAuto(o: {
   return Math.max(0, Math.round(o.otherBase - o.catsTotal - taken));
 }
 
-/** The money map's Savings row figure for a month. The goal's
- *  `saved_this_month` is what was posted toward the plan this month; an
- *  explicit `month` (a lens payload's own figure) wins over it. Without
- *  either the only figure is the goal's trailing 90-day average, and the
- *  row must say that is what it shows rather than call it this month's
- *  transfers. A plan-only goal (rate_90d === null) stays null. */
-export function monthSavings(
-  goal: { monthly_plan: number; rate_90d: number | null;
-          saved_this_month?: number | null },
-  month?: number | null,
-): { plan: number; saved: number | null; averaged: boolean } {
-  const posted = month ?? goal.saved_this_month;
-  if (typeof posted === "number" && Number.isFinite(posted))
-    return { plan: goal.monthly_plan, saved: posted, averaged: false };
-  return { plan: goal.monthly_plan, saved: goal.rate_90d,
-           averaged: goal.rate_90d !== null };
-}
-
-export const AVERAGED_SAVINGS_CAPTION = "avg / mo, last 90 days";
-
-/** The plan rows with the Savings row's caption made honest about an
- *  averaged figure. */
-export function labelSavingsRow<T extends { label: string; caption?: string }>(
-  rows: T[], averaged: boolean, caption: string = AVERAGED_SAVINGS_CAPTION,
-): T[] {
-  if (!averaged) return rows;
-  return rows.map((r) => r.label === "Savings / Investment" && r.caption
-    ? { ...r, caption } : r);
-}
-
-export const ESTIMATED_SAVINGS_CAPTION = "estimate from the last 90 days";
-
-/** The year map's Savings row: the standing monthly plan times the months
- *  the other rows cover. The lens's `saved_ytd` is the ledger's own figure
- *  for those months; without it (an older server, or no budgeted month to
- *  measure) the only number is the 90-day rate times the same months, which
- *  is a projection, so the row must say it is an estimate rather than call
- *  it what was transferred. Null when there is no goal or no month yet. */
-export function yearSavings(
-  goal: { monthly_plan: number; rate_90d: number | null } | null | undefined,
-  savedYtd: number | null | undefined,
-  elapsed: number,
-): { plan: number; saved: number | null; estimated: boolean } | null {
-  if (!goal || !(elapsed > 0)) return null;
-  const plan = goal.monthly_plan * elapsed;
-  if (typeof savedYtd === "number" && Number.isFinite(savedYtd))
-    return { plan, saved: savedYtd, estimated: false };
-  if (goal.rate_90d === null) return { plan, saved: null, estimated: false };
-  return { plan, saved: goal.rate_90d * elapsed, estimated: true };
+/** The planner's preview of the month's excess and savings while values
+ *  are typed but not yet saved: the server's `plan_surplus` (income −
+ *  bills − planned spending − EVERY goal's monthly plan) and
+ *  `savings_plan`, each moved by the difference between what is typed and
+ *  what is saved — the planned spending (`plan_variable`), the goal the
+ *  planner owns (only when the excess counts it), and a typed income
+ *  (only while income is typed). With nothing typed it is exactly the
+ *  server's figure. With no server figure yet (no income saved) and an
+ *  income box to type in, the preview is the typed income − the server's
+ *  bills − the typed planned spending − every goal's plan; with no box,
+ *  there is none. Twin: plannerPreview in webapp/src/moneymath.ts. */
+export function plannerPreview(o: {
+  planSurplus: number | null; savingsPlan: number;
+  savedVariable: number; typedVariable: number;
+  savedGoal: number; typedGoal: number; goalCounted: boolean;
+  savedIncome: number; typedIncome: number;
+  avgBills: number; incomeTyped: boolean;
+}): { excess: number | null; saved: number } {
+  const goal = o.goalCounted ? o.typedGoal - o.savedGoal : 0;
+  const saved = o.savingsPlan + goal;
+  if (o.planSurplus === null)
+    return { excess: o.incomeTyped
+               ? o.typedIncome - o.avgBills - o.typedVariable - saved
+               : null,
+             saved };
+  return {
+    excess: o.planSurplus - (o.typedVariable - o.savedVariable) - goal
+      + (o.typedIncome - o.savedIncome),
+    saved,
+  };
 }

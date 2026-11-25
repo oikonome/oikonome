@@ -9,12 +9,14 @@ offer is withdrawn as superseded instead of applied.
 """
 
 import datetime as dt
+import os
 import unittest
 from unittest import mock
 
+from oikonome.db import tenancy
 from oikonome.engine import bills as rd
 
-from .util import TODAY, add_bill, add_txn, make_db, write_config
+from .util import TEST_DB, TODAY, add_bill, add_txn, make_db, write_config
 
 
 class HandAddedBillCoversTheOffer(unittest.TestCase):
@@ -35,14 +37,26 @@ class HandAddedBillCoversTheOffer(unittest.TestCase):
             "AND kind='add'").fetchall()
 
     def test_a_bill_saved_during_maintenance_is_not_offered(self):
+        # The save comes from another session, as a person's save does:
+        # the pass holds its own transaction open, and a bill write inside
+        # it without the bill-claim lock is refused.
         real = rd._maintain_bills
+        tid = self.conn.execute(
+            "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"]
+        other = tenancy.tenant_connect(tid, os.environ.get(
+            "OIKONOME_TEST_DSN",
+            f"postgresql://oikonome_app:apppass@127.0.0.1:5433/{TEST_DB}"))
+        other.execute("SET statement_timeout = '10s'")
 
         def save_meanwhile(conn, *a, **kw):
-            add_bill(conn, "Streamflix", 15.49, source="manual")
+            add_bill(other, "Streamflix", 15.49, source="manual")
             return real(conn, *a, **kw)
 
-        with mock.patch.object(rd, "_maintain_bills", save_meanwhile):
-            rd.run(self.conn, TODAY)
+        try:
+            with mock.patch.object(rd, "_maintain_bills", save_meanwhile):
+                rd.run(self.conn, TODAY)
+        finally:
+            other.close()
         self.assertEqual(self._adds(), [])
 
     def test_approving_a_stale_offer_does_not_duplicate_the_bill(self):

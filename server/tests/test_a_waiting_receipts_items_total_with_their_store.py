@@ -45,7 +45,10 @@ class WaitingItemsTotalWithTheirStore(unittest.TestCase):
         self.conn.close()
 
     def _add(self, txn, payload):
-        rid = receipts.add(self.conn, txn, b"\x89PNG...", "image/png")
+        # each purchase its own photo: the same bytes are one slip
+        self._n = getattr(self, "_n", 0) + 1
+        rid = receipts.add(self.conn, txn, b"\x89PNG..." + bytes([self._n]),
+                           "image/png")
         out = receipts.parse_one(self.conn, rid, transport=_reply(payload))
         self.assertEqual(out["status"], "parsed")
         return rid

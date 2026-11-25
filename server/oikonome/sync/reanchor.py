@@ -21,6 +21,7 @@ counted too. Runs after every removal and once a night, and by hand as
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 
@@ -281,6 +282,48 @@ def hold_pairing_lock(conn) -> None:
     conn.execute(_REIMB_LOCK)
 
 
+# How long a person's request waits for a household lock (pairing,
+# storage, identity) before it answers "busy, try again".
+REQUEST_LOCK_WAIT_MS = 5 * 1000
+
+
+@contextlib.contextmanager
+def bounded_lock_wait(conn, ms: int = REQUEST_LOCK_WAIT_MS):
+    """Inside the caller's transaction: every lock asked for in the body
+    waits at most `ms`, then fails with LockNotAvailable — which the web
+    layer answers 409 "busy, try again" — instead of waiting as long as
+    the holder runs.
+
+    For request doors only. A restore holds the household's locks for
+    its whole transaction, minutes on a large archive; a person's edit
+    that queued behind it would pin one of the instance's few pooled
+    connections for all that time, and a handful of them take the pool
+    from every other household. Workers, syncs and the restore itself
+    keep the unbounded wait: they have no one waiting on an answer and
+    would only fail work that would have gone through.
+
+    The previous wait is put back after the body, so the bound covers the
+    locks the body takes and nothing after it; a shorter wait already in
+    force is kept. A body that fails leaves the transaction aborted, and
+    the transaction-local setting goes with it on rollback."""
+    prior = conn.execute(
+        "SELECT current_setting('lock_timeout') AS t").fetchone()["t"]
+    conn.execute(
+        "SELECT set_config('lock_timeout', CASE WHEN %(p)s <> '0' AND"
+        " %(p)s::interval <= make_interval(secs => %(ms)s / 1000.0)"
+        " THEN %(p)s ELSE %(ms)s || 'ms' END, true)",
+        {"p": prior, "ms": int(ms)})
+    yield
+    conn.execute("SELECT set_config('lock_timeout', %s, true)", (prior,))
+
+
+def hold_pairing_lock_for_request(conn) -> None:
+    """`hold_pairing_lock` for a person's request: the same lock, waited
+    on at most REQUEST_LOCK_WAIT_MS (`bounded_lock_wait`)."""
+    with bounded_lock_wait(conn):
+        hold_pairing_lock(conn)
+
+
 def _move(conn, old_id: str, new_id: str) -> dict | None:
     """The move itself; `carry` holds the transaction around it."""
     # before the row locks below, in the one order every pairing writer uses
@@ -373,19 +416,21 @@ def _move(conn, old_id: str, new_id: str) -> dict | None:
                     WHERE k.txn_id = %s AND {SAME_EQUITY_ANSWER})""",
         (new_id, old_id, new_id)).rowcount
     # a reimbursement pairing names two rows; either side may be the one
-    n = conn.execute(
+    carried = conn.execute(
         """UPDATE reimbursements r SET expense_id = %s
             WHERE r.expense_id = %s AND NOT EXISTS
                   (SELECT 1 FROM reimbursements x
-                    WHERE x.expense_id = %s AND x.reimburse_id = r.reimburse_id)""",
-        (new_id, old_id, new_id)).rowcount
-    n += conn.execute(
+                    WHERE x.expense_id = %s AND x.reimburse_id = r.reimburse_id)
+            RETURNING r.expense_id, r.reimburse_id""",
+        (new_id, old_id, new_id)).fetchall()
+    carried += conn.execute(
         """UPDATE reimbursements r SET reimburse_id = %s
             WHERE r.reimburse_id = %s AND NOT EXISTS
                   (SELECT 1 FROM reimbursements x
-                    WHERE x.reimburse_id = %s AND x.expense_id = r.expense_id)""",
-        (new_id, old_id, new_id)).rowcount
-    moved["reimbursements"] = n
+                    WHERE x.reimburse_id = %s AND x.expense_id = r.expense_id)
+            RETURNING r.expense_id, r.reimburse_id""",
+        (new_id, old_id, new_id)).fetchall()
+    moved["reimbursements"] = len(carried)
     # a pairing that stayed is one the live row already has to the same
     # counterpart; any other pairing is this row's own and keeps its place
     conn.execute(
@@ -416,6 +461,16 @@ def _move(conn, old_id: str, new_id: str) -> dict | None:
                     THEN NULL ELSE l.entity_id END
            FROM transactions k WHERE l.id = %s AND k.id = %s""",
         (old_id, new_id))
+    if carried:
+        # the carried links come back to the ledger on the twin: they take
+        # only the room the other side has left, and a link that gave way
+        # takes the twin's transfer stamp with it (web.data.settle_pairs;
+        # the pairing lock is held above). Last, once the retired row has
+        # let go of what the twin took, so nothing of it is left behind.
+        from ..web.data import _settle_pairs_locked
+        _settle_pairs_locked(
+            conn, [new_id], returning=True,
+            only={(p["expense_id"], p["reimburse_id"]) for p in carried})
     return {k: v for k, v in moved.items() if v}
 
 

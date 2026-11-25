@@ -175,10 +175,12 @@ SCHED_C_LINES = (
     "Other expenses",
 )
 
-# Fallback when a merchant has no history: map the ledger's own category to a
-# line. Low-confidence by construction — it knows the KIND of spend, not the
-# business purpose — so suggestions from here are always confirm-first.
-_CATEGORY_TO_LINE = {
+# What the review queue used to suggest from the ledger's own category. It
+# no longer suggests anything from it (a web host and an ad network both
+# arrive as "general services"): kept only so a saved line that is exactly
+# this guess — most likely a guess accepted, not the owner's own choice —
+# is not "learned" and repeated for that merchant (suggest_lines).
+_RETIRED_CATEGORY_GUESS = {
     "TRANSPORTATION": "Car and truck expenses",
     "TRAVEL": "Travel",
     "FOOD_AND_DRINK": "Meals",
@@ -412,6 +414,11 @@ _NEEDS_LINE = ("(c.txn_id IS NULL OR (c.sched_c_line IS NULL "
                "AND c.bucket = 'operating'))")
 
 
+# The one P&L key for an operating cost that has no Schedule C line yet: a
+# raw ledger category is never printed as if it were a line.
+UNLINED = "Uncategorized — needs a line"
+
+
 def unclassified_count(conn, entity_id: str) -> int:
     """How many business transactions still need a Schedule C decision.
 
@@ -436,12 +443,16 @@ def suggest_lines(conn, entity_id: str, *, limit: int = 200) -> list[dict]:
     SUGGEST, never apply. The personal side auto-applies a learned merchant
     category because a wrong one is cosmetic; a wrong Schedule C line is a
     wrong number on a filed return, so this returns proposals for a human to
-    confirm. Two sources, and the caller is told which:
+    confirm. Two sources, and the caller is told which —
+    never the bank's category (specs/business-books.md → Suggested lines):
 
       "merchant"  — this entity has classified the same canonical merchant
-                    before. Strong: it is the user's own prior decision.
-      "category"  — derived from the ledger category. Weak: it knows the
-                    kind of spend, not its business purpose.
+                    before. Strong: it is the user's own prior decision. A
+                    saved line equal to the retired category guess for its
+                    row does not count (_RETIRED_CATEGORY_GUESS).
+      "kind"      — the vendor's business kind (business_kinds.kind_for):
+                    its merchant category code, else words in its name or
+                    website. `kind_label` names the kind.
 
     Merchant history is scoped to THIS entity on purpose. Two businesses can
     legitimately book the same vendor to different lines, and a personal
@@ -455,6 +466,8 @@ def suggest_lines(conn, entity_id: str, *, limit: int = 200) -> list[dict]:
         f"""SELECT t.id, t.date, t.amount,
                    {_md.DISPLAY_MERCHANT} AS payee,
                    COALESCE(t.category_override, t.category_primary, '') AS cat,
+                   COALESCE(NULLIF(t.mcc, ''), mm.mcc) AS mcc,
+                   mm.website AS website,
                    c.bucket AS bucket
               FROM transactions t
               {_md.MC_JOIN}
@@ -470,27 +483,38 @@ def suggest_lines(conn, entity_id: str, *, limit: int = 200) -> list[dict]:
     learned: dict[str, str] = {}
     for r in conn.execute(
             f"""SELECT {_md.DISPLAY_MERCHANT} AS payee,
-                       c.sched_c_line AS line, COUNT(*) AS n
+                       c.sched_c_line AS line,
+                       UPPER(COALESCE(t.category_override,
+                                      t.category_primary, '')) AS cat,
+                       COUNT(*) AS n
                   FROM business_txn_class c
                   JOIN transactions t ON t.id = c.txn_id
                   {_md.MC_JOIN}
                  WHERE {_BIZ_TXN} AND c.sched_c_line IS NOT NULL
-                 GROUP BY 1, 2 ORDER BY 3 DESC""",
+                 GROUP BY 1, 2, 3 ORDER BY 4 DESC""",
             {"eid": entity_id}).fetchall():
+        # a saved line that is exactly what the bank-category guess
+        # offered is most likely that guess accepted, not a choice
+        if _RETIRED_CATEGORY_GUESS.get(r["cat"]) == r["line"]:
+            continue
         learned.setdefault(r["payee"], r["line"])   # most-used wins
 
+    from .business_kinds import kind_for
     out = []
     for r in rows:
         payee = r["payee"] or ""
         line = learned.get(payee)
         source = "merchant" if line else None
+        label = None
         if not line:
-            line = _CATEGORY_TO_LINE.get((r["cat"] or "").upper())
-            source = "category" if line else None
+            kind = kind_for(payee, website=r["website"], mcc=r["mcc"])
+            if kind:
+                label, line = kind
+                source = "kind"
         out.append({
             "txn_id": r["id"], "date": r["date"], "amount": float(r["amount"]),
             "payee": payee, "category": r["cat"],
-            "suggested_line": line, "source": source,
+            "suggested_line": line, "source": source, "kind_label": label,
             # the bucket is NOT a guess — it falls out of the entity's start
             # date (costs before it are pre-operating). Returned so a confirm
             # is one action: classify() requires a bucket, and asking the user
@@ -611,7 +635,175 @@ def entity_transactions(conn, entity_id: str, year: int | None = None) -> list[d
                 start, _row_date(r))
         else:
             r["effective_bucket"] = None
+    row_roles(rows)
+    for r in rows:
+        # money that moved is in no bucket, whatever its sign
+        if r["role"] not in ("cost", "refund"):
+            r["effective_bucket"] = None
+        r["ledger_line"] = ledger_line(r)
     return rows
+
+
+# ---- what each row is -----------------------------------------------------
+# One rule for every reader (specs/business-books.md → What a row is): the
+# Books list shows the costs, Owner equity offers the owner transfers, and
+# the ledgers in the CSV and the year-end package print each row's role.
+ROLES = ("cost", "revenue", "refund", "owner_in", "owner_out", "owner_side",
+         "internal", "card_payment", "owner_tax")
+
+# How close in time the two legs of a move between the business's own
+# accounts post: a same-bank transfer lands the same day, an ACH a few
+# business days later.
+_PAIR_DAYS = 5
+
+
+def _is_transfer(t: dict) -> bool:
+    cat = (t.get("category") or "").upper()
+    if (t["amount"] or 0) > 0:
+        return cat in ("TRANSFER_OUT", "TRANSFER_IN")
+    return "TRANSFER" in cat or (
+        "TRANSFER" in (t.get("cat_original") or "").upper()
+        and cat != "INCOME")
+
+
+def _role(t: dict) -> str:
+    if (t.get("cat_detailed") or "") == "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT":
+        return "card_payment"
+    if _is_owner_tax(t):
+        return "owner_tax"
+    if (t["amount"] or 0) < 0:
+        inflow = _inflow_role(t)
+        if inflow != "skip":
+            return inflow
+    elif not _is_transfer(t):
+        return "cost"
+    # money moved, not spent or earned: whose side of the move is it?
+    if t.get("paid_personally"):
+        return "owner_side"
+    return "owner_in" if (t["amount"] or 0) < 0 else "owner_out"
+
+
+def row_roles(rows: list[dict]) -> list[dict]:
+    """Set `role` on every row (ROLES). A transfer out of one business
+    account met by the same amount into another of its accounts within
+    _PAIR_DAYS is `internal` on both legs; any other transfer on a business
+    account is the owner's money moving in or out, and its leg on a
+    personal account is the owner's side of it."""
+    for t in rows:
+        t["role"] = _role(t)
+    # the ins indexed by amount in cents, so each out reads only the legs
+    # it could pair with (linear in the rows, where a scan of every in for
+    # every out was quadratic). A leg within half a cent may sit in the
+    # neighbouring cent, so three keys are read; among the candidates the
+    # earliest in `rows` wins, as the full scan's first match did.
+    by_cents: dict[int, list[int]] = {}
+    ins = [t for t in rows if t["role"] == "owner_in"]
+    for n, i in enumerate(ins):
+        by_cents.setdefault(round(abs(i["amount"]) * 100), []).append(n)
+    for o in rows:
+        if o["role"] != "owner_out":
+            continue
+        od = _row_date(o)
+        if not od:
+            continue
+        cents = round(abs(o["amount"]) * 100)
+        best = None
+        for k in (cents - 1, cents, cents + 1):
+            for n in by_cents.get(k, ()):
+                if best is not None and n >= best[1]:
+                    break
+                i = ins[n]
+                if i.get("account_id") == o.get("account_id"):
+                    continue
+                idate = _row_date(i)
+                if (abs(abs(i["amount"]) - abs(o["amount"])) < 0.005
+                        and idate and abs((idate - od).days) <= _PAIR_DAYS):
+                    best = (k, n)
+                    break
+        if best is not None:
+            k, n = best
+            by_cents[k].remove(n)
+            o["role"] = ins[n]["role"] = "internal"
+    return rows
+
+
+# What the ledger downloads print in the "Schedule C line" column for a row
+# that is not an operating cost (ledger_line).
+_ROLE_LINES = {
+    "revenue": "Gross receipts",
+    "owner_side": ("Owner's personal side of a transfer — not a business "
+                   "transaction"),
+    "internal": "Transfer between business accounts",
+    "card_payment": "Card payment — the charges are the costs",
+    "owner_tax": "Owner's income tax — not a business cost",
+}
+_RECORDED_LINES = {"contribution": "Owner contribution",
+                   "draw": "Owner draw", "distribution": "Owner distribution"}
+
+
+def ledger_line(t: dict) -> str:
+    """The one word on a ledger row of the P&L CSV and the year-end
+    package: the Schedule C line of an operating cost, the capitalized
+    bucket of an organizational or start-up cost (never its stored line as
+    well, or a preparer deducts it twice), and the role's words for every
+    other row. Needs entity_transactions' `role` and `effective_bucket`."""
+    role = t.get("role")
+    if role in ("cost", "refund"):
+        bucket = t.get("effective_bucket")
+        if bucket == "organizational":
+            return "Organizational cost (§248)"
+        if bucket == "startup_195":
+            return "Start-up cost (§195)"
+        return t.get("sched_c_line") or UNLINED
+    if role in ("owner_in", "owner_out"):
+        recorded = _RECORDED_LINES.get(t.get("owner_recorded") or "")
+        if recorded:
+            return recorded
+        return ("Owner money in — not yet recorded as a contribution"
+                if role == "owner_in"
+                else "Owner money out — not yet recorded as a draw")
+    return _ROLE_LINES.get(role or "", UNLINED)
+
+
+def personally_paid(rows: list[dict], through: dt.date | None = None) -> float:
+    """The business costs paid on a personal card or account that count as
+    the owner's contribution (specs/business-books.md → The capital
+    account): every cost or refund on an account that is not the
+    business's, net of what was paid back, unless the row already carries
+    a contribution or a reimbursement recorded by hand. Dated on or before
+    `through` when given."""
+    total = 0.0
+    for t in rows:
+        if not t.get("paid_personally") or t.get("role") not in (
+                "cost", "refund"):
+            continue
+        if t.get("owner_recorded") in ("contribution", "reimbursement"):
+            continue
+        d = _row_date(t)
+        if through is not None and (d is None or d > through):
+            continue
+        total += _net(t)
+    return round(total, 2)
+
+
+def owner_transfers(rows: list[dict]) -> list[dict]:
+    """The owner transfers (role owner_in / owner_out) Owner equity lists,
+    each with what recording it writes."""
+    return [{"txn_id": t["id"], "date": t["date"], "amount": t["amount"],
+             "payee": t.get("payee") or "", "role": t["role"],
+             "owner_recorded": t.get("owner_recorded"),
+             "offer": ("contribution" if t["role"] == "owner_in"
+                       else "draw")}
+            for t in rows if t.get("role") in ("owner_in", "owner_out")]
+
+
+def unrecorded_owner_money(rows: list[dict]) -> float:
+    """Owner transfers on the business's accounts with no contribution or
+    draw recorded: money in less money out (what the capital account is
+    missing that the cash already holds)."""
+    return round(sum(-t["amount"] for t in rows
+                     if t.get("role") in ("owner_in", "owner_out")
+                     and not t.get("owner_recorded")), 2)
 
 
 def _select_rows(conn, entity_id: str, year: int | None) -> list[dict]:
@@ -628,7 +820,15 @@ def _select_rows(conn, entity_id: str, year: int | None) -> list[dict]:
                    {reporting.ORIGINAL_CAT} AS cat_original,
                    {reporting.PARTLY_CLAIMED_DEPOSIT} AS partly_claimed,
                    tn.note AS note,
-                   c.bucket, c.sched_c_line
+                   c.bucket, c.sched_c_line,
+                   NOT EXISTS (SELECT 1 FROM accounts pa
+                                WHERE pa.id = t.account_id
+                                  AND pa.entity_id = %(eid)s)
+                       AS paid_personally,
+                   (SELECT m.kind FROM equity_movement m
+                     WHERE m.txn_id = t.id AND m.entity_id = %(eid)s
+                     ORDER BY m.created_at, m.id LIMIT 1) AS owner_recorded,
+                   t.account_id AS account_id
             FROM transactions t {_md.MC_JOIN}
                  LEFT JOIN business_txn_class c ON c.txn_id = t.id
                  LEFT JOIN transaction_notes tn ON tn.txn_id = t.id
@@ -641,7 +841,10 @@ def _select_rows(conn, entity_id: str, year: int | None) -> list[dict]:
              "category": r["category"], "cat_detailed": r["cat_detailed"],
              "cat_original": r["cat_original"], "note": r["note"],
              "partly_claimed": bool(r["partly_claimed"]),
-             "bucket": r["bucket"], "sched_c_line": r["sched_c_line"]}
+             "bucket": r["bucket"], "sched_c_line": r["sched_c_line"],
+             "paid_personally": bool(r["paid_personally"]),
+             "owner_recorded": r["owner_recorded"],
+             "account_id": r["account_id"]}
             for r in rows]
 
 
@@ -821,7 +1024,8 @@ def net_income_through(conn, entity_id: str, through_year: int,
         conn, entity_id, through_year, rows, lifetime), 2)
 
 
-def pnl(conn, entity_id: str, year: int | None = None, txns=None) -> dict:
+def pnl(conn, entity_id: str, year: int | None = None, txns=None,
+        lifetime=None) -> dict:
     """Full P&L, including the capital block."""
     # The all-history rows are read ONCE and shared: the year's §195/§248
     # scan and the capital account's cumulative net income both need
@@ -829,15 +1033,45 @@ def pnl(conn, entity_id: str, year: int | None = None, txns=None) -> dict:
     # scan the entity's whole history several times over.
     if year is None:
         if txns is None:
-            txns = entity_transactions(conn, entity_id, None)
+            txns = lifetime or entity_transactions(conn, entity_id, None)
         lifetime = txns
-    else:
+    elif lifetime is None:
         lifetime = entity_transactions(conn, entity_id, None)
     out = _pnl_core(conn, entity_id, year, txns, lifetime=lifetime)
     from . import equity
     out["capital"] = equity.capital_summary(conn, entity_id,
                                             lifetime=lifetime)
     return out
+
+
+def period_profit(conn, entity_id: str, period: str,
+                  lifetime=None) -> dict:
+    """Operating profit over the rows dated in `period` ("YYYY-MM" for a
+    month), by the P&L's own rules (`_pnl_core`) with the entity's whole
+    history as its index, so a refund nets against the cost it reverses
+    exactly as it does in the year's figure — the "this month" printed
+    under the year's profit (specs/shown-figures.md)."""
+    if lifetime is None:
+        lifetime = entity_transactions(conn, entity_id, None)
+    rows = [t for t in lifetime if (t["date"] or "").startswith(period)]
+    p = _pnl_core(conn, entity_id, int(period[:4]), rows, lifetime=lifetime)
+    return {"period": period, "net_operating": p["net_operating"]}
+
+
+def entity_cash(conn, entity_id: str) -> dict:
+    """The cash in the business: the sum of the entity's bank-account
+    balances, a linked backup and a hidden account left out (the shadow
+    rule every money sum follows, links.shadow_ids), and how many of its
+    accounts count at all — the Business overview's "Cash in the business"
+    tile and the tax set-aside's fallback when no reserve is nominated."""
+    from . import links
+    rows = conn.execute(
+        """SELECT a.type, a.balance_current AS bal FROM accounts a
+            WHERE a.entity_id = %s AND NOT (a.id = ANY(%s))""",
+        (entity_id, links.shadow_ids(conn))).fetchall()
+    return {"total": round(sum(float(r["bal"] or 0) for r in rows
+                               if r["type"] == "depository"), 2),
+            "accounts": len(rows)}
 
 
 def _pnl_core(conn, entity_id: str, year: int | None = None,
@@ -905,7 +1139,8 @@ def _pnl_core(conn, entity_id: str, year: int | None = None,
                             or (cost[3] if cost else None)
                             or merchant_line.get(t.get("payee"))
                             or (t["category"] or "Uncategorized"))
-                    by_line[line] = round(by_line.get(line, 0.0) + net, 2)
+                    key = line if line in SCHED_C_LINES else UNLINED
+                    by_line[key] = round(by_line.get(key, 0.0) + net, 2)
                     if _is_vehicle_cost(t, line):
                         vehicle += net
             continue
@@ -923,7 +1158,10 @@ def _pnl_core(conn, entity_id: str, year: int | None = None,
             # a charge paid back in full nets to nothing — no empty line
             operating += net
             line = t["sched_c_line"] or (t["category"] or "Uncategorized")
-            by_line[line] = round(by_line.get(line, 0.0) + net, 2)
+            # a line the closed list does not hold (a raw category) is
+            # summed under UNLINED; `line` still decides the vehicle test
+            key = line if line in SCHED_C_LINES else UNLINED
+            by_line[key] = round(by_line.get(key, 0.0) + net, 2)
             if _is_vehicle_cost(t, line):
                 vehicle += net
 

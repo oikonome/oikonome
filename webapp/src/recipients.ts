@@ -31,14 +31,23 @@ export function recipientDuplicate(
  *  until anyone has verified). So the sentence is worked out from the
  *  same facts. `recipients`/`status` come from the settings view and are
  *  undefined until it loads; `needBaseUrl` from /api/notify, absent on an
- *  older server. */
+ *  older server. A member's view carries only their own entry of the
+ *  roster, so it also carries `listConfigured` (a list is set) and
+ *  `onList` (that list, split as the worker splits it, names them); when
+ *  present they decide, and an owner's view or an older server falls back
+ *  to the roster. A member on the list gets one status row for their own
+ *  mailbox however the entry was stored: `mailed` is the mailer's answer
+ *  and `not_mailed` why it says no (`held`, or the invitation's state). */
 export function myDailyLine(x: {
   me: string; on: boolean; muted: boolean;
   prefs?: Partial<Record<string, boolean>> | null;
   verified?: boolean | null; hosted?: boolean;
   recipients?: string[] | null;
+  listConfigured?: boolean | null; onList?: boolean | null;
   status?: { email: string; verified?: boolean | null;
-             invite?: string | null; delivery?: string | null }[] | null;
+             invite?: string | null; delivery?: string | null;
+             mailed?: boolean | null; not_mailed?: string | null }[]
+           | null;
   needBaseUrl?: boolean;
 }): { receiving: boolean; text: string } {
   const no = (text: string) => ({ receiving: false, text });
@@ -49,15 +58,24 @@ export function myDailyLine(x: {
   const row = x.status?.find((r) => r.email.toLowerCase() === low);
   if (row?.delivery === "bouncing" || row?.delivery === "complained")
     return no("Held — mail to your address isn't being delivered.");
-  if (x.status && x.recipients?.length) {
-    if (!row) return no("The owner's mail list doesn't include you.");
-    if (row.invite !== "accepted") {
+  const listed = x.listConfigured != null ? x.listConfigured
+    : !!x.recipients?.length;
+  if (x.status && listed) {
+    if (x.onList === false || !row)
+      return no("The owner's mail list doesn't include you.");
+    // a member's own row carries the mailer's verdict and, when it does
+    // not mail them, why; an older server's row has only the invitation
+    const state = row.mailed == null ? row.invite
+      : row.mailed ? "accepted" : row.not_mailed ?? row.invite;
+    if (state === "held")
+      return no("Held until the owner confirms the mail list.");
+    if (state !== "accepted") {
       if (x.needBaseUrl)
         return no("Your invitation can't be sent until the server has a "
           + "public address (OIKONOME_BASE_URL).");
-      if (row.invite === "invited")
+      if (state === "invited")
         return no("Accept the invitation in your inbox to start receiving it.");
-      if (row.invite === "declined")
+      if (state === "declined")
         return no("You declined the invitation — ask the owner to send another.");
       return no("You haven't accepted an invitation yet — ask the owner to "
         + "send one.");
@@ -138,4 +156,56 @@ export function withPref<T extends { email: string;
   const low = email.toLowerCase();
   return rows.map((r) => r.email.toLowerCase() === low
     ? { ...r, prefs: { ...r.prefs, [kind]: on } } : r);
+}
+
+/** The facts myDailyLine works from, as /api/me and /api/settings hand
+ *  them to this person: the one place the Daily email card and the
+ *  Settings list's subtitle read them, so the two can never disagree about
+ *  whether the email reaches them. null until /api/me says (an older
+ *  server sends no daily_email). */
+export function myDailyFrom(
+  me: { email?: string | null; verified?: boolean | null; hosted?: boolean;
+        daily_email?: { on: boolean; hour: number; muted: boolean;
+                        prefs?: Partial<Record<string, boolean>> } | null }
+      | null | undefined,
+  settings: { email_recipients?: string[] | null;
+              email_list_configured?: boolean | null;
+              email_on_list?: boolean | null;
+              email_recipient_status?: NonNullable<
+                Parameters<typeof myDailyLine>[0]["status"]> | null }
+      | null | undefined,
+  needBaseUrl?: boolean,
+): { receiving: boolean; text: string } | null {
+  const d = me?.daily_email;
+  if (!d) return null;
+  return myDailyLine({
+    me: me.email ?? "", on: d.on, muted: d.muted, prefs: d.prefs,
+    verified: me.verified, hosted: me.hosted,
+    recipients: settings?.email_recipients,
+    listConfigured: settings?.email_list_configured,
+    onList: settings?.email_on_list,
+    status: settings?.email_recipient_status,
+    needBaseUrl });
+}
+
+/** The Settings list's email subtitle for someone who is not the owner:
+ *  their OWN daily email, read off /api/me's daily_email and the verdict
+ *  the Daily email card shows (myDailyFrom) — whether the household sends
+ *  it, whether it reaches them, and only then the hour. Never a default:
+ *  the household's schedule is the owner's to read, and a "daily 7am" to
+ *  someone the email does not reach (left off the owner's list, an
+ *  invitation not accepted, an address not confirmed) would be a wrong
+ *  figure. null while /api/me has not said (an older server), so the list
+ *  shows no subtitle at all. */
+export function myEmailSubtitle(
+  me: Parameters<typeof myDailyFrom>[0],
+  settings: Parameters<typeof myDailyFrom>[1],
+): string | null {
+  const d = me?.daily_email;
+  if (!d) return null;
+  if (!d.on) return "daily email off";
+  if (d.muted || d.prefs?.daily === false) return "daily email off for you";
+  if (!myDailyFrom(me, settings)?.receiving) return "not receiving it";
+  const h = d.hour;
+  return `daily ${((h + 11) % 12) + 1}${h < 12 ? "am" : "pm"}`;
 }

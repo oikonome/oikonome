@@ -57,7 +57,7 @@ class TransactionsExportStreamingTests(unittest.TestCase):
         return rows[0], rows[1:]
 
     def test_transactions_export_streams_in_chunks(self):
-        from oikonome.web import api, data
+        from oikonome.web import api_ledger as api, data
         seen = []
         real = data.search_transactions
 
@@ -77,7 +77,7 @@ class TransactionsExportStreamingTests(unittest.TestCase):
         self.assertEqual(len(rows), N_ROWS)
 
     def test_a_chunked_xlsx_is_one_valid_sheet(self):
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         with mock.patch.object(api, "_EXPORT_CHUNK", 3):
             r = self.get("/api/transactions/export?q=corner%20grocer&format=xlsx")
         self.assertEqual(r.status_code, 200, r.text)
@@ -89,7 +89,7 @@ class TransactionsExportStreamingTests(unittest.TestCase):
         self.assertIn(f'<row r="{1 + N_ROWS}">', sheet)
 
     def test_rows_past_the_cap_are_named_in_a_last_line(self):
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         with mock.patch.object(api, "TRANSACTIONS_EXPORT_CAP", 3), \
                 mock.patch.object(api, "_EXPORT_CHUNK", 2):
             r = self.get("/api/transactions/export?q=corner%20grocer")
@@ -99,7 +99,7 @@ class TransactionsExportStreamingTests(unittest.TestCase):
         self.assertIn(f"{N_ROWS - 3} more rows were not included", rows[-1][0])
 
     def test_transactions_export_one_at_a_time_per_tenant(self):
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         release = api._export_slot(self.tid)
         try:
             r = self.get("/api/transactions/export?q=corner%20grocer")
@@ -114,7 +114,7 @@ class TransactionsExportStreamingTests(unittest.TestCase):
         self.assertFalse(any(t == str(self.tid) for t, _b in api._EXPORT_SLOTS.values()))
 
     def test_the_process_takes_only_a_few_downloads_at_once(self):
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         others = [api._export_slot(f"other-{i}") for i in range(api._EXPORT_MAX)]
         try:
             r = self.get("/api/transactions/export?q=corner%20grocer")
@@ -126,13 +126,13 @@ class TransactionsExportStreamingTests(unittest.TestCase):
             self.get("/api/transactions/export?q=corner%20grocer").status_code, 200)
 
     def test_a_refused_filter_gives_the_slot_back(self):
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         r = self.get("/api/transactions/export?date_from=not-a-date")
         self.assertEqual(r.status_code, 400)
         self.assertFalse(any(t == str(self.tid) for t, _b in api._EXPORT_SLOTS.values()))
 
     def test_an_abandoned_slot_expires(self):
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         api._export_slot(self.tid)          # never released, like a lost client
         with mock.patch.object(api, "_EXPORT_SLOT_TTL", -1):
             self.assertEqual(
@@ -150,7 +150,7 @@ class TransactionsExportStreamingTests(unittest.TestCase):
         app's return, so a door that leaves the release to whoever drops
         the last reference (here, refcounting) must show up as a leak."""
         import asyncio
-        from oikonome.web import api
+        from oikonome.web import api_ledger as api
         from oikonome.web.app import app
         opened = []
         real_conn = api._conn

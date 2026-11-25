@@ -7,10 +7,11 @@ looks for a re-numbered twin. Every reader must then see the charge as
 unrepaid spend: the verdict's month spend, the reports' spend, and what
 has come back against it for the awaiting list. The removal path itself
 never releases the pair: a re-numbered twin can arrive on a later page,
-sync or re-link, and must find the pair there to carry it. Once the
-reconcile window has passed and the nightly sweep still finds no twin, the
-sweep releases the pair so the charge loses the transfer category the full
-link gave it. The mirror case holds too: a deposit whose charge is
+sync or re-link, and must find the pair there to carry it — but a full
+pair becomes the partial link recording what it repaid, so the charge
+loses the transfer category the full link gave it at once and is spend
+until a twin repays it again. Once the reconcile window has passed and
+the nightly sweep still finds no twin, the sweep releases the pair. The mirror case holds too: a deposit whose charge is
 withdrawn is income again.
 """
 import unittest
@@ -95,10 +96,13 @@ class WithdrawnRefundTests(unittest.TestCase):
             self.conn)[0]["received"]), 0.0)
 
     def _age_withdrawal(self, txn_id, days):
+        """The feed withdrew the row `days` ago: its stamp, and the time it
+        left the ledger, which the waits count from."""
         self.conn.execute(
             "UPDATE transactions SET raw = raw || jsonb_build_object("
-            "%s::text, now() - make_interval(days => %s)) WHERE id = %s",
-            (budget.FEED_REMOVED_KEY, days, txn_id))
+            "%s::text, now() - make_interval(days => %s)),"
+            " removed_at = now() - make_interval(days => %s) WHERE id = %s",
+            (budget.FEED_REMOVED_KEY, days, days, txn_id))
 
     def _full_pair_withdrawn_by_the_feed(self):
         from oikonome.sync import base
@@ -129,8 +133,10 @@ class WithdrawnRefundTests(unittest.TestCase):
         self.assertEqual(out["released"], 0)
         pairs = d.reimbursement_pairs(self.conn, charge)
         self.assertEqual(len(pairs), 1)
-        self.assertEqual(self._cat(charge), "TRANSFER_OUT")
+        # repaid again, by the link recording what it repaid
+        self.assertIsNone(self._cat(charge))
         self.assertEqual(self._received(charge), 120.0)
+        self.assertEqual(self._report_spend(), 0.0)
         self.assertNotEqual(twin, refund)
 
     def test_the_sweep_waits_the_window_before_releasing(self):
@@ -139,7 +145,10 @@ class WithdrawnRefundTests(unittest.TestCase):
         out = reanchor.reanchor_stranded(
             self.conn, release_after_days=adopt.RECONCILE_DAYS)
         self.assertEqual(out["released"], 0)
-        self.assertEqual(self._cat(charge), "TRANSFER_OUT")
+        # spend at once; the pair waits for its twin
+        self.assertIsNone(self._cat(charge))
+        self.assertEqual(self._report_spend(), 120.0)
+        self.assertEqual(len(d.reimbursement_pairs(self.conn, charge)), 1)
         self._age_withdrawal(refund, adopt.RECONCILE_DAYS + 1)
         out = reanchor.reanchor_stranded(
             self.conn, release_after_days=adopt.RECONCILE_DAYS)
@@ -148,28 +157,36 @@ class WithdrawnRefundTests(unittest.TestCase):
         self.assertEqual(d.reimbursement_pairs(self.conn, charge), [])
         self.assertEqual(self._report_spend(), 120.0)
 
-    def test_an_unreadable_withdrawal_stamp_holds_back_only_its_own_row(self):
-        """A restored row can carry a stamp that is not a time. That row is
+    def test_a_withdrawn_row_with_no_retirement_time_holds_back_only_itself(self):
+        """A retired row with no time it left the ledger (cleared by
+        hand, or written by a path that names the column as NULL) is
         skipped (never old enough) and named in the log; every other row's
-        release still happens."""
+        release still happens. An unreadable feed stamp no longer matters:
+        the wait is counted from removed_at."""
         from oikonome.sync import adopt
         charge, refund = self._full_pair_withdrawn_by_the_feed()
         self._age_withdrawal(refund, adopt.RECONCILE_DAYS + 1)
-        other = add_txn(self.conn, TODAY, 60.0, "SEED SHOP")
-        back = add_txn(self.conn, TODAY, -60.0, "SEED SHOP REFUND",
-                       account="chk", primary="INCOME")
-        d.link_reimbursement(self.conn, other, back)
         self.conn.execute(
-            "UPDATE transactions SET removed = 1, raw = COALESCE(raw, "
-            "'{}'::jsonb) || jsonb_build_object(%s::text, 'yes') "
-            "WHERE id = %s", (budget.FEED_REMOVED_KEY, back))
+            "UPDATE transactions SET raw = raw || jsonb_build_object("
+            "%s::text, 'yes') WHERE id = %s", (budget.FEED_REMOVED_KEY, refund))
+        other = add_txn(self.conn, TODAY, 60.0, "SEED SHOP")
+        back = "seed-shop-refund"
+        self.conn.execute(
+            "INSERT INTO transactions (id, account_id, date, amount, name,"
+            " pending, removed, raw) VALUES (%s, 'chk', %s, -60, "
+            "'SEED SHOP REFUND', 0, 1, jsonb_build_object(%s::text, now()))",
+            (back, TODAY, budget.FEED_REMOVED_KEY))
+        self.conn.execute("UPDATE transactions SET removed_at = NULL "
+                          "WHERE id = %s", (back,))
+        self.conn.execute(
+            "INSERT INTO reimbursements (expense_id, reimburse_id)"
+            " VALUES (%s, %s)", (other, back))
         with self.assertLogs("oikonome.budget", "WARNING") as logs:
             self.assertEqual(budget.release_withdrawn_pairs(
                 self.conn, [refund, back],
                 older_than_days=adopt.RECONCILE_DAYS), 1)
         self.assertIn(back, " ".join(logs.output))
         self.assertIsNone(self._cat(charge))
-        self.assertEqual(self._cat(other), "TRANSFER_OUT")
 
     def test_an_ambiguous_twin_is_never_released(self):
         from oikonome.sync import adopt, reanchor
@@ -182,7 +199,8 @@ class WithdrawnRefundTests(unittest.TestCase):
             self.conn, release_after_days=adopt.RECONCILE_DAYS)
         self.assertEqual(out["ambiguous"], 1)
         self.assertEqual(out["released"], 0)
-        self.assertEqual(self._cat(charge), "TRANSFER_OUT")
+        self.assertEqual(len(d.reimbursement_pairs(self.conn, charge)), 1)
+        self.assertIsNone(self._cat(charge))
 
     def test_release_leaves_pairs_on_rows_the_feed_did_not_withdraw(self):
         """A retired pending hold, a merged row and a live row keep their

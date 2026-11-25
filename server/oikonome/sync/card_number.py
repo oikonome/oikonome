@@ -88,7 +88,7 @@ from __future__ import annotations
 import itertools
 import re
 
-#: the mark a cut leaves in front of the last four digits
+# The mark a cut leaves in front of the last four digits.
 MARK = "…"
 
 # what reads as a space between two groups: any whitespace a cell, a
@@ -96,12 +96,12 @@ MARK = "…"
 # same characters (neither's `\s` is the other's)
 _WS = r"[ \t\n\v\f\r\u00a0]"
 
-#: between two groups of a number: one to three of whitespace, dash, dot,
-#: slash
+# What stands between two groups of a number: one to three of whitespace,
+# dash, dot or slash.
 _SEP = r"[ \t\n\v\f\r\u00a0./-]{1,3}"
 
-#: every separator `_SEP` matches, spelled out, with " " standing for any
-#: whitespace
+# Every separator `_SEP` matches, spelled out, with " " standing for any
+# whitespace.
 SEPARATORS = tuple("".join(p) for n in (1, 2, 3)
                    for p in itertools.product(" ./-", repeat=n))
 
@@ -123,18 +123,18 @@ _LAYOUTS = (
     rf"\d{{4}}{_SEP}\d{{4}}{_SEP}\d{{4}}(?:{_JOINED_AS_THE_FOURTH})(\d{{4}})"
     rf"|\d{{4}}{_SEP}\d{{6}}{_SEP}\d(\d{{4}})")
 
-#: a number in groups, with a mark directly in front of it taken in
+# A number in groups, with a mark directly in front of it taken in.
 GROUPED_PATTERN = rf"{MARK}?(?<!\d)(?:{_LAYOUTS})(?!\d)"
 GROUPED_REPLACEMENT = MARK + r"\1\2"
 
-#: an unbroken run of eight or more digits, its last four captured
+# An unbroken run of eight or more digits, its last four captured.
 LONG_PATTERN = r"\d{4,}(\d{4})"
 LONG_REPLACEMENT = MARK + r"\1"
 
-#: an unbroken run of eight or more digits (the hash input's cut)
+# An unbroken run of eight or more digits (the hash input's cut).
 LONG_RUN_PATTERN = r"\d{8,}"
 
-#: where a cut left its mark
+# Where a cut left its mark.
 CUT_MARK_PATTERN = MARK + r"[0-9]{4}"
 
 # the layouts without captures: what a selector reads

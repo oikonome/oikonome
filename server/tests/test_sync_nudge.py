@@ -92,6 +92,8 @@ class SyncNudgeTests(unittest.TestCase):
                          "would answer it a second time")
 
     def test_one_extra_pass_and_no_more(self):
+        self.enterContext(mock.patch.object(worker, "_enqueue_tenant_sync",
+                                            lambda tid: None))
         """A holder that kept chasing nudges would never release the lock on
         a busy tenant. A request arriving during the EXTRA pass is left for
         the next sweep."""
@@ -326,6 +328,28 @@ class LockHoldersThatDoNotSyncAnswerTheNudge(unittest.TestCase):
                            mock.AsyncMock(side_effect=OSError("down"))), \
                 self.assertLogs("oikonome", level="WARNING"):
             worker._enqueue_tenant_sync(self.tid)
+
+
+    def test_a_nudge_left_after_the_last_claim_is_queued_at_release(self):
+        """A sync turned away during the holder's SECOND pass (after its one
+        nudge claim) must not wait for the hourly slot: once the lock is
+        free the holder queues it, as every other holder does."""
+        passes = []
+        queued = []
+
+        def pass_(conn, tenant_id, since_days, progress, results, **kw):
+            passes.append(tenant_id)
+            self._write_nudge()          # a sync is turned away on each pass
+            return 0
+
+        with mock.patch.object(worker, "_sync_pass", pass_), \
+                mock.patch.object(worker, "_enqueue_tenant_sync",
+                                  lambda tid: queued.append(tid)):
+            worker.sync_tenant(self.tid)
+        self.assertEqual(len(passes), 2)
+        self.assertEqual(queued, [self.tid],
+                         "the nudge left during pass 2 was not queued")
+        self.assertEqual(self._pending(), 0)
 
 
 if __name__ == "__main__":

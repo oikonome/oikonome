@@ -7,10 +7,17 @@
 import { money } from "./pure.ts";
 
 export interface SeriesSpec { name: string; values: number[] }
+/** what a ring prints, the server's (assistant_blocks.ring_figures): the
+ *  centre total and each drawn part's whole dollars and share, adding up
+ *  to the total and to 100 */
+export interface RingShown {
+  total: number;
+  rows: { label: string; dollars: number; share: number | null }[];
+}
 export type AnswerBlock =
   | { kind: "text"; text: string }
   | { kind: "bar" | "line" | "pie"; title: string; labels: string[];
-      series: SeriesSpec[] }
+      series: SeriesSpec[]; shown?: RingShown | null }
   | { kind: "table"; title: string; columns: string[];
       rows: (string | number)[][] };
 
@@ -116,25 +123,36 @@ export function lineLayout(labels: string[], series: SeriesSpec[],
   };
 }
 
-export interface RingSeg { label: string; value: number; share: number;
+export interface RingSeg { label: string; value: number;
                            dash: number; offset: number; si: number }
 
-/** parts of a whole as ring arcs: non-positive parts are not drawn, the
- *  share is of what is */
+/** parts of a whole as ring arcs: non-positive parts are not drawn. The
+ *  geometry only — what the ring prints is the server's `shown` */
 export function ringLayout(labels: string[], values: number[], r: number) {
   const segs = labels.map((l, i) => ({ l, v: values[i], i }))
     .filter((s) => s.v > 0);
-  const total = segs.reduce((a, s) => a + s.v, 0);
+  const whole = segs.reduce((a, s) => a + s.v, 0);
   const circ = 2 * Math.PI * r;
   let off = 0;
   const out: RingSeg[] = segs.map((s, j) => {
-    const dash = total ? (s.v / total) * circ : 0;
-    const seg = { label: s.l, value: s.v, share: total ? s.v / total : 0,
-                  dash, offset: off, si: j };
+    const dash = whole ? (s.v / whole) * circ : 0;
+    const seg = { label: s.l, value: s.v, dash, offset: off, si: j };
     off += dash;
     return seg;
   });
-  return { segs: out, total, circ };
+  return { segs: out, circ };
+}
+
+/** a ring's legend rows, one per drawn arc in order: the server's whole
+ *  dollars and share; an older server sends no `shown`, and each row then
+ *  prints its own value and no share (never one worked out here) */
+export function ringLegend(segs: RingSeg[], shown?: RingShown | null) {
+  return segs.map((g, j) => {
+    const row = shown?.rows[j];
+    return { si: g.si, label: row?.label ?? g.label,
+             dollars: row ? row.dollars : g.value,
+             share: row ? row.share : null };
+  });
 }
 
 /** the figures behind a chart as table rows, money-formatted */

@@ -54,21 +54,21 @@ def covers(first_row: dt.date | None, from_day: dt.date) -> bool:
     return first_row is not None and first_row <= posting_grace_day(from_day)
 
 
-def month_known(years, start: str | None, key: str) -> bool:
-    """`key` 'YYYY-MM' has measured income: on or after the first whole
-    month `start`, in a year with bank rows. For a whole year pass
-    'YYYY-01' (a year is known only when its January is)."""
-    return start is not None and key >= start and key[:4] in years
+# A bank feed's rows for a month arrive after it: a just-ended month's last
+# rows post days into the next, and on the 1st nothing is on file yet. So a
+# bank feed may lag the rest of the ledger by CATCH_UP_MONTHS: the month
+# right after the feed's last row is read as measured (a $0 so far) while it
+# is the ledger's latest month. Once the rest of the ledger has moved past
+# it, the feed has stopped and every month after its last row is unknown.
+# Months after the ledger's latest month have nothing on either side and
+# read as measured. "The ledger's latest month" is bounded by the present,
+# so one stray future-dated row cannot make the month in progress a hole.
+CATCH_UP_MONTHS = 1
 
 
-def known_months(years, start: str | None, through: str) -> list[str]:
-    """Every 'YYYY-MM' from `start` through `through` (inclusive) whose
-    income is known, in order — a month with no deposit included, since
-    its income is a measured $0, not a missing one."""
-    if start is None:
-        return []
-    return [f"{y}-{mo:02d}" for y in sorted(years) for mo in range(1, 13)
-            if start <= f"{y}-{mo:02d}" <= through]
+def _ym_shift(ym: str, n: int) -> str:
+    y, m = divmod(int(ym[:4]) * 12 + int(ym[5:7]) - 1 + n, 12)
+    return f"{y:04d}-{m + 1:02d}"
 
 
 def _month(ym: str) -> dt.date:
@@ -109,12 +109,20 @@ class MeasuredWindow:
     income_years        years with bank rows the income total counts
     income_from         first month 'YYYY-MM' whose income is measured
                         whole, or None when no bank feed counts at all
+    income_months       months 'YYYY-MM' with a row on an income anchor
+                        account (see month_known)
+    ledger_last_month   the latest month 'YYYY-MM' any live row is dated in,
+                        bounded by the present month: months after it have
+                        not happened as far as the ledger knows, so a year
+                        in progress is judged on the months up to it
     """
     spend_first: dt.date | None
     spend_covered_from: dt.date | None
     income_first_row: dt.date | None
     income_years: frozenset
     income_from: str | None
+    income_months: frozenset = frozenset()
+    ledger_last_month: str | None = None
 
     @property
     def fingerprint(self) -> str:
@@ -154,13 +162,40 @@ class MeasuredWindow:
     # -- income coverage -----------------------------------------------------
 
     def month_known(self, ym: str) -> bool:
-        return month_known(self.income_years, self.income_from, ym)
-
-    def year_known(self, y) -> bool:
-        return self.month_known(f"{int(y):04d}-01")
+        """`ym` 'YYYY-MM' has measured income. A month counts when any
+        income anchor account has a counted row in it — a checking account
+        on file posts something every month (a deposit, a transfer, a fee),
+        a second account that did post covers it, and a quiet savings
+        account cannot unmake a month its checking posted in. A month with
+        no anchor row at all is a hole in the feed (a broken link, a relink
+        that backfilled 90 days, a missing statement): its income is
+        unknown, not $0. Months after the last anchor row follow the
+        catch-up rule above (CATCH_UP_MONTHS)."""
+        if self.income_from is None or ym < self.income_from:
+            return False
+        if ym in self.income_months:
+            return True
+        last = max(self.income_months, default=None)
+        if last is None or ym < last:
+            return False
+        latest = self.ledger_last_month
+        if latest is None or ym > latest:
+            return True
+        return ym == latest and ym <= _ym_shift(last, CATCH_UP_MONTHS)
 
     def known_months(self, through: str) -> list[str]:
-        return known_months(self.income_years, self.income_from, through)
+        """Every known 'YYYY-MM' from `income_from` through `through`
+        (inclusive), in order — a covered month with no deposit included,
+        since its income is a measured $0, not a missing one."""
+        out: list[str] = []
+        if self.income_from is None:
+            return out
+        k = self.income_from
+        while k <= through:
+            if self.month_known(k):
+                out.append(k)
+            k = _ym_shift(k, 1)
+        return out
 
     def clip(self, start: dt.date, last: dt.date, end: dt.date) -> Clip:
         """`start`..`last` (end exclusive at `end`) cut to the months whose
@@ -258,7 +293,7 @@ def _spend_anchors(conn, excl: str, ex_p: tuple
     return first, (as_date(row["date"]) if row and row["date"] else None)
 
 
-def build(conn) -> MeasuredWindow:
+def build(conn, today: dt.date | None = None) -> MeasuredWindow:
     """Read the ledger and derive the window (no memo; see `window`)."""
     from . import reporting as r
     excl, ex_p = r.excluded_accounts_sql(conn)
@@ -271,37 +306,49 @@ def build(conn) -> MeasuredWindow:
     nocash = r._bank_account_ids(conn, brokerage_cash=False)
     anchor = nocash or r._bank_account_ids(conn)
     years: frozenset = frozenset()
+    months: frozenset = frozenset()
     first_row = income_from = None
     if anchor:
         # The rows the income total counts (_counted_rows_where): business
         # and shadow rows never reach it, so they must not anchor it either.
         where, params = r._counted_rows_where(conn, anchor)
+        # by MONTH, so a hole inside a year is visible (month_known)
         rows = conn.execute(
-            f"""SELECT to_char(t.date,'YYYY') yr, MIN(t.date) AS d
+            f"""SELECT to_char(t.date,'YYYY-MM') ym, MIN(t.date) AS d
                 FROM transactions t WHERE {where}
-                GROUP BY yr""", params).fetchall()
+                GROUP BY ym""", params).fetchall()
         rows = [x for x in rows if x["d"]]
         if rows:
             first_row = min(as_date(x["d"]) for x in rows)
             if nocash:
-                years = frozenset(x["yr"] for x in rows)
+                months = frozenset(x["ym"] for x in rows)
+                years = frozenset(m[:4] for m in months)
                 income_from = _derive_income_from(first_row, spend_cov)
+    last = conn.execute(
+        f"""SELECT to_char(MAX(t.date),'YYYY-MM') ym FROM transactions t
+             WHERE t.removed = 0 {excl}""", ex_p or None).fetchone()
+    latest = last["ym"] if last else None
+    if latest is not None:
+        # never past the present: a stray future-dated row is not time
+        # the ledger has lived through
+        # (the caller's day when it reads as of one; else the clock's)
+        latest = min(latest, (today or dt.date.today()).strftime("%Y-%m"))
     return MeasuredWindow(spend_first, spend_cov, first_row, years,
-                          income_from)
+                          income_from, months, latest)
 
 
-def window(conn) -> MeasuredWindow:
+def window(conn, today: dt.date | None = None) -> MeasuredWindow:
     """The household's MeasuredWindow, built once per checkout: the
     connection's memo keeps it until any ledger input is written on it
     (budget._LEDGER_TABLES, which names the config), so the several
     reports one page load runs share one read of the ledger."""
     from . import reporting as r
     _excl, ex_p = r.excluded_accounts_sql(conn)
-    key = ("coverage.measured_window", repr(ex_p))
+    key = ("coverage.measured_window", repr(ex_p), today)
     hit = getattr(conn, "memo_get", lambda k: None)(key)
     if hit is not None:
         return hit
-    out = build(conn)
+    out = build(conn) if today is None else build(conn, today)
     if hasattr(conn, "memo_put"):
         conn.memo_put(key, out, *budget._LEDGER_TABLES)
     return out

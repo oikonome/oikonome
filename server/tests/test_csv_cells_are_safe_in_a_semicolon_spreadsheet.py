@@ -16,7 +16,6 @@ import re
 import time
 import unittest
 import uuid
-from pathlib import Path
 from unittest import mock
 
 from fastapi.testclient import TestClient
@@ -133,15 +132,21 @@ class SemicolonSpreadsheetTests(unittest.TestCase):
         self.assertEqual(api._csv_piece_safe('say "hi";-ok'), 'say "hi";\'-ok')
 
     def test_every_csv_the_api_writes_goes_through_the_safe_writer(self):
-        src = (Path(__file__).resolve().parents[1]
-               / "oikonome" / "web" / "api.py").read_text()
-        start = src.index("\ndef _csv_writer(")
-        end = src.index("\ndef ", start + 1)
-        bare = [src.count("\n", 0, m.start()) + 1
-                for m in re.finditer(r"\b_?c(?:sv)?\.writer\(", src)
-                if not start < m.start() < end]
+        from .util import api_source_files
+        bare = []
+        homes = 0
+        for fname, src in api_source_files():
+            start = end = -1
+            if "\ndef _csv_writer(" in src:
+                homes += 1
+                start = src.index("\ndef _csv_writer(")
+                end = src.index("\ndef ", start + 1)
+            bare += [f"{fname}:{src.count(chr(10), 0, m.start()) + 1}"
+                     for m in re.finditer(r"\b_?c(?:sv)?\.writer\(", src)
+                     if not start < m.start() < end]
+        self.assertEqual(homes, 1, "_csv_writer is defined once in the API")
         self.assertEqual(bare, [], "a csv.writer outside _csv_writer "
-                                   "(api.py lines listed)")
+                                   "(file:line listed)")
 
 
 class TransactionsDownloadTests(unittest.TestCase):

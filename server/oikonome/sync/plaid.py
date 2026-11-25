@@ -16,6 +16,7 @@ keys). Environment via config/env plaid_env: production | sandbox.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import datetime as dt
 import math
@@ -177,8 +178,10 @@ class LinkRefused(ValueError):
     that would not save. `reason` is the sentence the page shows — a
     fixed, user-facing string chosen here, never exception text — so a
     link door answers with it rather than with str(e)."""
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, kind: str | None = None):
         self.reason = reason
+        # what refused it, for a caller that counts: "cap", "repeat"
+        self.kind = kind
         super().__init__(reason)
 
 
@@ -209,9 +212,52 @@ class PlaidTransportError(PlaidError):
                                          httpx.PoolTimeout))
 
 
+def instance_env() -> str:
+    """The instance's Plaid environment from OIKONOME_PLAID_ENV — exactly
+    one of ENV_URLS' keys; unset or empty means production. Anything else
+    is refused rather than read as production: a typo'd or retired name
+    would otherwise send sandbox keys to production.plaid.com, where every
+    link fails with an error that never mentions the environment."""
+    raw = os.environ.get("OIKONOME_PLAID_ENV") or "production"
+    if raw not in ENV_URLS:
+        raise PlaidError({
+            "error_code": "UNKNOWN_ENVIRONMENT", "error_type": "CONFIG",
+            "error_message": "OIKONOME_PLAID_ENV must be one of: "
+                             + ", ".join(ENV_URLS)
+                             + f" (got {raw[:40]!r})"}, 0)
+    return raw
+
+
+def tenant_env(cfg: dict) -> str:
+    """The environment a household's Plaid calls use: its own choice only
+    alongside its own keys, otherwise the instance's. A restored export
+    can carry plaid_env=sandbox (secrets are scrubbed on restore, this key
+    is not), and production keys must never be sent to sandbox."""
+    own = cfg.get("plaid_env") if cfg.get("plaid_client_id") else None
+    return own if own in ENV_URLS else instance_env()
+
+
+def _release_env(cfg: dict) -> str:
+    """tenant_env for an /item/remove. A release must never wait on a
+    configuration typo: an erasure or reset that could not release would
+    wipe the only copy of the access token while the Item keeps billing. So
+    an unrecognised instance value is logged and the documented default is
+    used here, while every other Plaid call refuses it."""
+    try:
+        return tenant_env(cfg)
+    except PlaidError as e:
+        log.error("%s — releasing under the documented default, production",
+                  e.message)
+        return "production"
+
+
 def credentials(conn) -> tuple[str, str, str]:
     """(client_id, secret, base_url) for the current tenant: BYO config
     first, product env second."""
+    return _credentials(conn, tenant_env)
+
+
+def _credentials(conn, env_of) -> tuple[str, str, str]:
     from ..db import crypto
     cfg = budget.load_config(conn)
     client_id = cfg.get("plaid_client_id") or os.environ.get("OIKONOME_PLAID_CLIENT_ID")
@@ -220,18 +266,10 @@ def credentials(conn) -> tuple[str, str, str]:
     # through untouched, so env creds and legacy/dev-mode plaintext still work.
     secret = crypto.decrypt(conn, cfg.get("plaid_secret")) \
         or os.environ.get("OIKONOME_PLAID_SECRET")
-    # The tenant's own environment choice applies only to the tenant's own
-    # keys. With the instance's credentials the instance's environment
-    # rules: a restored export can carry plaid_env=sandbox (secrets are
-    # scrubbed on restore, this key is not), and production keys must never
-    # be sent to sandbox.plaid.com.
-    byo = bool(cfg.get("plaid_client_id"))
-    env = ((cfg.get("plaid_env") if byo else None)
-           or os.environ.get("OIKONOME_PLAID_ENV", "production"))
     if not client_id or not secret:
         raise PlaidError({"error_code": "NO_CREDENTIALS", "error_type": "CONFIG",
                           "error_message": "no Plaid credentials configured"}, 0)
-    return client_id, secret, ENV_URLS.get(env, ENV_URLS["production"])
+    return client_id, secret, ENV_URLS[env_of(cfg)]
 
 
 class Client:
@@ -274,6 +312,24 @@ class Client:
         cid, secret, url = credentials(conn)
         return cls(cid, secret, url, transport=transport)
 
+    @classmethod
+    def for_platform(cls, transport=None) -> "Client | None":
+        """The instance's own keys (OIKONOME_PLAID_CLIENT_ID/SECRET), or
+        None when it has none — for a link session made under them after
+        the household's keys changed or went."""
+        cid = os.environ.get("OIKONOME_PLAID_CLIENT_ID")
+        secret = os.environ.get("OIKONOME_PLAID_SECRET")
+        if not cid or not secret:
+            return None
+        return cls(cid, secret, ENV_URLS[_release_env({})],
+                   transport=transport)
+
+    @classmethod
+    def for_release(cls, conn, transport=None) -> "Client":
+        """for_tenant for a path that only releases Items (_release_env)."""
+        cid, secret, url = _credentials(conn, _release_env)
+        return cls(cid, secret, url, transport=transport)
+
     # RATE_LIMIT_EXCEEDED is the one error class Plaid documents as purely
     # transient on OUR side — brief in-run backoff beats failing the item
     # and waiting a whole poll cycle. Bounded (2 retries); everything else
@@ -295,7 +351,8 @@ class Client:
                                   "error_type": "API_ERROR",
                                   "error_message": r.text[:200]},
                                  r.status_code)
-            if r.status_code == 200:
+            # 2xx: /user/create answers 201 Created
+            if 200 <= r.status_code < 300:
                 return payload
             err = PlaidError(payload, r.status_code)
             if err.type == "RATE_LIMIT_EXCEEDED" \
@@ -311,13 +368,21 @@ class Client:
                            access_token: str | None = None,
                            account_selection: bool = False,
                            completion_redirect: str | None = None,
-                           conn=None) -> dict:
+                           conn=None, multi_item: bool = False) -> dict:
         """Hosted Link session (no local web server needed). With an
         access_token, runs in update/re-auth mode;
         account_selection additionally shows the shared-accounts checklist,
         which is the ONLY lever that stops Plaid billing a per-account
         subscription product for an unwanted account — a local hide cannot
-        change what the Item shares."""
+        change what the Item shares.
+
+        `multi_item` (a new link only, never update mode) lets the person
+        connect several banks before leaving Link: the token carries
+        ``enable_multi_item_link`` and the household's Plaid user
+        (sync/plaid_user.py). Whether the token really allows it is the
+        answer's ``multi_item``: off by the deployment switch, with no
+        Plaid user to be had, or refused by Plaid (asked once more as an
+        ordinary token, so linking never breaks on it), it is False."""
         body = {
             "client_name": client_name,
             "language": "en",
@@ -371,16 +436,52 @@ class Client:
             extra = extra_products(conn)
             if extra:
                 body["required_if_supported_products"] = extra
-            created = self.post("/link/token/create", body)
+            created, multi = self._create_new_link(body, conn, multi_item)
             # Plaid fixes the backfill here, once: the window this token
             # asked for is handed back so the session can carry it to the
             # exchange (link_item's window_asked). Read again at the
             # exchange, a history choice saved while Link was open would
             # be recorded for an Item that backfills the other window.
             if isinstance(created, dict):
-                created = {**created, "days_requested": window}
+                created = {**created, "days_requested": window,
+                           "multi_item": multi}
             return created
         return self.post("/link/token/create", body)
+
+    def _create_new_link(self, body: dict, conn,
+                         multi_item: bool) -> tuple[dict, bool]:
+        """/link/token/create for a new link: with several banks allowed
+        when asked for and possible, else exactly `body`. Returns the
+        answer and whether the token allows several banks."""
+        from . import plaid_user
+        user = (plaid_user.ensure(conn, self)
+                if multi_item and conn is not None and plaid_user.enabled()
+                else None)
+        if not user:
+            return self.post("/link/token/create", body), False
+        uid, cuid = user
+        try:
+            got = self.post("/link/token/create",
+                            {**body, "user": {"client_user_id": cuid},
+                             "enable_multi_item_link": True,
+                             "user_id": uid})
+        except PlaidTransportError:
+            raise
+        except PlaidError as e:
+            if e.status != 400:
+                raise
+            # a request Plaid refuses as asked (the multi-bank flag, a
+            # user it no longer knows): the ordinary token is the request
+            # every earlier link made, so it is asked for once more as that
+            log.warning("plaid refused a several-bank link token (%s) — "
+                        "asking for a one-bank token", e.code)
+            created = self.post("/link/token/create", body)
+            # the ordinary token went through, so it was the user (or the
+            # flag) Plaid refused: twice in a row and the user is dropped
+            plaid_user.note_outcome(conn, self, accepted=False)
+            return created, False
+        plaid_user.note_outcome(conn, self, accepted=True)
+        return got, True
 
     def get_link_session(self, link_token: str) -> dict:
         return self.post("/link/token/get", {"link_token": link_token})
@@ -432,10 +533,11 @@ def stamp_ledger_removed(item_id: str, reason: str) -> None:
             # of the institution cap (base.released_count)
             admin.execute(
                 "UPDATE plaid_item_ledger SET removed_at=now(), "
-                "removed_reason=CASE WHEN removed_reason IN (%s, %s) "
+                "removed_reason=CASE WHEN removed_reason IN (%s, %s, %s) "
                 "THEN removed_reason ELSE %s END "
                 "WHERE item_id=%s AND removed_at IS NULL",
-                (REPEAT_LEDGER_REASON, RELINK_LEDGER_REASON, reason, item_id))
+                (REPEAT_LEDGER_REASON, RELINK_LEDGER_REASON,
+                 OVERSHOOT_LEDGER_REASON, reason, item_id))
         finally:
             admin.close()
     except Exception as e:                                 # noqa: BLE001
@@ -461,6 +563,18 @@ class ReleaseCount(int):
         self.expected = int(expected)
         self.failed_ids = tuple(failed_ids)
         return self
+
+
+def _release_client(conn) -> "Client":
+    """The client a release path removes Items with: for_tenant, except
+    that an unrecognised OIKONOME_PLAID_ENV falls back to the documented
+    default (_release_env) instead of refusing the release."""
+    try:
+        return Client.for_tenant(conn)
+    except PlaidError as e:
+        if e.code != "UNKNOWN_ENVIRONMENT":
+            raise
+        return Client.for_release(conn)
 
 
 def release_tenant_items(tenant_id, reason: str = "erasure") -> ReleaseCount:
@@ -489,7 +603,7 @@ def release_tenant_items(tenant_id, reason: str = "erasure") -> ReleaseCount:
         if not rows:
             return ReleaseCount(0)
         try:
-            client = Client.for_tenant(conn)
+            client = _release_client(conn)
         except PlaidError:
             # no creds configured — nothing can be released, and every
             # Item that still holds a token is a straggler to report
@@ -616,7 +730,7 @@ def release_live_items(tenant_id, reason: str) -> int:
         if not rows:
             return 0
         try:
-            client = Client.for_tenant(conn)
+            client = _release_client(conn)
         except PlaidError:
             return 0
         for r in rows:
@@ -743,11 +857,60 @@ ALREADY_LINKED = ("this bank is already connected, with the same accounts — "
                   "the second connection was not kept. To repair the one "
                   "you have, use Reconnect on it")
 
-# What a link says once the household has used up its refused repeats for
-# the window: the token is not exchanged, so it is not known whether this
-# bank is a repeat at all — the message must not claim it is.
-TOO_MANY_REPEATS = ("Too many repeated bank links today — try again "
-                    "tomorrow")
+# What a repeat of a held login says once the household has used up its
+# refused repeats for the window: it was exchanged (so it could be handed
+# back) and found to be a repeat, and from here on it holds a place under
+# the cap like any refused link.
+TOO_MANY_REPEATS = ("this bank is already connected, and the second "
+                    "connection was not kept — too many repeated bank links "
+                    "were made today, so linking it again today will not "
+                    "help. To repair the one you have, use Reconnect on it")
+
+# The same two sentences for several banks at once (a session's summary
+# groups banks refused for one reason).
+PLURAL_REASONS = {
+    ALREADY_LINKED: ("these banks are already connected, with the same "
+                     "accounts — the second connections were not kept. To "
+                     "repair the ones you have, use Reconnect on them"),
+    TOO_MANY_REPEATS: ("these banks are already connected, and the second "
+                       "connections were not kept — too many repeated bank "
+                       "links were made today, so linking them again today "
+                       "will not help. To repair the ones you have, use "
+                       "Reconnect on them"),
+}
+
+# How many freshly linked banks a household may have handed back in a day
+# (refused at the cap, as a repeat, past a session's room) before new
+# bank links are refused until the day is out — and before a several-bank
+# session still open keeps any more of the banks it brings (each is handed
+# back as it arrives, and several banks per sign-in pause). Each is a real
+# Item at Plaid for the minutes before it is removed. Plaid's own "add
+# another bank" cannot be stopped from here, so this bounds what a sitting
+# can KEEP and when the next one may start, not how many banks a person
+# signs in to inside a window already open.
+HANDED_BACK_PER_DAY = 6
+TOO_MANY_HANDED_BACK = ("Too many banks were linked and handed back today — "
+                        "connect more banks tomorrow")
+
+
+def handed_back_today(conn, tenant_id: str | None = None) -> int:
+    """Freshly linked banks this household had handed back in the last
+    day (the ledger's refusal reasons). A failed read counts none."""
+    try:
+        if tenant_id is None:
+            tenant_id = conn.execute(
+                "SELECT current_setting('app.tenant_id', true) AS t"
+            ).fetchone()["t"]
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM plaid_item_ledger WHERE tenant = %s "
+            "AND created_at >= now() - interval '24 hours' "
+            "AND (removed_reason IN (%s, %s) "
+            "     OR removed_reason LIKE 'link refused%%')",
+            (tenant_id, REPEAT_LEDGER_REASON, "overshoot")).fetchone()
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("plaid handed-back count failed: %s", e)
+        return 0
+    return int(row["n"])
 
 # The ledger reason a refused repeat link's Item is written with. Plaid
 # created (and bills) the Item, so it stays in the slot ledger; but the
@@ -756,11 +919,40 @@ TOO_MANY_REPEATS = ("Too many repeated bank links today — try again "
 REPEAT_LEDGER_REASON = "repeat"
 
 # How many refused repeats a household may make inside REPEAT_WINDOW_HOURS
-# before a link is no longer exchanged at all. Each refused repeat is an
-# Item created at the exchange and billed for the month; a client stuck
-# relinking the same login would otherwise mint one per pass.
+# that hold no place under the institution cap. Each refused repeat is an
+# Item Plaid created and bills for the month; past the limit a repeat is
+# still exchanged and handed back (an unexchanged token's Item could never
+# be removed), but it is ledgered as an ordinary refusal, which holds its
+# place for RELEASED_HOLD_DAYS — so a client stuck relinking the same login
+# runs into the cap instead of minting billed Items without end.
 REPEAT_LIMIT = 3
 REPEAT_WINDOW_HOURS = 24
+
+# The ledger reason of a bank handed back because a several-bank session
+# went past the institution cap. Handed back within minutes and never
+# synced, it holds no place under the cap (base.released_count) — the
+# household did not churn a connection, it reached one bank too far in one
+# sitting. Bounded: past OVERSHOOT_FREE_PER_DAY such refusals in a day a
+# cap refusal is ledgered as an ordinary one again, so repeated sessions
+# past the cap cannot mint billed Items without holding places.
+OVERSHOOT_LEDGER_REASON = "overshoot"
+OVERSHOOT_FREE_PER_DAY = 2
+
+
+def _overshoot_free(conn, tenant_id: str) -> bool:
+    """True while the household has had fewer than OVERSHOOT_FREE_PER_DAY
+    banks handed back as a session's overshoot in the last day. A ledger
+    hiccup reads as no allowance: the ordinary hold is the safe side."""
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM plaid_item_ledger WHERE tenant = %s "
+            "AND removed_reason = %s "
+            "AND created_at >= now() - interval '24 hours'",
+            (tenant_id, OVERSHOOT_LEDGER_REASON)).fetchone()
+    except Exception as e:                                 # noqa: BLE001
+        log.warning("plaid overshoot count failed: %s", e)
+        return False
+    return int(row["n"]) < OVERSHOOT_FREE_PER_DAY
 
 
 def repeats_exhausted(conn, tenant_id: str | None = None) -> bool:
@@ -1172,7 +1364,8 @@ def link_item(conn, public_token: str, institution_name: str = "",
               outcome: dict | None = None, on_saved=None,
               first_sync: bool = True,
               window_asked: int | None = None,
-              relink_of: str | None = None) -> str:
+              relink_of: str | None = None,
+              several: bool = False, client: "Client | None" = None) -> str:
     """Exchange a public token (from a completed Link session) → item row
     (access token encrypted at rest) → first sync. With no caller-supplied
     institution_name, resolves the real name via /item/get +
@@ -1188,10 +1381,8 @@ def link_item(conn, public_token: str, institution_name: str = "",
     * ValueError — the exchange succeeded but the Item could not be kept
       (the institution cap, a key swap, a bank-link hold, a repeat of a
       login already held, or the row failing to save); it has been handed
-      back to Plaid already. Or — the one ValueError raised BEFORE the
-      exchange — the household has used up its refused repeats for the
-      window (REPEAT_LIMIT), so the token is not exchanged at all and no
-      Item is created.
+      back to Plaid already. Every refusal comes AFTER the exchange: an
+      Item whose token was never exchanged could never be removed.
     * A return — the Item is in the items table. Nothing after the
       insert can fail the link: the first sync, the products pull, the
       branding and the slot ledger are each best-effort, and
@@ -1203,6 +1394,10 @@ def link_item(conn, public_token: str, institution_name: str = "",
     has a record even if this process dies during the sync, so nothing
     afterwards exchanges the spent token again and reports a connected
     bank as a failed link.
+
+    ``several``: the token came from a session that could add several
+    banks, so a cap refusal is that session's overshoot
+    (OVERSHOOT_LEDGER_REASON, within its daily allowance).
 
     ``window_asked`` is the backfill the session's link token asked
     Plaid for (create_hosted_link's ``days_requested``); a new Item records
@@ -1222,7 +1417,10 @@ def link_item(conn, public_token: str, institution_name: str = "",
     item_id and the request_ids in sync_log these are what Plaid support
     and the dashboard Activity Log key on."""
     outcome = outcome if outcome is not None else {}
-    client = Client.for_tenant(conn, transport=transport)
+    # `client`: the keys the session's link token was made under — the
+    # only ones its public token can be exchanged (and its Item removed)
+    # with; a key swap since then is refused below and handed back
+    client = client or Client.for_tenant(conn, transport=transport)
     # read before the exchange: a refused link whose hand-back fails has
     # to queue the token under the household, and by then the connection
     # may be the reason it failed
@@ -1230,12 +1428,11 @@ def link_item(conn, public_token: str, institution_name: str = "",
         "SELECT current_setting('app.tenant_id', true) AS t"
     ).fetchone()["t"]
     # Whether a token repeats a held login can only be known after the
-    # exchange, and the exchange is what creates the billed Item. So a
-    # household that has had REPEAT_LIMIT repeats refused in the window
-    # (a client stuck relinking the same bank) gets no more exchanges
-    # until the window passes, rather than one more billed Item per pass.
-    if repeats_exhausted(conn, tenant_id):
-        raise LinkRefused(TOO_MANY_REPEATS)
+    # exchange, so the repeat limit is read now and applied only to a token
+    # that turns out to be a repeat: a new bank in the same session as
+    # repeats is kept, and a repeat past the limit is still exchanged and
+    # handed back, ledgered so that it holds a place under the cap.
+    exhausted = repeats_exhausted(conn, tenant_id)
     ex = client.exchange_public_token(public_token)
     item_id = ex["item_id"]
     # From the exchange until the items row commits, the access token lives
@@ -1370,7 +1567,8 @@ def link_item(conn, public_token: str, institution_name: str = "",
                         # institution cap, since the login it repeats
                         # already holds one.
                         repeated = True
-                        raise LinkRefused(ALREADY_LINKED)
+                        raise LinkRefused(TOO_MANY_REPEATS if exhausted
+                                          else ALREADY_LINKED, "repeat")
                     try:
                         # the Item being replaced frees its place as this
                         # one is saved, so it counts as free here
@@ -1383,11 +1581,18 @@ def link_item(conn, public_token: str, institution_name: str = "",
                         from .. import ext
                         from .base import institution_cap, institutions_held
                         raise LinkRefused(ext.gate.institution_cap_message(
-                            institution_cap(conn), institutions_held(conn)))
+                            institution_cap(conn), institutions_held(conn)),
+                            "cap")
+                # the hash of the public token that made it: a finisher that
+                # lost its record of this exchange finds the Item by its
+                # token, even when one session made several
+                held_raw = {"link_token_key": hashlib.sha256(
+                    public_token.encode()).hexdigest()}
+                if _is_days(window):
+                    held_raw["days_requested"] = window
                 upsert_item(conn, item_id, "plaid",
                             institution_name or "Plaid", ex["access_token"],
-                            raw=({"days_requested": window}
-                                 if _is_days(window) else None))
+                            raw=held_raw)
                 # in the same commit as the row, so the Item can be found by
                 # the session that made it from the moment it exists (a
                 # finisher that lost its record of the exchange looks it up
@@ -1429,11 +1634,17 @@ def link_item(conn, public_token: str, institution_name: str = "",
                 # already exists. (A link refused by a bank-link hold or a key
                 # swap is not the household reaching for one more bank, and
                 # stays out of the ledger as before.)
-                if capped:
+                overshoot = (capped and several and not relink_of
+                             and _overshoot_free(conn, tenant_id))
+                if overshoot:
+                    _record_slot(conn, item_id, client=client,
+                                 reason=OVERSHOOT_LEDGER_REASON)
+                elif capped:
                     _record_slot(conn, item_id, client=client)
                 elif repeated:
                     _record_slot(conn, item_id, client=client,
-                                 reason=REPEAT_LEDGER_REASON)
+                                 reason=None if exhausted
+                                 else REPEAT_LEDGER_REASON)
                 try:
                     client.remove_item(ex["access_token"])
                 except Exception as e2:           # noqa: BLE001 - best effort
@@ -1465,7 +1676,9 @@ def link_item(conn, public_token: str, institution_name: str = "",
                             if relink_of and not inst_id
                             else "link refused at the cap")
                     elif repeated:
-                        stamp_ledger_removed(item_id, REPEAT_LEDGER_REASON)
+                        stamp_ledger_removed(
+                            item_id, "link refused: repeat past the limit"
+                            if exhausted else REPEAT_LEDGER_REASON)
                     _drop_link_hold(item_id)
             else:
                 _drop_link_hold(item_id)
@@ -1541,8 +1754,15 @@ def _record_slot(conn, item_id: str, client: "Client | None" = None,
     back as it is created (REPEAT_LEDGER_REASON); the release stamp keeps
     it."""
     cfg = budget.load_config(conn)
-    env = cfg.get("plaid_env") or os.environ.get("OIKONOME_PLAID_ENV",
-                                                 "production")
+    # the environment the keys actually went to: the minting client's own
+    # base URL when there is one, else the same rule credentials() applies
+    env = next((k for k, url in ENV_URLS.items()
+                if client is not None and client.base_url == url), None)
+    if env is None:
+        try:
+            env = tenant_env(cfg)
+        except PlaidError:
+            env = "production"   # ledger trouble must never fail a link
     source = "byo" if cfg.get("plaid_client_id") else "platform"
     if client is not None:
         platform = os.environ.get("OIKONOME_PLAID_CLIENT_ID")
@@ -1768,9 +1988,11 @@ def enrich_rows(conn, *, limit: int = ENRICH_BATCH, transport=None) -> dict:
         return stats
     tid = conn.execute(
         "SELECT current_setting('app.tenant_id', true) AS t").fetchone()["t"]
+    from ..db import tenancy
     lock = f"oikonome:enrich:{tid}"
-    if not conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-                        (lock,)).fetchone()["ok"]:
+    if not tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (lock,))["ok"]:
         stats["error"] = "already running"
         return stats
     try:
@@ -1782,7 +2004,6 @@ def enrich_rows(conn, *, limit: int = ENRICH_BATCH, transport=None) -> dict:
         # a connection that goes back to the pool still holding the lock
         # answers "already running" to every later Enrich for this tenant
         # until the backend dies — release_lock drops it instead
-        from ..db import tenancy
         tenancy.release_lock(conn, lock)
 
 

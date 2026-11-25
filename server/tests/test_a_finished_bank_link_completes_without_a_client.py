@@ -325,7 +325,7 @@ class LinkWebhookTests(unittest.TestCase):
         plaid_links.record(tid, lt, "add", None, False, None)
         calls = []
 
-        async def fake_enqueue(tenant_id, link_token):
+        async def fake_enqueue(tenant_id, link_token, tokens=None):
             calls.append((tenant_id, link_token))
             return True
 

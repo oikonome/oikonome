@@ -9,8 +9,8 @@ import { useEffect, useRef, useSyncExternalStore } from "react";
 import { AppState } from "react-native";
 
 import { Client, type Connection } from "./api";
-import { firstSyncPending, LINK_BURST_MS, linkPollMayRetry, linkPollWait,
-         linkWindowAnswer, linkedLine } from "./pure";
+import { addedLine, firstSyncPending, LINK_BURST_MS, linkPollMayRetry,
+         linkPollWait, linkWindowAnswer } from "./pure";
 
 export type PlaidLinkOutcome = {
   kind?: "add" | "add_failed" | "update" | "update_failed" | "exited"
@@ -19,6 +19,13 @@ export type PlaidLinkOutcome = {
   /** "pending": the bank is saved and its first pull is queued on the
    *  worker — accounts arrive when it lands */
   first_sync?: "pending" | "ok";
+  /** several banks in one session: each one, and the server's sentence
+   *  for them all */
+  results?: { institution: string | null; connected: boolean;
+              error?: string }[];
+  summary?: string;
+  progress?: string;
+  quiet?: boolean;
 };
 
 /** How long a client waits on one link session: the Hosted Link URL's
@@ -96,10 +103,14 @@ async function pollLink(
   // linkPollMayRetry); only a definite refusal ends the wait early.
   const deadline = Date.now() + PLAID_LINK_WAIT_MS;
   let backoff = 0;
+  // the banks a several-bank session has connected so far, while the
+  // person may still add another: if the window closes, they are the
+  // answer (the server keeps finishing the session either way)
+  let sofar: PlaidLinkOutcome | null = null;
   while (Date.now() < deadline) {
     if (cancelled()) {
       if (!itemId && mayReleaseSlot()) void setPlaidLinkAside(client, linkToken);
-      return { kind: "cancelled" };
+      return sofar ?? { kind: "cancelled" };
     }
     let s: Awaited<ReturnType<Client["plaidLinkStatus"]>>;
     try {
@@ -111,9 +122,21 @@ async function pollLink(
       continue;
     }
     backoff = 0;
+    if (!s.done && s.progress) {
+      const p = pending.get(linkToken);
+      if (p && p.progress !== s.progress) { p.progress = s.progress; emit(); }
+    }
+    if (!s.done && s.summary && s.results?.some((r) => r.connected))
+      sofar = { kind: "add", summary: s.summary, results: s.results,
+                first_sync: "pending",
+                institution: s.results.filter((r) => r.connected)
+                  .map((r) => r.institution ?? "").filter(Boolean)
+                  .join(", ") };
     if (s.done) {
-      // only this session's own sign-in window is ours to close
-      if (browserToken === linkToken) {
+      // only this session's own sign-in window is ours to close — and not
+      // when the answer came because the session went quiet: the person
+      // may be adding another bank there
+      if (browserToken === linkToken && !s.quiet) {
         browserToken = null;
         WebBrowser.dismissBrowser?.();
       }
@@ -124,6 +147,10 @@ async function pollLink(
     // nothing: the server is completing this link behind the tenant's
     // sync lock, so keep waiting for it
     const closed = closedAt();
+    if (closed !== null && sofar && Date.now() - closed > 9_000) {
+      if (!itemId && mayReleaseSlot()) void setPlaidLinkAside(client, linkToken);
+      return sofar;
+    }
     if (closed !== null && s.kind !== "busy" && Date.now() - closed > 9_000) {
       // the window is gone: the server stops holding a connection slot
       // for it (and still finishes it if Plaid reports a bank after all)
@@ -134,6 +161,8 @@ async function pollLink(
     // back to the foreground (the bank step just ended)
     await sleepOrWake(linkPollWait(Date.now(), burstUntil));
   }
+  // a bank is in: that is the answer, never a timeout
+  if (sofar) return sofar;
   throw new Error("Timed out waiting for the bank connection");
 }
 
@@ -148,7 +177,10 @@ export type PendingLink = { token: string; kind: PendingLinkKind;
                             // a relink's old bank: it stays listed and
                             // live meanwhile, and the server refuses a
                             // second relink of it while this one is open
-                            itemId?: string };
+                            itemId?: string;
+                            // the server's line while a several-bank
+                            // session is open: the banks connected so far
+                            progress?: string };
 export type LinkOutcomeLine = { id: number; at: number; ok: boolean;
                                 text: string };
 export const OUTCOME_SHOWN_MS = 12_000;
@@ -251,10 +283,13 @@ export function linkOutcomeLine(r: PlaidLinkOutcome, kind: PendingLinkKind
     return { ok: false, text: kind === "fix"
       ? "No change — the sign-in window was closed."
       : "No bank was linked — the sign-in window was closed." };
+  // several banks, none kept: the server says which and why
+  if (r.kind === "add_failed" && r.summary)
+    return { ok: false, text: r.summary };
   if (r.kind === "add_failed" || r.kind === "update_failed")
     return { ok: false, text: `Link failed: ${r.error ?? "unknown"}` };
   if (r.kind === "update") return { ok: true, text: "Reconnected." };
-  return { ok: true, text: linkedLine(r.institution, r.first_sync) };
+  return { ok: true, text: addedLine(r) };
 }
 
 /** Open the bank's sign-in and come back as soon as it is on screen: the

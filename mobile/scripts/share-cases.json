@@ -1,0 +1,25 @@
+{
+  "about": "Whole-percent shares of a base by largest remainder. One table run through the server's reporting.shown_shares(parts, base), the web's plannerShares (webapp/src/moneymath.ts) and the phone's (mobile/src/lib/pure.ts). Invented figures.",
+  "cases": [
+    {"name": "three equal parts", "parts": [500, 500, 500], "base": 1500,
+     "shares": [34, 33, 33]},
+    {"name": "out, save and excess of the income", "parts": [2990, 510, 500],
+     "base": 4000, "shares": [75, 13, 12]},
+    {"name": "ties go to the earlier part", "parts": [1, 1, 1, 1, 1, 1],
+     "base": 6, "shares": [17, 17, 17, 17, 16, 16]},
+    {"name": "a part that is not positive has no share",
+     "parts": [0, -5, 300], "base": 600, "shares": [null, null, 50]},
+    {"name": "parts short of the base add to their own share",
+     "parts": [500, 500], "base": 4000, "shares": [13, 12]},
+    {"name": "a plan past its income", "parts": [3000, 500, 0],
+     "base": 3000, "shares": [100, 17, null]},
+    {"name": "no income, no shares", "parts": [10, 20], "base": 0,
+     "shares": [null, null]},
+    {"name": "half cents round to even", "parts": [0.125, 0.125, 0.25],
+     "base": 0.5, "shares": [24, 24, 50]},
+    {"name": "many small parts", "parts": [7, 13, 19, 23, 29, 31],
+     "base": 122, "shares": [6, 11, 15, 19, 24, 25]},
+    {"name": "a typed amount with cents", "parts": [1333.33, 1333.33, 1333.34],
+     "base": 4000, "shares": [33, 33, 34]}
+  ]
+}

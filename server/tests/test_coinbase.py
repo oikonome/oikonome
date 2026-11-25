@@ -88,7 +88,7 @@ def _transport(spot_status=200, seen=None, fail_accounts=False):
 class CoinbaseSyncTests(unittest.TestCase):
     def setUp(self):
         self.conn = make_db()
-        self.iid = coinbase.link(self.conn, "original", KEY_NAME, _PEM)
+        self.iid = coinbase.link(self.conn, "main", KEY_NAME, _PEM)
 
     def tearDown(self):
         self.conn.close()
@@ -97,7 +97,7 @@ class CoinbaseSyncTests(unittest.TestCase):
         return coinbase.sync(self.conn, self.iid, transport=_transport(**kw))
 
     def test_link_stores_credentials_round_trip(self):
-        self.assertEqual(self.iid, "coinbase-original")
+        self.assertEqual(self.iid, "coinbase-main")
         stored = sync_base.get_access_token(self.conn, self.iid)
         creds = json.loads(stored)
         self.assertEqual(creds["name"], KEY_NAME)
@@ -141,13 +141,13 @@ class CoinbaseSyncTests(unittest.TestCase):
         self.assertEqual(res["holdings_usd"], 20100.0)
         rows = {r["currency"]: r for r in self.conn.execute(
             "SELECT currency, quantity, native_usd FROM crypto_holdings "
-            "WHERE account_id='coinbase-original'").fetchall()}
+            "WHERE account_id='coinbase-main'").fetchall()}
         self.assertEqual(set(rows), {"BTC", "USD"})
         self.assertEqual(rows["BTC"]["native_usd"], 20000.0)
         self.assertEqual(rows["USD"]["native_usd"], 100.0)
         acct = self.conn.execute(
             "SELECT type, subtype, balance_current FROM accounts "
-            "WHERE id='coinbase-original'").fetchone()
+            "WHERE id='coinbase-main'").fetchone()
         self.assertEqual(acct["type"], "investment")
         self.assertEqual(acct["subtype"], "crypto")   # _coinbase_pl keys on this
         self.assertEqual(acct["balance_current"], 20100.0)
@@ -162,16 +162,16 @@ class CoinbaseSyncTests(unittest.TestCase):
         # stable id scheme: coinbase:<native transaction id>
         self.assertIn("coinbase:tx-buy", rows)
         buy = rows["coinbase:tx-buy"]
-        # native_amount is stored AS-IS (informational only; spend-excluded
-        # by TRANSFER_* category)
-        self.assertEqual(buy["amount"], 500.0)
-        self.assertEqual(buy["category_primary"], "TRANSFER_OUT")
+        # native_amount in the LEDGER's sign: value arriving in the wallet
+        # is money in (spend-excluded by its TRANSFER_* category)
+        self.assertEqual(buy["amount"], -500.0)
+        self.assertEqual(buy["category_primary"], "TRANSFER_IN")
         self.assertEqual(buy["category_detailed"], "COINBASE_BUY")
         self.assertEqual(buy["name"], "Coinbase buy BTC")
         self.assertEqual(buy["merchant_name"], "Coinbase")
         self.assertEqual(buy["date"], dt.date(2024, 1, 5))
-        self.assertEqual(rows["coinbase:tx-sell"]["amount"], -150.0)
-        self.assertEqual(rows["coinbase:tx-sell"]["category_primary"], "TRANSFER_IN")
+        self.assertEqual(rows["coinbase:tx-sell"]["amount"], 150.0)
+        self.assertEqual(rows["coinbase:tx-sell"]["category_primary"], "TRANSFER_OUT")
         # zero-balance wallets still contribute history; pending flagged
         self.assertEqual(rows["coinbase:tx-pending"]["pending"], 1)
 
@@ -198,7 +198,7 @@ class CoinbaseSyncTests(unittest.TestCase):
         self.assertEqual(n, 4)
         h = self.conn.execute(
             "SELECT COUNT(*) n FROM crypto_holdings "
-            "WHERE account_id='coinbase-original'").fetchone()["n"]
+            "WHERE account_id='coinbase-main'").fetchone()["n"]
         self.assertEqual(h, 2)
         self.assertEqual(self.conn.execute(
             "SELECT status FROM items WHERE id=%s",
@@ -215,10 +215,10 @@ class CoinbaseSyncTests(unittest.TestCase):
         # previous holdings + balance intact
         self.assertEqual(self.conn.execute(
             "SELECT native_usd FROM crypto_holdings WHERE account_id="
-            "'coinbase-original' AND currency='BTC'").fetchone()["native_usd"],
+            "'coinbase-main' AND currency='BTC'").fetchone()["native_usd"],
             20000.0)
         self.assertEqual(self.conn.execute(
-            "SELECT balance_current FROM accounts WHERE id='coinbase-original'"
+            "SELECT balance_current FROM accounts WHERE id='coinbase-main'"
         ).fetchone()["balance_current"], 20100.0)
 
     def test_api_error_marks_item_and_logs(self):
@@ -233,12 +233,12 @@ class CoinbaseSyncTests(unittest.TestCase):
 
     def test_rollback_removes_everything(self):
         self._sync()
-        n = coinbase.rollback(self.conn, "original")
+        n = coinbase.rollback(self.conn, "main")
         self.assertEqual(n, 4)
-        for table, col, val in (("transactions", "account_id", "coinbase-original"),
-                                ("crypto_holdings", "account_id", "coinbase-original"),
-                                ("accounts", "id", "coinbase-original"),
-                                ("items", "id", "coinbase-original")):
+        for table, col, val in (("transactions", "account_id", "coinbase-main"),
+                                ("crypto_holdings", "account_id", "coinbase-main"),
+                                ("accounts", "id", "coinbase-main"),
+                                ("items", "id", "coinbase-main")):
             self.assertEqual(self.conn.execute(
                 f"SELECT COUNT(*) n FROM {table} WHERE {col}=%s",
                 (val,)).fetchone()["n"], 0, table)
@@ -248,12 +248,12 @@ class CoinbaseSyncTests(unittest.TestCase):
         _ensure_account is ON CONFLICT DO NOTHING."""
         self.conn.execute(
             """INSERT INTO accounts (id, item_id, name, display_name, type, subtype)
-               VALUES ('coinbase-original', 'coinbase-original',
-                       'Coinbase (original)', 'My Coinbase', 'investment', 'crypto')""")
+               VALUES ('coinbase-main', 'coinbase-main',
+                       'Coinbase (main)', 'My Coinbase', 'investment', 'crypto')""")
         self._sync()
         row = self.conn.execute(
             "SELECT display_name, balance_current FROM accounts "
-            "WHERE id='coinbase-original'").fetchone()
+            "WHERE id='coinbase-main'").fetchone()
         self.assertEqual(row["display_name"], "My Coinbase")
         self.assertEqual(row["balance_current"], 20100.0)  # balance still updates
 

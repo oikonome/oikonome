@@ -10,19 +10,21 @@ import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput,
 import DatePicker, { DateField } from "../../components/date-picker";
 import PullRefresh from "../../components/pull-refresh";
 import Select from "../../components/select";
-import Sheet, { sheetStyles as b } from "../../components/sheet";
+import Sheet, { FOOTER_SLOP, sheetStyles as b } from "../../components/sheet";
 
-import StaleBanner from "../../components/stale-banner";
+import { EmptyState, FailedLine, NoAccountsLine, StaleLine, useNoAccounts }
+  from "../../components/loaded";
 import TxnRow from "../../components/txn-row";
 import { SnapReceiptButton, WaitingBadge }
   from "../../components/waiting-receipts";
 import { errText, setHandedOffTxn, Txn, TxnPage, TxnQuery }
   from "../../lib/api";
 import { patchQueries } from "../../lib/cache";
-import { DayHead, RANGE_LABEL, TREND_RANGES, withDayHeads, catLabel,
-         filterCategories, householdDay, ledgerRange, routeYm,
+import { catKey, DayHead, RANGE_LABEL, TREND_RANGES, withDayHeads, catLabel,
+         filterCategories, householdDay, routeYm,
          BULK_CHUNK, BULK_MAX, flattenPile, goneTxnIds, mergePilePages,
-         runChunked }
+         EMPTY_LINES, failLine, figureGreyed, listedSpendWord, runChunked,
+         spendDrillState }
   from "../../lib/pure";
 import { useRefetchWhenShown } from "../../lib/focus";
 
@@ -31,6 +33,8 @@ import { useSession } from "../../lib/session";
 import { useDemo, useMe, useOwner, useViewer } from "../../lib/viewer";
 import { WAITING_KEY, useWaitingReceipts } from "../../lib/waiting";
 import { C, mmddyy, money } from "../../lib/theme";
+import SegmentedControl from "../../components/segmented-control";
+import { fieldA11y } from "../../components/field";
 
 const MONTHS = ["January", "February", "March", "April", "May", "June",
                 "July", "August", "September", "October", "November",
@@ -66,11 +70,14 @@ export default function Transactions() {
                                    bucket?: string; y?: string;
                                    m?: string; date_from?: string;
                                    date_to?: string; as_of?: string;
-                                   counted?: string }>();
+                                   counted?: string; q?: string;
+                                   spend?: string; merchant?: string;
+                                   side?: string }>();
   const str = (v: string | string[] | undefined) => v ? String(v) : "";
   // read through routeYm: a deep link can carry any month at all
   const [ym, setYm] = useState(() => routeYm(sp.y, sp.m, now));
-  const [q, setQ] = useState("");
+  // a charge's alert links here searched for that charge (?q=)
+  const [q, setQ] = useState(str(sp.q));
   const [showFilters, setShowFilters] = useState(false);
   const [acct, setAcct] = useState(str(sp.acct));
   const [cat, setCat] = useState(str(sp.cat));
@@ -82,6 +89,15 @@ export default function Transactions() {
   // a lens category label's link: the rows that label summed (personal
   // spend, reimbursements netted), not every row filed under the category
   const [counted, setCounted] = useState(str(sp.counted) === "1");
+  // a Spending figure's link: the rows that figure summed over one range
+  // (`spend`), for a category (`cat`), a merchant or the whole window, on
+  // its current or previous side — the server's own row set (web same)
+  const [spend, setSpend] = useState(str(sp.spend));
+  const [merchant, setMerchant] = useState(str(sp.merchant));
+  const [side, setSide] = useState(str(sp.side));
+  // the server answered a figure's link without naming its rows: it is
+  // older than the drill, so the list fell back to the month browse
+  const [drillRefused, setDrillRefused] = useState(false);
   // whether the view is one MONTH's slice. A bucket always is; a category
   // deep-linked with y&m is that month's category. A category picked in
   // the sheet is not — it searches all history, as it always has — so
@@ -100,13 +116,19 @@ export default function Transactions() {
   // "Everything else" asked for Food again, and a month link after a
   // year link kept the year's date range.
   const linkKey = [sp.acct, sp.cat, sp.bucket, sp.y, sp.m, sp.date_from,
-                   sp.date_to, sp.as_of, sp.counted].map(str).join("|");
+                   sp.date_to, sp.as_of, sp.counted, sp.q, sp.spend,
+                   sp.merchant, sp.side].map(str).join("|");
   useEffect(() => {
+    setQ(str(sp.q));
     setAcct(str(sp.acct));
     setCat(str(sp.cat));
     setBucket(str(sp.bucket));
     setAsOf(str(sp.as_of));
     setCounted(str(sp.counted) === "1");
+    setSpend(str(sp.spend));
+    setMerchant(str(sp.merchant));
+    setSide(str(sp.side));
+    setDrillRefused(false);
     setDateFrom(str(sp.date_from));
     setDateTo(str(sp.date_to));
     setYm(routeYm(sp.y, sp.m, now));
@@ -146,6 +168,7 @@ export default function Transactions() {
       if (want) {
         setBucket(""); setAsOf(""); setCounted(false);
         setMonthScope(false); setYearScope(false);
+        setSpend(""); setMerchant(""); setSide("");
       }
       setPage(1);
     }, 250);
@@ -154,10 +177,16 @@ export default function Transactions() {
 
   // the web's param split: any filter/search → the search path (with
   // paging); otherwise the month view
-  const searching = !!(search || acct || cat || bucket || dateFrom || dateTo
-                       || channel || checksF);
+  const searching = !!(search || acct || cat || bucket || spend || dateFrom
+                       || dateTo || channel || checksF);
+  const noAccounts = useNoAccounts();
   const params: TxnQuery = {
-    ...(bucket
+    ...(spend
+      // a Spending figure IS the query: the server names its rows, and no
+      // sheet filter rides along (web same)
+      ? { spend, page: String(page), ...(cat ? { cat } : {}),
+          ...(merchant ? { merchant } : {}), ...(side ? { side } : {}) }
+      : bucket
       ? { bucket, y: String(ym.y), page: String(page),
           ...(yearScope ? {} : { m: String(ym.m) }),
           ...(asOf ? { as_of: asOf } : {}) }
@@ -172,13 +201,13 @@ export default function Transactions() {
           ...(channel ? { channel } : {}),
           ...(checksF ? { checks: "1" } : {}) }
       : { y: String(ym.y), m: String(ym.m) }),
-    ...(reimbF && !bucket && !(counted && cat) ? { reimb: "1" } : {}),
+    ...(reimbF && !bucket && !spend && !(counted && cat) ? { reimb: "1" } : {}),
     // the search path is owner-agnostic server-side (the web sends owner
     // only in month view) — sending it anyway lit a filter chip that did
     // nothing
     // a bucket listing is the engine's own row set — the lenses would
     // only empty it under a non-zero chip, so none rides along (web same)
-    ...(bucket || (counted && cat) ? {} : {
+    ...(bucket || spend || (counted && cat) ? {} : {
       ...(owner && !searching ? { owner } : {}),
       ...(scope ? { scope } : {}),
     }),
@@ -240,10 +269,16 @@ export default function Transactions() {
   };
   useRefetchWhenShown({ isStale: query.isStale, isFetching: query.isFetching,
                         refetch: refreshAll }, TXNS_KEY);
+  // the question the pile answers: a new search shows the pile only once
+  // its own first page has arrived, never the last search's rows
+  const [pileFor, setPileFor] = useState(filterKey);
   useEffect(() => {
-    if (!query.data || !searching) return;
+    // the previous question's page standing in (placeholderData) is not
+    // this question's answer, and must not be merged into its pile
+    if (!query.data || !searching || query.isPlaceholderData) return;
     const reset = pileKey.current !== filterKey || page === 1;
     pileKey.current = filterKey;
+    setPileFor(filterKey);
     // every earlier page is re-read from the cache: a row edited or
     // removed on the detail screen is patched there, never in this state
     const cached = (p: number) => qcPile.getQueryData<TxnPage>(
@@ -253,7 +288,8 @@ export default function Transactions() {
                      goneTxnIds));
     // params is rebuilt every render; filterKey + page name it
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [query.data, searching, filterKey, page, qcPile, pileTick]);
+  }, [query.data, query.isPlaceholderData, searching, filterKey, page, qcPile,
+      pileTick]);
   const accts = useQuery({ queryKey: ["accounts"],
     queryFn: () => client!.accounts(),
     // also needed while a search names an account (the context line)
@@ -294,7 +330,7 @@ export default function Transactions() {
       // — the rows must not sit there until the active variant returns
       const ids = ctx.ids;
       const patch: Partial<Txn> =
-        v.action === "category" ? { category: catLabel(v.category ?? "") }
+        v.action === "category" ? { category: catKey(v.category) }
         : v.action === "reimb_flag" ? { reimb_flag: true }
         : v.action === "reimb_unflag" ? { reimb_flag: false }
         : v.action === "biz_on" ? { biz_flag: true }
@@ -363,11 +399,26 @@ export default function Transactions() {
   };
 
   const pageRows = query.data?.rows ?? [];
-  const rows = searching ? (pile.length ? pile : pageRows) : pageRows;
+  const rows = searching
+    ? (pileFor === filterKey && pile.length ? pile : pageRows) : pageRows;
   // the ledger is the app's one long date-ordered list, so it is the one
   // surface that gets day dividers — matching the web's Transactions page.
   // Today's recent pane is short enough that a header per day is chrome.
-  const listData = useMemo(() => withDayHeads(rows), [rows]);
+  // Each divider prints the server's whole-day spend (day_spend): a day a
+  // page boundary cuts reads the whole day, not the rows loaded so far.
+  // A search's pile merges the figures of every loaded page.
+  const daySpendMap = useMemo(() => {
+    if (!searching) return query.data?.day_spend;
+    const m: Record<string, number> = {};
+    for (let p = 1; p < page; p++)
+      Object.assign(m, qcPile.getQueryData<TxnPage>(
+        ["transactions", { ...params, page: String(p) }])?.day_spend ?? {});
+    return Object.assign(m, query.data?.day_spend ?? {});
+    // params is rebuilt every render; filterKey + page name it
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [query.data, searching, filterKey, page, qcPile, pileTick]);
+  const listData = useMemo(() => withDayHeads(rows, daySpendMap),
+                           [rows, daySpendMap]);
   const atNow = ym.y === now.getFullYear() && ym.m === now.getMonth() + 1;
   // a destination count, not a filter — same as the web hero's pill-link
   const reimbQ = useQuery({ queryKey: ["reimburse"],
@@ -375,6 +426,12 @@ export default function Transactions() {
     staleTime: 5 * 60_000 });
   const awaitingN = reimbQ.data?.pending.length ?? 0;
   const d0 = query.data;
+  // the range buttons' windows (TxnPage.ranges): the last page that
+  // answered, so a failed read — a too-wide query — still leaves the
+  // buttons that narrow it (web: the same)
+  const lastRanges = useRef(d0?.ranges);
+  if (d0?.ranges) lastRanges.current = d0.ranges;
+  const ranges = d0?.ranges ?? lastRanges.current;
   const acctName = (id: string) =>
     accts.data?.accounts.find((a) => a.id === id)?.name ?? "1 account";
   // What a deep link narrowed the list to, in one chip: a bucket in the
@@ -390,14 +447,32 @@ export default function Transactions() {
     (d0?.bucket === bucket && d0?.bucket_label)
     || (bucket === "food" ? "Food"
         : bucket === "other" ? "Everything else" : bucket);
-  const scopeChip = bucket
+  // a Spending figure's chip is the server's words (drill_label: the
+  // figure and the days it was read over), once they answer THIS figure
+  const scopeChip = spend
+    ? (d0?.drill_label && !query.isPlaceholderData ? d0.drill_label : null)
+    : bucket
     ? `${bucketLabel} · ${yearScope ? ym.y : monthShort}`
     : cat && monthScope ? `${catLabel(cat)} · ${monthShort}` : null;
-  // ✕ on the chip drops the grouping and keeps the month it named
+  // ✕ on the chip drops the grouping and keeps the month it named; a
+  // Spending figure's chip returns to the month browse
   const clearScope = () => {
     setBucket(""); setAsOf(""); setCounted(false); setCat("");
     setMonthScope(false); setYearScope(false); setPage(1);
+    setSpend(""); setMerchant(""); setSide("");
   };
+  // A server from before the drill drops `spend=` and answers its plain
+  // search (a category's every row, or the whole month), with no chip to
+  // say so. Its reply carries no drill_label: say so in one line and go
+  // back to the month browse rather than list rows that are not the figure.
+  const drillState = spendDrillState(spend, d0, query.isPlaceholderData);
+  useEffect(() => {
+    if (drillState !== "unsupported") return;
+    setDrillRefused(true);
+    setBucket(""); setAsOf(""); setCounted(false); setCat("");
+    setMonthScope(false); setYearScope(false); setPage(1);
+    setSpend(""); setMerchant(""); setSide("");
+  }, [drillState]);
   // every filter in force, as a removable chip under the search box — the
   // sheet can be closed and the list still says what is shaping it
   const active: { key: string; label: string; clear: () => void }[] = [
@@ -405,7 +480,7 @@ export default function Transactions() {
                   clear: () => setAcct("") }] : []),
     ...(scopeChip ? [{ key: "scope-link", label: scopeChip,
                        clear: clearScope }] : []),
-    ...(cat && !monthScope
+    ...(cat && !monthScope && !spend
       ? [{ key: "cat", label: catLabel(cat), clear: () => setCat("") }]
       : []),
     ...(dateFrom || dateTo ? [{ key: "date",
@@ -426,10 +501,15 @@ export default function Transactions() {
   ];
   // a month view narrowed by a lens (whose money, business scope,
   // reimbursements) keeps the month's cash flow as its headline; the
-  // rows on screen are then a subset, so say what THEY add up to
+  // rows on screen are then a subset, so say what THEY spent — the
+  // server's figure (listed_spend: spending only, by the rule the day
+  // totals and the verdict use; a business's spending when every listed
+  // row is a business's, listed_scope saying so), as on the web. An older
+  // server sends none and the line leaves the amount out.
   const narrowed = !searching && active.length > 0;
-  const listedSum = useMemo(
-    () => rows.reduce((a, r) => a + (r.amount ?? 0), 0), [rows]);
+  const listedSpend = d0?.mode === "month" ? d0.listed_spend : undefined;
+  const listedWord = listedSpendWord(
+    d0?.mode === "month" ? d0.listed_scope : undefined);
   // The sheet's filters search ALL history, so reaching for one leaves a
   // bucket or a month's category behind rather than silently narrowing
   // the new filter to the month that happened to be on screen — and a
@@ -437,7 +517,7 @@ export default function Transactions() {
   // one would otherwise look broken. (web: leaveScope)
   const leaveScope = () => {
     setBucket(""); setAsOf(""); setCounted(false); setMonthScope(false);
-    setYearScope(false);
+    setYearScope(false); setSpend(""); setMerchant(""); setSide("");
   };
   // every filter change starts back at page 1 and leaves that scope
   const refilter = () => { setPage(1); leaveScope(); };
@@ -470,19 +550,22 @@ export default function Transactions() {
   const clearAll = () => {
     setAcct(""); setCat(""); setBucket(""); setAsOf(""); setCounted(false);
     setMonthScope(false); setYearScope(false);
+    setSpend(""); setMerchant(""); setSide("");
     setReimbF(false); setQ(""); setSearch("");
     setDateFrom(""); setDateTo(""); setOwner(""); setScope("");
     setChannel(""); setChecksF(false); setPage(1);
   };
-  const summary = !d0 ? (query.isError ? "Couldn't reach the server."
+  const summary = !d0 ? (query.isError
+                           ? failLine(query.error, "transactions", "phone").text
                                        : "Loading…")
     : searching
-      ? `${d0.total ?? rows.length} result${
-          (d0.total ?? rows.length) === 1 ? "" : "s"} · ${
-          money(-(d0.amount_sum ?? 0))} total`
+      ? `${d0.total} result${d0.total === 1 ? "" : "s"}${
+          d0.flow ? ` · out ${money(d0.flow.money_out)} · in ${
+            money(d0.flow.money_in)}` : ""}`
       : `${MONTHS[ym.m - 1]} ${ym.y} · ${rows.length} transaction${
           rows.length === 1 ? "" : "s"}${
-          narrowed ? ` · ${money(-listedSum)} listed` : ""}`;
+          narrowed && listedSpend != null
+            ? ` · ${money(listedSpend)} ${listedWord}` : ""}`;
 
   const primary = accts.data?.primary_checking_id
     ? accts.data.accounts.find((a) => a.id === accts.data!.primary_checking_id)
@@ -493,7 +576,7 @@ export default function Transactions() {
   return (
     <View style={s.wrap}>
       <View style={{ flexDirection: "row", gap: 8 }}>
-        <TextInput style={[s.search, { flex: 1 }]}
+        <TextInput {...fieldA11y("Search payee, category")} style={[s.search, { flex: 1 }]}
                    placeholder="search payee, category…"
                    placeholderTextColor={C.mut} autoCapitalize="none"
                    autoCorrect={false} value={q} onChangeText={setQ}
@@ -504,7 +587,7 @@ export default function Transactions() {
                      setSearch(q.trim()); setPage(1);
                      if (q.trim()) leaveScope();
                    }} />
-        <Pressable style={[s.filterBtn, nFilters > 0 && s.filterOn]}
+        <Pressable accessibilityRole="button" style={[s.filterBtn, nFilters > 0 && s.filterOn]}
                    onPress={() => setShowFilters(true)}>
           <Text style={{ color: nFilters > 0 ? C.text : C.mut,
                          fontSize: 13, fontWeight: "600" }}>
@@ -513,49 +596,10 @@ export default function Transactions() {
         </Pressable>
         {!viewer && <SnapReceiptButton />}
       </View>
-      {/* the primary checking balance heads the ledger (mirrors the web
-          header): the account the cash forecast starts from — the live
-          pin, else the largest-balance pick — available balance first
-          like the runway. Nothing without a checking account; "balance
-          not set" when the row has none yet. Tapping opens Accounts,
-          where the pin is changed */}
-      {primary && (
-        <Pressable onPress={() => router.push("/accounts" as never)}
-                   accessibilityRole="link"
-                   accessibilityLabel={`primary checking ${primary.name}, ${
-                     primaryBal == null ? "balance not set" : money(primaryBal)}`}
-                   style={{ flexDirection: "row", alignItems: "baseline",
-                            justifyContent: "flex-end", gap: 6,
-                            paddingHorizontal: 12 }}>
-          <Text style={{ color: C.mut, fontSize: 12 }} numberOfLines={1}>
-            {primary.name}{primary.mask ? ` ••${primary.mask}` : ""}
-          </Text>
-          <Text style={{ color: (primaryBal ?? 0) < 0 ? C.bad : C.text,
-                         fontSize: 16, fontWeight: "700",
-                         fontVariant: ["tabular-nums"] }}>
-            {primaryBal == null ? "balance not set" : money(primaryBal)}
-          </Text>
-        </Pressable>
-      )}
-      {(waiting.data?.count ?? 0) > 0 && (
-        <View style={{ flexDirection: "row" }}>
-          <WaitingBadge />
-        </View>
-      )}
-      {/* the page as a file, filters included: the share sheet takes it,
-          since a browser tab cannot carry the bearer token. Owner-only:
-          the door refuses a member or a viewer, so they get no chip */}
-      {d0 && mayExport && (
-        <View style={{ flexDirection: "row", justifyContent: "flex-end",
-                       paddingHorizontal: 12 }}>
-          <Pressable style={s.chip} onPress={exportRows} disabled={exporting}
-                     accessibilityLabel="download these transactions"
-                     accessibilityState={{ busy: exporting, disabled: exporting }}>
-            <Text style={s.chipText(false)}>
-              {exporting ? "preparing download…" : "download CSV / XLSX"}
-            </Text>
-          </Pressable>
-        </View>
+      {drillRefused && (
+        <Text style={{ color: C.mut, fontSize: 12, marginBottom: 6 }}>
+          This server can&apos;t list a figure&apos;s rows — showing the month instead.
+        </Text>
       )}
       {active.length > 0 && (
         // a ScrollView grows by default, so in this flex column the strip
@@ -566,14 +610,14 @@ export default function Transactions() {
                     style={{ flexGrow: 0, flexShrink: 0 }}>
           <View style={{ flexDirection: "row", gap: 6 }}>
             {active.map((f) => (
-              <Pressable key={f.key} style={[s.chip, s.chipOn]}
+              <Pressable accessibilityRole="button" key={f.key} style={[s.chip, s.chipOn]}
                          onPress={() => { f.clear(); setPage(1); }}
                          accessibilityLabel={`remove filter ${f.label}`}>
                 <Text style={s.chipText(true)}>{f.label}  ✕</Text>
               </Pressable>
             ))}
             {active.length > 1 && (
-              <Pressable style={s.chip} onPress={clearAll}>
+              <Pressable accessibilityRole="button" style={s.chip} onPress={clearAll}>
                 <Text style={s.chipText(false)}>clear all</Text>
               </Pressable>
             )}
@@ -585,7 +629,9 @@ export default function Transactions() {
           can be walked back through the year in place */}
       {(!searching || monthScope) && (
         <View style={s.nav}>
-          <Pressable style={s.navBtn} onPress={() => shift(-1)}>
+          <Pressable style={s.navBtn}
+                     accessibilityRole="button" accessibilityLabel="Previous month"
+                     onPress={() => shift(-1)}>
             <Text style={s.navText}>‹</Text>
           </Pressable>
           <View style={{ flexDirection: "row", alignItems: "center",
@@ -601,166 +647,267 @@ export default function Transactions() {
             )}
           </View>
           <Pressable style={[s.navBtn, atNow && { opacity: 0.3 }]}
-                     disabled={atNow} onPress={() => shift(1)}>
+                     disabled={atNow}
+                     accessibilityRole="button" accessibilityLabel="Next month"
+                     onPress={() => shift(1)}>
             <Text style={s.navText}>›</Text>
           </Pressable>
         </View>
       )}
-      <StaleBanner query={query} />
-      {/* HERO — the month's cash flow (income / spend / net, the Cash
-          Flow page's definitions; transfers and card payments are money
-          moved, not made or spent) as the headline, not a footer; a
-          search answers with its count + true total (+ per-item Amazon
-          spend when the term matched order items) */}
-      {d0 && (
-        <View style={{ gap: 2 }}>
-          <Text style={{ color: C.text, fontSize: 18, fontWeight: "700",
-                         fontVariant: ["tabular-nums"] }}>
-            {!searching ? (
-              <>
-                {/* in and net are null for a month before the bank feed
-                    starts: income unknown reads "—" and no net is shown,
-                    never a false loss */}
-                {d0.in_sum == null
-                  ? <Text style={s.heroMut}>—</Text>
-                  : <Text style={{ color: C.good }}>{money(d0.in_sum)}</Text>}
-                <Text style={s.heroMut}> in</Text>
-                {/* the current month: the paychecks still due before month
-                    end — the Budget plan's income is the two together */}
-                {(d0.in_expected ?? 0) > 0 ? (
-                  <Text style={s.heroMut}> (+{money(d0.in_expected!)} expected)</Text>
-                ) : null}
-                <Text style={s.heroMut}> · </Text>
-                {money(d0.out_sum ?? 0)}
-                <Text style={s.heroMut}> out · </Text>
-                {d0.net_sum != null && (
-                  <>
-                    <Text style={{ color: d0.net_sum < 0 ? C.bad : C.good }}>
-                      {d0.net_sum < 0 ? "" : "+"}{money(d0.net_sum)}
-                    </Text>
-                    <Text style={s.heroMut}> net · </Text>
-                  </>
-                )}
-                <Text style={s.heroMut}>{rows.length} txn
-                  {rows.length === 1 ? "" : "s"}
-                  {(d0.biz_count ?? 0) > 0
-                    ? ` · ${d0.biz_count} business (not in the totals)` : ""}</Text>
-                {d0.per_day != null ? (
-                  <Text style={s.heroMut}>
-                    {" · "}
-                    <Text style={{ color: C.text }}>{money(d0.per_day)}</Text>
-                    {"/day"}
-                  </Text>
-                ) : null}
-              </>
-            ) : (
-              <>
-                {d0.total ?? rows.length}
-                <Text style={s.heroMut}>
-                  {" result"}{(d0.total ?? rows.length) === 1 ? "" : "s"} ·{" "}
-                </Text>
-                <Text style={(d0.amount_sum ?? 0) < 0
-                               ? { color: C.good } : undefined}>
-                  {money(-(d0.amount_sum ?? 0))}
-                </Text>
-                <Text style={s.heroMut}> total</Text>
-                {/* the figure the label wore, when the raw sum of its
-                    rows is not it: reimbursements netted, an envelope's
-                    overflow counted only past the envelope */}
-                {bucket && d0.bucket === bucket && d0.bucket_amount != null
-                  && Math.abs(d0.bucket_amount - (d0.amount_sum ?? 0)) >= 0.005 ? (
-                  <Text style={s.heroMut}>
-                    {" · counted as "}
-                    <Text style={{ color: C.text }}>{money(d0.bucket_amount)}</Text>
-                  </Text>
-                ) : null}
-                {(d0.biz_count ?? 0) > 0 && scope !== "business" ? (
-                  <Text style={s.heroMut}>
-                    {" "}· {d0.biz_count} business (not in the total)</Text>
-                ) : null}
-                {/* the total says how much has gone to this merchant; the
-                    average says what one visit costs — the question a
-                    merchant search is usually really asking. Mirrors the
-                    web hero exactly. */}
-                {d0.spend_avg != null ? (
-                  <Text style={s.heroMut}>
-                    {" · "}
-                    <Text style={{ color: C.text }}>{money(d0.spend_avg)}</Text>
-                    {" avg of "}{d0.spend_count}
-                  </Text>
-                ) : null}
-                {/* per DAY over the window asked for, beside the per-visit
-                    average — mirrors the web hero */}
-                {d0.per_day != null ? (
-                  <Text style={s.heroMut}>
-                    {" · "}
-                    <Text style={{ color: C.text }}>{money(d0.per_day)}</Text>
-                    {"/day"}
-                  </Text>
-                ) : null}
-                {d0.amazon_items ? (
-                  <Text style={s.heroMut}>
-                    {" · "}{money(d0.amazon_items.sum)} on{" "}
-                    {d0.amazon_items.count} Amazon item
-                    {d0.amazon_items.count === 1 ? "" : "s"}
-                    {d0.amazon_items.unpriced > 0
-                      ? ` (${d0.amazon_items.unpriced} without a price)` : ""}
-                  </Text>
-                ) : null}
-              </>
-            )}
-          </Text>
-          {narrowed && (
-            <Text style={{ color: C.mut, fontSize: 12 }}>
-              {rows.length} listed ·{" "}
-              <Text style={listedSum < 0 ? { color: C.good } : { color: C.text }}>
-                {money(-listedSum)}
-              </Text>
-              {" "}total for this filter
-            </Text>
-          )}
-          {searching && (
-            // the web's context line — what question produced these rows
-            <Text style={{ color: C.mut, fontSize: 12 }}>
-              in <Text style={{ color: C.text }}>
-                {acct
-                  ? (accts.data?.accounts.find((a) => a.id === acct)?.name
-                     ?? "1 account")
-                  : "all accounts"}
-              </Text>
-              {/* a bucket or a month-scoped category is already named by
-                  the chip above, with its month — saying it twice reads
-                  as two different filters */}
-              {cat && !monthScope ? ` · ${catLabel(cat)}` : ""}
-              {dateFrom || dateTo
-                ? ` · ${dateFrom ? mmddyy(dateFrom) : "start"} – ${
-                    dateTo ? mmddyy(dateTo) : "now"}`
-                : ""}
-              {" · newest first"}
-              {/* the term matched an account by name, so that account's
-                  rows are in the result — a renamed account found through
-                  the BANK'S name states both (mirrors the web line) */}
-              {(d0.account_hits ?? []).map((h) => (
-                <Text key={h.id}>
-                  {" · includes "}
-                  <Text style={{ color: C.text }}>{h.label}</Text>
-                  {h.via_bank ? ` (the bank calls it “${h.bank_name}”)` : ""}
-                </Text>
-              ))}
-            </Text>
-          )}
-          {awaitingN > 0 && (
-            <View style={{ flexDirection: "row", gap: 14 }}>
-              <Text style={{ color: C.warn, fontSize: 12 }}
-                    onPress={() => router.push("/reimburse" as never)}>
-                {awaitingN} awaiting reimbursement ›
-              </Text>
-            </View>
-          )}
-        </View>
-      )}
+      <StaleLine query={query} />
       <FlashList
         ref={topRef}
+        // The month's summary rides at the head of the LIST, not above it:
+        // fixed over the list it left the rows a third of a phone screen,
+        // and a header that grows when the totals arrive resized the list
+        // under the recycler — rows scrolled into the top came up blank.
+        ListHeaderComponent={
+          <View style={{ gap: 8, paddingBottom: 8 }}>
+            {/* the primary checking balance heads the ledger (mirrors the web
+                header): the account the cash forecast starts from — the live
+                pin, else the largest-balance pick — available balance first
+                like the runway. Nothing without a checking account; "balance
+                not set" when the row has none yet. Tapping opens Accounts,
+                where the pin is changed */}
+            {primary && (
+              <Pressable onPress={() => router.push("/accounts" as never)}
+                         accessibilityRole="link"
+                         accessibilityLabel={`primary checking ${primary.name}, ${
+                           primaryBal == null ? "balance not set" : money(primaryBal)}`}
+                         style={{ flexDirection: "row", alignItems: "baseline",
+                                  justifyContent: "flex-end", gap: 6,
+                                  paddingHorizontal: 12 }}>
+                <Text style={{ color: C.mut, fontSize: 12 }} numberOfLines={1}>
+                  {primary.name}{primary.mask ? ` ••${primary.mask}` : ""}
+                </Text>
+                <Text style={{ color: (primaryBal ?? 0) < 0 ? C.bad : C.text,
+                               fontSize: 16, fontWeight: "700",
+                               fontVariant: ["tabular-nums"] }}>
+                  {primaryBal == null ? "balance not set" : money(primaryBal)}
+                </Text>
+              </Pressable>
+            )}
+            {(waiting.data?.count ?? 0) > 0 && (
+              <View style={{ flexDirection: "row" }}>
+                <WaitingBadge />
+              </View>
+            )}
+            {/* the page as a file, filters included: the share sheet takes it,
+                since a browser tab cannot carry the bearer token. Owner-only:
+                the door refuses a member or a viewer, so they get no chip */}
+            {d0 && mayExport && (
+              <View style={{ flexDirection: "row", justifyContent: "flex-end",
+                             paddingHorizontal: 12 }}>
+                <Pressable accessibilityRole="button"
+                           style={s.chip} onPress={exportRows} disabled={exporting}
+                           accessibilityLabel="download these transactions"
+                           accessibilityState={{ busy: exporting, disabled: exporting }}>
+                  <Text style={s.chipText(false)}>
+                    {exporting ? "preparing download…" : "download CSV / XLSX"}
+                  </Text>
+                </Pressable>
+              </View>
+            )}
+            {/* HERO — the month's cash flow (income / spend / net, the Cash
+                Flow page's definitions; transfers and card payments are money
+                moved, not made or spent) as the headline, not a footer; a
+                search answers with its count + true total (+ per-item Amazon
+                spend when the term matched order items) */}
+            {d0 && (
+              <View style={{ gap: 2,
+                             opacity: figureGreyed(query) ? 0.55 : undefined }}>
+                {!searching ? (
+                  <>
+                    {/* the month's four figures as labelled tiles, two across
+                        (the web's row of tiles): a sentence of figures has to be
+                        read, tiles are scanned. In and net are null for a month
+                        before the bank feed starts: income unknown reads "—",
+                        never a false loss */}
+                    <View style={{ flexDirection: "row", gap: 6 }}>
+                      {([
+                        ["In", d0.in_sum == null ? "—" : money(d0.in_sum, false),
+                         d0.in_sum == null ? C.mut : C.good,
+                         (d0.in_expected ?? 0) > 0
+                           ? `+${money(d0.in_expected!, false)} expected` : "landed"],
+                        ["Out", money(d0.out_sum, false), C.text, "spent"],
+                        ["Net", d0.net_sum == null ? "—"
+                           : (d0.net_sum < 0 ? "" : "+") + money(d0.net_sum, false),
+                         d0.net_sum == null ? C.mut
+                           : d0.net_sum < 0 ? C.bad : C.good,
+                         // mid-month the net is the month so far, with
+                         // paychecks still to come (web: the same words)
+                         (d0.in_expected ?? 0) > 0 ? "so far" : "in less out"],
+                        ["A day", d0.per_day == null ? "—"
+                           : money(d0.per_day, false),
+                         d0.per_day == null ? C.mut : C.text, "spent on average"],
+                      ] as const).map(([k, v, color, sub]) => (
+                        <View key={k} accessible
+                        accessibilityLabel={`${k} ${v}, ${sub}`}
+                        style={{ flex: 1, minWidth: 0,
+                                         backgroundColor: C.hover,
+                                         borderColor: C.border, borderWidth: 1,
+                                         borderRadius: 8, paddingVertical: 6,
+                                         paddingHorizontal: 8 }}>
+                    <Text style={{ color: C.mut, fontSize: 11 }}
+                          numberOfLines={1}>{k}</Text>
+                    <Text style={{ color, fontSize: 15, fontWeight: "700",
+                                   fontVariant: ["tabular-nums"] }}
+                          numberOfLines={1} adjustsFontSizeToFit>{v}</Text>
+                  </View>
+                ))}
+                    </View>
+                    <Text style={[s.heroMut, { fontSize: 12, marginTop: 4 }]}>
+                      {(d0.in_expected ?? 0) > 0
+                  ? `+${money(d0.in_expected!, false)} expected · ` : ""}
+                {rows.length} txn{rows.length === 1 ? "" : "s"}
+                      {(d0.biz_count ?? 0) > 0
+                        ? ` · ${d0.biz_count} business (not in the totals)` : ""}
+                    </Text>
+                  </>
+                ) : (
+                  <Text style={{ color: C.text, fontSize: 18, fontWeight: "700",
+                                 fontVariant: ["tabular-nums"] }}>
+                    <>
+                      {d0.total}
+                      <Text style={s.heroMut}>
+                        {" result"}{d0.total === 1 ? "" : "s"}
+                      </Text>
+                      {/* a bucket's or a counted category's rows: the label's
+                          own figure; any other search: out / in / net over
+                          every matched row by Cash Flow's rules (TxnPage.flow)
+                          — the web hero's words and signs */}
+                      {(bucket || counted || spend) && d0.amount_sum != null ? (
+                        <>
+                          <Text style={s.heroMut}> · </Text>
+                          <Text style={d0.amount_sum < 0
+                                         ? { color: C.good } : undefined}>
+                            {money(-d0.amount_sum)}
+                          </Text>
+                          <Text style={s.heroMut}> total</Text>
+                        </>
+                      ) : d0.flow ? (
+                        <>
+                          <Text style={s.heroMut}> · out </Text>
+                          {money(d0.flow.money_out)}
+                          <Text style={s.heroMut}> · in </Text>
+                          <Text style={d0.flow.money_in > 0
+                                         ? { color: C.good } : undefined}>
+                            {money(d0.flow.money_in)}</Text>
+                          <Text style={s.heroMut}> · net </Text>
+                          <Text style={{ color: d0.flow.net < 0 ? C.bad
+                                           : d0.flow.net > 0 ? C.good : C.text }}>
+                            {(d0.flow.net > 0 ? "+" : "") + money(d0.flow.net)}</Text>
+                        </>
+                      ) : null}
+                      {/* the figure the label wore, when the raw sum of its
+                          rows is not it: reimbursements netted, an envelope's
+                          overflow counted only past the envelope */}
+                      {bucket && d0.bucket === bucket && d0.bucket_amount != null
+                        && d0.amount_sum != null
+                        && Math.abs(d0.bucket_amount - d0.amount_sum) >= 0.005 ? (
+                        <Text style={s.heroMut}>
+                          {" · counted as "}
+                          <Text style={{ color: C.text }}>{money(d0.bucket_amount)}</Text>
+                        </Text>
+                      ) : null}
+                      {(d0.biz_count ?? 0) > 0 && scope !== "business" ? (
+                        <Text style={s.heroMut}>
+                          {" "}· {d0.biz_count} business (not in the total)</Text>
+                      ) : null}
+                      {/* the total says how much has gone to this merchant; the
+                          average says what one visit costs — the question a
+                          merchant search is usually really asking. Mirrors the
+                          web hero exactly. */}
+                      {d0.spend_avg != null ? (
+                        <Text style={s.heroMut}>
+                          {" · "}
+                          <Text style={{ color: C.text }}>{money(d0.spend_avg)}</Text>
+                          {" avg of "}{d0.spend_count}
+                        </Text>
+                      ) : null}
+                      {/* per DAY over the window asked for, beside the per-visit
+                          average — mirrors the web hero */}
+                      {d0.per_day != null ? (
+                        <Text style={s.heroMut}>
+                          {" · "}
+                          <Text style={{ color: C.text }}>{money(d0.per_day, false)}</Text>
+                          {"/day"}
+                        </Text>
+                      ) : null}
+                      {d0.amazon_items ? (
+                        <Text style={s.heroMut}>
+                          {" · "}{money(d0.amazon_items.sum)} on{" "}
+                          {d0.amazon_items.count} Amazon item
+                          {d0.amazon_items.count === 1 ? "" : "s"}
+                          {d0.amazon_items.unpriced > 0
+                            ? ` (${d0.amazon_items.unpriced} without a price)` : ""}
+                        </Text>
+                      ) : null}
+                    </>
+                  </Text>
+                )}
+                {narrowed && (
+                  <Text style={{ color: C.mut, fontSize: 12 }}>
+                    {rows.length} listed
+                    {listedSpend != null ? <>
+                      {" · "}
+                      <Text style={{ color: C.text }}>
+                        {money(listedSpend)}</Text>
+                      {` ${listedWord}`}</> : null}
+                  </Text>
+                )}
+                {searching && (
+                  // the web's context line — what question produced these rows
+                  <Text style={{ color: C.mut, fontSize: 12 }}>
+                    in <Text style={{ color: C.text }}>
+                      {acct
+                        ? (accts.data?.accounts.find((a) => a.id === acct)?.name
+                           ?? "1 account")
+                        : "all accounts"}
+                    </Text>
+                    {/* a bucket or a month-scoped category is already named by
+                        the chip above, with its month — saying it twice reads
+                        as two different filters */}
+                    {cat && !monthScope ? ` · ${catLabel(cat)}` : ""}
+                    {dateFrom || dateTo
+                      ? ` · ${dateFrom ? mmddyy(dateFrom) : "start"} – ${
+                          dateTo ? mmddyy(dateTo) : "now"}`
+                      : ""}
+                    {" · newest first"}
+                    {/* the term matched an account by name, so that account's
+                        rows are in the result — a renamed account found through
+                        the BANK'S name states both (mirrors the web line) */}
+                    {(d0.account_hits ?? []).map((h) => h.rows_listed ? (
+                      <Text key={h.id}>
+                        {" · includes "}
+                        <Text style={{ color: C.text }}>{h.label}</Text>
+                        {h.via_bank ? ` (the bank calls it “${h.bank_name}”)` : ""}
+                      </Text>
+                    ) : (
+                      // the term matched rows by their own text; the account
+                      // named like it is a link of its own (web: the same)
+                      <Text key={h.id}>
+                        {" · also: "}
+                        <Text style={{ color: C.accent }} accessibilityRole="link"
+                              onPress={() => { setQ(""); setSearch("");
+                                               refilter(); setAcct(h.id); }}>
+                          rows on {h.label}</Text>
+                      </Text>
+                    ))}
+                  </Text>
+                )}
+                {awaitingN > 0 && (
+                  <View style={{ flexDirection: "row", gap: 14 }}>
+                    <Text style={{ color: C.warn, fontSize: 12 }}
+                          onPress={() => router.push("/reimburse" as never)}>
+                      {awaitingN} awaiting reimbursement ›
+                    </Text>
+                  </View>
+                )}
+              </View>
+            )}
+          </View>
+        }
         data={listData}
         keyExtractor={(it) => "kind" in it ? it.key : it.id}
         // headers and rows recycle in separate pools — one pool would
@@ -776,7 +923,8 @@ export default function Transactions() {
                   about the day rather than about what the total excludes */}
               <Text style={s.dayHeadR}>
                 {item.count} transaction{item.count === 1 ? "" : "s"}
-                {item.spent > 0 ? ` · ${money(-item.spent)} spent` : ""}
+                {/* whole dollars, as the web's day divider prints it */}
+                {item.spent > 0 ? ` · ${money(item.spent, false)} spent` : ""}
               </Text>
             </View>
           ) : (
@@ -789,12 +937,15 @@ export default function Transactions() {
         refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                         onRefresh={refreshAll} />}
-        ListEmptyComponent={
-          <Text style={s.mut}>
-            {query.isPending ? "Loading…"
-              : query.isError ? "Couldn't reach the server."
-              : "No transactions."}
-          </Text>}
+        ListEmptyComponent={query.data === undefined && query.isError
+          ? <FailedLine q={query} what="transactions" />
+          : query.data === undefined ? <Text style={s.mut}>Loading…</Text>
+          // a filter that matches nothing says so, with no action (the
+          // web's words); "Connect or import" only with no accounts at all
+          : searching || owner || scope || reimbF
+            ? <EmptyState title={EMPTY_LINES.filtered} />
+          : noAccounts ? <NoAccountsLine />
+          : <EmptyState title={EMPTY_LINES.monthNoTransactions} />}
         ListFooterComponent={rows.length > 0 ? (
           <View>
             <Text style={s.mut}>
@@ -875,12 +1026,12 @@ export default function Transactions() {
                       sel.size === 1 ? "" : "s"}`}
              footer={
                <View style={b.footer}>
-                 <Pressable style={[b.btn, b.btnQuiet]}
+                 <Pressable accessibilityRole="button" hitSlop={FOOTER_SLOP} style={[b.btn, b.btnQuiet]}
                             onPress={() => setBulkPicking(false)}>
                    <Text style={b.btnQuietText}>Close</Text>
                  </Pressable>
                </View>}>
-        <TextInput style={s.search} placeholder="filter…"
+        <TextInput {...fieldA11y("Filter")} style={s.search} placeholder="filter…"
                    placeholderTextColor={C.mut} autoCapitalize="none"
                    value={bulkFilter} onChangeText={setBulkFilter} />
         {/* your own categories first, then the standard set — the web
@@ -897,7 +1048,7 @@ export default function Transactions() {
           const match = (c: string) =>
             filterCategories([c], bulkFilter).length > 0;
           const row = (c: string) => (
-            <Pressable key={c} style={s.catRow}
+            <Pressable accessibilityRole="button" key={c} style={s.catRow}
                        disabled={bulk.isPending}
                        onPress={() => bulk.mutate({
                          action: "category", category: c })}>
@@ -925,12 +1076,13 @@ export default function Transactions() {
              title="Filters"
              footer={
                <View style={b.footer}>
-                 <Pressable style={b.btn}
+                 <Pressable accessibilityRole="button" hitSlop={FOOTER_SLOP} style={b.btn}
                             onPress={() => setShowFilters(false)}>
                    <Text style={b.btnText}>Done</Text>
                  </Pressable>
                  {(nFilters > 0 || q) && (
-                   <Pressable style={[b.btn, b.btnQuiet]} onPress={clearAll}>
+                   <Pressable accessibilityRole="button" hitSlop={FOOTER_SLOP}
+                              style={[b.btn, b.btnQuiet]} onPress={clearAll}>
                      <Text style={b.btnQuietText}>Clear</Text>
                    </Pressable>
                  )}
@@ -945,22 +1097,24 @@ export default function Transactions() {
             windows every over-time toggle offers; a picked from/to that
             matches none of them lights nothing, and All is the
             no-date-filter state */}
-        <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap" }}>
-          {TREND_RANGES.map((r) => {
-            const v = ledgerRange(r, now);
-            const on = dateFrom === v.from && dateTo === v.to;
-            return (
-              <Pressable key={r} style={[s.chip, on && s.chipOn]}
-                         onPress={() => {
-                           // an explicit range answers a different
-                           // question from "this bucket, this month"
-                           setDateFrom(v.from); setDateTo(v.to); refilter();
-                         }}>
-                <Text style={s.chipText(on)}>{RANGE_LABEL[r]}</Text>
-              </Pressable>
-            );
-          })}
-        </View>
+        {/* the windows are Cash Flow's, sent with every page
+            (TxnPage.ranges): complete months, This month to today, All
+            unbounded; with no page yet the buttons wait, and after one they
+            keep its windows through a failed read (web: the same) */}
+        <SegmentedControl label="Date range" size="sm"
+          value={TREND_RANGES.find((r) => {
+            const v = ranges?.[r];
+            return !!v && dateFrom === v.start && dateTo === v.end;
+          }) ?? null}
+          onChange={(r) => {
+            // an explicit range answers a different question from "this
+            // bucket, this month"
+            const v = ranges?.[r];
+            if (!v) return;
+            setDateFrom(v.start); setDateTo(v.end); refilter();
+          }}
+          options={TREND_RANGES.map((r) => ({ value: r, label: RANGE_LABEL[r],
+                                             disabled: !ranges?.[r] }))} />
         <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
           <DateField value={dateFrom} placeholder="from"
                      onPress={() => setPick("from")}
@@ -1011,12 +1165,12 @@ export default function Transactions() {
           <>
             <Text style={s.lbl}>Whose money</Text>
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
-              <Pressable style={[s.chip, !owner && s.chipOn]}
+              <Pressable accessibilityRole="button" style={[s.chip, !owner && s.chipOn]}
                          onPress={() => { setOwner(""); refilter(); }}>
                 <Text style={s.chipText(!owner)}>all</Text>
               </Pressable>
               {ownersQ.data!.owners.map((o) => (
-                <Pressable key={o}
+                <Pressable accessibilityRole="button" key={o}
                            style={[s.chip, owner === o && s.chipOn]}
                            onPress={() => { setOwner(o); refilter(); }}>
                   <Text style={s.chipText(owner === o)}>{o}</Text>
@@ -1031,7 +1185,8 @@ export default function Transactions() {
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
               {([["", "household + business"], ["personal", "household only"],
                  ["business", "business only"]] as const).map(([v, l]) => (
-                <Pressable key={v} style={[s.chip, scope === v && s.chipOn]}
+                <Pressable accessibilityRole="button"
+                           key={v} style={[s.chip, scope === v && s.chipOn]}
                            onPress={() => { setScope(v); refilter(); }}>
                   <Text style={s.chipText(scope === v)}>{l}</Text>
                 </Pressable>
@@ -1043,17 +1198,18 @@ export default function Transactions() {
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
           {([["", "any"], ["in store", "in store"], ["online", "online"],
              ["other", "other"]] as const).map(([v, l]) => (
-            <Pressable key={v} style={[s.chip, channel === v && s.chipOn]}
+            <Pressable accessibilityRole="button"
+                       key={v} style={[s.chip, channel === v && s.chipOn]}
                        onPress={() => { setChannel(v); refilter(); }}>
               <Text style={s.chipText(channel === v)}>{l}</Text>
             </Pressable>
           ))}
-          <Pressable style={[s.chip, checksF && s.chipOn]}
+          <Pressable accessibilityRole="button" style={[s.chip, checksF && s.chipOn]}
                      onPress={() => { setChecksF((x) => !x); refilter(); }}>
             <Text style={s.chipText(checksF)}>checks only</Text>
           </Pressable>
         </View>
-        <Pressable style={[s.chip, reimbF && s.chipOn,
+        <Pressable accessibilityRole="button" style={[s.chip, reimbF && s.chipOn,
                            { alignSelf: "flex-start", marginTop: 8 }]}
                    // a filter of its own, like the chips above: it leaves a
                    // bucket or a month's category rather than riding along
@@ -1069,12 +1225,14 @@ export default function Transactions() {
 const s = {
   ...StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg, padding: 12, gap: 8 },
-  search: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
+  search: { backgroundColor: C.card, borderColor: C.field, borderWidth: 1,
             borderRadius: 10, color: C.text, fontSize: 15,
             paddingHorizontal: 12, paddingVertical: 9 },
   nav: { alignItems: "center", flexDirection: "row",
          justifyContent: "space-between" },
-  navBtn: { paddingHorizontal: 18, paddingVertical: 4 },
+  // a fingertip in each direction: the arrows are the screen's main control
+  navBtn: { paddingHorizontal: 18, paddingVertical: 4, minHeight: 44,
+            minWidth: 44, alignItems: "center", justifyContent: "center" },
   navText: { color: C.accent, fontSize: 24 },
   navLabel: { color: C.text, fontSize: 16, fontWeight: "600" },
   list: { paddingBottom: 24 },

@@ -37,7 +37,8 @@ log = logging.getLogger("oikonome.notify.push_native")
 # What a push is allowed to say. The relay accepts a superset of this
 # (relay/app.py EVENTS): it serves every instance version still out
 # there, so an event retired here stays accepted there.
-EVENTS = frozenset({"daily", "monthly", "yearly", "alert", "test"})
+EVENTS = frozenset({"daily", "monthly", "yearly", "alert", "security",
+                    "test"})
 
 _TIMEOUT = 10.0
 
@@ -96,6 +97,19 @@ def _why(detail: dict | None, label: str, sentence: str) -> None:
     if detail is not None:
         detail["unavailable"] = [label]
         detail["reason"] = sentence
+
+
+def _refused_as_unknown_event(r) -> bool:
+    """True when the relay refused the batch because it does not know the
+    event — its exact answer for that, 400 {"detail": "unknown event"}, and
+    no other. A 400 always means nothing in the batch was delivered."""
+    if r.status_code != 400:
+        return False
+    try:
+        body = r.json()
+    except Exception:                              # noqa: BLE001
+        return False
+    return isinstance(body, dict) and body.get("detail") == "unknown event"
 
 
 def send_tenant(conn, tenant_id: str, event: str,
@@ -165,6 +179,8 @@ def send_tenant(conn, tenant_id: str, event: str,
                 r.status_code,
                 (f"relay HTTP {r.status_code}",
                  f"the push relay answered HTTP {r.status_code}")))
+            if detail is not None and _refused_as_unknown_event(r):
+                detail["unknown_event"] = True
             return 0
         out = r.json()
     except Exception as e:                         # noqa: BLE001
@@ -202,3 +218,27 @@ def send_tenant(conn, tenant_id: str, event: str,
         log.warning("push_native: relay 'sent' is not a number: %.100r",
                     out.get("sent"))
         return 0
+
+
+def send_security(conn, tenant_id: str, *, user_id=None,
+                  connect=None) -> int:
+    """Tell the devices about an account-security change: the "security"
+    event, whose fixed line the relay chooses and whose tap opens the
+    Security screen. Like every event but the daily one it carries no text.
+
+    The relay is a shared service and may be a version behind this
+    instance. One that does not know the event refuses the whole batch
+    (nothing delivered), and then the batch goes once more as the generic
+    "alert", so the person still hears of the change. Only that refusal
+    falls back: a dead key, a token held elsewhere or a rate limit would
+    refuse the alert just the same. Never raises (send_tenant's
+    contract)."""
+    detail: dict = {}
+    sent = send_tenant(conn, tenant_id, "security", detail=detail,
+                       user_id=user_id, connect=connect)
+    if detail.get("unknown_event"):
+        log.info("push_native: relay does not know the security event; "
+                 "sending it as an alert")
+        sent = send_tenant(conn, tenant_id, "alert", user_id=user_id,
+                           connect=connect)
+    return sent

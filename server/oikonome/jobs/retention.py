@@ -1,9 +1,9 @@
 """Nightly retention for the logs that only machines read.
 
 Each table here is pruned to what its readers can still ask for, and no
-further. A table whose rows a person reads as history is not pruned here:
-whether to forget part of a household's history is a product decision,
-not a performance one.
+further. A table whose rows a person reads as history is pruned only to a
+window the product chose (alerts_log below): whether to forget part of a
+household's history is a product decision, not a performance one.
 
   sync_log       one row per pull. Readers: each connection's newest
                  success (status chips, the reaper's quiet-item check),
@@ -24,12 +24,25 @@ not a performance one.
                  links minted in the last hour, so a row whose link and
                  window both closed UNLOCK_KEEP_DAYS ago is never read.
 
+  alerts_log     the household's alert history. Kept HISTORY_KEEP_DAYS
+                 past an alert's last sighting. A standing alert (active)
+                 is current state, not history, and is never dropped. A
+                 dismissed row is what keeps a dismissed alert hidden, but
+                 the alert writer advances last_seen on every sighting,
+                 dismissed or not, so a dismissed alert that still fires
+                 always looks young here; only one that has not been seen
+                 for the whole window goes, and if it ever returns it is
+                 news again.
+  admin_audit    the operator's audit trail (control plane; it survives a
+                 household's erasure, and still does — this trims by age,
+                 never by tenant). Kept HISTORY_KEEP_DAYS. Its machine
+                 readers look back at most ninety days or ask "was this
+                 already recorded once", where a re-record after the window
+                 is one more line, not a wrong decision.
+
 Already pruned elsewhere: the activity log (engine/activity.prune, its
 own retention window), the logo cache (web/logos._prune, size caps),
 sessions (auth/sessions), webhook deliveries (notify/webhooks.prune).
-Not pruned on purpose: alerts_log (the household's alert history, and its
-dismissed rows are what keep a dismissed alert hidden) and admin_audit
-(the operator's audit trail, kept through erasure by design).
 
 Deletes are batched, so a first pass over a years-old log never holds one
 long transaction, and every pass is idempotent: a second run finds
@@ -46,6 +59,10 @@ log = logging.getLogger(__name__)
 
 SYNC_LOG_KEEP_DAYS = 180
 UNLOCK_KEEP_DAYS = 30
+# A year plus the quarter that reads it: a yearly review (or a tax-season
+# look back at last year's alerts and operator actions) still finds the
+# whole previous year a quarter after it closed.
+HISTORY_KEEP_DAYS = 400
 BATCH = 5000
 
 _SWEEP_LOCK = "oikonome:retention"
@@ -89,6 +106,49 @@ def prune_login_unlocks(admin, keep_days: int = UNLOCK_KEEP_DAYS) -> int:
         (int(keep_days),) * 3).rowcount
 
 
+def prune_alerts_log(conn, keep_days: int = HISTORY_KEEP_DAYS,
+                     batch: int = BATCH) -> int:
+    """Drop alert rows that stopped standing and were last seen more than
+    `keep_days` ago, `batch` at a time. On a tenant-scoped connection this
+    prunes that household; on the owner connection, every household (the
+    cutoff is the same for all, so one pass is the per-household pass)."""
+    total = 0
+    while True:
+        n = conn.execute(
+            """DELETE FROM alerts_log d
+                USING (SELECT tenant_id, id FROM alerts_log
+                        WHERE active = 0
+                          AND last_seen < current_date - %s
+                        LIMIT %s) doomed
+               WHERE d.tenant_id = doomed.tenant_id AND d.id = doomed.id
+                 -- said again on the row being deleted: a sync that sights
+                 -- the alert again between the pick and the delete makes it
+                 -- wait on the row, and the wait re-reads only these tests
+                 AND d.active = 0
+                 AND d.last_seen < current_date - %s""",
+            (int(keep_days), int(batch), int(keep_days))).rowcount
+        total += n
+        if n < batch:
+            return total
+
+
+def prune_admin_audit(admin, keep_days: int = HISTORY_KEEP_DAYS,
+                      batch: int = BATCH) -> int:
+    """Drop audit rows older than `keep_days`, `batch` at a time.
+    Control-plane table: the owner connection."""
+    total = 0
+    while True:
+        n = admin.execute(
+            """DELETE FROM admin_audit
+                WHERE id IN (SELECT id FROM admin_audit
+                              WHERE at < now() - make_interval(days => %s)
+                              LIMIT %s)""",
+            (int(keep_days), int(batch))).rowcount
+        total += n
+        if n < batch:
+            return total
+
+
 def sweep() -> dict:
     """The nightly pass over every table above, on the owner connection.
     Single-flight: a console run-now overlapping the cron's run skips."""
@@ -102,7 +162,9 @@ def sweep() -> dict:
             return {"skipped": "in-flight"}
         try:
             out = {"sync_log": prune_sync_log(admin),
-                   "login_unlocks": prune_login_unlocks(admin)}
+                   "login_unlocks": prune_login_unlocks(admin),
+                   "alerts_log": prune_alerts_log(admin),
+                   "admin_audit": prune_admin_audit(admin)}
         finally:
             admin.execute("SELECT pg_advisory_unlock(hashtext(%s))",
                           (_SWEEP_LOCK,))

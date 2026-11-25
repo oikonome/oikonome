@@ -1,0 +1,13 @@
+{
+  "oldest_supported": "v0.1.0",
+  "accepted": [
+    {
+      "problem_sha256": "34aa7f0f57758ce6dbb0ad69fba17d128054b620a5dcb2c53bfc3da78441eaae",
+      "reason": "a renamed funding alias no client reads"
+    },
+    {
+      "problem_sha256": "791c3d4f1b9aa343afb0160ff2eaaf47bdb479f51061270359fd7c115aa5a15e",
+      "reason": "a renamed funding alias no client reads"
+    }
+  ]
+}

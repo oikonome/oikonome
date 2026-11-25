@@ -55,6 +55,7 @@ import uuid as _uuid
 
 from fastapi import APIRouter, Body, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from starlette.concurrency import run_in_threadpool
 
 from .. import ext
 from ..db import tenancy
@@ -345,7 +346,7 @@ def _render(request: Request, **ctx) -> HTMLResponse:
 _SINGLE_HOUSEHOLD_NOTICE = (
     "This instance is a single household — it does not take signups, so "
     "invites and instance provisioning do not apply here. "
-    "To share it, use Settings → Users → Invite.")
+    "To share it, use Settings → Household → Create invite link.")
 
 _NOTICE_CODES = {
     "rebooting": ("Reboot requested — users see a 60-second countdown, "
@@ -1574,8 +1575,10 @@ async def invite(request: Request, email: str = Form(...),
     form = await request.form()
     extra = {k: str(v) for k, v in form.multi_items()
              if k not in ("email", "days", "note")}
-    return _mint_invite(request, email=email, days=days, note=note,
-                        extra=extra)
+    # the mint takes an instance-wide advisory lock and renders the
+    # dashboard: database work, so off the event loop
+    return await run_in_threadpool(_mint_invite, request, email=email,
+                                   days=days, note=note, extra=extra)
 
 
 def _mint_invite(request: Request, *, email: str = "", days: int = 14,
@@ -2483,7 +2486,7 @@ def tenant_export(request: Request, tenant_id: str = Form(...),
                 request,
                 notice="Export refused: this household has not granted "
                        "support access. Ask them to grant it in Settings → "
-                       "Support access; they can also export their own data "
+                       "Security → Support access; they can also export their own data "
                        "there without you.")
         if _passkey_count():
             if not _stepup_ok(_session(request), admin, stepup):
@@ -2871,6 +2874,15 @@ async def create_instance(request: Request, email: str = Form(...)):
     what the account is born with."""
     form = await request.form()
     extra = {k: str(v) for k, v in form.multi_items() if k != "email"}
+    # everything past reading the form — the password hash, the per-email
+    # advisory lock, the inserts, the dashboard render — runs in the
+    # threadpool: a lock wait on the loop stalls every request the worker
+    # is serving
+    return await run_in_threadpool(_create_instance, request, email, extra)
+
+
+def _create_instance(request: Request, email: str, extra: dict):
+    """The body of the create-instance door, run off the event loop."""
     if (bounce := _require(request)) is not None:
         return bounce
     if not _multi_tenant():

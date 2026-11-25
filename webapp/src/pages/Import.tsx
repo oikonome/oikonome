@@ -1,9 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect, useRef, useState, type ReactNode } from "react";
-import { api, assistant as assistantApi, errText, type Batch, type TaxdocPlan, type TaxdocRow, mmdd, type ImportOutcome, type AccountChoice, money, bulkJobLive, type BulkJob, type BulkJobStatus, type ColumnMappingNeeded, type MappingNeeded, type YnabAccountsNeeded, type YnabDestination } from "../api/client";
-import { parseMoneyDraft } from "../moneymath";
+import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+import { api, assistant as assistantApi, errText, type Batch, type TaxdocPlan, type TaxdocRow, type StoredDoc, type W2Match, mmdd, type ImportOutcome, type AccountChoice, money, bulkJobLive, type BulkJob, type BulkJobStatus, type ColumnMappingNeeded, type MappingNeeded, type YnabAccountsNeeded, type YnabDestination } from "../api/client";
+import { EMPTY_LINES, importCountText, parseMoneyDraft }
+  from "../moneymath";
 import { removeFromList } from "../api/cache";
 import DemoLock from "../components/DemoLock";
+import { FailedLine, StaleLine } from "../components/Loaded";
 import { keptRowsNote, keptRowsQuestion } from "../components/RemoveAccountPanel";
 import { sharedLock } from "../sharedlogin";
 import { isOwner, isViewer } from "../role";
@@ -11,6 +13,8 @@ import { useElevate } from "../elevation";
 import { useLocation } from "react-router";
 import HistoryChoice, { HISTORY_CHOICES, HISTORY_SAVING, useHistorySaving }
   from "../components/HistoryChoice";
+import Note from "../components/Note";
+import { fieldProps } from "../components/Field";
 
 // Rows older than the household's history window never reach the ledger,
 // so an import that dropped some says how many and where the window is
@@ -76,19 +80,35 @@ function RestoreProgressCard({ onDone }: { onDone: () => void }) {
   }, [st, seenDone, onDone]);
   if (!st || st.state === "idle") return null;
   if (st.state === "error")
-    return <div className="note bad">
-      {st.progress.error ?? "the restore failed"}</div>;
+    return <Note tone="bad">
+      {st.progress.error ?? "the restore failed"}</Note>;
   if (st.state === "done") {
     const r = st.progress.result;
-    return <div className="note good">
-      {r?.source && <b>{r.source} — </b>}
-      Restored <b>{r?.imported ?? 0}</b> transactions.
-      {(r?.warnings ?? []).length > 0 && (
-        <ul style={{ margin: ".4rem 0 0 1.2rem" }}>
-          {r!.warnings!.map((w, i) => <li key={i}>{w}</li>)}
-        </ul>
+    // rows the restore could not read are said apart from the result and
+    // above it, and a restore that left some out does not read as plainly
+    // good; an older server sends no `skipped`
+    const skipped = r?.skipped ?? [];
+    const said = new Set(skipped.map((k) => k.sentence));
+    const warnings = (r?.warnings ?? []).filter((w) => !said.has(w));
+    return <>
+      {skipped.length > 0 && (
+        <Note tone="warn">
+          <b>Some rows could not be read and were left out</b>
+          <ul style={{ margin: ".4rem 0 0 1.2rem" }}>
+            {skipped.map((k) => <li key={k.table}>{k.sentence}</li>)}
+          </ul>
+        </Note>
       )}
-    </div>;
+      <Note tone={skipped.length > 0 ? "info" : "good"}>
+        {r?.source && <b>{r.source} — </b>}
+        Restored <b>{r?.imported ?? 0}</b> transactions.
+        {warnings.length > 0 && (
+          <ul style={{ margin: ".4rem 0 0 1.2rem" }}>
+            {warnings.map((w, i) => <li key={i}>{w}</li>)}
+          </ul>
+        )}
+      </Note>
+    </>;
   }
   const p = st.progress ?? {};
   return (
@@ -172,7 +192,7 @@ function BulkJobCard({ onSettled }: { onSettled: (j: BulkJob) => void }) {
                   ? undefined : { color: "var(--red)" }}>
               {f.name}: {f.state === "running" ? "importing…"
                 : f.ok ? (f.restore_started ? "restoring…"
-                          : `${f.imported ?? 0} transactions`
+                          : importCountText(f, "file")
                             + (f.corrected
                               ? ` · corrected ${f.corrected} an earlier `
                                 + "import read differently (sign or year)"
@@ -343,14 +363,14 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
             <table style={{ fontSize: 13 }}>
               {/* The amount convention is auto-detected; this column is where you
                   correct it when it looks backwards. */}
-              <thead><tr><th></th><th>File</th><th>Type</th>
+              <thead><tr><th><span className="sr-only">Select</span></th><th>File</th><th>Type</th>
                 <th>Into</th><th>If amounts look backwards</th>
                 <th>Note</th></tr></thead>
               <tbody>
                 {plan.files.map((f) => (
                   <tr key={f.index} style={f.action === "skip"
                       ? { opacity: .45 } : undefined}>
-                    <td><input type="checkbox"
+                    <td><input aria-label={`Import ${f.name}`} type="checkbox"
                       checked={f.action === "import"}
                       /* can't import an unsupported or oversized
                          (empty-staged) file — keep the box disabled */
@@ -368,7 +388,8 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
                         // only the accounts the file could mean: a new
                         // account under the same number would lead back
                         // to the same question
-                        <select value={f.account_id ?? ""}
+                        <select aria-label={`Into which account: ${f.name}`}
+                                value={f.account_id ?? ""}
                           onChange={(e) => patch(f.index,
                             { account_id: e.target.value || null })}>
                           <option value="">choose one…</option>
@@ -378,7 +399,8 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
                         </select>
                       ) : (
                         <>
-                          <select value={f.account_id ?? "__new__"}
+                          <select aria-label={`Into which account: ${f.name}`}
+                                  value={f.account_id ?? "__new__"}
                             onChange={(e) => patch(f.index,
                               e.target.value === "__new__"
                                 ? { account_id: null }
@@ -390,7 +412,7 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
                             ))}
                           </select>
                           {f.account_id === null && (
-                            <input value={f.new_account_name}
+                            <input aria-label="New account name" value={f.new_account_name}
                               placeholder="new account name"
                               onChange={(e) => patch(f.index,
                                 { new_account_name: e.target.value })}
@@ -400,7 +422,8 @@ function PlanReview({ files, onSubmitted, onTaxDocs, onRestore }: {
                       )}
                     </td>
                     <td>
-                      <select value={f.amount_sign}
+                      <select aria-label={`If amounts look backwards: ${f.name}`}
+                              value={f.amount_sign}
                         style={!f.sign_certain
                           ? { borderColor: "var(--amber)" } : undefined}
                         title={f.sign_certain ? ""
@@ -475,9 +498,10 @@ function DropZone({ onFiles, busy, mayRestore = true }: {
            e.preventDefault(); setOver(false);
            if (!saving) take(e.dataTransfer.files);
          }}>
-      <input ref={fileRef} type="file" multiple style={{ display: "none" }}
+      <input aria-label="Choose files"
+             ref={fileRef} type="file" multiple style={{ display: "none" }}
              onChange={(e) => { take(e.target.files); e.target.value = ""; }} />
-      <input ref={folderRef} type="file" multiple
+      <input aria-label="Choose a folder" ref={folderRef} type="file" multiple
         // @ts-expect-error non-standard but universal folder picker
         webkitdirectory=""
         style={{ display: "none" }}
@@ -511,9 +535,11 @@ function DropZone({ onFiles, busy, mayRestore = true }: {
 }
 
 // heading/prelude: the Accounts page embeds this section as "Connect
-// accounts and import transactions" with the Account-management card on
-// top; the standalone /import deep link keeps its own name and shape.
-export default function Import({ heading = "Import transactions",
+// accounts and import" with the Account-management card on top; the
+// standalone /import deep link keeps its own name and shape. The page is
+// "Import", as the menu calls it: it takes statements, tax forms and a
+// whole-household restore, not transactions alone.
+export default function Import({ heading = "Import",
                                  prelude = null, connect = null,
                                  manual = null }: {
   heading?: string; prelude?: ReactNode;
@@ -645,7 +671,7 @@ export default function Import({ heading = "Import transactions",
   if (isViewer(me))
     return (
       <>
-        <h1>Import transactions</h1>
+        <h1>Import</h1>
         <p className="sub">View-only access — the instance owner manages
           imports.</p>
       </>
@@ -688,7 +714,7 @@ export default function Import({ heading = "Import transactions",
       )}
 
       {res?.error && (
-        <div className="note bad">{res.error}
+        <Note tone="bad">{res.error}
           {/* the file goes to the card picked; the YNAB card asks on
               its own row */}
           {!!res.choices?.length && !mapping && escalate.variables && (
@@ -696,15 +722,12 @@ export default function Import({ heading = "Import transactions",
               onPick={(id) => escalate.mutate(
                 { ...escalate.variables!, accountId: id })} />
           )}
-        </div>
+        </Note>
       )}
       {res && !res.error && (
-        <div className="note good">
+        <Note tone="good">
           {res.source && <b>{res.source} — </b>}
-          Imported <b>{res.imported}</b> transactions
-          {res.skipped_duplicates
-            ? ` · skipped ${res.skipped_duplicates} already covered`
-            : ""}
+          {importCountText(res)}
           {res.corrected
             ? ` · corrected ${res.corrected} an earlier import read `
               + "differently (sign or year)"
@@ -735,7 +758,7 @@ export default function Import({ heading = "Import transactions",
               {res.warnings!.map((w, i) => <li key={i}>{w}</li>)}
             </ul>
           )}
-        </div>
+        </Note>
       )}
 
       {/* the mapping step appears ONLY when a file actually needs it */}
@@ -794,8 +817,26 @@ export default function Import({ heading = "Import transactions",
       {taxDocs.map((f, i) => (
         <TaxDocsCard key={`${i}:${f.name}:${f.size}`} file={f} />
       ))}
+      <StoredDocuments />
 
-      <BatchList rows={batches.data?.batches ?? []} onChanged={refresh} />
+      {/* a failed read keeps the card's place: gone, it read as no imports
+          to undo */}
+      {batches.data === undefined && batches.isError ? (
+        <div className="card"><h2>Recent imports</h2>
+          <FailedLine q={batches} what="the recent imports" /></div>
+      ) : (<>
+        <StaleLine query={batches} />
+        {/* an answered empty list says so (the phone's words) */}
+        {batches.data && batches.data.batches.length === 0
+          ? <div className="card"><h2>Recent imports</h2>
+              <p className="mut">{EMPTY_LINES.imports}</p>
+              {/* accounts filled from files no batch here imported: the
+                  server's words, so "nothing to undo" is not read as
+                  "nothing imported" */}
+              {batches.data.older_imports_line && (
+                <p className="sub">{batches.data.older_imports_line}</p>)}</div>
+          : <BatchList rows={batches.data?.batches ?? []} onChanged={refresh} />}
+      </>)}
       </DemoLock>
     </>
   );
@@ -833,6 +874,179 @@ function settleW2Rows(rows: TaxdocRow[], drafts: Record<string, string>,
   return { ok: true, rows: out };
 }
 
+// The stored W-2s a refused save says each row looks like (a 409 that
+// carries `matches`), or null for any other failure.
+function w2LookalikesOf(e: unknown): W2Match[][] | null {
+  const raw = e instanceof Error ? e.message : "";
+  const m = /^409:\s*([\s\S]*)$/.exec(raw);
+  if (!m) return null;
+  try {
+    const b = JSON.parse(m[1]);
+    return Array.isArray(b?.matches) ? b.matches as W2Match[][] : null;
+  } catch { return null; }
+}
+
+// The people a W-2 can belong to are the server's (w2_people,
+// taxdocs.w2_people): the primary earner, and the spouse only in a
+// household that has one.
+type W2Person = "primary" | "spouse";
+const W2_WHOSE: Record<string, string> =
+  { primary: "the primary earner", spouse: "the spouse",
+    unassigned: "nobody yet" };
+
+// What a W-2 row still needs before it is stored: whose it is, and — when
+// it looks like a W-2 already stored — whether it is that form. Both are
+// asked, never assumed (specs/w2-wages.md).
+function w2RowsUnanswered(rows: TaxdocRow[]): string | null {
+  if (rows.some((r) => !r.owner)) return "Say whose each W-2 is first.";
+  if (rows.some((r) => r.matches?.length && r.replaces === undefined))
+    return "Say whether this is the W-2 already stored or a second one.";
+  return null;
+}
+
+// Every stored tax and income document: what each is, the years it wrote,
+// whose, the file and when — and the way to take one away (put back for 30
+// days). The words are the server's (GET /api/import/taxdoc/stored); a
+// W-2 keeps its whose-picker, since each counts toward one person's wages.
+// Other forms feed no figure and sit collapsed. Hidden until there is one.
+// Phone twin: StoredDocuments in mobile/src/app/imports.tsx.
+function StoredDocuments() {
+  const qc = useQueryClient();
+  const list = useQuery({ queryKey: ["taxdoc-stored"],
+                          queryFn: api.taxdocStored });
+  const [err, setErr] = useState<string | null>(null);
+  const [open, setOpen] = useState<Record<string, boolean>>({});
+  // every figure the stored income feeds is read again once one moved
+  const moved = () => {
+    setErr(null);
+    qc.invalidateQueries({ queryKey: ["taxdoc-stored"] });
+    qc.invalidateQueries({ queryKey: ["taxdoc-w2s"] });
+    qc.invalidateQueries({ queryKey: ["report", "cashflow"] });
+    qc.invalidateQueries({ queryKey: ["retirement"] });
+  };
+  const failed = (e: unknown) => {
+    setErr(errText(e));
+    qc.invalidateQueries({ queryKey: ["taxdoc-stored"] });
+  };
+  const remove = useMutation({
+    mutationFn: async (d: StoredDoc) => {
+      // the confirm says what the removal does, in the server's words
+      const fx = await api.taxdocStoredEffect(d);
+      if (!window.confirm(`Remove the ${d.kind_label} (${d.years_label})?\n\n`
+          + `${fx.effect_line}\n\nYou can put it back for 30 days.`))
+        return null;
+      return api.taxdocStoredDelete(d);
+    },
+    onSuccess: (r) => { if (r) moved(); },
+    onError: failed,
+  });
+  const putBack = useMutation({
+    mutationFn: (d: StoredDoc) => api.taxdocStoredRestore(d),
+    onSuccess: moved, onError: failed,
+  });
+  const assign = useMutation({
+    mutationFn: (v: { w: StoredDoc["w2s"][number]; owner: W2Person }) =>
+      api.taxdocW2Owner(v.w, v.owner),
+    onSuccess: moved, onError: failed,
+  });
+  // the payer's name, corrected: no figure reads it, so no confirm
+  const rename = useMutation({
+    mutationFn: async (d: StoredDoc) => {
+      const name = window.prompt("Payer's name", d.employer_shown ?? "");
+      if (name === null || !name.trim() || name.trim() === d.employer_shown)
+        return null;
+      return api.taxdocStoredPayer(d, name.trim());
+    },
+    onSuccess: (r) => { if (r) moved(); },
+    onError: failed,
+  });
+  const docs = list.data?.documents ?? [];
+  if (list.data === undefined && list.isError)
+    return (
+      <div className="card"><h2 style={{ marginTop: 0 }}>Stored tax &amp; income documents</h2>
+        <FailedLine q={list} what="the stored documents" /></div>);
+  if (!docs.length) return null;
+  const busy = remove.isPending || putBack.isPending || assign.isPending
+    || rename.isPending;
+  return (
+    <div className="card">
+      <h2 style={{ marginTop: 0 }}>Stored tax &amp; income documents</h2>
+      <p className="mut">Each year uses the newest document that gives the
+        figure. Remove one and the next older document's figure takes its
+        place, or the year goes blank; a person's wages go back to the sum
+        of their W-2s.</p>
+      {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
+      {(list.data?.groups ?? []).map((g) => {
+        const rows = docs.filter((d) => d.group === g.key);
+        const shown = !g.collapsed || open[g.key];
+        return (
+          <div key={g.key} style={{ marginTop: ".6rem" }}>
+            {g.collapsed ? (
+              <button type="button" className="as-link" aria-expanded={!!shown}
+                      onClick={() => setOpen({ ...open, [g.key]: !shown })}>
+                {shown ? "▾" : "▸"} {g.label}</button>
+            ) : <h3 style={{ margin: ".2rem 0" }}>{g.label}</h3>}
+            {shown && (
+              <table>
+                <tbody>
+                  {rows.map((d) => (
+                    <tr key={d.id} style={d.removed ? { opacity: .6 } : undefined}>
+                      <td>
+                        <b>{d.kind_label}</b> · {d.years_label}
+                        {d.employer_shown && <> · {d.employer_shown}
+                          {d.abbreviated &&
+                            <span className="sub"> (as the IRS abbreviates it)</span>}
+                          {d.payer && d.removable && (
+                            <>{" "}<button type="button" className="as-link sub"
+                                    disabled={busy}
+                                    aria-label={`Rename the payer ${d.employer_shown}`}
+                                    onClick={() => rename.mutate(d)}>rename payer</button></>)}</>}
+                        {d.whose_label && <span className="sub"> · {d.whose_label}</span>}
+                        <div className="sub" style={{ fontSize: 12 }}>
+                          {d.removed_label ?? d.stored_label}
+                          {d.filename && <span className="hide-m"> · {d.filename}</span>}
+                        </div>
+                        {d.w2s.map((w) => (
+                          <div key={w.id} className="sub" style={{ fontSize: 12 }}>
+                            {w.year} W-2 · box 1 {w.box1 == null ? "unread" : money(w.box1)}
+                            {/* the EIN steps aside at phone width, so the
+                                row's whose-picker and "remove" stay on
+                                screen */}
+                            {w.ein ? <span className="sub hide-m"> · EIN {w.ein}</span> : null}{" "}
+                            <select aria-label={`Whose W-2: ${w.employer_shown || "unknown employer"}`}
+                                    value={w.owner} disabled={busy}
+                              style={w.owner === "unassigned"
+                                ? { borderColor: "var(--amber)" } : undefined}
+                              onChange={(e) => assign.mutate(
+                                { w, owner: e.target.value as W2Person })}>
+                              {w.owner === "unassigned" &&
+                                <option value="unassigned" disabled>whose?</option>}
+                              {(list.data?.w2_people ?? []).map((p) =>
+                                <option key={p.owner} value={p.owner}>{p.label}</option>)}
+                            </select>
+                          </div>
+                        ))}
+                      </td>
+                      <td style={{ textAlign: "right" }}>
+                        {d.removable && (
+                          <button disabled={busy}
+                                  onClick={() => remove.mutate(d)}>remove</button>)}
+                        {d.restorable && (
+                          <button disabled={busy}
+                                  onClick={() => putBack.mutate(d)}>put back</button>)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 // tax & income documents → the lifetime income spine
 // (income_annual / income_documents) that Cash Flow coverage and
 // retirement analysis read. Analyze → editable preview → commit.
@@ -859,7 +1073,10 @@ function TaxDocsCard({ file }: { file: File | null }) {
   // (a loss year's AGI) into a stuck "NaN"
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [picked, setPicked] = useState<Set<number>>(new Set());
-  const [msg, setMsg] = useState<{ text: string; bad: boolean } | null>(null);
+  // `cell` is the "row:field" draft a "not a number" refusal is about: that
+  // cell is marked invalid and points at the message
+  const [msg, setMsg] = useState<{ text: string; bad: boolean; cell?: string } | null>(null);
+  const msgId = useId();
   const analyze = useMutation({
     mutationFn: (f: File) => api.taxdocAnalyze(f),
     onSuccess: (p) => {
@@ -876,20 +1093,40 @@ function TaxDocsCard({ file }: { file: File | null }) {
       // the income spine feeds Cash Flow's coverage and the retirement model
       qc.invalidateQueries({ queryKey: ["report", "cashflow"] });
       qc.invalidateQueries({ queryKey: ["retirement"] });
+      if (r.kind === "w2") qc.invalidateQueries({ queryKey: ["taxdoc-w2s"] });
       setMsg({ text: r.kind === "w2"
-        ? `Stored ${r.documents} W-2 document${r.documents === 1 ? "" : "s"}.`
+        ? (r.documents === 1 && r.replaced === 1
+            ? "The stored W-2 was updated."
+            : `Stored ${r.documents} W-2 document${r.documents === 1 ? "" : "s"}.`)
         : `Income history: ${r.created} year${r.created === 1 ? "" : "s"} added, ${r.updated} updated.`,
         bad: false });
     },
-    onError: (e) => setMsg({ text: errText(e), bad: true }),
+    onError: (e) => {
+      // a lookalike the server found at the save (the person's own edit
+      // made the W-2 look like a stored one, or another device stored it
+      // meanwhile): its rows carry the stored W-2s back, so ask here
+      const lk = w2LookalikesOf(e);
+      if (lk && plan?.kind === "w2") {
+        const sent = rows.map((_, i) => i).filter((i) => picked.has(i));
+        setRows(rows.map((r, i) => {
+          const k = sent.indexOf(i);
+          return k >= 0 && lk[k]?.length
+            ? { ...r, matches: lk[k], replaces: undefined } : r;
+        }));
+      }
+      setMsg({ text: errText(e), bad: true });
+    },
   });
   // the one door routed a tax/income document here — read it straight away
   useEffect(() => {
     if (file) analyze.mutate(file);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [file]);
-  const upd = (i: number, f: string, v: string) =>
+  const upd = (i: number, f: string, v: string) => {
     setDrafts({ ...drafts, [`${i}:${f}`]: v });
+    // typing in the refused cell answers its message
+    if (msg?.cell === `${i}:${f}`) setMsg(null);
+  };
   // settle the typed cells; one that is not a number stops the save and
   // names the year, instead of going out as NaN (sent as null → dropped)
   const save = () => {
@@ -901,7 +1138,7 @@ function TaxDocsCard({ file }: { file: File | null }) {
       if (n === null && v.trim() !== "") {
         if (picked.has(i)) {
           setMsg({ text: `${out[i].year}: that amount is not a number`,
-                   bad: true });
+                   bad: true, cell: k });
           return;
         }
         continue;
@@ -927,27 +1164,30 @@ function TaxDocsCard({ file }: { file: File | null }) {
         <a href="https://github.com/oikonome/oikonome/blob/main/docs/tax-documents.md"
           target="_blank" rel="noreferrer">the how-to</a>.
         {vision?.where === "remote" ? <b>{whereLine}</b> : whereLine}</p>
-      {msg && <div className={"note " + (msg.bad ? "bad" : "good")}
-                   onClick={() => setMsg(null)}>{msg.text}</div>}
+      {msg && <Note tone={msg.bad ? "bad" : "good"} id={msgId}
+                   onDismiss={() => setMsg(null)}>{msg.text}</Note>}
       {analyze.isPending && <p className="mut">reading {file?.name}…</p>}
       {plan && plan.kind !== "w2" && (
         <>
           <table style={{ marginTop: ".6rem" }}>
-            <thead><tr><th />
+            <thead><tr><th><span className="sr-only">Select</span></th>
               <th>Year</th>
               {FIELDS.map(([f, label]) => <th className="num" key={f}>{label}</th>)}
-              <th /></tr></thead>
+              <th><span className="sr-only">Actions</span></th></tr></thead>
             <tbody>
               {rows.map((r, i) => (
                 <tr key={r.year}>
-                  <td><input type="checkbox" checked={picked.has(i)}
+                  <td><input aria-label={`Import ${r.year}`} type="checkbox" checked={picked.has(i)}
                     onChange={() => { const n = new Set(picked);
                       if (n.has(i)) n.delete(i); else n.add(i);
                       setPicked(n); }} /></td>
                   <td>{r.year}</td>
-                  {FIELDS.map(([f]) => (
+                  {FIELDS.map(([f, fl]) => (
                     <td className="num" key={f}>
                       <input size={9}
+                        {...fieldProps(`${r.year} ${fl}`,
+                          msg?.cell === `${i}:${f as string}`
+                            ? { error: true, describedBy: [msgId] } : {})}
                         style={{ minHeight: 0, padding: ".1rem .3rem",
                                  textAlign: "right" }}
                         value={drafts[`${i}:${f as string}`]
@@ -1001,14 +1241,51 @@ function TaxDocsCard({ file }: { file: File | null }) {
                     value={cell("box1", r.boxes?.["1"] ?? r.box1)}
                     onChange={(e) => upd(i, "box1", e.target.value)} />
                 </label>
-                {r.ein ? <span>EIN {r.ein}</span> : null}</p>
+                {/* the form does not print which of the household it
+                    belongs to, and each person's wages are summed apart */}
+                <label>whose{" "}
+                  <select value={r.owner ?? ""}
+                    onChange={(e) => setRows(rows.map((x, j) => j === i
+                      ? { ...x, owner: e.target.value as W2Person } : x))}>
+                    {!r.owner && <option value="" disabled>choose…</option>}
+                    {(plan.w2_people ?? []).map((p) =>
+                      <option key={p.owner} value={p.owner}>{p.label}</option>)}
+                  </select>
+                </label>
+                {r.ein ? <span>EIN {r.ein}</span> : null}
+                {/* two people at one employer can earn the same box 1, so
+                    a lookalike is asked about, never merged */}
+                {r.matches?.length ? (
+                  <span style={{ flexBasis: "100%" }}>
+                    This looks like a W-2 already stored. Is it{" "}
+                    {r.matches.map((m) => (
+                      <label key={m.id}><input type="radio"
+                        name={`w2same-${i}`} checked={r.replaces === m.id}
+                        onChange={() => setRows(rows.map((x, j) => j === i
+                          ? { ...x, replaces: m.id } : x))} />
+                        {" "}the same form as the one stored for{" "}
+                        {W2_WHOSE[m.owner] ?? "nobody yet"} ({
+                          m.employer || "unknown employer"}, {
+                          m.box1 == null ? "unread" : money(m.box1)}) —
+                        replace it</label>
+                    ))}{" "}
+                    <label><input type="radio" name={`w2same-${i}`}
+                      checked={r.replaces === null}
+                      onChange={() => setRows(rows.map((x, j) => j === i
+                        ? { ...x, replaces: null } : x))} />
+                      {" "}a second W-2 — keep both</label>
+                  </span>
+                ) : null}</p>
             );
           })}
           <button className="pri" disabled={commit.isPending}
                   onClick={() => {
                     const s = settleW2Rows(rows, drafts, parseMoneyDraft);
                     if (!s.ok) { setMsg({ text: s.error, bad: true }); return; }
-                    commit.mutate(s.rows);
+                    const ask = w2RowsUnanswered(s.rows);
+                    if (ask) { setMsg({ text: ask, bad: true }); return; }
+                    // the lookalikes were the server's to show, not to send
+                    commit.mutate(s.rows.map(({ matches: _m, ...r }) => r));
                   }}>
             {commit.isPending ? "saving…" : "Store W-2"}</button>{" "}
           <button onClick={() => { setPlan(null); setRows([]); }}>cancel</button>
@@ -1078,8 +1355,8 @@ function MappingCard({ need, onDone }: {
         {sel("merchant_col", "Merchant column (optional)", false)}
         {sel("category_col", "Category column (optional)", false)}
       </div>
-      <details style={{ marginTop: ".5rem" }}>
-        <summary className="mut" style={{ cursor: "pointer" }}>
+      <details className="disclosure" style={{ marginTop: ".5rem" }}>
+        <summary className="mut">
           No single Amount column? Map Debit and/or Credit instead — either
           one alone is fine</summary>
         <div className="field-grid" style={{ marginTop: ".4rem" }}>
@@ -1211,7 +1488,7 @@ function YnabAccountsCard({ need, onDone }: {
                 <td className="num">{a.rows}</td>
                 <td className="mut">{mmdd(a.first_date)}–{mmdd(a.last_date)}</td>
                 <td>
-                  <select value={dest[a.name] ?? ""}
+                  <select aria-label={`Into which account: ${a.label}`} value={dest[a.name] ?? ""}
                     onChange={(e) => setDest({ ...dest,
                                                [a.name]: e.target.value })}>
                     <option value="">— choose —</option>
@@ -1223,7 +1500,7 @@ function YnabAccountsCard({ need, onDone }: {
                     <option value="skip">skip — don't import</option>
                   </select>
                   {dest[a.name] === "__new__" && (
-                    <input value={newName[a.name] ?? ""}
+                    <input aria-label="New account name" value={newName[a.name] ?? ""}
                       placeholder="new account name"
                       onChange={(e) => setNewName({ ...newName,
                                                     [a.name]: e.target.value })}
@@ -1323,11 +1600,11 @@ function BatchList({ rows, onChanged }: {
   return (
     <div className="card">
       <h2>Recent imports</h2>
-      {warning && <div className="note" onClick={() => setWarning(null)}>{warning}</div>}
+      {warning && <Note onDismiss={() => setWarning(null)}>{warning}</Note>}
       <table>
         <thead>
           <tr><th>When</th><th>File</th><th>Source</th>
-              <th className="num">Rows</th><th></th></tr>
+              <th className="num">Rows</th><th><span className="sr-only">Actions</span></th></tr>
         </thead>
         <tbody>
           {rows.map((b) => (

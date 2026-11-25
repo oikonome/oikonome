@@ -58,14 +58,14 @@ export function SecretCopyButtons({ text, what, plural = false, onDone }: {
   return (
     <View style={{ gap: 4 }}>
       <View style={{ flexDirection: "row", gap: 8 }}>
-        <Pressable style={s.btn}
+        <Pressable accessibilityRole="button" style={s.btn}
                    onPress={async () => {
                      if (await copySecret(text)) onDone();
                      else setFailed(true);
                    }}>
           <Text style={s.btnText}>Copy &amp; dismiss</Text>
         </Pressable>
-        <Pressable style={[s.btn, s.btnQuiet]} onPress={onDone}>
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]} onPress={onDone}>
           <Text style={s.btnText}>Dismiss</Text>
         </Pressable>
       </View>
@@ -81,7 +81,7 @@ export function SecretCopyButtons({ text, what, plural = false, onDone }: {
 }
 
 const s = StyleSheet.create({
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 16, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

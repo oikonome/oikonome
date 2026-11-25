@@ -52,7 +52,7 @@ class GoalMatchWordsNeedAnAccount(unittest.TestCase):
 
     def _store(self, *goals):
         """Write goals straight into the stored config, the way a save from
-        before the rule, a restore or the mirror left them."""
+        before the rule, a restore or a whole-row copy left them."""
         conn = tenancy.tenant_connect(self.tid)
         try:
             cfg = budget.load_config(conn)

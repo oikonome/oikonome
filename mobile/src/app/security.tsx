@@ -12,49 +12,26 @@ import { useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text,
          TextInput, View } from "react-native";
 import { SvgXml } from "react-native-svg";
+import { DeleteCard, explain, LeaveCard } from "../components/account-exits";
 import PullRefresh from "../components/pull-refresh";
 import { SecretCopyButtons } from "../components/secret-copy";
-import { VerifyEmailCard } from "../components/verify-email-card";
 
-import { Card, H, Pill, SharedLock } from "../components/ui";
-import { errText, Me, NextCodeNeeded, type MemberNotify } from "../lib/api";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, H, Pill, SharedLock, Note } from "../components/ui";
+import { errText, Me, NextCodeNeeded, type EmailSchedule,
+         type MemberNotify } from "../lib/api";
 import { invalidateAfterRotation, patchList, patchQuery, removeFromList,
          smsPauseNote }
   from "../lib/cache";
-import { EMAIL_KIND_LABEL, EMAIL_KINDS, inviteOutcome, localDayOf,
-         membersRemovedNote, oneTimeCodeDigits, oneTimeCodeSentence, prefOn,
+import { EMAIL_KIND_LABEL, EMAIL_KINDS, inviteOutcome, kindOffNote, localDayOf,
+         membersRemovedNote, oneTimeCodeDigits, prefOn,
          signedOutOthers, svgFromDataUri, type InviteOutcome }
   from "../lib/pure";
+import { CADENCES, cadenceOf } from "../lib/schedule";
 import { useSession } from "../lib/session";
 import { C, mmddyy } from "../lib/theme";
 import { useOwner, useSharedLock, useViewer } from "../lib/viewer";
-
-// the web's error → sentence map, shared across the cards
-function explain(e: unknown): string {
-  const s0 = String(e);
-  if (s0.includes("totp_required"))
-    return "Two-factor is on — enter your 6-digit code to confirm.";
-  if (s0.includes("wrong password") || s0.includes("password_required"))
-    return "That password didn't match.";
-  const codeSentence = oneTimeCodeSentence(s0);
-  if (codeSentence) return codeSentence;
-  if (s0.includes("recovery_required"))
-    return "This account signs in with a passkey — confirm with a "
-      + "recovery code below.";
-  if (s0.includes("too many requests"))
-    return "Too many attempts — try again later.";
-  if (s0.includes("already in use"))
-    return "That email is already in use.";
-  if (s0.includes("look like an email"))
-    return "That doesn't look like an email.";
-  if (s0.includes("at least 10"))
-    return "New password must be at least 10 characters.";
-  if (s0.includes("last_factor"))
-    return "This is your only two-factor method — add another first.";
-  // String(e) leads with "Error: " before the status, so stripping a
-  // leading status alone still showed "Error: 409: {...}"
-  return errText(e);
-}
+import { fieldA11y } from "../components/field";
 
 function browserLabel(ua: string): string {
   if (!ua) return "Unknown device";
@@ -115,7 +92,8 @@ export default function Security() {
           next visitor. Explore freely; the data is synthetic.
         </Text>
       )}
-      <VerifyEmailCard me={me.data} />
+      {/* the confirm-your-email card lives on Email & Push alone (as on
+          the web): one card in two places read as two things to do */}
       {/* reached from the forced-2FA lockout: say where the way out is,
           since the authenticator card sits below the password and email
           ones (web: TwoFactorGate) */}
@@ -141,6 +119,7 @@ export default function Security() {
             Require biometric unlock when opening the app
           </Text>
           <Switch value={!gateOff}
+                  accessibilityLabel="Require biometric unlock when opening the app"
                   onValueChange={(on) => setGateOff(!on)}
                   trackColor={{ true: C.accent, false: C.hover }}
                   thumbColor={C.text} />
@@ -154,6 +133,7 @@ export default function Security() {
             Block screenshots and screen recording
           </Text>
           <Switch value={!captureAllowed}
+                  accessibilityLabel="Block screenshots and screen recording"
                   onValueChange={(on) => setCaptureAllowed(!on)}
                   trackColor={{ true: C.accent, false: C.hover }}
                   thumbColor={C.text} />
@@ -261,23 +241,25 @@ function PasswordCard() {
         pending family invite is removed — re-add them after. That is
         deliberate: nothing enrolled by a thief survives.
       </Text>
-      <TextInput style={s.input} placeholder="current password"
+      <TextInput {...fieldA11y("Current password")} style={s.input} placeholder="current password"
                  placeholderTextColor={C.mut} secureTextEntry
                  value={cur} onChangeText={setCur} />
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("New password (at least 10 characters)")} style={s.input}
                  placeholder="new password (at least 10 characters)"
                  placeholderTextColor={C.mut} secureTextEntry
                  value={next} onChangeText={setNext} />
-      <TextInput style={s.input} placeholder="confirm new password"
+      <TextInput {...fieldA11y("Confirm new password", msg?.bad ? msg.text : null)}
+                 style={s.input} placeholder="confirm new password"
                  placeholderTextColor={C.mut} secureTextEntry
                  value={confirm} onChangeText={setConfirm} />
       {codes && <ReissuedSheet codes={codes}
                                onDone={() => setCodes(null)} />}
       {msg && (
-        <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg.text}</Text>
+        <Note bad={msg.bad} style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
+              onPress={() => setMsg(null)}>{msg.text}</Note>
       )}
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                    (!cur || !next || !confirm || run.isPending)
                      && { opacity: 0.5 }]}
                  disabled={!cur || !next || !confirm || run.isPending}
@@ -381,7 +363,7 @@ function EmailCard({ email, pending, pendingUntil }: {
               ? ` (the link works until ${mmddyy(localDayOf(pendingUntil))})`
               : ""}
           </Text>
-          <Pressable style={[s.btn, s.btnQuiet,
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                              withdraw.isPending && { opacity: 0.5 }]}
                      disabled={withdraw.isPending}
                      onPress={() => withdraw.mutate()}>
@@ -391,16 +373,18 @@ function EmailCard({ email, pending, pendingUntil }: {
           </Pressable>
         </View>
       )}
-      <TextInput style={s.input} placeholder="new email"
+      <TextInput {...fieldA11y("New email", msg?.bad ? msg.text : null)}
+                 style={s.input} placeholder="new email"
                  placeholderTextColor={C.mut} keyboardType="email-address"
                  autoCapitalize="none" value={next} onChangeText={setNext} />
       {codes && <ReissuedSheet codes={codes}
                                onDone={() => setCodes(null)} />}
       {msg && (
-        <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg.text}</Text>
+        <Note bad={msg.bad} style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
+              onPress={() => setMsg(null)}>{msg.text}</Note>
       )}
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                    (!next.trim() || run.isPending) && { opacity: 0.5 }]}
                  disabled={!next.trim() || run.isPending}
                  onPress={() => run.mutate()}>
@@ -462,7 +446,8 @@ function PendingRecoveryCard({ lands }: { lands: string }) {
         Someone asked for a recovery that removes this account's
         two-factor methods. It lands {mmddyy(localDayOf(lands))}. Not you? Cancel it.
       </Text>
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                    cancel.isPending && { opacity: 0.5 }]}
                  disabled={cancel.isPending}
                  onPress={() => cancel.mutate()}>
@@ -470,7 +455,7 @@ function PendingRecoveryCard({ lands }: { lands: string }) {
           {cancel.isPending ? "cancelling…" : "Cancel recovery"}
         </Text>
       </Pressable>
-      {err ? <Text style={[s.mut, { color: C.warn }]}>{err}</Text> : null}
+      {err ? <Note bad style={[s.mut, { color: C.warn }]}>{err}</Note> : null}
     </Card>
   );
 }
@@ -610,14 +595,14 @@ function TwoFactorCard({ enabled, left }: {
               {enroll.secret}
             </Text>
           </Text>
-          <TextInput style={s.input}
+          <TextInput {...fieldA11y("6-digit code from your authenticator")} style={s.input}
                      placeholder="6-digit code from your authenticator"
                      placeholderTextColor={C.mut}
                      keyboardType="number-pad"
                      value={code}
                      onChangeText={(t) => setCode(oneTimeCodeDigits(t))} />
           <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
-            <Pressable style={[s.btn, (!code || confirm.isPending)
+            <Pressable accessibilityRole="button" style={[s.btn, (!code || confirm.isPending)
                          && { opacity: 0.5 }]}
                        disabled={!code || confirm.isPending}
                        onPress={() => confirm.mutate()}>
@@ -626,7 +611,7 @@ function TwoFactorCard({ enabled, left }: {
                   : enabled ? "Confirm and replace" : "Confirm and enable"}
               </Text>
             </Pressable>
-            <Pressable style={[s.btn, s.btnQuiet]}
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                        onPress={() => { setEnroll(null); setCode("");
                                         setMsg(null); }}>
               <Text style={[s.btnText, { color: C.mut }]}>cancel</Text>
@@ -642,13 +627,13 @@ function TwoFactorCard({ enabled, left }: {
               Signing in requires your password and a 6-digit code.
             </Text>
           </View>
-          <TextInput style={s.input}
+          <TextInput {...fieldA11y("Current 6-digit code (required to turn off)")} style={s.input}
                      placeholder="current 6-digit code (required to turn off)"
                      placeholderTextColor={C.mut}
                      keyboardType="number-pad"
                      value={code}
                      onChangeText={(t) => setCode(oneTimeCodeDigits(t))} />
-          <Pressable style={[s.btn, s.btnQuiet,
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                        { alignSelf: "flex-start", marginTop: 6 },
                        (!code || disable.isPending) && { opacity: 0.5 }]}
                      disabled={!code || disable.isPending}
@@ -680,7 +665,7 @@ function TwoFactorCard({ enabled, left }: {
             6-digit code from an authenticator app. Confirming
             enrollment signs out every other session.
           </Text>
-          <Pressable style={[s.btn, { alignSelf: "flex-start",
+          <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start",
                        marginTop: 6 },
                        start.isPending && { opacity: 0.5 }]}
                      disabled={start.isPending}
@@ -727,9 +712,9 @@ function TwoFactorCard({ enabled, left }: {
         </View>
       )}
       {msg && (
-        <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 12,
+        <Note bad={msg.bad} style={{ color: msg.bad ? C.bad : C.good, fontSize: 12,
                        marginTop: 4 }}
-              onPress={() => setMsg(null)}>{msg.text}</Text>
+              onPress={() => setMsg(null)}>{msg.text}</Note>
       )}
     </Card>
   );
@@ -799,6 +784,10 @@ function SessionsCard() {
         Everywhere you&apos;re signed in. Changing your password signs
         out every other session automatically.
       </Text>
+      {/* a failed read is not "signed in nowhere else": it says so here */}
+      <StaleLine query={sessions} />
+      {sessions.data === undefined && sessions.isError && (
+        <FailedLine q={sessions} what="the sessions" />)}
       {rows.map((r) => (
         <View key={r.id} style={s.row}>
           <View style={{ flex: 1 }}>
@@ -826,6 +815,8 @@ function SessionsCard() {
           )}
         </View>
       ))}
+      {devices.data === undefined && devices.isError && (
+        <FailedLine q={devices} what="the mobile devices" />)}
       {devs.length > 0 && (
         <>
           <Text style={[s.mut, { fontWeight: "700", marginTop: 8,
@@ -863,7 +854,7 @@ function SessionsCard() {
         </>
       )}
       {anyOther && (
-        <Pressable style={[s.btn, s.btnQuiet,
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                      { alignSelf: "flex-start", marginTop: 8 },
                      revokeAll.isPending && { opacity: 0.5 }]}
                    disabled={revokeAll.isPending}
@@ -875,8 +866,8 @@ function SessionsCard() {
         </Pressable>
       )}
       {msg && (
-        <Text style={{ color: C.bad, fontSize: 12, marginTop: 4 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12, marginTop: 4 }}
+              onPress={() => setMsg(null)}>{msg}</Note>
       )}
     </Card>
   );
@@ -892,8 +883,11 @@ const ROLE_LABEL: Record<string, string> = {
 /** One member's notices on the roster (the web's MemberNotifyRow): email —
  *  on the household's mail, receiving, which kinds — and push, with the
  *  devices the switch governs. */
-function MemberNotifyRow({ n, busy, onChange }: {
+function MemberNotifyRow({ n, busy, sending, onChange }: {
   n: MemberNotify; busy: boolean;
+  // which kinds the household sends at all; one it does not send reads
+  // as off here, whatever this person chose for it
+  sending?: Partial<Record<string, boolean>>;
   onChange: (body: { push_muted?: boolean; email_muted?: boolean;
                      email_pref?: { kind: string; on: boolean } }) => void;
 }) {
@@ -922,14 +916,17 @@ function MemberNotifyRow({ n, busy, onChange }: {
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                            flex: 1 }}>
               {EMAIL_KINDS.map((k) => {
-                const on = prefOn(n.email_prefs, k);
+                const off = sending ? kindOffNote(k, sending) : null;
+                const on = !off && prefOn(n.email_prefs, k);
                 return (
-                  <Pressable key={k} disabled={busy}
+                  <Pressable key={k} disabled={busy || !!off}
+                    accessibilityRole="checkbox"
                     accessibilityLabel={`${EMAIL_KIND_LABEL[k]} email`}
-                    accessibilityState={{ checked: on }}
+                    accessibilityState={{ checked: on, disabled: !!off }}
                     onPress={() => onChange({ email_pref: { kind: k, on: !on } })}>
                     <Text style={{ color: on ? C.text : C.mut, fontSize: 12 }}>
                       {on ? "☑" : "☐"} {EMAIL_KIND_LABEL[k]}
+                      {off ? " (off)" : ""}
                     </Text>
                   </Pressable>
                 );
@@ -962,6 +959,14 @@ function FamilyCard({ owner }: { owner: boolean }) {
   const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
                         enabled: !!client });
   const hosted = !!me.data?.hosted;
+  // which kinds the household sends at all (the owner's schedule), so a
+  // report that is off reads as off on every member's row
+  const settings = useQuery({ queryKey: ["settings"],
+    queryFn: () => client!.settingsFull(), enabled: !!client && owner });
+  const schedule = settings.data?.email_schedule as EmailSchedule | null
+    | undefined;
+  const sending = settings.data ? Object.fromEntries(CADENCES.map(
+    (c) => [c, !!cadenceOf(schedule, c).on])) : undefined;
   const [label, setLabel] = useState("");
   // What the invite creates. View-only is the default: an owner who does
   // not read the choice hands out the smaller grant.
@@ -1051,7 +1056,7 @@ function FamilyCard({ owner }: { owner: boolean }) {
   };
   return (
     <Card>
-      <H>Family</H>
+      <H>Household</H>
       <Text style={s.mut}>
         Everyone signed into this household. Everyone here sees
         everything; what differs is what they can change.
@@ -1063,6 +1068,10 @@ function FamilyCard({ owner }: { owner: boolean }) {
                     + "and only that address can use it." : ".")
           : ""}
       </Text>
+      {/* a failed roster is not "nobody": it says so where the list sits */}
+      <StaleLine query={members} />
+      {members.data === undefined && members.isError && (
+        <FailedLine q={members} what="the household's people" />)}
       {(members.data?.users ?? []).map((u) => (<View key={u.id}>
         <View style={s.row}>
           <View style={{ flex: 1 }}>
@@ -1100,11 +1109,13 @@ function FamilyCard({ owner }: { owner: boolean }) {
         {/* what this person receives — every switch here is the one their
             own Settings flips, so the two views agree */}
         {showNotify && u.notify && (
-          <MemberNotifyRow n={u.notify}
+          <MemberNotifyRow n={u.notify} sending={sending}
             busy={notify.isPending && notify.variables?.id === u.id}
             onChange={(body) => notify.mutate({ id: u.id, ...body })} />
         )}
       </View>))}
+      {owner && invites.data === undefined && invites.isError && (
+        <FailedLine q={invites} what="the invitations" />)}
       {owner && (invites.data?.invites ?? []).map((iv) => (
         <View key={iv.token_hash} style={s.row}>
           <View style={{ flex: 1 }}>
@@ -1147,7 +1158,7 @@ function FamilyCard({ owner }: { owner: boolean }) {
               link works once, expires in 7 days, and only that address
               can use it.
             </Text>
-            <Pressable style={[s.btn, { alignSelf: "flex-start" }]}
+            <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start" }]}
                        onPress={() => setMinted(null)}>
               <Text style={s.btnText}>Done</Text>
             </Pressable>
@@ -1156,7 +1167,7 @@ function FamilyCard({ owner }: { owner: boolean }) {
       )}
       {owner && (
         <>
-          <TextInput style={[s.input, { marginTop: 8 }]}
+          <TextInput {...fieldA11y("Their email address")} style={[s.input, { marginTop: 8 }]}
                      placeholder={hosted ? "their email address"
                                          : "who's it for? (name or email)"}
                      placeholderTextColor={C.mut}
@@ -1167,7 +1178,7 @@ function FamilyCard({ owner }: { owner: boolean }) {
               is binary */}
           <View style={{ flexDirection: "row", gap: 8, marginTop: 4 }}>
             {["viewer", "member"].map((r) => (
-              <Pressable key={r}
+              <Pressable accessibilityRole="button" key={r}
                          style={[s.btn, invRole === r
                            ? { borderColor: C.good } : { opacity: 0.6 }]}
                          onPress={() => setInvRole(r)}>
@@ -1176,10 +1187,10 @@ function FamilyCard({ owner }: { owner: boolean }) {
             ))}
           </View>
           {msg && (
-            <Text style={{ color: C.bad, fontSize: 12 }}
-                  onPress={() => setMsg(null)}>{msg}</Text>
+            <Note bad style={{ color: C.bad, fontSize: 12 }}
+                  onPress={() => setMsg(null)}>{msg}</Note>
           )}
-          <Pressable style={[s.btn, { alignSelf: "flex-start",
+          <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start",
                        marginTop: 6 },
                        mint.isPending && { opacity: 0.5 }]}
                      disabled={mint.isPending}
@@ -1195,107 +1206,13 @@ function FamilyCard({ owner }: { owner: boolean }) {
   );
 }
 
-// ---- leave household (a member's own login; the web's card) ----
-function LeaveCard({ onDeleted }: { onDeleted: () => void }) {
-  const { client } = useSession();
-  const [confirm, setConfirm] = useState("");
-  const [msg, setMsg] = useState<string | null>(null);
-  const run = useMutation({
-    mutationFn: () => client!.accountLeave(),
-    onSuccess: onDeleted,
-    onError: (e) => setMsg(explain(e)),
-  });
-  return (
-    <Card>
-      <Text style={{ color: C.bad, fontSize: 16, fontWeight: "700" }}>
-        Delete my login
-      </Text>
-      <Text style={s.mut}>
-        Removes your login from this household and signs you out. The
-        household's data and the owner's account are not affected — the
-        owner can invite you again any time.
-      </Text>
-      <TextInput style={s.input}
-                 placeholder="type “delete my login” to confirm"
-                 placeholderTextColor={C.mut} autoCapitalize="none"
-                 value={confirm} onChangeText={setConfirm} />
-      {msg && (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
-      )}
-      <Pressable style={[s.btn, { backgroundColor: C.bad,
-                   alignSelf: "flex-start", marginTop: 6 },
-                   (confirm !== "delete my login" || run.isPending)
-                     && { opacity: 0.5 }]}
-                 disabled={confirm !== "delete my login" || run.isPending}
-                 onPress={() => run.mutate()}>
-        <Text style={s.btnText}>
-          {run.isPending ? "deleting…" : "Delete my login"}
-        </Text>
-      </Pressable>
-    </Card>
-  );
-}
-
-// ---- delete account ----
-function DeleteCard({ onDeleted }: { onDeleted: () => void }) {
-  const { client } = useSession();
-  const [confirm, setConfirm] = useState("");
-  const [msg, setMsg] = useState<string | null>(null);
-  const run = useMutation({
-    mutationFn: () => client!.accountDelete(),
-    // the session is already dead server-side — drop the local one
-    onSuccess: onDeleted,
-    onError: (e) => setMsg(explain(e)),
-  });
-  // the typed phrase, then a native confirm, then the server's own fresh
-  // "confirm it's you" — three doors, because there is no undo
-  const ask = () => Alert.alert("Delete this account forever?",
-    "Every account, transaction, budget and setting is erased and "
-    + "everyone is signed out. This cannot be undone.",
-    [{ text: "Delete everything", style: "destructive",
-       onPress: () => run.mutate() },
-     { text: "Cancel", style: "cancel" }]);
-  return (
-    <Card>
-      <Text style={{ color: C.bad, fontSize: 16, fontWeight: "700" }}>
-        Delete account
-      </Text>
-      <Text style={s.mut}>
-        Erases this household permanently: every account, transaction,
-        budget, and setting — and signs everyone out. There is no undo.
-        Export your data first (Settings → Your data) if you want a
-        copy.
-      </Text>
-      <TextInput style={s.input}
-                 placeholder="type “delete everything” to confirm"
-                 placeholderTextColor={C.mut} autoCapitalize="none"
-                 value={confirm} onChangeText={setConfirm} />
-      {msg && (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
-      )}
-      <Pressable style={[s.btn, { backgroundColor: C.bad,
-                   alignSelf: "flex-start", marginTop: 6 },
-                   (confirm !== "delete everything" || run.isPending)
-                     && { opacity: 0.5 }]}
-                 disabled={confirm !== "delete everything" || run.isPending}
-                 onPress={ask}>
-        <Text style={s.btnText}>
-          {run.isPending ? "deleting…" : "Delete my account forever"}
-        </Text>
-      </Pressable>
-    </Card>
-  );
-}
-
 const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   mut: { color: C.mut, fontSize: 12, lineHeight: 17 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8, marginTop: 6 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 16, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

@@ -115,8 +115,40 @@ class TotpAtRestTests(unittest.TestCase):
             "totp_code": _fresh_code(secret)})
         self.assertEqual(r.status_code, 200)
 
+    def _put_back_after_the_sweep(self):
+        """The sweep is instance-wide: besides this test's seed it seals
+        every plaintext control-plane secret earlier suites left in the
+        shared database (the web-push signing key, other users' seeds,
+        queued releases) under this test's throwaway master key, which
+        tearDown then drops. Read them now and write them back afterwards,
+        so no later suite inherits a secret it can no longer decrypt."""
+        from oikonome.db.migrate import CP_SECRET_COLUMNS
+        saved = []
+        admin = tenancy.admin_connect()
+        try:
+            for table, pk, col in CP_SECRET_COLUMNS:
+                for r in admin.execute(
+                        f"SELECT {pk} AS k, {col} AS v FROM {table} "
+                        f"WHERE {col} IS NOT NULL AND {col} <> '' "
+                        f"AND {col} NOT LIKE %s",
+                        (crypto.CP_PREFIX + "%",)).fetchall():
+                    saved.append((table, pk, col, r["k"], r["v"]))
+        finally:
+            admin.close()
+
+        def restore():
+            conn = tenancy.admin_connect()
+            try:
+                for table, pk, col, k, v in saved:
+                    conn.execute(f"UPDATE {table} SET {col}=%s "
+                                 f"WHERE {pk}=%s", (v, k))
+            finally:
+                conn.close()
+        self.addCleanup(restore)
+
     def test_migrate_sweep_encrypts_legacy_rows(self):
         from oikonome.db.migrate import _encrypt_cp_secrets
+        self._put_back_after_the_sweep()
         secret = totp_mod.new_secret()
         with _control() as conn:
             conn.execute("UPDATE users SET totp_secret=%s WHERE email=%s",

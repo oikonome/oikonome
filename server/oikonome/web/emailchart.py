@@ -188,12 +188,11 @@ INK = (219, 227, 234)
 
 
 def _title(label: str) -> str:
-    """'FOOD AND DRINK' -> 'Food and drink'; a label already in mixed case
-    (a merchant cluster such as 'Northwind - Fuel') passes through."""
-    s = str(label)
-    if s.isupper():
-        s = s.capitalize()
-    return s
+    """'FOOD AND DRINK' -> 'Food and Drink', as every page prints a
+    category; a label already in mixed case (a merchant cluster such as
+    'Northwind - Fuel') passes through."""
+    from ..engine.categories import display_label
+    return display_label(str(label))
 
 
 def pie(slices: list[tuple[str, float, float]]) -> bytes:

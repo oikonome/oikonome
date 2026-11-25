@@ -8,9 +8,10 @@ import { useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput,
          View } from "react-native";
 
-import { Card, H } from "../components/ui";
+import { Card } from "../components/ui";
+import { FailedLine } from "../components/loaded";
 import { discardPicked, PickedFile } from "../lib/api";
-import { composeBugReport } from "../lib/pure";
+import { composeBugReport, failLine } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
 
@@ -46,8 +47,12 @@ export default function Feedback() {
   };
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}>
+      {/* a failed read of where reports go says so; the form stays, and a
+          send still gets the server's own answer */}
+      {testing.data === undefined && testing.isError && (
+        <FailedLine q={testing} what="the feedback page" />)}
+      {/* no card title: the screen's own header already says it */}
       <Card>
-        <H>Feedback & bug reports</H>
         <View style={s.seg} accessibilityRole="radiogroup">
           {(["feedback", "bug"] as Kind[]).map((k) => (
             <Pressable key={k} accessibilityRole="radio"
@@ -60,22 +65,19 @@ export default function Feedback() {
             </Pressable>
           ))}
         </View>
+        {/* one line, as on the web: what to write, and where it goes */}
         <Text style={s.mut}>
           {kind === "bug"
-            ? "Something broke? Say what happened, what you expected, and "
-              + "where — a screenshot helps a lot. "
-            : "Something confusing, missing, or worth changing? Tell us. "}
-          Goes straight to the instance operator. The report carries the
-          app version, a system-health diagnostic bundle and recent log
-          lines — so what broke is diagnosable. No transaction contents or
-          tokens; the bundle also leaves out hostnames, bank names and
-          collector labels.
-          {testing.data?.feedback_to
-            ? ` Delivered to ${testing.data.feedback_to}.` : ""}
+            ? "Say what happened, what you expected, and where"
+            : "Something confusing, missing, or worth changing?"}
+          {" — it goes to "}
+          {testing.data?.feedback_to || "the maintainer"}
+          {" with a diagnostic bundle (no bank names or transactions)."}
         </Text>
         {testing.data && testing.data.enabled === false && (
           <Text style={{ color: C.warn, fontSize: 12, marginTop: 4 }}>
-            Feedback is turned off on this instance.
+            Feedback is turned off on this instance — the owner can turn
+            it back on under Settings › Data.
           </Text>
         )}
         {kind === "bug" ? (
@@ -105,7 +107,7 @@ export default function Feedback() {
         )}
         <View style={{ flexDirection: "row", gap: 8, marginTop: 8,
                        alignItems: "center" }}>
-          <Pressable style={[s.btn, s.btnQuiet]} onPress={pickShot}>
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]} onPress={pickShot}>
             <Text style={[s.btnText, { color: C.mut }]}>
               {shot ? "replace screenshot" : "attach screenshot"}
             </Text>
@@ -118,7 +120,7 @@ export default function Feedback() {
         </View>
         {send.isError ? (
           <Text style={{ color: C.bad, fontSize: 12, marginTop: 6 }}>
-            {String(send.error)}
+            {failLine(send.error, "your report", "phone", "send").text}
           </Text>
         ) : null}
         {send.isSuccess ? (
@@ -132,7 +134,7 @@ export default function Feedback() {
                 + `#${send.data.number}. Thank you.`}
           </Text>
         ) : null}
-        <Pressable style={[s.btn, { alignSelf: "flex-start",
+        <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start",
                      marginTop: 10 },
                      (!text.trim() || send.isPending)
                        && { opacity: 0.5 }]}
@@ -150,7 +152,7 @@ export default function Feedback() {
 const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   mut: { color: C.mut, fontSize: 12, lineHeight: 17 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8, minHeight: 120,
            textAlignVertical: "top", marginTop: 8 },
@@ -161,7 +163,7 @@ const s = StyleSheet.create({
             paddingHorizontal: 12, paddingVertical: 6 },
   segOn: { backgroundColor: C.accent },
   segText: { color: C.mut, fontSize: 13, fontWeight: "600" },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 16, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

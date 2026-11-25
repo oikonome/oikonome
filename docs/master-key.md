@@ -24,16 +24,22 @@ re-linking and TOTP re-enrolling.
   (`backups/master-key-before-reset-<date>.env`,
   `~/oikonome-backups-<project>-<date>/master-key.env`). Move it into your
   password manager and delete the file.
-- After any restore, verify key/data agreement:
+- After any restore, verify key/data agreement (from `docker/`):
 
   ```bash
-  docker compose -f docker/compose.yaml exec app \
-    python -m oikonome.cli keycheck
+  cd docker
+  docker compose exec app python -m oikonome.cli keycheck
   ```
 
   (`./oikonome.sh restore` runs this for you and warns on mismatch.)
 
 ## Rotate it
+
+Run every command below from the `docker/` directory with plain
+`docker compose`, never with a file option of its own. Compose ignores
+`COMPOSE_FILE` in `.env` whenever `-f` is given, so on an
+external-database install a pinned `-f` starts an empty bundled Postgres
+and the rotation runs against that instead of your data.
 
 Rotate on a schedule if your policy asks for one, and immediately if the
 key may have leaked (a copied `.env`, a compromised backup host). Rotation
@@ -58,9 +64,10 @@ they stop working; the next email carries fresh ones.
    to the one command that needs it on standard input:
 
    ```bash
-   docker compose -f docker/compose.yaml up -d   # app picks up the new key
+   cd docker
+   docker compose up -d   # app picks up the new key
    read -rs -p 'Old master key: ' OLD_KEY; echo
-   printf '%s\n' "$OLD_KEY" | docker compose -f docker/compose.yaml exec -T app \
+   printf '%s\n' "$OLD_KEY" | docker compose exec -T app \
      sh -c 'read -r OIKONOME_MASTER_KEY_OLD && export OIKONOME_MASTER_KEY_OLD &&
             exec python -m oikonome.cli rotate-master-key'
    unset OLD_KEY
@@ -72,8 +79,8 @@ they stop working; the next email carries fresh ones.
    beside the backups — read it from there in place of the prompt:
 
    ```bash
-   sed -n 's/^OIKONOME_MASTER_KEY=//p' backups/master-key-before-reset-<date>.env \
-     | docker compose -f docker/compose.yaml exec -T app \
+   sed -n 's/^OIKONOME_MASTER_KEY=//p' ../backups/master-key-before-reset-<date>.env \
+     | docker compose exec -T app \
          sh -c 'read -r OIKONOME_MASTER_KEY_OLD && export OIKONOME_MASTER_KEY_OLD &&
                 exec python -m oikonome.cli rotate-master-key'
    ```
@@ -81,13 +88,15 @@ they stop working; the next email carries fresh ones.
    The command is idempotent — if it is interrupted, re-run it; rows
    already on the new key are skipped. If it reports MISMATCH, nothing
    was changed (wrong old key — every ciphertext must decrypt under one
-   of the two keys).
+   of the two keys). If it reports NOTHING ROTATED, it found no stored
+   secret at all — on an instance with households that means it reached
+   the wrong database; check you are in `docker/` and passed no `-f`, and
+   keep the old key.
 
 3. Verify, then clean up:
 
    ```bash
-   docker compose -f docker/compose.yaml exec app \
-     python -m oikonome.cli keycheck
+   docker compose exec app python -m oikonome.cli keycheck
    ```
 
    Nothing to remove from `docker/.env` — step 2 deliberately never put

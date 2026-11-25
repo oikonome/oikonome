@@ -29,7 +29,11 @@ ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1 OIKONOME_SPA_DIST=/app/webapp/dist
 ENV MALLOC_ARENA_MAX=2
 # pg_dump 18 for the in-app database-dump download — the base
 # distro's own postgresql-client can lag the PG18 server and refuse it
+# The base image is rebuilt upstream on its own schedule; Debian's security
+# fixes (zlib, openssl, …) land in the archive first, so the image takes them
+# from there rather than waiting for the next base rebuild.
 RUN apt-get update \
+ && apt-get upgrade -y --no-install-recommends \
  && apt-get install -y --no-install-recommends curl ca-certificates gnupg \
  && install -d /usr/share/postgresql-common/pgdg \
  && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
@@ -41,19 +45,35 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends postgresql-client-18 \
  && apt-get purge -y curl gnupg && apt-get autoremove -y \
  && rm -rf /var/lib/apt/lists/*
-COPY server/pyproject.toml server/
-COPY server/oikonome server/oikonome
-# [model] = the optional local-categorizer stack; the image carries it so
-# mounting a model file is all an operator has to do to enable the feature
+# Dependencies first, from the committed resolution and nothing else: every
+# package is pinned to one version and checked against its hash, so the image
+# runs the versions the test suite ran. Resolving afresh here would let a
+# release published yesterday into production with no test ever having
+# imported it. `make lock` moves the pins; the suite refuses a venv that
+# disagrees with them. The file carries the optional local-categorizer stack
+# too, so mounting a model file is all an operator has to do to enable it.
 # The base image's bundled pip/setuptools lag their security fixes by months;
 # upgrade them before anything is built on them (an image scanner reads the
 # bundled copies as the image's packages otherwise)
+COPY server/requirements.txt server/
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
- && pip install './server[model]'
+ && pip install --require-hashes -r server/requirements.txt
+COPY server/pyproject.toml server/
+COPY server/oikonome server/oikonome
+RUN pip install --no-deps ./server && pip check
 # An operator's add-on, if one sits in extras/ (empty in the public tree):
 # installed after the product so its entry points register in this image.
+# Its own requirements.txt, when it ships one, is held to the same hash
+# check; without one its dependencies resolve under the product's pins, so
+# an add-on can add packages but never move one the product was tested on.
 COPY extras extras
-RUN if [ -f extras/pyproject.toml ]; then pip install ./extras; fi
+RUN if [ -f extras/requirements.txt ]; then \
+      pip install --require-hashes -r extras/requirements.txt \
+      && pip install --no-deps ./extras; \
+    elif [ -f extras/pyproject.toml ]; then \
+      grep -oE '^[A-Za-z0-9_.-]+==[^ ;\\]+' server/requirements.txt > /tmp/pins.txt \
+      && pip install -c /tmp/pins.txt ./extras && rm /tmp/pins.txt; \
+    fi
 # pip is a build tool: nothing in the running image installs anything, and
 # pip carries its own vendored copies of urllib3, msgpack and setuptools that
 # lag their fixes and that a scanner reads as the image's. Out it goes.

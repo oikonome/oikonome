@@ -13,12 +13,11 @@ export const KIND_ROUTE: Record<string, string> = {
   "llm-backend": "/doctor", "collector-token-revoked": "/settings",
 };
 
-// "fix this" is for something broken; a queue waiting on a yes/no is
-// reviewed, not fixed — the web's wording, kind for kind.
-export const KIND_CTA: Record<string, string> = {
-  proposals: "review", drift: "review", merges: "review", anomaly: "review",
-  bonus: "review", reimb: "review", transfer: "review",
-};
+// "Fix" is for something broken; a queue waiting on a yes/no is reviewed,
+// not fixed — the web's alertAction, kind for kind, one verb set for every
+// surface.
+const ALERT_REVIEW = new Set(["proposals", "drift", "merges", "anomaly",
+                              "bonus", "reimb", "transfer"]);
 
 // web path → native screen. Only paths with a native twin are listed, so a
 // link to a web-only page falls back to the kind map instead of pushing a
@@ -37,6 +36,15 @@ function nativeFor(link: string): string | null {
     const payee = new URLSearchParams(query).get("payee");
     return payee ? `/bill-history?payee=${encodeURIComponent(payee)}` : "/bills";
   }
+  // a charge's alert opens Transactions searched for that charge, on its
+  // own days when the server names them (a double charge)
+  if (path === "/transactions") {
+    const sp = new URLSearchParams(query);
+    const keep = (["q", "date_from", "date_to"] as const)
+      .filter((k) => sp.get(k))
+      .map((k) => `${k}=${encodeURIComponent(sp.get(k)!)}`);
+    return keep.length ? `/transactions?${keep.join("&")}` : "/transactions";
+  }
   // a Settings section opens Settings; the section is a web anchor
   const base = path.startsWith("/settings/") ? "/settings" : path;
   return WEB_TO_NATIVE[base] ?? null;
@@ -49,4 +57,5 @@ export function alertRoute(a: Pick<Alert, "kind"> & { link?: string | null }):
   return (a.link ? nativeFor(a.link) : null) ?? KIND_ROUTE[a.kind] ?? null;
 }
 
-export const alertCta = (kind: string) => KIND_CTA[kind] || "fix this";
+export const alertCta = (kind: string) =>
+  ALERT_REVIEW.has(kind) ? "Review" : "Fix";

@@ -55,11 +55,13 @@ class BackfillTests(unittest.TestCase):
             "VALUES (2026, 6, %s)",
             (jsonb({"food_monthly": "x", "other_monthly": 5}),))
         self.assertIsNone(budget.snapshot_config(self.conn, 2026, 6))
-        # both lenses render (live-config fallback), no exception
+        # both lenses render, no exception, and agree: a snapshot that
+        # does not read as a budget is no budget, so the month is unjudged
         r = lenses.month_summary(self.conn, 2026, 6, today=TODAY)
         self.assertEqual(r["budget_source"], "live")
+        self.assertIsNone(r["verdict"])
         y = lenses.year_summary(self.conn, 2026, today=TODAY)
-        self.assertEqual(y["cells"][5]["status"], "final")
+        self.assertEqual(y["cells"][5]["status"], "net")
 
     def test_a_frozen_months_junk_settings_never_crash_its_lenses(self):
         """A snapshot is a full copy of the settings at close, so it carries

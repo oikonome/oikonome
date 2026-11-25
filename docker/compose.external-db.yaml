@@ -13,7 +13,9 @@
 #   OIKONOME_DB_SSLMODE=require   # managed providers require TLS
 #   OIKONOME_DB_ADMIN_USER=dbadmin      # provider admin (CREATEROLE; no
 #                                       # superuser needed — see migrate.py)
-#   POSTGRES_PASSWORD=…                 # that admin user's password
+#   POSTGRES_PASSWORD='…'               # that admin user's password, as
+#                                       # issued, in single quotes (no
+#                                       # URL-encoding; a '$' stays literal)
 #   OIKONOME_DB_MAINT_DB=postgres       # db to connect to for DROP/CREATE
 #                                       # DATABASE (restore); some managed
 #                                       # providers name it differently
@@ -42,10 +44,16 @@ services:
 
   migrate:
     environment:
-      # the provider ADMIN credential lives ONLY here (and in the
-      # maintenance DSN oikonome.sh backup/restore use)
-      OIKONOME_ADMIN_DSN: postgresql://${OIKONOME_DB_ADMIN_USER:-postgres}:${POSTGRES_PASSWORD:?}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_NAME:-oikonome}?sslmode=${OIKONOME_DB_SSLMODE:-require}
-      OIKONOME_MAINT_DSN: postgresql://${OIKONOME_DB_ADMIN_USER:-postgres}:${POSTGRES_PASSWORD:?}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_MAINT_DB:-postgres}?sslmode=${OIKONOME_DB_SSLMODE:-require}
+      # the provider ADMIN credential lives ONLY in this container — the
+      # admin DSN (migrate, backup) and the maintenance DSN (restore/reset
+      # DROP/CREATE DATABASE). The password travels as PGPASSWORD, never
+      # inside the URLs: a provider-issued password may hold '/', '@', '%',
+      # '#' or ':', which a postgres:// URL would misread. libpq, psql,
+      # pg_dump and psycopg all read PGPASSWORD; a password written into a
+      # DSN would override it, so these URLs carry none.
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (the provider admin password) for external-db mode}
+      OIKONOME_ADMIN_DSN: postgresql://${OIKONOME_DB_ADMIN_USER:-postgres}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_NAME:-oikonome}?sslmode=${OIKONOME_DB_SSLMODE:-require}
+      OIKONOME_MAINT_DSN: postgresql://${OIKONOME_DB_ADMIN_USER:-postgres}@${OIKONOME_DB_HOST:?}:${OIKONOME_DB_PORT:-5432}/${OIKONOME_DB_MAINT_DB:-postgres}?sslmode=${OIKONOME_DB_SSLMODE:-require}
     depends_on: !reset {}
 
   postgres:

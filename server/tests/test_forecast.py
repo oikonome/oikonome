@@ -59,8 +59,9 @@ class TestForecast(unittest.TestCase):
         add_bill(self.conn, "Rent", 900.0, next_due=TODAY + dt.timedelta(days=3),
                  last_seen=TODAY - dt.timedelta(days=27))
         f = forecast.build(self.conn, today=TODAY, days=30)
+        # due on a Saturday: the debit posts the business day after
         self.assertEqual(f["plan"]["negative_date"],
-                         str(TODAY + dt.timedelta(days=3)))
+                         str(forecast.bill_landing(TODAY + dt.timedelta(days=3))))
 
     def test_first_negative_amount_is_the_balance_at_that_date(self):
         """A small early dip plus a deeper later trough are two different
@@ -162,7 +163,7 @@ class TestForecast(unittest.TestCase):
                     "next_payment_due_date": due.isoformat()}),))
         f = forecast.build(self.conn, today=TODAY, days=60)
         self.assertEqual(f["card_events"], [(due.isoformat(), -1000.0,
-                                             "Test Card payment")])
+                                             "Card payment — Test Card")])
         stmt = {d: a for d, a, _ in f["card_events_stmt"]}
         self.assertEqual(stmt[due.isoformat()], -300.0)
         ny, nm = (due.year, due.month + 1) if due.month < 12 else (due.year + 1, 1)

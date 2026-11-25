@@ -618,20 +618,35 @@ def states(tenant_id, emails: list[str]) -> dict[str, dict]:
     `accepted`, `declined`. An address with no row is absent from the map,
     which is how "typed but never saved" stays distinguishable from
     "invited": the app has genuinely never heard of it."""
+    if not [e for e in {_norm(x) for x in emails} if e]:
+        return {}
+    try:
+        conn = _conn()
+    except Exception:                                    # noqa: BLE001
+        log.exception("recipient invite states failed")
+        return {}
+    try:
+        return states_on(conn, tenant_id, emails)
+    finally:
+        conn.close()
+
+
+def states_on(conn, tenant_id, emails: list[str]) -> dict[str, dict]:
+    """`states`, read on an admin connection the caller already holds — a
+    caller building one answer from several invitation reads (a member's
+    own mail row, the mailer's list) pays one connect for all of them
+    instead of one each. Same answer, same "unreadable reads as nobody
+    asked" posture; the connection stays the caller's to close."""
     wanted = [e for e in {_norm(x) for x in emails} if e]
     if not wanted:
         return {}
     try:
-        conn = _conn()
-        try:
-            rows = conn.execute(
-                """SELECT email, created_at, expires_at, accepted_at,
-                          declined_at, last_sent_at, send_count
-                     FROM recipient_invites
-                    WHERE tenant_id = %s AND email = ANY(%s)""",
-                (tenant_id, wanted)).fetchall()
-        finally:
-            conn.close()
+        rows = conn.execute(
+            """SELECT email, created_at, expires_at, accepted_at,
+                      declined_at, last_sent_at, send_count
+                 FROM recipient_invites
+                WHERE tenant_id = %s AND email = ANY(%s)""",
+            (tenant_id, wanted)).fetchall()
     except Exception:                                    # noqa: BLE001
         log.exception("recipient invite states failed")
         return {}

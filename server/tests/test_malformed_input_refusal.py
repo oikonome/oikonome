@@ -29,7 +29,8 @@ class MalformedInputRefusalTests(unittest.TestCase):
         test_business_route_malformed_ids.py; this only holds the line that
         every entity route still goes through a guard at all.
         """
-        src = _src("web/api.py")
+        from .util import api_sources
+        src = api_sources()
         self.assertIn("def _require_entity_id(", src)
         self.assertGreaterEqual(src.count("_require_entity_id("), 10)
 

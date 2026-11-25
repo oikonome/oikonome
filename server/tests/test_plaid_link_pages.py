@@ -1080,6 +1080,40 @@ class PlaidLinkPagesTests(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_a_window_narrowed_while_the_relink_starts_is_refused(self):
+        """The token asks for the window the household holds when it is
+        minted. A history choice narrowed between the relink's check and
+        that moment would mint a relink no wider than the bank it
+        replaces, so the start is refused and the old bank stays unbound."""
+        item = "pl-relink-narrowed"
+        self._narrow_bank(item, days=31)
+        self.client.post("/api/settings", json={"history_months": 12})
+        real = pages._relink_binding
+
+        def then_narrowed(user, item_id):
+            got = real(user, item_id)
+            self.client.post("/api/settings", json={"history_months": 1})
+            return got
+        state = {"link_token": "lt-relink-narrowed"}
+        try:
+            with _patch_client(state), mock.patch.object(
+                    pages, "_relink_binding", then_narrowed):
+                r = self.client.post("/accounts/plaid/link",
+                                     data={"relink_item_id": item},
+                                     headers={"accept": "application/json"})
+        finally:
+            self.client.post("/api/settings", json={"history_months": None})
+        self.assertEqual(r.status_code, 400, r.text)
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            it = conn.execute(
+                "SELECT status, raw->>'relink_session' AS b FROM items "
+                "WHERE id=%s", (item,)).fetchone()
+        finally:
+            conn.close()
+        self.assertNotEqual(it["status"], "archived")
+        self.assertIsNone(it["b"])
+
     def test_one_relink_at_a_time_and_a_failed_release_still_counts_as_a_relink(self):
         """A second relink start on an Item whose session is still open is
         refused (409) rather than overwriting the binding; and when Plaid

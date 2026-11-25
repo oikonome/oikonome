@@ -1,6 +1,6 @@
 """The Rules page is grouped by provenance, with server-side
 search + pagination. list_rules filters by source, searches merchant AND
-category, pages at ~50, and always returns q-filtered per-source counts
+category, pages at 25, and always returns q-filtered per-source counts
 (collapsed headers need counts without loading rows; the Model-learned
 group hides at zero). Editing OR disabling a model/seed rule PROMOTES it
 to source='user'; re-enabling a promoted rule keeps source='user'."""
@@ -25,11 +25,11 @@ class RulesPaginationTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def test_pagination_pages_at_50(self):
+    def test_pagination_pages_at_25(self):
         out = data.list_rules(self.conn, source="llm")
-        self.assertEqual(out["per_page"], 50)
+        self.assertEqual(out["per_page"], 25)
         self.assertEqual(out["total"], 50)
-        self.assertEqual(len(out["rules"]), 50)
+        self.assertEqual(len(out["rules"]), 25)
         out = data.list_rules(self.conn, source="llm", per_page=30)
         self.assertEqual(len(out["rules"]), 30)
         out2 = data.list_rules(self.conn, source="llm", per_page=30, page=2)

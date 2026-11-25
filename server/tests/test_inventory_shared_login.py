@@ -182,6 +182,7 @@ ALLOWED = {
     "POST /api/bills/merchant-category/undo",
     "POST /api/bills/proposal", "POST /api/bills/proposals/approve-all",
     "POST /api/bills/restore", "POST /api/bills/save", "POST /api/bills/toggle",
+    "POST /api/income/payer",
     "POST /bills/detect", "POST /bills/proposal",
     "POST /api/budget/snapshots/backfill", "POST /api/debt-plan",
     "POST /api/categories/rename",
@@ -192,13 +193,17 @@ ALLOWED = {
     "POST /api/receipts/{rid}/items/{line}/tag",
     "POST /api/receipts/{rid}/match", "POST /api/receipts/{rid}/parse",
     "POST /api/receipts/{rid}/unmatch",
+    "POST /api/receipts/{rid}/same-slip",
+    "POST /api/receipts/{rid}/two-purchases",
     "POST /api/reimburse/link", "POST /api/reimburse/unlink",
+    "POST /api/reimburse/selection",
     "POST /api/reimburse/{txn_id:path}/flag",
     "POST /api/reimburse/{txn_id:path}/unflag",
     "POST /api/transactions/bulk", "POST /api/transactions/retire-pending",
     "POST /api/transactions/{txn_id:path}/category",
     "POST /api/transactions/{txn_id:path}/entity",
     "POST /api/transactions/{txn_id:path}/note",
+    "POST /api/transactions/{txn_id:path}/check-payee",
     "POST /api/transactions/{txn_id:path}/owner",
     "POST /api/transactions/{txn_id:path}/receipt",
     "POST /transactions/recategorize",
@@ -221,6 +226,7 @@ ALLOWED = {
     "POST /api/business/entities/{entity_id}/compliance",
     "POST /api/business/entities/{entity_id}/delete-forever",
     "POST /api/business/entities/{entity_id}/equity",
+    "POST /api/business/entities/{entity_id}/owner-transfer",
     "POST /api/business/entities/{entity_id}/import-flags",
     "POST /api/business/entities/{entity_id}/members",
     "POST /api/business/entities/{entity_id}/mileage",
@@ -238,6 +244,16 @@ ALLOWED = {
     "POST /api/import/mapped", "POST /api/import/plan-activity",
     "POST /api/import/rollback", "POST /api/import/taxdoc/analyze",
     "POST /api/import/taxdoc/commit", "POST /api/import/ynab-accounts",
+    "DELETE /api/import/taxdoc/w2s/{doc_id}",
+    "POST /api/import/taxdoc/w2s/{doc_id}/owner",
+    # a stored tax document's removal and put-back: the household's own
+    # figures, like a W-2's removal, and reversible for 30 days — it acts
+    # on no other person and outlives no visit (the step-up in front of
+    # a multi-year one proves nothing for this login; the put-back is the
+    # safety)
+    "DELETE /api/import/taxdoc/stored/{upload_id}",
+    "POST /api/import/taxdoc/stored/{upload_id}/restore",
+    "POST /api/import/taxdoc/stored/{upload_id}/payer",
     "POST /import/mapped", "POST /import/rollback",
     "POST /api/jobs/sync", "POST /api/jobs/sync/start",
     # the assistant; its shared question log refuses deletes in the handler

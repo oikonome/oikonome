@@ -54,7 +54,7 @@ export default function BudgetHistoryCard({ mayEdit, onToast }: {
       <h2 style={{ marginTop: 0 }}>Budget history
         <span className="sub" style={{ fontWeight: 400 }}>
           {" "}— each month's budget and bill schedule, frozen as the month
-          closed</span></h2>
+          closed (this month's so far)</span></h2>
       {d.months.length > 0 && (
         <table>
           <thead><tr><th>Month</th><th className="num">Food</th>
@@ -63,12 +63,19 @@ export default function BudgetHistoryCard({ mayEdit, onToast }: {
             {/* "—" = the snapshot predates schedule freezing; showing
                 today's bill load there would be exactly the retroactive
                 judgment this card exists to prevent */}
-            <th className="num hide-m">Fixed bills</th>
-            <th className="hide-m" /></tr></thead>
+            <th className="num hide-m" title="the schedule's monthly load, evened out, as frozen with the month">
+              Bills, evened out</th>
+            <th className="hide-m"><span className="sr-only">Source</span></th></tr></thead>
           <tbody>
             {rows.map((r) => (
               <tr key={`${r.y}-${r.m}`}>
-                <td>{MONTHS[r.m - 1]} {r.y}</td>
+                <td>{MONTHS[r.m - 1]} {r.y}
+                  {r.status_text && <span className="sub"> · {r.status_text}</span>}
+                  {/* at phone width the Bills column is hidden, so the
+                      month says it under its name, as the app does */}
+                  {r.bills_monthly !== undefined && (
+                    <span className="only-m sub">
+                      <br />Bills {money(Math.abs(r.bills_monthly))}, evened out</span>)}</td>
                 <td className="num">{money(r.food_monthly)}</td>
                 <td className="num">{money(r.other_monthly)}</td>
                 <td className="num"><b>{money(r.variable_budget)}</b></td>

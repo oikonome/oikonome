@@ -142,7 +142,7 @@ class TodayLedgerTests(unittest.TestCase):
         self.assertIn("Food", line)
         # ...directly under the hero verdict sentence
         idx = plain.splitlines().index(line)
-        self.assertIn("pace", plain.splitlines()[idx - 1])
+        self.assertRegex(plain.splitlines()[idx - 1], r"planned by today|on pace")
 
 
 if __name__ == "__main__":

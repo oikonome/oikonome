@@ -377,6 +377,81 @@ def _renamed_feed_twins(conn, scan_limit: int) -> list[dict]:
     return out
 
 
+def _first_entity_twins(conn, scan_limit: int) -> list[dict]:
+    """Merchants the feed's entity minted for a bank line that already had
+    its merchant.
+
+    The resolver now asks the line before an entity seen for the first time
+    mints (merchant_identity._first_entity_answers). A twin minted before it
+    asked holds the charges since that day while the line's history sits
+    under the older merchant, and the descriptor sweep above converges such
+    a pair onto the feed-named side, or refuses it because the line cuts
+    the older name short.
+
+    A candidate is a merchant nobody has touched: named by the feed, with
+    an entity, no parent, no child, nothing merged into it and no alias a
+    person or a review wrote. EVERY live row it has sits under one bank
+    line, and that line answers — by the resolver's own test
+    (`_line_holder`), on the evidence of the line's other rows only — to a
+    single merchant older than the twin. A pair a person has called two
+    businesses is never a candidate."""
+    cands = conn.execute(
+        """SELECT m.id, m.name, m.created_at,
+                  min(t.name) AS line, count(*) AS rows,
+                  array_agg(t.id) AS ids
+             FROM merchants m
+             JOIN transactions t ON t.merchant_id = m.id AND t.removed = 0
+            WHERE m.name_source = 'plaid' AND m.plaid_entity_id IS NOT NULL
+              AND m.merged_into IS NULL AND m.parent_id IS NULL
+              AND coalesce(m.kind, 'merchant') = 'merchant'
+              AND NOT EXISTS (SELECT 1 FROM merchant_canonical a
+                               WHERE a.merchant_id = m.id
+                                 AND a.method <> 'layer1')
+              AND NOT EXISTS (SELECT 1 FROM merchants c
+                               WHERE c.parent_id = m.id OR c.merged_into = m.id)
+            GROUP BY m.id, m.name, m.created_at
+           HAVING count(DISTINCT t.name) = 1
+              AND bool_and(btrim(coalesce(t.name, '')) <> '')
+              AND NOT bool_or(t.merchant_outlet IS NOT NULL)
+            ORDER BY m.created_at, m.id LIMIT %s""", (scan_limit,)).fetchall()
+    if not cands:
+        return []
+    evidence = merchant_identity._descriptor_evidence(
+        conn, [(c["line"], list(c["ids"])) for c in cands])
+    agreement = merchant_identity._agreement_evidence(
+        conn, [(c["line"], c["name"]) for c in cands])
+    out = []
+    for c in cands:
+        if _COUNTERPARTY_MARK in c["name"]:
+            continue
+        sid = merchant_identity._line_holder(
+            conn, c["line"], c["name"], list(c["ids"]), ignore={c["id"]},
+            evidence=evidence, agreement=agreement)
+        if sid is None:
+            continue
+        s = conn.execute(
+            "SELECT id, name, name_source, created_at FROM merchants"
+            " WHERE id = %s AND merged_into IS NULL", (sid,)).fetchone()
+        if s is None or s["id"] == c["id"] or s["created_at"] >= c["created_at"]:
+            continue
+        # two live merchants of one name are fold_twins' to join, and a
+        # rename moves rows by the name they display
+        if s["name"].lower() == c["name"].lower():
+            continue
+        from . import merchant_merge
+        if conn.execute(
+                "SELECT 1 FROM merchant_merge_proposals"
+                " WHERE id = %s AND status = 'rejected'",
+                (merchant_merge._sig(str(c["id"]), str(s["id"])),)).fetchone():
+            continue
+        out.append({"descriptor": c["line"], "kind": "first-entity-name",
+                    "survivor": s["name"], "survivor_source": s["name_source"],
+                    "merge": [c["name"]], "rows": c["rows"],
+                    "_survivor": {"id": s["id"], "name": s["name"]},
+                    "_losers": [{"id": c["id"], "name": c["name"]}]})
+    return out
+
+
 def _rules_disagree(conn, survivor: dict, losers: list[dict]) -> bool:
     """Has the person taught the survivor one category and a loser another?
 
@@ -408,6 +483,9 @@ def plan(conn, *, scan_limit: int = SCAN_LIMIT, limit: int = MAX_MERGES) -> dict
     # evidence of its own, and a descriptor the sweep below would refuse
     # because of that same twin is then not reported as a refusal.
     twins = _renamed_feed_twins(conn, scan_limit)
+    # ...and the twins a first-seen entity minted beside a line's merchant:
+    # the same shape, one merchant into the older one its line names
+    twins += _first_entity_twins(conn, scan_limit)
     taken = {lo["id"] for t in twins for lo in t["_losers"]}
     for t in twins:
         if _rules_disagree(conn, t["_survivor"], t["_losers"]):
@@ -491,7 +569,8 @@ def repair(conn, *, apply: bool = False, scan_limit: int = SCAN_LIMIT,
                     moved = merchant_dedup.rename(conn, lo["name"],
                                                   survivor["name"])
                     rows += moved["rows"]
-                    if rec.get("kind") == "renamed-feed-name":
+                    if rec.get("kind") in ("renamed-feed-name",
+                                           "first-entity-name"):
                         # A twin's line key can be mapped with no live row
                         # under it (a hold's unenriched line, a posted
                         # charge's own descriptor), and the rename moves

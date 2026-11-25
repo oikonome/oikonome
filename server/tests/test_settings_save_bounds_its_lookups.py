@@ -44,7 +44,8 @@ class SettingsSaveRefusesOversizedListsBeforeWork(unittest.TestCase):
         self.assertEqual(r.status_code, 200, r.text)
 
     def _counting(self):
-        from oikonome.web import api, netguard
+        # the module the settings door looks `_conn` up in
+        from oikonome.web import api_settings as api, netguard
         lookups, conns = [], []
         real_conn = api._conn
 

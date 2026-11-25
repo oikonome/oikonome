@@ -39,3 +39,6 @@ mobile/google-services.json
 # the README is the product's
 extras/*
 !extras/README.md
+
+# the forecast benchmark's scoreboard runs (specs/forecast-benchmark.md)
+server/tests/forecast_bench/runs/

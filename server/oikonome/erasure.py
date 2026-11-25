@@ -74,6 +74,18 @@ log = logging.getLogger(__name__)
 # transaction, are always taken in one order, because two writers taking
 # any pair of them the other way round can each hold what the other wants,
 # and Postgres then kills one of them:
+#  -1. the household bill-claim lock (engine.bills.hold_bill_claims, taken
+#      by bills.bill_write), before every lock below, and never asked for
+#      once one of them is held: an approval holding it waits on offer,
+#      bill and transaction rows. save_bill, rename_bill and restore_bill
+#      refuse to write inside a transaction that does not hold it. A
+#      restore and the nightly bills pass write bill rows without it, by
+#      design: they hold the locks below first, so asking for it there
+#      would be the inversion;
+#   0. the household file-storage lock (engine.storage_quota.hold_lock),
+#      which every writer of stored bytes (receipts, staged uploads, a
+#      restore) takes first — web.bulk_import.hold_ledger_write_locks takes
+#      it before the two below;
 #   1. the reimbursement-pairing lock (sync.reanchor.hold_pairing_lock);
 #   2. the household merchant-identity lock
 #      (engine.merchant_identity._lock_identity) — AFTER the pairing lock
@@ -82,6 +94,15 @@ log = logging.getLogger(__name__)
 #      for the first time once a transaction row is held: a rename holds
 #      identity while it moves rows, so a writer that restated a row and
 #      then asked for identity would wait on a rename waiting on that row;
+#   2a. the bill-ceiling lock (engine.bills.lock_active_bills), after
+#      identity and before the settings row: a restore takes it when its
+#      bills land, holding the three above, and merges the settings later;
+#      a rename takes it before the settings keyed by the bill's name, for
+#      the save that follows it in the bill editor's transaction;
+#   2b. the tax-document year locks (engine.taxdocs._lock_years), then
+#      the document-ids lock (engine.taxdocs.lock_document_ids): after
+#      the bill-ceiling lock a restore holds while its income lands, and
+#      before the settings row it merges later;
 #   3. the settings row before any accounts row (engine.budget.config_txn),
 #      and before the household-member lock (oikonome:tenant-members), which
 #      comes before the inviter's invite rows and then users rows: an
@@ -107,7 +128,10 @@ log = logging.getLogger(__name__)
 # first, even when it only reaches them near the end of its work.
 PUSH_LOCK = "oikonome:push:{}"
 WRITER_LOCKS = ("oikonome:sync:{}", "oikonome:sync-categorize:{}",
-                "oikonome:nightly:{}", "oikonome:email:{}",
+                "oikonome:nightly:{}",
+                # the nightly forecast step keeps its own key (it yields to
+                # a nightly rather than making one skip)
+                "oikonome:forecast:{}", "oikonome:email:{}",
                 "oikonome:snapshot:{}", "oikonome:script-alert:{}",
                 "oikonome:bills-detect:{}", PUSH_LOCK)
 
@@ -126,20 +150,50 @@ def hold_writers(conn, tenant_id, *, xact: bool = False) -> None:
         conn.execute(f"SELECT {fn}(hashtext(%s))", (key,))
 
 
+def _drop(conn, what: str) -> None:
+    log.exception("erasure: %s the shared push lock — dropping the "
+                  "connection", what)
+    try:
+        (conn.discard if hasattr(conn, "discard") else conn.close)()
+    except Exception:                                    # noqa: BLE001
+        pass
+
+
+def _probe_push_lock(conn, tenant_id) -> bool:
+    """True when an erasure holds the push writer lock exclusively. The
+    door's connection is POOLED, so any failure on either side — a take
+    whose reply was lost after the server granted it (a statement timeout,
+    a cancel), a connection inside an aborted transaction, a release that
+    could not be sent — drops the handle rather than hand the next
+    borrower a shared lock an erasure would wait on forever (the same rule
+    as tenancy.release_lock). A failed take answers False: the caller
+    falls through to the control plane."""
+    key = PUSH_LOCK.format(tenant_id)
+    try:
+        got = conn.execute(
+            "SELECT pg_try_advisory_lock_shared(hashtext(%s)) AS ok",
+            (key,)).fetchone()
+    except Exception:                                    # noqa: BLE001
+        _drop(conn, "could not take")
+        return False
+    if not (got["ok"] if isinstance(got, dict) else got[0]):
+        return True
+    try:
+        conn.execute("SELECT pg_advisory_unlock_shared(hashtext(%s))",
+                     (key,))
+    except Exception:                                    # noqa: BLE001
+        _drop(conn, "could not release")
+    return False
+
+
 def being_deleted(tenant_id, conn=None) -> bool:
     """True once an erasure of this household has begun: its status was
     flipped to pending_delete, or its row is already gone — or, given a
     connection, the push writer lock is held exclusively, which only an
     erasure does. Read from the control plane, so it is current even
     inside another transaction."""
-    if conn is not None:
-        got = conn.execute(
-            "SELECT pg_try_advisory_lock_shared(hashtext(%s)) AS ok",
-            (PUSH_LOCK.format(tenant_id),)).fetchone()
-        if not (got["ok"] if isinstance(got, dict) else got[0]):
-            return True
-        conn.execute("SELECT pg_advisory_unlock_shared(hashtext(%s))",
-                     (PUSH_LOCK.format(tenant_id),))
+    if conn is not None and _probe_push_lock(conn, tenant_id):
+        return True
     from .db import tenancy
     cc = tenancy.control_connect()
     try:

@@ -1005,8 +1005,11 @@ class AuthLockoutAndOpsCmdTests(unittest.TestCase):
         r = TestClient(app).post(
             "/api/login", data={"email": email, "password": "x"})
         self.assertEqual(r.status_code, 429)
-        # a successful login clears the counter (legit user not penalized)
+        # a tripped lock stands past a successful sign-in elsewhere (it
+        # escalates; see security._LOCK_MAX); a completed reset lifts it
         security.clear_login_failures(email)
+        self.assertTrue(security.account_login_locked(email))
+        security.lift_login_lock(email)
         self.assertFalse(security.account_login_locked(email))
 
     def test_wrong_password_cannot_lock_account_dos(self):

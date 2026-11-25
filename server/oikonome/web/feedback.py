@@ -187,10 +187,14 @@ LOGS_NOTE = ("The app-logs.txt beside this bundle is the app's recent log "
 
 def build_package(conn, tenant_id: str, number: str, message: str,
                   screenshot: tuple[str, bytes] | None = None,
-                  kind: str = "feedback") -> bytes:
+                  kind: str = "feedback", owner: bool = True) -> bytes:
     """The zip a maintainer needs to act on a report: what the person
     said, what the instance looks like, what the app logged. NO
-    transaction contents, NO tokens (doctor.bundle's own rule)."""
+    transaction contents, NO tokens (doctor.bundle's own rule).
+
+    `owner=False` is the copy a member or viewer may hold: the bundle's
+    member view (no AI model names) and no app log, which names hosts —
+    the same household setup Settings and the Doctor page keep from them."""
     from . import doctor
     kind = normalize_kind(kind)
     md = [f"# Oikonome {_HEADING[kind].lower()} {number}",
@@ -201,8 +205,8 @@ def build_package(conn, tenant_id: str, number: str, message: str,
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr(f"{number}/feedback.md", "\n".join(md))
-        bundle = doctor.bundle(tenant_id)
-        with_logs = _single_tenant_instance()
+        bundle = doctor.bundle(tenant_id, owner=owner)
+        with_logs = owner and _single_tenant_instance()
         if with_logs:
             bundle["redacted"] = f"{bundle['redacted']} {LOGS_NOTE}"
         z.writestr(f"{number}/doctor-bundle.json",
@@ -263,7 +267,8 @@ def sender_muted(email: str | None) -> bool:
 
 def submit(conn, tenant_id: str, message: str,
            screenshot: tuple[str, bytes] | None = None,
-           kind: str = "feedback", sender: str | None = None) -> dict:
+           kind: str = "feedback", sender: str | None = None,
+           owner: bool = True) -> dict:
     """Returns {number, delivery, package?}: delivery 'emailed' when SMTP
     took it, else 'downloaded' with the zip for the person to send to
     feedback_to() themselves. Email failure falls back to the download —
@@ -313,5 +318,12 @@ def submit(conn, tenant_id: str, message: str,
     conn.execute(
         "INSERT INTO feedback_reports (number, message, delivery, kind) "
         "VALUES (%s,%s,%s,%s)", (number, message.strip(), delivery, kind))
-    return {"number": number, "delivery": delivery,
-            "package": None if delivery == "emailed" else package}
+    if delivery == "emailed":
+        return {"number": number, "delivery": delivery, "package": None}
+    # the download goes back to whoever pressed Send: a member or viewer
+    # gets the member view of the bundle; the emailed copy above is the
+    # operator's and keeps the full one
+    if not owner:
+        package = build_package(conn, tenant_id, number, message,
+                                screenshot, kind=kind, owner=False)
+    return {"number": number, "delivery": delivery, "package": package}

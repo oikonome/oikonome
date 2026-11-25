@@ -364,20 +364,22 @@ class BatchRollbackTests(unittest.TestCase):
             "SELECT COUNT(*) AS n FROM transactions WHERE id LIKE 'qif:%'"
         ).fetchone()["n"]
 
-    def test_reimport_appends_batches_and_rollback_preserves_first(self):
+    def test_a_reimport_joins_the_owners_and_rollback_preserves_first(self):
         """Content-hashed ids mean an overlapping re-import UPSERTS the same
-        rows; the batch id must APPEND to raw->'_batches', and rolling back
-        the re-import must NOT delete rows the first batch created."""
+        rows: it added none (so it counts them as matched), but its file
+        holds them, so it joins their owners, and rolling it back must NOT
+        delete rows the first batch created."""
         from oikonome.sync import batches
         b1 = batches.create(self.conn, "qif", "chk", "one.qif")
         qifimport.import_qif(self.conn, "chk", QIF, batch_id=b1)
         b2 = batches.create(self.conn, "qif", "chk", "one-again.qif")
-        qifimport.import_qif(self.conn, "chk", QIF, batch_id=b2)
+        r = qifimport.import_qif(self.conn, "chk", QIF, batch_id=b2)
+        self.assertEqual((r["imported"], r["matched"]), (0, 3))
         row = self.conn.execute(
             "SELECT raw->'_batches' AS b, raw->>'_batch' AS latest "
             "FROM transactions WHERE id LIKE 'qif:%' LIMIT 1").fetchone()
-        self.assertEqual(row["b"], [b1, b2])     # appended, not overwritten
-        self.assertEqual(row["latest"], b2)      # display = latest
+        self.assertEqual(row["b"], [b1, b2])     # joined, not overwritten
+        self.assertEqual(row["latest"], b2)      # the latest writer
         res = batches.rollback(self.conn, b2)
         self.assertEqual(int(res), 0)            # nothing deleted…
         self.assertEqual(self._qif_count(), 3)   # …b1's rows survive

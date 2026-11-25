@@ -3,14 +3,19 @@
 // pagination (100/page), merchant → recurring-history links, inline
 // recategorize + biz toggle.
 import { useQuery } from "@tanstack/react-query";
-import { useDeferredValue, useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router";
 import TxnTable from "../components/TxnTable";
 import { api, mmdd, money as money$, catLabel, errText, toast } from "../api/client";
-import { RANGES, RANGE_LABEL, ledgerRange } from "../components/RangePicker";
+import { RANGES, RANGE_LABEL } from "../components/RangePicker";
 import { SnapReceiptButton, WaitingBadge } from "../components/WaitingReceipts";
 import { canEdit, isOwner } from "../role";
-import { householdDay } from "../moneymath";
+import { EMPTY_LINES, accountLabel, figureGreyed, householdDay, knownOr,
+         listedSpendWord, UNKNOWN_FIGURE } from "../moneymath";
+import { FailedLine, NoAccountsLine, StaleLine, useNoAccounts }
+  from "../components/Loaded";
+import EmptyState from "../components/EmptyState";
+import SegmentedControl from "../components/SegmentedControl";
 const money = (v: number | null | undefined) => money$(v, true);  // cents on transaction/recurring surfaces
 
 
@@ -51,6 +56,12 @@ export default function Transactions() {
   // a lens category label's link: the rows that label summed (personal
   // spend, reimbursements netted), not every row filed under the category
   const [counted, setCounted] = useState(sp.get("counted") === "1");
+  // a Spending figure's link: the rows that figure summed over one range
+  // (`spend`), for a category (`cat`), a merchant, or the whole window,
+  // on its current or previous side — the server's own row set
+  const [spend, setSpend] = useState(sp.get("spend") ?? "");
+  const [merchant, setMerchant] = useState(sp.get("merchant") ?? "");
+  const [side, setSide] = useState(sp.get("side") ?? "");
   // whether the view is one MONTH's slice. A bucket always is; a category
   // deep-linked with y&m is that month's category. A category picked in
   // the toolbar is not — it searches all history, as it always has — so
@@ -105,7 +116,7 @@ export default function Transactions() {
   // inside one would otherwise look broken.
   const leaveScope = () => {
     setBucket(""); setAsOf(""); setCounted(false); setMonthScope(false);
-    setYearScope(false);
+    setYearScope(false); setSpend(""); setMerchant(""); setSide("");
   };
 
   // A deep link arriving while this page is already open RETARGETS it:
@@ -123,6 +134,8 @@ export default function Transactions() {
     setAcct(sp.get("acct") ?? ""); setCat(sp.get("cat") ?? "");
     setBucket(sp.get("bucket") ?? ""); setAsOf(sp.get("as_of") ?? "");
     setCounted(sp.get("counted") === "1");
+    setSpend(sp.get("spend") ?? ""); setMerchant(sp.get("merchant") ?? "");
+    setSide(sp.get("side") ?? "");
     setMonthScope(!!((sp.get("bucket") && sp.get("m"))
                      || (sp.get("cat") && sp.get("y") && sp.get("m"))));
     setYearScope(!!(sp.get("bucket") && sp.get("y") && !sp.get("m")));
@@ -159,7 +172,7 @@ export default function Transactions() {
       // rather than the helper: a stable effect body)
       if (want) {
         setBucket(""); setAsOf(""); setCounted(false); setMonthScope(false);
-        setYearScope(false);
+        setYearScope(false); setSpend(""); setMerchant(""); setSide("");
       }
     }, 250);
     return () => clearTimeout(t);
@@ -167,10 +180,15 @@ export default function Transactions() {
 
   // a bucket listing is a search-mode result like any other filter: a
   // paged, totalled list rather than the month browse
-  const searching = !!(live || acct || cat || bucket || df || dt_
+  const searching = !!(live || acct || cat || bucket || spend || df || dt_
                        || channelF || checksF);
   const params: Record<string, string> = {
-    ...(bucket
+    ...(spend
+      // a Spending figure IS the query: the server names its rows, and
+      // no toolbar filter rides along
+      ? { spend, page: String(page), ...(cat ? { cat } : {}),
+          ...(merchant ? { merchant } : {}), ...(side ? { side } : {}) }
+      : bucket
       // the bucket IS the query — it already names its month, and mixing
       // it with the toolbar's filters would list something the verdict
       // never counted
@@ -190,7 +208,7 @@ export default function Transactions() {
     // a bucket or a counted category is the engine's own row set — the
     // lenses below would only empty it under a non-zero chip, so none
     // rides along
-    ...(bucket || (counted && cat) ? {} : {
+    ...(bucket || spend || (counted && cat) ? {} : {
       ...(reimbF ? { reimb: "1" } : {}),
       // owner filter is a month-view lens (search path is owner-agnostic)
       ...(ownerF && !searching ? { owner: ownerF } : {}),
@@ -247,6 +265,7 @@ export default function Transactions() {
   // rule edit (which invalidates this key) left the other copy stale.
   const cats = useQuery({ queryKey: ["categories"], queryFn: api.categories });
   const accts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
+  const noAccounts = useNoAccounts();
   const owners = useQuery({ queryKey: ["owners"], queryFn: api.owners });
   // count pill on the awaiting-reimbursement door. The business count that
   // sat beside it is gone: the Business tab is where that number lives,
@@ -272,12 +291,30 @@ export default function Transactions() {
 
   const total = query.data?.total ?? 0;
   const totalPages = Math.max(1, Math.ceil(total / PER_PAGE));
+  // the figures the hero prints: only from an answer on screen, greyed
+  // while it is a kept or a previous filter's answer — never 0 results,
+  // $0.00 or 0 transactions for a read that has not answered
+  const shownTotal = knownOr(query, (d) => d.total);
+  const shownSum = knownOr(query, (d) => d.amount_sum);
+  // a plain search's headline: money out / in / net over every matched
+  // row, by Cash Flow's rules — the server's figures (TxnPage.flow), null
+  // for a bucket's or a counted category's rows and the business scope
+  const flow = query.data?.flow ?? null;
+  // what each range button sets the dates to (TxnPage.ranges): the last
+  // page that answered, so a read that failed — a too-wide query — still
+  // leaves the buttons that narrow it
+  const lastRanges = useRef(query.data?.ranges);
+  if (query.data?.ranges) lastRanges.current = query.data.ranges;
+  const ranges = query.data?.ranges ?? lastRanges.current;
+  const shownCount = knownOr(query, (d) => d.rows.length);
+  const greyed = figureGreyed(query);
   const acctLabel = acct
     ? accts.data?.accounts.find((a) => a.id === acct)?.name : null;
   const clear = () => {
     setLive(""); setQ(""); setAcct(""); setCat(""); setDf(""); setDt("");
     setChannelF(""); setChecksF(false); setBucket(""); setAsOf("");
     setCounted(false); setMonthScope(false); setYearScope(false); setPage(1);
+    setSpend(""); setMerchant(""); setSide("");
   };
   // What the list is narrowed to, said in one chip with its month: a deep
   // link's scope is the part that otherwise goes unsaid, and neither a
@@ -290,13 +327,21 @@ export default function Transactions() {
     (query.data?.bucket === bucket && query.data?.bucket_label)
     || (bucket === "food" ? "Food"
         : bucket === "other" ? "Everything else" : bucket);
-  const scopeChip = bucket
+  // a Spending figure's chip is the server's words (drill_label: the
+  // figure and the days it was read over), printed once they are THIS
+  // figure's answer
+  const scopeChip = spend
+    ? (query.data?.drill_label && !query.isPlaceholderData
+       ? query.data.drill_label : null)
+    : bucket
     ? `${bucketLabel} · ${yearScope ? y : monthShort}`
     : cat && monthScope ? `${catLabel(cat)} · ${monthShort}` : null;
-  // ✕ on the chip drops the grouping and keeps the month it named
+  // ✕ on the chip drops the grouping and keeps the month it named; a
+  // Spending figure's chip returns to the month browse
   const clearScope = () => {
     setBucket(""); setAsOf(""); setCounted(false); setCat("");
     setMonthScope(false); setYearScope(false); setPage(1);
+    setSpend(""); setMerchant(""); setSide("");
   };
   // any filter change starts back at page 1
   const set = <T,>(fn: (v: T) => void) => (v: T) => {
@@ -363,23 +408,16 @@ export default function Transactions() {
         <WaitingBadge />
         {canEdit(me) && <SnapReceiptButton />}
       </div>
-      {/* placeholderData keeps the last page on screen while refetching —
-          which also means a FAILED background refetch (server mid-deploy,
-          network blip) would silently show stale rows. Say so instead. */}
-      {query.isError && (
-        <div className="note bad" style={{ marginTop: 0 }}>
-          <span style={{ flex: 1 }}>
-            Couldn't refresh — {query.data ? "showing possibly stale data"
-              : "nothing loaded"}: {String(query.error)}
-          </span>
-          <button onClick={() => query.refetch()}>Retry</button>
-        </div>
-      )}
+      {/* a FAILED background refetch (server mid-deploy, network blip)
+          keeps the rows it had; say so, and when. A failed first read says
+          so in the list's place below. */}
+      <StaleLine query={query} />
       {/* HERO. Without this the month view states no total — only searches
           do — and the DEFAULT state of the ledger answers nothing about the
           month on screen. Money out / money in, the count, and the two
           counts that are actually destinations rather than filters. */}
-      <div className="card" style={{ marginTop: 0 }}>
+      <div className="card" style={{ marginTop: 0,
+                                     opacity: greyed ? 0.55 : undefined }}>
         <div style={{ display: "flex", gap: "1rem", alignItems: "baseline",
                       flexWrap: "wrap" }}>
           {/* the month arrows belong to any view that IS a month — the
@@ -387,9 +425,10 @@ export default function Transactions() {
               rows can be walked back through the year in place */}
           {(!searching || monthScope) && (
             <span style={{ display: "inline-flex", gap: ".35rem", alignItems: "center" }}>
-              <button onClick={prev} title="previous month">‹</button>
+              <button onClick={prev} title="previous month" aria-label="Previous month">‹</button>
               <b style={{ minWidth: "9.5rem", textAlign: "center" }}>{label}</b>
-              {!isCurrent && <button onClick={next} title="next month">›</button>}
+              {!isCurrent && <button onClick={next} title="next month"
+                                      aria-label="Next month">›</button>}
               {!isCurrent && <button title="jump to current month"
                 onClick={() => { setPage(1); setY(now.getFullYear());
                                  setM(now.getMonth() + 1); }}>today</button>}
@@ -401,65 +440,97 @@ export default function Transactions() {
                   page's definitions) — transfers and card payments are money
                   moved, not money made or spent, so they are not in these */}
               {query.data?.out_sum !== undefined && (
-                <span style={{ fontSize: "1.35rem", fontWeight: 700,
-                               letterSpacing: "-.01em" }}>
+                <div className="grid cols4 herotiles" style={{ flex: "1 1 100%",
+                                                     marginTop: 0, gap: ".6rem" }}>
                   {/* in and net are null for a month before the bank feed
                       starts — its income is unknown, so it reads "—", and
                       there is no net to show rather than a false loss */}
-                  {query.data.in_sum == null
-                    ? <span className="sub">—</span>
-                    : <span className="pos">{money(query.data.in_sum)}</span>}
-                  <span className="sub" style={{ fontWeight: 400 }}> in</span>
-                  {/* the current month: what has landed, and the paychecks
-                      still due before month end — the Budget plan's income
-                      is the two together */}
-                  {(query.data.in_expected ?? 0) > 0 && (
-                    <span className="sub" style={{ fontWeight: 400 }}
-                          title="paychecks still due this month, at their current amount">
-                      {" "}(+{money(query.data.in_expected!)} expected)</span>
-                  )}
-                  {" · "}
-                  {money(query.data.out_sum)}
-                  <span className="sub" style={{ fontWeight: 400 }}> out</span>
-                  {query.data.net_sum != null && (
-                    <>
-                      {" · "}
-                      <span className={query.data.net_sum < 0 ? "neg" : "pos"}>
-                        {query.data.net_sum < 0 ? "" : "+"}
-                        {money(query.data.net_sum)}
-                      </span>
-                      <span className="sub" style={{ fontWeight: 400 }}> net</span>
-                    </>
-                  )}
-                  {query.data.per_day != null && (
-                    <>
-                      {" · "}
-                      <b>{money(query.data.per_day)}</b>
-                      <span className="sub" style={{ fontWeight: 400 }}
-                            title={`spending over ${query.data.per_day_days} day${
-                              query.data.per_day_days === 1 ? "" : "s"}`}>
-                        /day</span>
-                    </>
-                  )}
-                </span>
+                  <div className="tile">
+                    <div className="sub">In</div>
+                    <div className={"kpi sm " + (query.data.in_sum == null
+                                                  ? "mut" : "pos")}>
+                      {query.data.in_sum == null ? "—"
+                        : money$(query.data.in_sum)}</div>
+                    {/* the current month: what has landed, and the paychecks
+                        still due before month end — the Budget plan's income
+                        is the two together */}
+                    <div className="sub"
+                         title="paychecks still due this month, at their current amount">
+                      {(query.data.in_expected ?? 0) > 0
+                        ? `+${money$(query.data.in_expected!)} expected`
+                        : "landed"}</div>
+                  </div>
+                  <div className="tile">
+                    <div className="sub">Out</div>
+                    <div className="kpi sm">{money$(query.data.out_sum)}</div>
+                    <div className="sub">spent</div>
+                  </div>
+                  <div className="tile">
+                    <div className="sub">Net</div>
+                    <div className={"kpi sm " + (query.data.net_sum == null
+                        ? "mut" : query.data.net_sum < 0 ? "neg" : "pos")}>
+                      {query.data.net_sum == null ? "—"
+                        : (query.data.net_sum < 0 ? "" : "+")
+                          + money$(query.data.net_sum)}</div>
+                    {/* mid-month the net is the month so far, with
+                        paychecks still to come beside it under In */}
+                    <div className="sub">
+                      {(query.data.in_expected ?? 0) > 0 ? "so far" : "in less out"}</div>
+                  </div>
+                  <div className="tile"
+                       title={query.data.per_day != null
+                         ? `spending over ${query.data.per_day_days} day${
+                             query.data.per_day_days === 1 ? "" : "s"}`
+                         : undefined}>
+                    <div className="sub">A day</div>
+                    <div className={"kpi sm " + (query.data.per_day == null
+                                                  ? "mut" : "")}>
+                      {query.data.per_day == null ? "—"
+                        : money$(query.data.per_day)}</div>
+                    <div className="sub">spent on average</div>
+                  </div>
+                </div>
               )}
             </>
           ) : (
             <span style={{ fontSize: "1.35rem", fontWeight: 700,
                            letterSpacing: "-.01em" }}>
-              {total}<span className="sub" style={{ fontWeight: 400 }}>
-                {" "}result{total === 1 ? "" : "s"}</span>
-              {" · "}
-              <b className={(query.data?.amount_sum ?? 0) < 0 ? "pos" : ""}>
-                {money(-(query.data?.amount_sum ?? 0))}</b>
-              <span className="sub" style={{ fontWeight: 400 }}> total</span>
+              {shownTotal ?? UNKNOWN_FIGURE}
+              <span className="sub" style={{ fontWeight: 400 }}>
+                {" "}result{shownTotal === 1 ? "" : "s"}</span>
+              {/* a bucket's or a counted category's rows: the label's
+                  own figure; any other search: out / in / net */}
+              {(bucket || counted || spend) ? (
+                <>
+                  {" · "}
+                  <b className={shownSum !== null && shownSum < 0 ? "pos" : ""}>
+                    {money(shownSum === null ? null : -shownSum)}</b>
+                  <span className="sub" style={{ fontWeight: 400 }}> total</span>
+                </>
+              ) : flow && (
+                <>
+                  {" · "}
+                  <span className="sub" style={{ fontWeight: 400 }}>out </span>
+                  <b>{money(flow.money_out)}</b>
+                  {" · "}
+                  <span className="sub" style={{ fontWeight: 400 }}>in </span>
+                  <b className={flow.money_in > 0 ? "pos" : ""}>
+                    {money(flow.money_in)}</b>
+                  {" · "}
+                  <span className="sub" style={{ fontWeight: 400 }}
+                        title="money in less money out; transfers and card payments are in neither">
+                    net </span>
+                  <b className={flow.net < 0 ? "neg" : flow.net > 0 ? "pos" : ""}>
+                    {(flow.net > 0 ? "+" : "") + money(flow.net)}</b>
+                </>
+              )}
               {/* the figure the label wore, when the raw sum of its rows
                   is not it: reimbursements netted, an envelope's overflow
                   counted only past the envelope */}
               {bucket && query.data?.bucket === bucket
                 && query.data.bucket_amount != null
-                && Math.abs(query.data.bucket_amount
-                            - (query.data.amount_sum ?? 0)) >= 0.005 && (
+                && shownSum !== null
+                && Math.abs(query.data.bucket_amount - shownSum) >= 0.005 && (
                 <span className="sub" style={{ fontWeight: 400 }}
                       title="what the label counted: reimbursements netted, envelope overflow counted the way the plan counts it">
                   {" · counted as "}<b>{money(query.data.bucket_amount)}</b>
@@ -487,7 +558,7 @@ export default function Transactions() {
               {query.data?.per_day != null && (
                 <>
                   {" · "}
-                  <b>{money(query.data.per_day)}</b>
+                  <b>{money$(query.data.per_day)}</b>
                   <span className="sub" style={{ fontWeight: 400 }}
                         title={`spending over ${query.data.per_day_days} day${
                           query.data.per_day_days === 1 ? "" : "s"}`}>
@@ -539,7 +610,19 @@ export default function Transactions() {
                                       gap: ".9rem", flexWrap: "wrap",
                                       alignItems: "center" }}>
           {!searching ? (
-            <span>{rows.length} transaction{rows.length === 1 ? "" : "s"}
+            <span>{shownCount !== null
+                && <>{shownCount} transaction{shownCount === 1 ? "" : "s"}</>}
+              {/* a month narrowed by a lens (whose money, business rows,
+                  reimbursements) keeps the month's cash flow above; the
+                  listed rows are a subset, so say what THEY spent — the
+                  server's figure, spending only (card payments, transfers
+                  and money in count nothing; a business's spending when
+                  every listed row is a business's), as the phone prints it */}
+              {(ownerF || scopeF || reimbF) && query.data?.mode === "month" && (
+                <> · <b style={{ color: "var(--ink)" }}>
+                  {money(query.data.listed_spend)}</b>{" "}
+                  {listedSpendWord(query.data.listed_scope)}</>
+              )}
               {/* the out/in figures above are household money; say how
                   many listed rows are a business's so the two agree */}
               {(query.data?.biz_count ?? 0) > 0 && (
@@ -552,7 +635,7 @@ export default function Transactions() {
               {/* a month-scoped category is already named by the chip
                   below, with its month — saying it twice reads as two
                   different filters */}
-              {cat && !monthScope && <> · {catLabel(cat)}</>}
+              {cat && !monthScope && !spend && <> · {catLabel(cat)}</>}
               {(df || dt_) && <> · {df ? mmdd(df) : "start"} – {dt_ ? mmdd(dt_) : "now"}</>}
               {" · newest first"}
               {(query.data?.biz_count ?? 0) > 0 && scopeF !== "business" && (
@@ -563,10 +646,21 @@ export default function Transactions() {
                   rows are in the result. A renamed account found through
                   the BANK'S name states both, or a "CREDIT CARD" search
                   lists rows that show neither word */}
-              {(query.data?.account_hits ?? []).map((h) => (
+              {(query.data?.account_hits ?? []).map((h) => h.rows_listed ? (
                 <span key={h.id} className="mut">
                   {" · includes "}<b style={{ color: "var(--ink)" }}>{h.label}</b>
                   {h.via_bank && <> (the bank calls it “{h.bank_name}”)</>}
+                </span>
+              ) : (
+                /* the term matched rows by their own text, so the account
+                   named like it is not in these figures — its rows are
+                   one tap away instead */
+                <span key={h.id} className="mut">
+                  {" · also: "}
+                  <button type="button" className="linkish"
+                          onClick={() => { setLive(""); setQ(""); setPage(1);
+                                           leaveScope(); setAcct(h.id); }}>
+                    rows on {h.label}</button>
                 </span>
               ))}
             </span>
@@ -601,27 +695,33 @@ export default function Transactions() {
                        alignItems: "center", width: "100%" }}
               onSubmit={(e) => { e.preventDefault(); setLive(q.trim());
                                  setPage(1); if (q.trim()) leaveScope(); }}>
-          <input placeholder="search all accounts & history…" size={20} value={q}
+          <input aria-label="Search all accounts and history"
+                 placeholder="search payee, category…" size={20} value={q}
                  onChange={(e) => setQ(e.target.value)} />
-          <select value={acct} style={{ maxWidth: "13rem" }}
+          <select aria-label="Account" value={acct} style={{ maxWidth: "13rem" }}
                   onChange={(e) => set(setAcct)(e.target.value)}>
             <option value="">all accounts</option>
-            {accts.data?.accounts.filter((a) => a.balance_current !== null).map((a) => (
+            {/* an account with no rows has nothing to list — the
+                phone's rule, so the two pickers offer the same accounts */}
+            {accts.data?.accounts.filter((a) => a.txns > 0
+                                               && a.balance_current !== null).map((a) => (
               <option key={a.id} value={a.id}>
-                {a.institution_name} {a.name}{a.mask ? ` ${a.mask}` : ""}
+                {accountLabel(a)}
               </option>
             ))}
-            {(accts.data?.accounts.some((a) => a.balance_current === null)) && (
+            {(accts.data?.accounts.some((a) => a.txns > 0
+                                               && a.balance_current === null)) && (
               <optgroup label="── Archived / closed ──">
-                {accts.data!.accounts.filter((a) => a.balance_current === null).map((a) => (
+                {accts.data!.accounts.filter((a) => a.txns > 0
+                                                    && a.balance_current === null).map((a) => (
                   <option key={a.id} value={a.id}>
-                    {a.institution_name} {a.name}{a.mask ? ` ${a.mask}` : ""}
+                    {accountLabel(a)}
                   </option>
                 ))}
               </optgroup>
             )}
           </select>
-          <select value={cat} style={{ maxWidth: "11rem" }}
+          <select aria-label="Category" value={cat} style={{ maxWidth: "11rem" }}
                   onChange={(e) => set(setCat)(e.target.value)}>
             <option value="">all categories</option>
             {cats.data?.categories.map((c) => (
@@ -648,23 +748,26 @@ export default function Transactions() {
             {/* the site-wide This month … All vocabulary — one click
                 instead of two typed dates; a typed pair matching none of
                 them lights nothing, and All is the no-date-filter state */}
-            <span style={{ display: "inline-flex", gap: ".35rem", flexWrap: "wrap" }}>
-              {RANGES.map((r) => {
-                const v = ledgerRange(r, now);
-                const on = df === v.from && dt_ === v.to;
-                return (
-                  <button key={r} type="button"
-                          className={`pill m${on ? " pri" : ""}`}
-                          title={r === "all" ? "no date filter"
-                                 : r === "cur" ? "from the first of this month"
-                                 : r === "1m" ? "the last complete month"
-                                 : `${r} — from the first of the month`}
-                          onClick={() => { setDf(v.from); setDt(v.to); setPage(1);
-                                           leaveScope(); }}>
-                    {RANGE_LABEL[r]}</button>
-                );
-              })}
-            </span>
+            {/* the windows are Cash Flow's, sent by the server with every
+                page (TxnPage.ranges): complete months, "This month" to
+                today, All unbounded — so "3m" lists what Cash Flow's 3m
+                counts. Until a page has answered there are no dates to
+                set, and the buttons wait; after that they keep the last
+                answer's windows through a failed read. */}
+            <SegmentedControl label="Date range" size="sm"
+              value={RANGES.find((r) => {
+                const v = ranges?.[r];
+                return !!v && df === v.start && dt_ === v.end;
+              }) ?? null}
+              onChange={(r) => { const v = ranges?.[r];
+                                 if (!v) return;
+                                 setDf(v.start); setDt(v.end); setPage(1);
+                                 leaveScope(); }}
+              options={RANGES.map((r) => ({
+                value: r, label: RANGE_LABEL[r], disabled: !ranges?.[r],
+                title: r === "all" ? "no date filter"
+                  : ranges?.[r] ? `${mmdd(ranges[r].start)} – ${mmdd(ranges[r].end)}`
+                  : undefined }))} />
             <label className="mut" style={{ fontSize: 12, whiteSpace: "nowrap" }}>
               from <input type="date" value={df}
                           onChange={(e) => set(setDf)(e.target.value)} /></label>
@@ -672,7 +775,7 @@ export default function Transactions() {
               to <input type="date" value={dt_}
                         onChange={(e) => set(setDt)(e.target.value)} /></label>
             {(owners.data?.owners.length ?? 0) > 0 && (
-              <select value={ownerF} style={{ maxWidth: "9rem", fontSize: 12 }}
+              <select aria-label="Owner" value={ownerF} style={{ maxWidth: "9rem", fontSize: 12 }}
                       title="owner lens — whose money (month view)"
                       onChange={(e) => { leaveScope(); setOwnerF(e.target.value); setPage(1); }}>
                 <option value="">all owners</option>
@@ -681,7 +784,8 @@ export default function Transactions() {
               </select>
             )}
             {!bizGated && (
-              <select value={scopeF} style={{ maxWidth: "12rem", fontSize: 12 }}
+              <select aria-label="Household or business"
+                      value={scopeF} style={{ maxWidth: "12rem", fontSize: 12 }}
                       title="business-entity accounts are listed with a named pill; narrow to household only or business only"
                       onChange={(e) => { setScopeF(e.target.value); setPage(1);
                                          leaveScope(); }}>
@@ -690,7 +794,8 @@ export default function Transactions() {
                 <option value="business">business only</option>
               </select>
             )}
-            <select value={channelF} style={{ maxWidth: "9rem", fontSize: 12 }}
+            <select aria-label="How it was paid"
+                    value={channelF} style={{ maxWidth: "9rem", fontSize: 12 }}
                     title="how it was paid — the bank's payment channel"
                     onChange={(e) => { setChannelF(e.target.value); setPage(1);
                                        leaveScope(); }}>
@@ -699,20 +804,18 @@ export default function Transactions() {
               <option value="online">online</option>
               <option value="other">other</option>
             </select>
-            <button type="button"
-                    className={checksF ? "pri" : ""}
+            <button type="button" className="tgl" aria-pressed={checksF}
                     style={{ fontSize: 12 }}
                     title="only transactions the bank reports as checks"
                     onClick={() => { setChecksF(!checksF); setPage(1);
                                      leaveScope(); }}>
-              checks only{checksF ? " ✓" : ""}</button>
-            <button type="button"
-                    className={reimbF ? "pri" : ""}
+              Checks only{checksF ? " ✓" : ""}</button>
+            <button type="button" className="tgl" aria-pressed={reimbF}
                     style={{ fontSize: 12 }}
                     title="show only reimbursement activity — matched pairs and awaiting flags"
                     onClick={() => { setReimbF(!reimbF); setPage(1);
                                      leaveScope(); }}>
-              reimbursement activity only{reimbF ? " ✓" : ""}</button>
+              Reimbursement activity only{reimbF ? " ✓" : ""}</button>
           </span>
           )}
         </form>
@@ -721,17 +824,25 @@ export default function Transactions() {
       {/* the result summary is the hero above — a second one here would
           repeat the same counts, the same total and "page N of M" */}
 
-      <div className="card">
+      <div className="card stickyhead">
         {query.isPending && <p className="mut">loading…</p>}
+        {query.data === undefined && query.isError && (
+          <FailedLine q={query} what="transactions" />
+        )}
+        {/* a filter that matches nothing is said as that, with no
+            action: the way out is the filter just used; "Connect or
+            import" only when the household has no accounts at all */}
         {query.data && rows.length === 0 && (
-          <p className="sub">{searching
-            ? "No matches anywhere — try a different search."
-            : "No transactions for this month/filter."}</p>
+          searching || ownerF || scopeF || reimbF
+            ? <EmptyState title={EMPTY_LINES.filtered} />
+            : noAccounts ? <NoAccountsLine />
+            : <EmptyState title={EMPTY_LINES.monthNoTransactions} />
         )}
         {/* the ledger is the one long, date-ordered list in the app, so it
             is the one surface where a day divider is structure */}
         {query.data && rows.length > 0 && (
-          <TxnTable rows={tableRows} showAccount={!acct} dayGroups />
+          <TxnTable rows={tableRows} showAccount={!acct} dayGroups
+                    daySpend={query.data?.day_spend} />
         )}
         {!searching && rows.length > monthRows.length && (
           <div className="sub" style={{ marginTop: ".6rem", display: "flex",

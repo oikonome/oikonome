@@ -108,7 +108,7 @@ class SqlParity(unittest.TestCase):
         self.assertEqual(base.NUMBERED_NAME_PATTERN, card_number.sql_selector())
 
     def test_random_text_cuts_alike(self):
-        rnd = random.Random(20261106)
+        rnd = random.Random(73529)
         alphabet = "0123456789" * 4 + " ./-…a\t\u00a0\n"
         texts = ["".join(rnd.choice(alphabet)
                          for _ in range(rnd.randint(1, 48)))
@@ -200,7 +200,7 @@ class SqlParity(unittest.TestCase):
     def test_random_number_shaped_text_cuts_alike(self):
         """Text built from groups and separators, so the joining rule
         after the fourth group is exercised in every combination."""
-        rnd = random.Random(20261107)
+        rnd = random.Random(91263)
         seps = card_number.SEPARATORS + ("", "", "x", "\t", " \t",
                                          "\u00a0", "\r\n", "\t-")
         groups = ("1234", "5678", "56", "123456", "12345", "…", "0002")

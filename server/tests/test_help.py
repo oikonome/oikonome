@@ -92,6 +92,20 @@ class HelpApiTests(unittest.TestCase):
             self.assertGreater(len(topics[gid]["body"]), 400,
                                f"guide '{gid}' is a stub")
 
+    def test_self_hosting_docs_are_grouped_apart_from_household_topics(self):
+        """The running-an-instance docs (server, proxy, master key,
+        collectors, the integration doors) carry their own group, which
+        the Help page folds away; importing a household's own history does
+        not land in it, and the FAQ stays reference."""
+        r = self.client.get("/api/help")
+        group = {t["id"]: t["group"] for t in r.json()["topics"]}
+        for stem in ("quickstart", "reverse-proxy", "master-key",
+                     "collectors", "integrations", "troubleshooting"):
+            if stem in group:
+                self.assertEqual(group[stem], "selfhost", stem)
+        self.assertEqual(group.get("importing"), "setup")
+        self.assertEqual(group.get("faq"), "reference")
+
 
 if __name__ == "__main__":
     unittest.main()

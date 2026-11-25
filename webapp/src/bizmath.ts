@@ -1,18 +1,9 @@
-// Business-page arithmetic and wizard routing, kept free of React so the
-// same rules can be exercised by a plain-node test. The phone carries an
+// Business-page rules and wizard routing, kept free of React so the same
+// rules can be exercised by a plain-node test. The phone carries an
 // identical copy in mobile/src/lib/pure.ts, and the mobile pure-logic suite
-// runs both copies over the same cases — the two clients must never show a
-// business different numbers or open its wizard on a different business.
-
-// Banker's rounding, the same as api/client.ts's pyround. Copied rather than
-// imported so this module stays loadable by plain node (the mobile pure-logic
-// suite imports it directly) and free of the React client's dependency graph.
-const pyround = (v: number) => {
-  const f = Math.floor(v), diff = v - f;
-  if (diff > 0.5) return f + 1;
-  if (diff < 0.5) return f;
-  return f % 2 === 0 ? f : f + 1;
-};
+// runs both copies over the same cases — the two clients must never open
+// the wizard on a different business. The page's figures (this month's
+// profit, the cash in the business, the tax set-aside) are the server's.
 
 /** An account's balance belongs in a money aggregate.
  *
@@ -58,103 +49,6 @@ export function bizWizardEntryStep(
   return hasEntity ? steps.findIndex((s) => s.key === "accounts") : 0;
 }
 
-/** A business transaction as the P&L reads it (books.entity_transactions). */
-export interface BizProfitRow {
-  date: string | null; amount: number;
-  /** the amount net of partial reimbursement links, ledger sign kept */
-  net_amount?: number | null;
-  category: string | null; cat_detailed: string | null;
-  cat_original?: string | null;
-  /** a deposit whose links claim only part of it — still revenue */
-  partly_claimed?: boolean | null;
-  bucket: string | null;
-  /** the bucket the server's P&L counted this row in: a refund takes the
-   *  bucket of the cost it reverses, which only the server can find (the
-   *  charge may sit in another period or year). Null for money in that is
-   *  not a refund; absent from an older server. */
-  effective_bucket?: string | null;
-  /** the Schedule C line the user chose; a tax payment with one is a
-   *  business cost again (see bizPeriodProfit) */
-  sched_c_line?: string | null;
-}
-
-/** Money IN still carrying one of these spending categories is a merchant
- *  giving money back — a refund that reverses a cost in its own bucket, not
- *  revenue. The server's list (books._REFUND_CATEGORIES); the mobile
- *  pure-logic suite checks the two clients' copies against it. */
-export const BIZ_REFUND_CATEGORIES: ReadonlySet<string> = new Set([
-  "BANK_FEES", "ENTERTAINMENT", "FOOD_AND_DRINK", "GENERAL_MERCHANDISE",
-  "GENERAL_SERVICES", "GOVERNMENT_AND_NON_PROFIT", "HOME_IMPROVEMENT",
-  "MEDICAL", "PERSONAL_CARE", "RENT_AND_UTILITIES", "TRANSPORTATION",
-  "TRAVEL", "PROFESSIONAL_SERVICES", "INSURANCE",
-]);
-
-/** Operating profit over the rows whose date starts with `period`
- *  ("2026-08" for a month), by the server's P&L rules, so a period figure
- *  shown under the year's profit is the same arithmetic.
- *
- *  - Amounts are NET of reimbursement links: a charge paid back counts only
- *    what was not repaid, a deposit only the part no charge claimed. Gross
- *    figures would count one client check that repays two charges as both
- *    revenue and a cost.
- *  - Money in is revenue unless it is a transfer or a card payment, and
- *    money whose ORIGINAL category was a transfer stays capital unless it
- *    was made INCOME outright — except a partly-claimed deposit, whose
- *    unclaimed part is revenue whatever its category says.
- *  - Money in that still carries a spending category is a refund: it
- *    reverses a cost in its own bucket, so a start-up or organizational
- *    refund leaves the period untouched (its cost was capitalized) and an
- *    operating refund lowers operating cost. The row's `effective_bucket`
- *    names that bucket when the server sent it — a refund dated after the
- *    business opened can reverse a start-up purchase. Counted as revenue, a
- *    returned pre-opening purchase would show as profit.
- *  - Money out is an operating cost only in the operating bucket;
- *    organizational and start-up costs are capitalized, and an unbucketed
- *    cost dated before the business opened is a start-up cost.
- *  - An owner's tax payment (and a tax refund) is not a business cost:
- *    income and self-employment tax belong on the owner's return, so it is
- *    skipped like a transfer unless the user gave it a Schedule C line. */
-export function bizPeriodProfit(
-  rows: readonly BizProfitRow[], businessStart: string | null | undefined,
-  period: string,
-): number {
-  let revenue = 0;
-  let operating = 0;
-  for (const t of rows) {
-    if (!t.date || !t.date.startsWith(period)) continue;
-    const net = t.net_amount ?? t.amount;
-    const cat = (t.category || "").toUpperCase();
-    const card = (t.cat_detailed || "") === "LOAN_PAYMENTS_CREDIT_CARD_PAYMENT";
-    const ownerTax = !t.sched_c_line
-      && (t.cat_detailed === "GOVERNMENT_AND_NON_PROFIT_TAX_PAYMENT"
-        || t.cat_detailed === "INCOME_TAX_REFUND");
-    // the server's own bucket first, so a refund nets against the cost it
-    // reverses rather than being re-bucketed by its own date
-    const bucket = t.effective_bucket ?? (t.bucket
-      || (businessStart && t.date < businessStart
-        ? "startup_195" : "operating"));
-    const capitalized = bucket === "organizational"
-      || bucket === "startup_195";
-    if (t.amount < 0) {
-      if (t.partly_claimed) { revenue += -net; continue; }
-      const wasTransfer = (t.cat_original || "").toUpperCase()
-        .includes("TRANSFER");
-      if (cat.includes("TRANSFER") || card || ownerTax
-          || (wasTransfer && cat !== "INCOME")) continue;
-      if (BIZ_REFUND_CATEGORIES.has(cat)) {
-        // net is negative: the refund lowers the cost it reverses
-        if (!capitalized) operating += net;
-      } else revenue += -net;
-      continue;
-    }
-    if (cat === "TRANSFER_OUT" || cat === "TRANSFER_IN" || card
-        || ownerTax) continue;
-    if (capitalized) continue;
-    if (net > 0) operating += net;
-  }
-  return pyround((revenue - operating) * 100) / 100;
-}
-
 /** The tax years the year-end package and the 1099 list offer, newest
  *  first: this year back to the year the business was formed or started,
  *  whichever is earlier (pre-opening costs sit in the formation year), at
@@ -186,31 +80,15 @@ export function bizDefaultTaxYear(
   return today.getMonth() <= 3 && years.includes(now - 1) ? now - 1 : now;
 }
 
-/** What the year's tax estimate still asks for: the estimate less what the
- *  business already paid toward it (the P&L's estimated_tax_paid), never
- *  below zero. A tax reserve is measured against this, not the whole
- *  year's figure, or paying the estimates out of it reads as a shortfall
- *  that grows each quarter. */
-export function bizTaxStillDue(
-  estimated: number, paid: number | null | undefined,
-): number {
-  // The estimate is the tax on profit earned so far, so it already grows
-  // with the calendar; the payments are simply taken off it. The books
-  // cannot tell April's prior-year balance due from the first estimate
-  // paid the same day, so the card says that such a payment is in `paid`
-  // rather than guessing a split.
-  return pyround(Math.max(0, estimated - (paid ?? 0)) * 100) / 100;
-}
-
 /** The bucket a business cost shows on the Books control: the one the
  *  server's P&L counts it in (a cost dated before the business started is
- *  start-up there), else the stored class, else operating. A control that
- *  showed "Operating" for a start-up cost could not send Operating: the
- *  choice would already be selected. */
+ *  start-up there), else the stored class. A control that showed
+ *  "Operating" for a start-up cost could not send Operating: the choice
+ *  would already be selected. */
 export function bizShownBucket(
   t: { bucket: string | null; effective_bucket?: string | null },
 ): string {
-  return t.effective_bucket || t.bucket || "operating";
+  return t.effective_bucket ?? t.bucket ?? "";
 }
 
 /** Whether a Books row still needs a Schedule C line: a cost given an

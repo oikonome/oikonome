@@ -44,10 +44,11 @@ class RetireTests(unittest.TestCase):
         self.assertLessEqual(self.src.count("{money(r.spend)}/yr"), 1,
                              "every other surface should say 'target'")
         self.assertIn("Earliest at target", self.src)
-        self.assertIn("<th>At target?</th>", self.src)
+        self.assertIn('<th className="num">Past markets</th>', self.src)
 
     def test_a_failing_stress_row_colours_its_number(self):
-        self.assertIn('s.max_spend_at_ref < r.spend ? "neg" : ""', self.src)
+        # the server decides which rows fall short; the page only colours
+        self.assertIn('s.under_target ? "neg" : ""', self.src)
 
     def test_the_projection_chart_has_no_zoom_affordance(self):
         """The site has one timeframe vocabulary, the RangePicker — no
@@ -70,10 +71,11 @@ class NetWorthTests(unittest.TestCase):
                          self.src, "the tiles ARE the breakdown")
 
     def test_the_month_delta_comes_from_the_trend_already_shipped(self):
-        """The hero's change is the last two points of the series the server
-        ships (the full-total series, so a mortgage payment is not a loss),
-        never a second computation of its own."""
-        self.assertIn("monthChange(nw.full_trend)", self.src)
+        """The hero's change is the server's `month_change`, measured on the
+        full-total series (so a mortgage payment is not a loss) — never a
+        computation of the page's own (specs/counted-figures.md)."""
+        self.assertIn("nw.month_change", self.src)
+        self.assertNotIn("monthChange(", self.src)
 
     def test_the_profit_card_does_not_grow_a_second_hero(self):
         self.assertNotIn('fontSize: "2rem", fontWeight: 800', self.src)

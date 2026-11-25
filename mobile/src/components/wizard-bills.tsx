@@ -12,24 +12,28 @@ import type { BillsData, Proposal } from "../lib/api";
 import { removeFromList } from "../lib/cache";
 import { onSeveralDays, severalDaysWords, TWICE_A_MONTH, withSeveralDays } from "../lib/monthdays";
 import { cadenceChoices, cadenceWords, localYmd, money, parseMoneyDraft,
-         proposalSuperseded } from "../lib/pure";
+         proposalSuperseded, SAVE_WAITS_LOADING } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, mmddyy } from "../lib/theme";
 import { useOwner, useViewer } from "../lib/viewer";
 import Select from "./select";
-import { Pill } from "./ui";
+import { FailedLine } from "./loaded";
+import { Pill, Note } from "./ui";
 import { adjustOf, type AdjustForm, billLine, cadenceTakesDueDay, dueDayOf,
          MANUAL_CADENCES, manualTally, nextDueForDay, parseDueDay,
          proposalAdjustable, proposalCadenceValue } from "./wizard-logic";
 import { OptionCard, PillRow, TAP, ws } from "./wizard-ui";
+import { fieldA11y } from "./field";
 
 export type SetupMode = "auto" | "manual";
 
 /** The question pane's two answers, the web's words. The answer is the
  *  owner's (the server refuses anyone else's with a 403), so everyone
  *  else reads the household's answer instead of cards that snap back. */
+/** `value` null: the stored answer has not been read, so neither card is
+ *  marked (the web's SetupQuestion). */
 export function BillsQuestion({ value, onPick, disabled }: {
-  value: SetupMode; onPick: (v: SetupMode) => void; disabled?: boolean;
+  value: SetupMode | null; onPick: (v: SetupMode) => void; disabled?: boolean;
 }) {
   const owner = useOwner();
   if (!owner)
@@ -37,7 +41,8 @@ export function BillsQuestion({ value, onPick, disabled }: {
       <View style={ws.body}>
         <Text style={{ color: C.text, fontSize: 14 }}>
           {value === "manual" ? "Bills are entered by hand"
-            : "The finder proposes bills and paychecks"}</Text>
+            : value === "auto" ? "The finder proposes bills and paychecks"
+            : SAVE_WAITS_LOADING}</Text>
         <Text style={ws.mut}>the household owner sets this</Text>
       </View>
     );
@@ -131,7 +136,7 @@ export function ProposalsInline() {
     },
   });
   const approveAll = useMutation({
-    mutationFn: () => client!.billsApproveAll(),
+    mutationFn: (pids: string[]) => client!.billsApproveAll(pids),
     onSuccess: (r) => {
       setNotice((r.failed.length
         ? `Approved ${r.approved}; ${r.failed.length} stayed pending.`
@@ -150,13 +155,16 @@ export function ProposalsInline() {
     },
     onError: (e) => setNotice(errText(e)),
   });
-  if (!q.data) return <Text style={ws.mut}>Loading proposals…</Text>;
+  // a failed read ends in the failed line, not "Loading proposals…" for good
+  if (!q.data)
+    return q.isError ? <FailedLine q={q} what="bills" />
+      : <Text style={ws.mut}>Loading proposals…</Text>;
   const props = q.data.proposals;
   const tracked = q.data.bills.length;
   const busyAny = act.isPending || approveAll.isPending;
   return (
     <View style={{ marginTop: 10 }}>
-      {notice ? <Text style={[ws.mut, { color: C.good }]}>{notice}</Text> : null}
+      {notice ? <Note style={[ws.mut, { color: C.good }]}>{notice}</Note> : null}
       {props.length === 0 ? (
         <Text style={ws.mut}>
           {tracked > 0
@@ -168,11 +176,11 @@ export function ProposalsInline() {
       ) : (
         <>
           {!viewer && props.length > 1 && (
-            <Pressable style={[ws.btn, { alignSelf: "flex-start",
+            <Pressable accessibilityRole="button" style={[ws.btn, { alignSelf: "flex-start",
                                          marginTop: 6 },
                                busyAny && { opacity: 0.5 }]}
                        disabled={busyAny}
-                       onPress={() => approveAll.mutate()}>
+                       onPress={() => approveAll.mutate(props.map((x) => x.id))}>
               <Text style={ws.btnText}>
                 {approveAll.isPending ? "Approving…"
                   : `Approve all ${props.length}`}
@@ -196,18 +204,25 @@ export function ProposalsInline() {
                     <Text style={{ color: C.text, fontSize: 14,
                                    fontWeight: "600", flexShrink: 1 }}
                           numberOfLines={1}>{x.payee}</Text>
-                    {x.kind ? (
-                      <Pill text={x.kind}
+                    {/* the server's words for what approving does, in
+                        the Bills tab's tones; an older server sends none */}
+                    {x.change_text ? (
+                      <Pill text={x.change_text}
                             tone={x.kind === "remove" ? "bad"
                               : x.kind === "add" ? "good" : "warn"} />
                     ) : null}
-                    {x.income ? <Pill text="income" tone="good" /> : null}
-                    {x.bill_type === "envelope" ? <Pill text="envelope" /> : null}
+                    {x.kind === "attach" && x.bill_payee ? (
+                      <Text style={ws.mut}>a fee of {x.bill_payee}</Text>) : null}
+                    {x.kind === "merchant" && x.bill_payee ? (
+                      <Text style={ws.mut}>add to bill “{x.bill_payee}”</Text>) : null}
                   </View>
+                  {/* the Bills tab's line: the server's cadence, the next
+                      date (never one already past), the tag, the evidence */}
                   <Text style={ws.mut}>
-                    {x.cadence} · {x.income ? "+" : ""}{money(x.amount)}
-                    {x.next_due ? ` · next ${mmddyy(x.next_due)}` : ""}
-                    {x.summary ? ` · ${x.summary}` : ""}
+                    {[x.cadence_text,
+                      (x.income ? "+" : "") + money(x.amount),
+                      x.upcoming_due ? `next ${mmddyy(x.upcoming_due)}` : null,
+                      x.tag_text, x.summary].filter(Boolean).join(" · ")}
                     {open ? " — " : ""}
                     {open ? <Text style={{ color: C.accent }}>adjusting</Text>
                           : null}
@@ -225,7 +240,7 @@ export function ProposalsInline() {
                 ) : !viewer && (
                   <View style={{ flexDirection: "row", gap: 8,
                                  flexWrap: "wrap" }}>
-                    <Pressable style={[ws.btn, ws.quiet,
+                    <Pressable accessibilityRole="button" style={[ws.btn, ws.quiet,
                                        busy && { opacity: 0.5 }]}
                                disabled={busy}
                                onPress={() => act.mutate({ pid: x.id,
@@ -236,7 +251,7 @@ export function ProposalsInline() {
                         fee, merchant, removal or change offer edits an
                         existing bill, and the server refuses an adjust */}
                     {proposalAdjustable(x) && (
-                      <Pressable style={[ws.btn, ws.quiet,
+                      <Pressable accessibilityRole="button" style={[ws.btn, ws.quiet,
                                          busy && { opacity: 0.5 }]}
                                  disabled={busy}
                                  onPress={() => {
@@ -245,7 +260,7 @@ export function ProposalsInline() {
                         <Text style={ws.btnText}>Adjust</Text>
                       </Pressable>
                     )}
-                    <Pressable style={[ws.btn, busy && { opacity: 0.5 }]}
+                    <Pressable accessibilityRole="button" style={[ws.btn, busy && { opacity: 0.5 }]}
                                disabled={busy}
                                onPress={() => act.mutate({ pid: x.id,
                                                            action: "approve" })}>
@@ -269,7 +284,7 @@ export function ProposalsInline() {
           <AddBillForm />
         </View>
       ) : (
-        <Pressable onPress={() => setByHand(true)}
+        <Pressable accessibilityRole="button" onPress={() => setByHand(true)}
                    style={{ minHeight: TAP, justifyContent: "center" }}>
           <Text style={{ color: C.accent, fontSize: 13 }}>
             Add a bill by hand</Text>
@@ -333,10 +348,11 @@ function AdjustFields({ p, cadences, busy, refused, onCancel, onSave }: {
       ) : null}
       <View style={{ flexDirection: "row", gap: 8, justifyContent: "flex-end",
                      flexWrap: "wrap" }}>
-        <Pressable style={[ws.btn, ws.quiet]} onPress={onCancel}>
+        <Pressable accessibilityRole="button" style={[ws.btn, ws.quiet]} onPress={onCancel}>
           <Text style={ws.btnText}>Cancel</Text>
         </Pressable>
-        <Pressable style={[ws.btn, busy && { opacity: 0.5 }]} disabled={busy}
+        <Pressable accessibilityRole="button"
+                   style={[ws.btn, busy && { opacity: 0.5 }]} disabled={busy}
                    onPress={() => {
                      const r = adjustOf(p, f);
                      if ("error" in r) { setErr(r.error); return; }
@@ -390,12 +406,12 @@ function AddBillForm() {
   };
   return (
     <View style={{ gap: 8 }}>
-      <TextInput style={ws.input} value={name}
+      <TextInput {...fieldA11y("Bill name")} style={ws.input} value={name}
                  placeholder="Bill name (e.g. Rent)"
                  placeholderTextColor={C.mut} onChangeText={setName} />
       <PillRow choices={MANUAL_CADENCES} value={cadence} onPick={setCadence}
                label="Cadence" />
-      <TextInput style={ws.input} value={amount} placeholder="Amount"
+      <TextInput {...fieldA11y("Amount")} style={ws.input} value={amount} placeholder="Amount"
                  placeholderTextColor={C.mut} keyboardType="decimal-pad"
                  onChangeText={setAmount} />
       <TextInput style={ws.input} value={due}
@@ -404,17 +420,19 @@ function AddBillForm() {
                  keyboardType="number-pad" maxLength={2}
                  onChangeText={setDue} />
       <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
-        <Pressable style={[ws.btn, ws.quiet, add.isPending && { opacity: 0.5 }]}
+        <Pressable accessibilityRole="button"
+                   style={[ws.btn, ws.quiet, add.isPending && { opacity: 0.5 }]}
                    disabled={add.isPending} onPress={() => submit(false)}>
           <Text style={ws.btnText}>+ Add bill</Text>
         </Pressable>
-        <Pressable style={[ws.btn, ws.quiet, add.isPending && { opacity: 0.5 }]}
+        <Pressable accessibilityRole="button"
+                   style={[ws.btn, ws.quiet, add.isPending && { opacity: 0.5 }]}
                    disabled={add.isPending} onPress={() => submit(true)}>
           <Text style={ws.btnText}>+ Add paycheck</Text>
         </Pressable>
       </View>
-      {msg ? <Text style={[ws.mut, { color: msg.bad ? C.warn : C.good }]}>
-        {msg.text}</Text> : null}
+      {msg ? <Note bad={!!msg.bad} style={[ws.mut, { color: msg.bad ? C.warn : C.good }]}>
+        {msg.text}</Note> : null}
     </View>
   );
 }
@@ -445,10 +463,13 @@ export function ManualBills() {
             {b.income ? "income" : "added"}</Text>
         </View>
       ))}
+      {/* the tally only from a list that answered: never "0 bills" */}
+      {q.data === undefined && q.isError && <FailedLine q={q} what="bills" />}
+      {q.data !== undefined && (
       <Text style={[ws.mut, { fontSize: 13 }]}>
         {manualTally(list.length - income, income)} Nothing here was
         detected; the finder is off for this household until you turn it on.
-      </Text>
+      </Text>)}
     </View>
   );
 }

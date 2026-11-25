@@ -23,6 +23,7 @@ from fastapi.testclient import TestClient
 from oikonome.auth import reset as reset_mod
 from oikonome.db import tenancy
 
+from .push_keys import browser_keys
 from .util import _ensure_db, clear_totp_burn
 
 PW = "correct-horse-battery"
@@ -219,15 +220,16 @@ class AResetMidRequestStopsFactorEnrolment(unittest.TestCase):
             "AND used_at IS NULL"), 0)
 
     def test_push_subscribe_after_a_reset_stores_nothing(self):
-        from oikonome.web import api
+        # the module whose push door looks the check up
+        from oikonome.web import api_notify
 
         def allowed(endpoint):
             self._reset_now()
             return True
-        with mock.patch.object(api, "_valid_push_endpoint", allowed):
+        with mock.patch.object(api_notify, "_valid_push_endpoint", allowed):
             r = self.client.post("/api/notify/push/subscribe", json={
                 "endpoint": f"https://push.example.com/{uuid.uuid4().hex}",
-                "keys": {"p256dh": "p", "auth": "a"}, "password": PW})
+                "keys": browser_keys(), "password": PW})
         self.assertEqual(r.status_code, 401, r.text)
         self.assertEqual(self._count(
             "SELECT count(*) AS n FROM push_subscriptions WHERE user_id=%s"),

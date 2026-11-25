@@ -1,7 +1,8 @@
 // Shared chrome: the SPA's card / section / meter / pill anatomy in
 // native form, so every screen reads as the same product.
 import { useRouter } from "expo-router";
-import { StyleSheet, Text, View, ViewStyle, Pressable } from "react-native";
+import { StyleSheet, Text, View, ViewStyle, Pressable, type TextProps }
+  from "react-native";
 
 import { C } from "../lib/theme";
 
@@ -19,13 +20,54 @@ export function HelpLink({ topic }: { topic: string }) {
   );
 }
 
+/** What a screen shows while its first payload is on the way: quiet
+ *  blocks in the shape of a screen, so the data fills a layout in rather
+ *  than replacing a word and shoving everything down (the web's
+ *  PageSkeleton). */
+export function Skeleton() {
+  const bar = (w: `${number}%`, h: number, mt = 0) => (
+    <View style={{ width: w, height: h, marginTop: mt, borderRadius: 6,
+                   backgroundColor: C.hover }} />
+  );
+  return (
+    <View accessible accessibilityRole="progressbar"
+          accessibilityLabel="Loading">
+      <View style={s.card}>
+        {bar("45%", 28)}
+        {bar("96%", 10, 16)}
+        {bar("82%", 10, 10)}
+        {bar("64%", 10, 10)}
+      </View>
+      <View style={s.card}>
+        {bar("40%", 16)}
+        {bar("100%", 84, 14)}
+      </View>
+    </View>
+  );
+}
+
 export function Card({ children, style }:
     { children: React.ReactNode; style?: ViewStyle }) {
   return <View style={[s.card, style]}>{children}</View>;
 }
 
 export function H({ children }: { children: React.ReactNode }) {
-  return <Text style={s.h}>{children}</Text>;
+  // a heading to a screen reader's heading navigation, not plain text
+  return <Text style={s.h} accessibilityRole="header">{children}</Text>;
+}
+
+/** The one line for what happened: an error, a result, a warning that
+ *  appeared because of something the person did (specs/accessibility.md).
+ *  A screen reader hears it when it appears: an error is an alert, anything
+ *  else a polite live region. It looks like the Text it replaces; the web
+ *  twin is components/Note.tsx. */
+export function Note({ bad, children, ...rest }: TextProps & { bad?: boolean }) {
+  return (
+    <Text {...rest} accessibilityRole={bad ? "alert" : undefined}
+          accessibilityLiveRegion={bad ? "assertive" : "polite"}>
+      {children}
+    </Text>
+  );
 }
 
 /** month-scope progress bar with an optional "today" post tick (0..1) */
@@ -39,8 +81,13 @@ export function Meter({ frac, pace, tone, big }:
   return (
     // the padding gives the tick its 3px overshoot without negative
     // offsets (Android clips children that overflow)
+    // a progress bar to a screen reader, at the width it draws; the
+    // figures it stands for are printed beside it
     <View style={[s.meterWrap,
-                  pace !== undefined && { paddingVertical: 3 }]}>
+                  pace !== undefined && { paddingVertical: 3 }]}
+          accessible accessibilityRole="progressbar"
+          accessibilityValue={{ min: 0, max: 100,
+                                now: Math.round(Math.min(1, Math.max(0, frac)) * 100) }}>
       {/* big = the web money map's 14px bar — the Today hero rows use it
           so the whole page speaks one bar idiom */}
       <View style={[s.meterTrack,
@@ -68,7 +115,7 @@ export function KV({ k, v, tone, onPress }:
   return (
     <View style={s.kv}>
       {onPress
-        ? <Pressable onPress={onPress} style={s.kvPress}>
+        ? <Pressable accessibilityRole="button" onPress={onPress} style={s.kvPress}>
             {({ pressed }) => (
               <Text style={[s.kvK, pressed && { color: C.accent }]}>{k}</Text>)}
           </Pressable>

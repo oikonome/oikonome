@@ -7,7 +7,17 @@ bottom: **Hidden** for accounts you chose to set aside and **Archived**
 for closed ones. Each institution shows its own mark beside its name —
 the bank's logo when the provider supplied one at link time, otherwise a
 monogram in the bank's brand colour. **Show merchant logos** under
-Settings → Merchants turns these off along with the ledger's.
+Settings → Merchants turns these off along with the ledger's. The total
+at the top is **Financial accounts**, the same figure as on the Net Worth
+page; loans are listed under it as owed rather than taken off it.
+Where a section's printed total is not what the headline counts from it,
+its name carries the counted part — a card section reads **−$250 in the
+total** (owed, so it comes off), a loan or an uncombined business section
+reads **not in the total**. A login whose only account is the one row
+carries no subtotal of its own, and a login whose accounts are all the
+backup copies of a linked pair (see below) prints **backup of Plaid — not
+counted** (naming whatever serves) in place of a subtotal, over dimmed
+rows: their balances are already in the total through the serving copy.
 
 On an instance whose operator supplies the provider keys, the button that
 adds one reads **Connect an account** — a card, a brokerage, and a bank all
@@ -69,6 +79,26 @@ the next bank while the first is still at the sign-in. A line turns into
 the bank's row as soon as you return to the app's tab (it checks at
 once, then every second for a while); a tab you closed without finishing
 is cleared with **cancel — I closed the bank window**.
+
+**Several banks in one sign-in.** After the first bank in Plaid's window,
+you can choose to add another bank there before you finish, instead of
+starting over from the button. The line under the button says when this
+is on, and — on a plan with a limit — how many more banks you can connect.
+While the window is open, the row under the button names each bank as it
+connects. When you finish, or about a minute and a half (a few minutes in
+an older version of the app) after the last
+bank if you simply close the window, the line names every bank that
+connected — *Connected Harbor Bank and Northwind Credit Union* — and any
+that could not be kept, with why (a login already connected, or the
+plan's last connection used by the banks before it). A bank that could
+not be kept is handed straight back to Plaid; the others stay. A bank you
+add after that answer is still taken: within a few minutes it appears in
+your connections, or — if it could not be kept — the activity log says
+which bank and why. Reconnecting a bank and **more history** for a bank are
+always one bank. If one sign-in brings more than two banks that could not
+be kept, sign-ins go back to one bank each for a day, and the activity log
+says so. A self-hosted install can turn several banks per sign-in off with
+`OIKONOME_PLAID_MULTI_ITEM=0`.
 
 **How far back a new link reaches.** The household's history window —
 **Last month**, **3 months**, **6 months**, **1 year** or **Everything
@@ -132,6 +162,12 @@ row can carry one extra line of context beside it:
   may bounce off the bank's own error page until the outage clears, not
   that anything about the fix is wrong; worth trying again a little
   later if it does.
+- A connection the bank feed removed stops needing attention once you
+  have linked that bank again: it is no longer counted in the
+  **needs attention** figure (here, in the header and on the phone, all
+  one count from the server), and Settings → Connections lists it once as
+  **removed by the bank feed on 11/02/26 — replaced** beside a
+  **forget** button, which stops listing it and keeps its history.
 - Script-fed items get the same dot: green means a successful push
   within the last 26 hours; red means the collector has gone quiet —
   its error lives in its own logs on your machine.
@@ -277,7 +313,12 @@ at read time, so flapping sources can't corrupt anything.
 Connected accounts get balances from the provider each sync. File-only
 and manual accounts start at $0 — edit the account and type the real
 balance, and mark your **primary checking** account so the cash
-forecast anchors on it. With exactly one checking account the pin is
+forecast anchors on it. The edit row offers that switch only on a bank
+account, and **excl. from budget** on every account whose transactions
+can count as spending — bank accounts and cards, and also investment and
+other accounts (an HSA's card charges, a brokerage's fee rows), but not a
+loan, whose rows never count; a switch that is already on always shows,
+so it can be turned off. With exactly one checking account the pin is
 set for you (after the first bank's pull, a file import, or the setup
 wizard's Connect step); with two or more you pick, on the Today card or
 here. An account whose bank was disconnected, one excluded from the
@@ -297,13 +338,34 @@ balance is preferred as the forecast's anchor. With no checking account
 at all, the forecast stays off and Today says "No checking account
 linked" instead of reporting a shortfall.
 
-When the bank shares them (from the liabilities pull), a card's next
-due date and statement balance appear under its balance on the account
-row; a bank that shares nothing shows nothing.
+When the bank shares them (from the liabilities pull), a card's due
+date and statement balance appear under its balance on the account
+row; a bank that shares nothing shows nothing. The due words never name
+a date already gone: **due 11/25** while it is ahead; once it has
+passed, **paid 11/14** when a payment came in after the statement (the
+bank's last payment date, or a posted payment or transfer onto the card
+— a refund or cashback does not count), otherwise **past due since
+11/15**. A card with nothing owed shows no due words.
 
 The ✎ edit row also sets the account's default **owner** — a reporting
 filter for whose money it is (yours / mine / ours); it never affects
 the budget.
+
+## Top holdings
+
+The **Top holdings** card lists the largest positions your investment
+accounts report, with the date beside the title (**holdings as of
+11/16/26**, the oldest one listed) and the day each position was priced
+under its value (**priced 11/16**). Prices can be a day behind the
+balance, so on a day the market fell the positions may add up to a
+little more than the account shows; they are still listed. An account is
+left out only when its holdings were last priced more than two days ago,
+or add up to more than 3% above its balance, and the line under the
+title names each such account, its reason said once for all the accounts
+it holds back ("Holdings not shown: Brokerage (last priced 03/02) —
+priced more than 2 days ago"). Its balance still counts
+everywhere; it is only the position list that waits for the next fresh
+pull.
 
 ## Hiding an account
 

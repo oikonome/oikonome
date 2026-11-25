@@ -158,6 +158,7 @@ services:
       OIKONOME_LLM_SLOT_WAIT_S: ${OIKONOME_LLM_SLOT_WAIT_S:-}
       OIKONOME_PLAID_WEBHOOK_NEG_TTL: ${OIKONOME_PLAID_WEBHOOK_NEG_TTL:-}
       OIKONOME_PLAID_WEBHOOK_FETCH_CEILING: ${OIKONOME_PLAID_WEBHOOK_FETCH_CEILING:-}
+      OIKONOME_MCP_ENABLED: ${OIKONOME_MCP_ENABLED:-}
       OIKONOME_LLM_URL: ${OIKONOME_LLM_URL:-}
       OIKONOME_CATEGORIZER_MODEL: ${OIKONOME_CATEGORIZER_MODEL:-}
       OIKONOME_CATEGORIZER_MIN_CONF: ${OIKONOME_CATEGORIZER_MIN_CONF:-}
@@ -173,6 +174,7 @@ services:
       OIKONOME_PLAID_ENV: ${OIKONOME_PLAID_ENV:-production}
       OIKONOME_PLAID_WEBHOOK_URL: ${OIKONOME_PLAID_WEBHOOK_URL:-}
       OIKONOME_PLAID_COMPLETION_REDIRECT: ${OIKONOME_PLAID_COMPLETION_REDIRECT:-}
+      OIKONOME_PLAID_MULTI_ITEM: ${OIKONOME_PLAID_MULTI_ITEM:-}
       # Extra billed products + the zombie-Item reaper threshold (0 = never
       # reap). Empty is NOT the opt-out: every declared key is materialised,
       # so empty is what a commented-out variable looks like from in here,
@@ -327,6 +329,7 @@ services:
       OIKONOME_PLAID_ENV: ${OIKONOME_PLAID_ENV:-production}
       OIKONOME_PLAID_WEBHOOK_URL: ${OIKONOME_PLAID_WEBHOOK_URL:-}
       OIKONOME_PLAID_COMPLETION_REDIRECT: ${OIKONOME_PLAID_COMPLETION_REDIRECT:-}
+      OIKONOME_PLAID_MULTI_ITEM: ${OIKONOME_PLAID_MULTI_ITEM:-}
       # Product gating + the nightly zombie-Item reaper both run
       # in the worker. Empty here means the documented default, not "off"
       # (a commented-out variable is indistinguishable from empty inside a

@@ -13,7 +13,7 @@
 # when you know the other run targets a different database.
 set -uo pipefail
 
-DB="${OIKONOME_TEST_DB:-oikonome_test}"
+DB="${OIKONOME_TEST_DB:-oikonome_test}"; DB="${DB,,}"   # Postgres lowercases an unquoted CREATE DATABASE
 SELF=$$
 
 # Other unittest processes on this box.
@@ -48,6 +48,7 @@ collide=0
 for pid in $others; do
   env_db=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null \
            | sed -n 's/^OIKONOME_TEST_DB=//p' | head -1)
+  env_db="${env_db,,}"   # compared lowercased, as the DB itself is named
   [ -z "$env_db" ] && env_db="oikonome_test"
   [ "$env_db" = "$DB" ] && collide=1
 done
@@ -62,7 +63,7 @@ cat >&2 <<EOF
 
   Working in parallel? Give this worktree its own database:
 
-      export OIKONOME_TEST_DB=oikonome_test_\$(basename "\$PWD")
+      export OIKONOME_TEST_DB=oikonome_test_\$(basename "\$PWD" | tr -c 'a-zA-Z0-9_\n' '_' | tr 'A-Z' 'a-z')
       make test
 
   Or wait for the other run to finish. Override with

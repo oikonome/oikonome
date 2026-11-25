@@ -9,32 +9,36 @@ import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput,
 import PullRefresh from "../components/pull-refresh";
 import { SecretCopyButtons } from "../components/secret-copy";
 
-import { Card, H, HelpLink, KV, SharedLock } from "../components/ui";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { OfflineNote, offlineGrey, useOffline } from "../components/offline";
+import { Card, H, HelpLink, KV, SharedLock, Note } from "../components/ui";
 import { ext } from "../ext";
 
 // the add-on's account card, fixed for the life of the bundle
 const AccountCard = ext.account?.Card;
 import * as DocumentPicker from "expo-document-picker";
-import { router, useRouter } from "expo-router";
+import { router, useLocalSearchParams, useRouter } from "expo-router";
 
 import { ApiError, Continuity, errText, Me, PickedFile, SettingsView, TokenScope, Webhook,
-         WebhookEvent, EmailSchedule } from "../lib/api";
+         WebhookEvent } from "../lib/api";
 import { invalidateAiRoute, patchQuery, removeFromList, saveSettings,
          SETTINGS_SAVES } from "../lib/cache";
-import { EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote, localDayOf, myDailyLine,
-         prefOn, signOutAction }
+import { droppedCredentialsNote, EMAIL_KIND_LABEL, EMAIL_KINDS, kindOffNote,
+         localDayOf, myDailyLine,
+         prefOn, saveWaits, SettingsMovedError, signOutAction,
+         themeFollowsHousehold }
   from "../lib/pure";
 import { INVEST_STALE_STATUS, investChanges, investFormOf, investSeenOf,
          llmBackendsSeed, storedEnrichCap,
          type BasisRow, type FeeRow, type InvestForm, type InvestSeen }
   from "../lib/settings-pure";
 import { wizardRestartMarks } from "../components/wizard-logic";
-import { cadenceOf } from "../lib/schedule";
 import { registerNativePush } from "../lib/push";
 import { useSession } from "../lib/session";
 import { useOwner, useSharedLock, useViewer } from "../lib/viewer";
 import { C, ThemeMode, getThemeMode, mmddyy, setThemeMode,
          themeRestartPending } from "../lib/theme";
+import { fieldA11y } from "../components/field";
 
 // the web Settings' section headers — same names, same order
 function SectionHead({ children }: { children: React.ReactNode }) {
@@ -51,7 +55,7 @@ function NavRow({ label, sub, href, warn }: {
 }) {
   const router = useRouter();
   return (
-    <Pressable onPress={() => router.push(href as never)}
+    <Pressable accessibilityRole="button" onPress={() => router.push(href as never)}
                style={({ pressed }) => [{
                  backgroundColor: pressed ? C.hover : C.card,
                  borderColor: C.border, borderWidth: 1,
@@ -118,14 +122,16 @@ function ExportDownloads({ dump }: { dump: boolean }) {
      { text: "Cancel", style: "cancel" }]);
   return (
     <View>
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                          !!busy && { opacity: 0.5 }]}
                  disabled={!!busy} onPress={() => ask("zip")}>
         <Text style={s.btnText}>
           {busy === "zip" ? "downloading…" : "Download export ZIP"}</Text>
       </Pressable>
       {dump && (
-        <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+        <Pressable accessibilityRole="button"
+                   style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                            !!busy && { opacity: 0.5 }]}
                    disabled={!!busy} onPress={() => ask("dump")}>
           <Text style={s.btnText}>
@@ -133,8 +139,8 @@ function ExportDownloads({ dump }: { dump: boolean }) {
               : "Download database dump (.sql.gz)"}</Text>
         </Pressable>
       )}
-      {msg && <Text style={[s.hint, msg.bad && { color: C.warn }]}>
-        {msg.text}</Text>}
+      {msg && <Note bad={!!msg.bad} style={[s.hint, msg.bad && { color: C.warn }]}>
+        {msg.text}</Note>}
     </View>
   );
 }
@@ -144,6 +150,8 @@ function ExportDownloads({ dump }: { dump: boolean }) {
 // the owner writes, the PDF through the export ticket + share sheet, and
 // an emailed copy that steps up like the download.
 function ContinuityCard() {
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const { client } = useSession();
   const qc = useQueryClient();
   // mailing the packet sends to a member: not the shared login's to do
@@ -201,20 +209,30 @@ function ContinuityCard() {
     <Card>
       <H>Continuity packet</H>
       <Text style={s.hintL}>
-        If something happens to you, the person left running the household
-        needs a map: every account and where it is held, the balances that
-        day, the bills and what pays them, the income, the businesses — and,
-        in your words, where the rest is (the password manager, the will,
-        the lawyer, who to call). One PDF from what Oikonome already knows.
-        It holds no passwords.
+        One PDF, printed from what Oikonome already knows, for the person
+        left running the household if something happens to you. It holds
+        no passwords.{" "}
+        <Text style={{ color: C.accent }}
+              onPress={() => router.push(
+                "/help?topic=continuity-packet" as never)}>
+          How this works</Text>
       </Text>
+      {/* the note says where the will and the passwords are: the server
+          sends its text to the owner alone, and anyone else is told only
+          that one is written — so they get no box to type over it in */}
+      {d?.note_readable === false ? (
+        <Text style={[s.hintL2, { marginTop: 10 }]}>
+          Only the household owner can read this note.</Text>
+      ) : (<>
       <Text style={[s.hintL2, { marginTop: 10 }]}>Prepared for (optional)</Text>
-      <TextInput style={s.input} placeholder="a name, e.g. Sam"
+      <TextInput {...fieldA11y("Prepared for (optional)")}
+                 style={s.input} placeholder="a name, e.g. Sam"
                  placeholderTextColor={C.mut} maxLength={120}
                  value={whoNow} onChangeText={setWho} />
       <Text style={[s.hintL2, { marginTop: 10 }]}>
         Where the rest is — printed as the first section</Text>
-      <TextInput style={[s.input, { minHeight: 110, textAlignVertical: "top" }]}
+      <TextInput {...fieldA11y("Where the rest is — printed as the first section")}
+                 style={[s.input, { minHeight: 110, textAlignVertical: "top" }]}
                  multiline maxLength={d?.note_max ?? 4000}
                  placeholder={"Passwords: in the family password manager; "
                    + "the recovery kit is in the safe.\nWill and life "
@@ -222,13 +240,18 @@ function ContinuityCard() {
                    + "Call…"}
                  placeholderTextColor={C.mut}
                  value={noteNow} onChangeText={setNote} />
+      </>)}
       <View style={{ flexDirection: "row", gap: 8, marginTop: 8,
                      flexWrap: "wrap" }}>
-        <Pressable style={[s.btn, s.btnQuiet, (!dirty || busy) && { opacity: 0.5 }]}
-                   disabled={!dirty || busy} onPress={() => save.mutate()}>
+        {d?.note_readable !== false && (<>
+        <Pressable accessibilityRole="button"
+                   style={[s.btn, s.btnQuiet, (!dirty || busy) && { opacity: 0.5 }, offlineGrey(offline)]}
+                   disabled={!dirty || busy || offline} onPress={() => save.mutate()}>
           <Text style={s.btnText}>{save.isPending ? "saving…" : "Save"}</Text>
         </Pressable>
-        <Pressable style={[s.btn, (busy || !d) && { opacity: 0.5 }]}
+        <OfflineNote />
+        </>)}
+        <Pressable accessibilityRole="button" style={[s.btn, (busy || !d) && { opacity: 0.5 }]}
                    disabled={busy || !d} onPress={() => get.mutate()}>
           <Text style={s.btnText}>
             {get.isPending ? "preparing…" : "Download PDF"}</Text>
@@ -247,19 +270,21 @@ function ContinuityCard() {
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                            marginTop: 6 }}>
               {d.members.map((m) => (
-                <Pressable key={m} style={[s.chip, to === m && s.chipOn]}
+                <Pressable accessibilityRole="button" key={m} style={[s.chip, to === m && s.chipOn]}
                            onPress={() => setTo(m)}>
                   <Text style={{ color: C.text, fontSize: 12 }}>{m}</Text>
                 </Pressable>
               ))}
             </View>
           ) : (
-            <TextInput style={s.input} placeholder="their email address"
+            <TextInput {...fieldA11y("Their email address")}
+                       style={s.input} placeholder="their email address"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        keyboardType="email-address" value={to}
                        onChangeText={setTo} />
           )}
-          <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
                               marginTop: 8 },
                              (busy || !to.trim() || !d.mail_configured
                               || !!sendLock) && { opacity: 0.5 }]}
@@ -277,14 +302,14 @@ function ContinuityCard() {
           {d.members_only && (
             <Text style={[s.hintL2, { marginTop: 6 }]}>
               Hosted mails the household's finances only to an address with
-              an account here. Invite them under Users first, or download
+              an account here. Invite them under Household first, or download
               the PDF and hand it over.</Text>
           )}
         </View>
       )}
-      {msg && <Text style={[s.hintL, { marginTop: 8,
+      {msg && <Note bad={!!msg.bad} style={[s.hintL, { marginTop: 8,
                                        color: msg.bad ? C.warn : C.good }]}>
-        {msg.text}</Text>}
+        {msg.text}</Note>}
     </Card>
   );
 }
@@ -346,7 +371,10 @@ export default function Settings() {
 
   // the web's settings search + status subtitles — computed from
   // queries the app already keeps warm, never extra fetches per row
-  const [filter, setFilter] = useState("");
+  // a door elsewhere may open Settings on one section (?find=…, e.g. the
+  // Assistant's "set one up" → the AI section)
+  const { find } = useLocalSearchParams<{ find?: string }>();
+  const [filter, setFilter] = useState(typeof find === "string" ? find : "");
   // reads are demo-safe — the sections render (untouchable) on demo too
   const owner = me.data?.role === "owner";
   // the shared demonstration login may not mint a token, a hook or a
@@ -355,9 +383,11 @@ export default function Settings() {
   const lockGrant = useSharedLock("grant");
   const connsQ = useQuery({ queryKey: ["connections"],
     queryFn: () => client!.connections(), enabled: !!client && owner });
+  // who the daily email actually reaches is the server's line
+  // (notify/reach) — the web's Settings list prints the same one
   const schedQ = useQuery({ queryKey: ["settings"],
     queryFn: () => client!.settingsFull(),
-    select: (v) => (v.email_schedule as EmailSchedule | null) ?? null,
+    select: (v) => v.email_reach ?? null,
     enabled: !!client && owner });
   const q2 = filter.trim().toLowerCase();
   const hit = (words: string) =>
@@ -406,22 +436,18 @@ export default function Settings() {
       + "landing screen opens"),
   };
   // the web's status board, on the rows the app can answer cheaply
-  const nConns = (connsQ.data?.connections ?? []).length;
-  const nBad = (connsQ.data?.connections ?? [])
-    .filter((c) => c.status && c.status !== "ok").length;
+  // a removed link linked again since is history, not a connection; the
+  // count that needs a hand is the server's (the web's header and list)
+  const nConns = (connsQ.data?.connections ?? [])
+    .filter((c) => !c.replaced).length;
+  const nBad = connsQ.data?.attention ?? 0;
   const connSub = connsQ.data
     ? `${nConns} linked${nBad ? ` · ${nBad} need${
         nBad === 1 ? "s" : ""} attention` : ""}`
     : null;
   const connWarn = nBad > 0;
-  const schedSub = (() => {
-    // an unset daily email is on (the schedule's own default)
-    if (schedQ.data === undefined) return null;
-    const d0 = cadenceOf(schedQ.data, "daily");
-    if (!d0.on) return null;
-    const h = d0.hour ?? 7;
-    return `daily ${h % 12 === 0 ? 12 : h % 12}${h < 12 ? "am" : "pm"}`;
-  })();
+  const schedSub = schedQ.data ? schedQ.data.daily.text : null;
+  const schedWarn = !!schedQ.data?.daily.warn;
 
   // The dialog promises "this device's token is revoked", so the
   // decision can't ride whatever the devices query happens to hold at
@@ -455,6 +481,8 @@ export default function Settings() {
                                       onRefresh={() => Promise.all([
                                         me.refetch(), devices.refetch()])} />}>
       <OutboundPausedBanner />
+      {/* the account read kept from before a refresh that failed */}
+      <StaleLine query={me} />
       <Card>
         <H>Account</H>
         <KV k="Signed in as" v={me.data?.email ?? "…"} />
@@ -469,6 +497,9 @@ export default function Settings() {
       </Card>
       <Card>
         <H>This household's devices</H>
+        <StaleLine query={devices} />
+        {devices.data === undefined && devices.isError && (
+          <FailedLine q={devices} what="the devices" />)}
         {(devices.data?.devices ?? []).map((d) => (
           <KV key={d.id}
               k={`${d.device_name}${d.current ? " (this device)" : ""}`}
@@ -492,12 +523,12 @@ export default function Settings() {
         <Card>
           <H>Your data</H>
           <Text style={s.hintL}>
-            Everything is exportable, always: the full export ZIP — every
-            table as CSV, with a README that maps what each file is.
+            Everything is exportable, always: the full export ZIP
             {me.data && !me.data.hosted
-              ? " The database dump restores with ./oikonome.sh "
-                + "restore <file>."
+              ? ", or the exact database dump — restore one with "
+                + "./oikonome.sh restore <file>"
               : ""}
+            .
           </Text>
           <ExportDownloads dump={!me.data.hosted && me.data.role === "owner"} />
         </Card>
@@ -515,7 +546,8 @@ export default function Settings() {
             phone and browser registered in the household, not this
             phone alone */}
         {owner && !me.data?.demo && (
-          <Pressable style={[s.testBtn, (testPush.isPending || !!pushTestLock)
+          <Pressable accessibilityRole="button"
+                     style={[s.testBtn, (testPush.isPending || !!pushTestLock)
                                         && { opacity: 0.5 }]}
                      disabled={testPush.isPending || !!pushTestLock}
                      onPress={() => { setTestMsg(null); testPush.mutate(); }}>
@@ -525,8 +557,8 @@ export default function Settings() {
           </Pressable>
         )}
         {testMsg && (
-          <Text style={[s.hint, { color: C.good }]}
-                onPress={() => setTestMsg(null)}>{testMsg}</Text>
+          <Note style={[s.hint, { color: C.good }]}
+                onPress={() => setTestMsg(null)}>{testMsg}</Note>
         )}
       </Card>
       {/* owner-only, never on demo — the web shows viewers only
@@ -557,7 +589,7 @@ export default function Settings() {
       <>
         {/* the web's settings search — the same keyword index, so the
             two pages find things by the same words */}
-        <TextInput style={s.search} placeholder="Search settings…"
+        <TextInput {...fieldA11y("Search settings")} style={s.search} placeholder="Search settings…"
                    placeholderTextColor={C.mut} autoCapitalize="none"
                    value={filter} onChangeText={setFilter} />
         {owner && (hits.conn || hits.tokens || hits.move || hits.invest) && (
@@ -597,6 +629,7 @@ export default function Settings() {
           <NavRow label="Email & Push"
                   sub={schedSub
                     ?? "cadences, recipients, email, SMS + push channels"}
+                  warn={schedWarn}
                   href="/notifications" />
         )}
         {/* the web's Settings → Integrations: what the instance tells
@@ -611,8 +644,8 @@ export default function Settings() {
           </SharedLock>)}
         {owner && hits.readtokens && <EndpointsCard />}
         {hits.family && (<>
-          <SectionHead>Users</SectionHead>
-          <NavRow label="Family & invites"
+          <SectionHead>Household</SectionHead>
+          <NavRow label="Members & invites"
                   sub="members, one-time invite links"
                   href="/security" />
         </>)}
@@ -686,15 +719,20 @@ export default function Settings() {
       </>
       </View>
       )}
-      <Pressable style={[s.signOut, revoke.isPending && { opacity: 0.5 }]}
+      <Pressable accessibilityRole="button"
+                 style={[s.signOut, revoke.isPending && { opacity: 0.5 }]}
                  disabled={revoke.isPending} onPress={confirmSignOut}>
         <Text style={s.signOutText}>
           {revoke.isPending ? "Signing out…" : "Sign out on this device"}
         </Text>
       </Pressable>
-      <Text style={s.hint}>
-        Passkey enrollment is managed on the web app.
-      </Text>
+      {/* passkeys exist on a hosted instance only; a self-hosted web app
+          has no passkey card to send anyone to */}
+      {!!me.data?.hosted && (
+        <Text style={s.hint}>
+          Passkey enrollment is managed on the web app.
+        </Text>
+      )}
     </ScrollView>
   );
 }
@@ -702,6 +740,8 @@ export default function Settings() {
 // ---- SMTP (self-host) — where the daily verdict and alerts go OUT
 // through; blank password keeps the stored one ----
 function SmtpCard() {
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const { client } = useSession();
   const qc = useQueryClient();
   const settings = useQuery({ queryKey: ["settings"],
@@ -753,6 +793,9 @@ function SmtpCard() {
   });
   const pwSet = !!d?.smtp_password_set;
   const [smtpOpen, setSmtpOpen] = useState(false);
+  // the fields hold defaults until the stored values land: a save before
+  // then would blank the user and sender nobody saw
+  const waits = saveWaits(seeded, settings.isError);
   return (
     <Card>
       <View style={{ flexDirection: "row", alignItems: "center" }}>
@@ -775,29 +818,32 @@ function SmtpCard() {
       {smtpOpen && (<>
       <Text style={s.hintL}>
         Where the daily verdict, alerts, invites, and feedback emails go
-        OUT through — any provider works (Proton, Fastmail, Gmail
-        app-password…). Leaving the host empty falls back to the
-        operator&apos;s OIKONOME_SMTP_* settings.
+        out through — any provider works (Proton, Fastmail, Gmail
+        app-password…).{" "}
+        <Text style={{ color: C.accent }}
+              onPress={() => router.push(
+                "/help?topic=quickstart" as never)}>
+          How this works</Text>
       </Text>
-      <TextInput style={s.input} placeholder="smtp.fastmail.com"
+      <TextInput {...fieldA11y("SMTP server")} style={s.input} placeholder="smtp.fastmail.com"
                  placeholderTextColor={C.mut} autoCapitalize="none"
                  value={host} onChangeText={setHost} />
       <View style={{ flexDirection: "row", gap: 6 }}>
-        <TextInput style={[s.input, { width: 80 }]} placeholder="587"
+        <TextInput {...fieldA11y("SMTP port")} style={[s.input, { width: 80 }]} placeholder="587"
                    placeholderTextColor={C.mut} keyboardType="number-pad"
                    value={port} onChangeText={setPort} />
-        <TextInput style={[s.input, { flex: 1 }]}
+        <TextInput {...fieldA11y("SMTP username")} style={[s.input, { flex: 1 }]}
                    placeholder="username (you@example.com)"
                    placeholderTextColor={C.mut} autoCapitalize="none"
                    value={user} onChangeText={setUser} />
       </View>
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("SMTP password / app password")} style={s.input}
                  placeholder={pwSet
                    ? "•••••••• (one is set — type to replace)"
                    : "password / app password"}
                  placeholderTextColor={C.mut} secureTextEntry
                  value={pw} onChangeText={setPw} />
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("From address")} style={s.input}
                  placeholder="from address (oikonome@example.com)"
                  placeholderTextColor={C.mut} autoCapitalize="none"
                  value={from} onChangeText={setFrom} />
@@ -809,24 +855,28 @@ function SmtpCard() {
             — turn off only for a plain relay on your own network
           </Text>
         </Text>
-        <Switch value={starttls} onValueChange={setStarttls}
+        <Switch value={starttls}
+                accessibilityLabel="Use STARTTLS"
+                onValueChange={setStarttls}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
       {msg ? (
-        <Text style={{ color: msg.includes("failed") ? C.bad : C.good,
+        <Note bad={msg.includes("failed")} style={{ color: msg.includes("failed") ? C.bad : C.good,
                        fontSize: 12, marginTop: 4 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
       <View style={{ flexDirection: "row", gap: 8, marginTop: 6 }}>
-        <Pressable style={[s.btn, save.isPending && { opacity: 0.5 }]}
-                   disabled={save.isPending}
+        <Pressable accessibilityRole="button" style={[s.btn, (save.isPending || !!waits)
+                             && { opacity: 0.5 }, offlineGrey(offline)]}
+                   disabled={save.isPending || !!waits || offline}
                    onPress={() => save.mutate()}>
           <Text style={s.btnText}>
             {save.isPending ? "saving…" : "Save SMTP settings"}
           </Text>
         </Pressable>
-        <Pressable style={[s.btn, s.btnQuiet,
+        <OfflineNote />
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                      test.isPending && { opacity: 0.5 }]}
                    disabled={test.isPending}
                    onPress={() => test.mutate()}>
@@ -835,6 +885,7 @@ function SmtpCard() {
           </Text>
         </Pressable>
       </View>
+      {waits && <Text style={s.hintL}>{waits}</Text>}
       </>)}
     </Card>
   );
@@ -856,6 +907,8 @@ const LLM_TASKS: [string, string][] = [
   ["vision", "Receipts & documents"]];
 
 function LlmCard({ hosted }: { hosted: boolean }) {
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const { client } = useSession();
   const qc = useQueryClient();
   const settings = useQuery({ queryKey: ["settings"],
@@ -868,7 +921,12 @@ function LlmCard({ hosted }: { hosted: boolean }) {
   const [bundledVision, setBundledVision] = useState("");
   const [editing, setEditing] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  // the view the rows on screen were built from: its list versions go
+  // with the save, so a list another device saved since is merged rather
+  // than replaced. The cached view moves on every refetch; this does not.
+  const [basis, setBasis] = useState<SettingsView | null>(null);
   if (d && !seeded) {
+    setBasis(d as SettingsView);
     // a legacy single-endpoint config shows as one synthetic row
     setBackends(llmBackendsSeed(d));
     setRoles((d.llm_roles as Record<string, string> | null) ?? {});
@@ -886,6 +944,9 @@ function LlmCard({ hosted }: { hosted: boolean }) {
       || !h.includes(".")
       || /^(10\.|192\.168\.|127\.|172\.(1[6-9]|2\d|3[01])\.)/.test(h));
   };
+  // the rows hold an empty list until the stored backends land: a save
+  // before then would post that empty list over them
+  const waits = saveWaits(seeded, settings.isError);
   const effective = (d?.llm_effective ?? {}) as
     Record<string, { model?: string; url?: string } | undefined>;
   const save = useMutation({
@@ -895,7 +956,8 @@ function LlmCard({ hosted }: { hosted: boolean }) {
         ({ api_key_set, extra_body_set, ...rest }) => rest),
       llm_roles: roles,
       taxdocs_allow_remote_llm: taxOk ? "1" : "",
-      ...(bundled ? { llm_vision_model: bundledVision.trim() } : {}) }),
+      ...(bundled ? { llm_vision_model: bundledVision.trim() } : {}) },
+      basis),
     onSuccess: () => {
       setMsg("LLM settings saved.");
       // the reply carries api_key_set / extra_body_set for what was just
@@ -903,7 +965,12 @@ function LlmCard({ hosted }: { hosted: boolean }) {
       // secret, and a second save doesn't resend it
       setSeeded(false);
     },
-    onError: (e) => setMsg(errText(e)),
+    onError: (e) => {
+      // moved twice: the cache now holds the stored view, and the rows on
+      // screen are rebuilt from it, as the sentence says
+      if (e instanceof SettingsMovedError) setSeeded(false);
+      setMsg(errText(e));
+    },
   });
   const patch = (id: string, p: Partial<Backend>) =>
     setBackends((bs) => bs.map((b) =>
@@ -912,16 +979,19 @@ function LlmCard({ hosted }: { hosted: boolean }) {
     <Card>
       <H>AI (optional)</H>
       <Text style={s.hintL}>
-        Everything core works without AI. Add one or more
+        Optional — everything core works without AI. Add one or more
         OpenAI-compatible backends
         {hosted
-          ? " — public APIs only (OpenAI, OpenRouter…); a model on "
-            + "your home network is not reachable from this server"
+          ? " — public APIs only (OpenAI, OpenRouter, a cloud endpoint "
+            + "you run…); a model on your laptop or home network is not "
+            + "reachable from this server"
           : " — local (Ollama, LM Studio…, no API key needed) or "
-            + "cloud"}
-        . They power the Assistant, categorize unknown merchants,
-        summarize Amazon orders, tag recurring proposals, and — with a
-        vision model — read receipts and paper documents.
+            + "cloud — and pick which one handles each task"}
+        .{" "}
+        <Text style={{ color: C.accent }}
+              onPress={() => router.push(
+                "/help?topic=assistant" as never)}>
+          How this works</Text>
       </Text>
       {bundled && (
         <>
@@ -938,7 +1008,7 @@ function LlmCard({ hosted }: { hosted: boolean }) {
             backend handles them. `./oikonome.sh llm vision` pulls
             qwen2.5vl:3b. Empty turns it off.
           </Text>
-          <TextInput style={s.input}
+          <TextInput {...fieldA11y("Vision model (empty = off)")} style={s.input}
                      placeholder="vision model (qwen2.5vl:3b, empty = off)"
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      value={bundledVision}
@@ -949,16 +1019,16 @@ function LlmCard({ hosted }: { hosted: boolean }) {
         <View key={b.id} style={{ borderColor: C.border, borderWidth: 1,
                                   borderRadius: 8, padding: 8,
                                   marginTop: 6, gap: 6 }}>
-          <TextInput style={s.input} placeholder="name"
+          <TextInput {...fieldA11y("Backend name")} style={s.input} placeholder="name"
                      placeholderTextColor={C.mut} value={b.name}
                      onChangeText={(v) => patch(b.id, { name: v })} />
-          <TextInput style={s.input}
+          <TextInput {...fieldA11y(`${b.name || "Backend"} URL`)} style={s.input}
                      placeholder={hosted ? "https://api.anthropic.com"
                        : "http://localhost:11434/v1"}
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      value={b.url}
                      onChangeText={(v) => patch(b.id, { url: v })} />
-          <TextInput style={s.input}
+          <TextInput {...fieldA11y(`${b.name || "Backend"} model`)} style={s.input}
                      placeholder={hosted ? "a model id from that provider"
                        : "llama3.1:8b"}
                      placeholderTextColor={C.mut} autoCapitalize="none"
@@ -971,13 +1041,13 @@ function LlmCard({ hosted }: { hosted: boolean }) {
               : "; bundled Ollama: `./oikonome.sh llm vision` pulls "
                 + "qwen2.5vl:3b"}
           </Text>
-          <TextInput style={s.input}
+          <TextInput {...fieldA11y(`${b.name || "Backend"} vision model`)} style={s.input}
                      placeholder={hosted ? "gpt-4o-mini" : "qwen2.5vl:3b"}
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      value={b.vision_model ?? ""}
                      onChangeText={(v) =>
                        patch(b.id, { vision_model: v })} />
-          <TextInput style={s.input}
+          <TextInput {...fieldA11y(`${b.name || "Backend"} API key`)} style={s.input}
                      placeholder={b.api_key_set
                        ? "•••••••• (one is set — type to replace)"
                        : hosted ? "API key (required for most clouds)"
@@ -993,7 +1063,8 @@ function LlmCard({ hosted }: { hosted: boolean }) {
               Remove the stored API key
             </Text>
           )}
-          <TextInput style={[s.input, { fontFamily: "monospace",
+          <TextInput {...fieldA11y(`${b.name || "Backend"} extra request body`)}
+                     style={[s.input, { fontFamily: "monospace",
                        fontSize: 12, minHeight: 52,
                        textAlignVertical: "top" }]}
                      placeholder={b.extra_body_set
@@ -1016,14 +1087,14 @@ function LlmCard({ hosted }: { hosted: boolean }) {
           <View style={{ flexDirection: "row", gap: 8 }}>
             {/* the web's required-field gate: a backend without a URL
                 and model is a row that can only fail later */}
-            <Pressable style={[s.btn,
+            <Pressable accessibilityRole="button" style={[s.btn,
                          (!b.url.trim() || !b.model.trim())
                            && { opacity: 0.4 }]}
                        disabled={!b.url.trim() || !b.model.trim()}
                        onPress={() => setEditing(null)}>
               <Text style={s.btnText}>apply</Text>
             </Pressable>
-            <Pressable style={[s.btn, s.btnQuiet]}
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                        onPress={() => { setBackends((bs) =>
                          bs.filter((x) => x.id !== b.id));
                          setEditing(null); }}>
@@ -1064,11 +1135,11 @@ function LlmCard({ hosted }: { hosted: boolean }) {
         + Add backend
       </Text>
       <Text style={s.hintL2}>
-        Free options that work here: Google Gemini (AI Studio free
-        tier), Groq, and OpenRouter&apos;s free-routed models. One honest
-        caveat: free tiers generally reserve the right to use what you
-        send them — and what this sends is merchant names from your
-        transactions. Read the provider&apos;s data policy first.
+        Free options that work here: Google Gemini, Groq, and
+        OpenRouter&apos;s free-routed models. Free tiers generally reserve
+        the right to use what you send them to improve their models — and
+        what this sends is merchant names from your transactions. Read
+        the provider&apos;s data policy first.
         Nothing is saved until you hit Save AI settings.
       </Text>
       {/* the per-household overlay needs no operator setup — it trains
@@ -1099,7 +1170,7 @@ function LlmCard({ hosted }: { hosted: boolean }) {
           <Text style={s.hintL2}>{label}</Text>
           <View style={{ flexDirection: "row", flexWrap: "wrap",
                          gap: 6, marginTop: 2 }}>
-            <Pressable style={[s.chip, !roles[role] && s.chipOn]}
+            <Pressable accessibilityRole="button" style={[s.chip, !roles[role] && s.chipOn]}
                        onPress={() => setRoles((r) => {
                          const n = { ...r }; delete n[role]; return n;
                        })}>
@@ -1111,7 +1182,7 @@ function LlmCard({ hosted }: { hosted: boolean }) {
               </Text>
             </Pressable>
             {bundled && (
-              <Pressable style={[s.chip,
+              <Pressable accessibilityRole="button" style={[s.chip,
                            roles[role] === "bundled" && s.chipOn]}
                          onPress={() => setRoles((r) =>
                            ({ ...r, [role]: "bundled" }))}>
@@ -1122,7 +1193,7 @@ function LlmCard({ hosted }: { hosted: boolean }) {
               </Pressable>
             )}
             {backends.map((b) => (
-              <Pressable key={b.id}
+              <Pressable accessibilityRole="button" key={b.id}
                          style={[s.chip, roles[role] === b.id && s.chipOn]}
                          onPress={() => setRoles((r) =>
                            ({ ...r, [role]: b.id }))}>
@@ -1147,24 +1218,29 @@ function LlmCard({ hosted }: { hosted: boolean }) {
             number.
           </Text>
         </Text>
-        <Switch value={taxOk} onValueChange={setTaxOk}
+        <Switch value={taxOk}
+                accessibilityLabel="Allow sensitive documents to be sent to my remote model"
+                onValueChange={setTaxOk}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
       {msg ? (
-        <Text style={{ color: msg.includes("saved") ? C.good : C.bad,
+        <Note bad={!(msg.includes("saved"))} style={{ color: msg.includes("saved") ? C.good : C.bad,
                        fontSize: 12, marginTop: 4 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 8 },
-                   (save.isPending || editing !== null)
-                     && { opacity: 0.5 }]}
-                 disabled={save.isPending || editing !== null}
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 8 },
+                   (save.isPending || editing !== null || !!waits)
+                     && { opacity: 0.5 }, offlineGrey(offline)]}
+                 disabled={save.isPending || editing !== null || !!waits || offline}
                  onPress={() => save.mutate()}>
         <Text style={s.btnText}>
           {save.isPending ? "saving…" : "Save AI settings"}
         </Text>
       </Pressable>
+      <OfflineNote />
+      {waits && <Text style={s.hintL}>{waits}</Text>}
     </Card>
   );
 }
@@ -1196,9 +1272,12 @@ function ConnectionsBackupCard() {
     mutationFn: () => client!.connectionsImport(file!, importPass),
     onSuccess: (r) => {
       setFile(null); setImportPass("");
+      // a key or password whose address the bundle moved was not kept
+      const dropped = droppedCredentialsNote(r.credentials_dropped);
       setMsg({ text: `Imported ${r.items} bank link${
         r.items === 1 ? "" : "s"}; config restored: ${
-        r.config.join(", ") || "none"}. Run a sync to pull accounts.` });
+        r.config.join(", ") || "none"}. Run a sync to pull accounts.`
+        + (dropped ? ` ${dropped}` : "") });
       // the bundle restores provider config and bank links — refresh
       // what it touches instead of refetching every query in the app
       qc.invalidateQueries({ queryKey: ["settings"] });
@@ -1222,21 +1301,22 @@ function ConnectionsBackupCard() {
       <H>Move to a fresh environment</H>
       <Text style={s.hintL}>
         A passphrase-sealed bundle of your instance credentials —
-        provider keys, LLM endpoint, SMTP, and every live bank link.
-        Unlike the database dump it survives a different install.
-        Accounts, history and budgets ride the export ZIP; one sync
-        after import repopulates accounts.
+        Plaid/MX provider keys, the LLM endpoint + key, SMTP mail
+        settings, and every live bank link.
       </Text>
       <Text style={[s.hintL, { marginTop: 8, color: C.text,
                                fontWeight: "700" }]}>Export</Text>
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("Export passphrase (8+ chars — needed on the other side)")}
+                 style={s.input}
                  placeholder="passphrase (8+ chars — needed on the other side)"
                  placeholderTextColor={C.mut} secureTextEntry
                  value={pass} onChangeText={setPass} />
-      <TextInput style={s.input} placeholder="confirm passphrase"
+      <TextInput {...fieldA11y("Confirm export passphrase")}
+                 style={s.input} placeholder="confirm passphrase"
                  placeholderTextColor={C.mut} secureTextEntry
                  value={confirm} onChangeText={setConfirm} />
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                    (!canExport || exp.isPending) && { opacity: 0.5 }]}
                  disabled={!canExport || exp.isPending}
                  onPress={askExport}>
@@ -1246,7 +1326,7 @@ function ConnectionsBackupCard() {
       </Pressable>
       <Text style={[s.hintL, { marginTop: 8, color: C.text,
                                fontWeight: "700" }]}>Import</Text>
-      <Pressable style={[s.btn, s.btnQuiet,
+      <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                    { alignSelf: "flex-start", marginTop: 4 }]}
                  onPress={async () => {
                    const r0 = await DocumentPicker.getDocumentAsync(
@@ -1259,10 +1339,11 @@ function ConnectionsBackupCard() {
           {file ? file.name : "choose bundle file (.oikx)"}
         </Text>
       </Pressable>
-      <TextInput style={s.input} placeholder="passphrase"
+      <TextInput {...fieldA11y("Import passphrase")} style={s.input} placeholder="passphrase"
                  placeholderTextColor={C.mut} secureTextEntry
                  value={importPass} onChangeText={setImportPass} />
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
                    (!file || !importPass || imp.isPending)
                      && { opacity: 0.5 }]}
                  disabled={!file || !importPass || imp.isPending}
@@ -1272,9 +1353,9 @@ function ConnectionsBackupCard() {
         </Text>
       </Pressable>
       {msg && (
-        <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 12,
+        <Note bad={msg.bad} style={{ color: msg.bad ? C.bad : C.good, fontSize: 12,
                        marginTop: 6 }}
-              onPress={() => setMsg(null)}>{msg.text}</Text>
+              onPress={() => setMsg(null)}>{msg.text}</Note>
       )}
     </Card>
   );
@@ -1298,7 +1379,8 @@ function WizardsCard() {
         Walkthroughs you can re-run any time — nothing is deleted, and
         you can skip out at any step.
       </Text>
-      {ob.data && !ob.data.wizard_done && (
+      {/* the server's test, as on the web */}
+      {ob.data && !ob.data.setup_complete && (
         <Text style={{ color: C.accent, fontSize: 13, paddingVertical: 4 }}
               onPress={() => router.push("/welcome" as never)}>
           Finish setup — continue where you left off ›
@@ -1334,6 +1416,8 @@ function WizardsCard() {
 
 // instance feedback on/off (self-host owner)
 function EnrichCard() {
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   // the web's "Describe imported history with Plaid" card — billed per
   // row, so a button and a monthly cap, never automatic
   const { client } = useSession();
@@ -1405,7 +1489,7 @@ function EnrichCard() {
         </Text>
       ) : null}
       {!viewer && (
-        <Pressable style={{ backgroundColor: C.accent, borderRadius: 8,
+        <Pressable accessibilityRole="button" style={{ backgroundColor: C.btn, borderRadius: 8,
                             paddingHorizontal: 14, paddingVertical: 8,
                             alignSelf: "flex-start", marginTop: 8,
                             opacity: (!d || !d.plaid_configured || d.candidates === 0
@@ -1424,20 +1508,22 @@ function EnrichCard() {
           <Text style={{ color: C.mut, fontSize: 12 }}>
             Monthly cap (rows)
           </Text>
-          <TextInput style={[s.input, { marginTop: 0, minWidth: 88 }]}
+          <TextInput {...fieldA11y("Monthly cap (rows)")}
+                     style={[s.input, { marginTop: 0, minWidth: 88 }]}
                      keyboardType="number-pad"
                      value={capValue}
                      onChangeText={setCapDraft}
                      placeholderTextColor={C.mut} />
-          <Pressable style={{ backgroundColor: C.accent, borderRadius: 8,
+          <Pressable accessibilityRole="button" style={[{ backgroundColor: C.btn, borderRadius: 8,
                               paddingHorizontal: 12, paddingVertical: 6,
-                              opacity: !capOk || saveCap.isPending ? 0.5 : 1 }}
-                     disabled={!capOk || saveCap.isPending}
+                              opacity: !capOk || saveCap.isPending ? 0.5 : 1 }, offlineGrey(offline)]}
+                     disabled={!capOk || saveCap.isPending || offline}
                      onPress={() => saveCap.mutate()}>
             <Text style={{ color: C.text, fontSize: 13, fontWeight: "600" }}>
               {saveCap.isPending ? "saving…" : "Save"}
             </Text>
           </Pressable>
+          <OfflineNote />
         </View>
       )}
       {last ? <Text style={{ color: C.mut, fontSize: 12, marginTop: 6 }}>{last}</Text> : null}
@@ -1447,6 +1533,8 @@ function EnrichCard() {
 
 
 function InvestmentFeesCard() {
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   // the web's "Investment fees & basis" card: the Net Worth page's fee
   // estimate for robo-advisors (no fee rows in their exports, so a stated
   // rate is the only honest number) and money-in anchors where the feed's
@@ -1535,7 +1623,7 @@ function InvestmentFeesCard() {
             <Text style={[sub, { color: C.bad }]}>
               Couldn&apos;t load these settings.
             </Text>
-            <Pressable onPress={() => q.refetch()}>
+            <Pressable accessibilityRole="button" onPress={() => q.refetch()}>
               <Text style={{ color: C.mut, fontSize: 12 }}>retry</Text>
             </Pressable>
           </View>
@@ -1546,7 +1634,8 @@ function InvestmentFeesCard() {
       <Text style={h3}>Advisory fees</Text>
       {form.fees.map((r, i) => (
         <View key={i} style={row}>
-          <TextInput style={[s.input, { marginTop: 0, flex: 1 }]}
+          <TextInput {...fieldA11y("Institution name contains")}
+                     style={[s.input, { marginTop: 0, flex: 1 }]}
                      placeholder="Institution name contains"
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      value={r.inst}
@@ -1557,13 +1646,13 @@ function InvestmentFeesCard() {
                      accessibilityLabel="Yearly fee %"
                      onChangeText={(t) => setFee(i, { pct: t })} />
           <Text style={sub}>%</Text>
-          <Pressable onPress={() => edit((o) => ({
+          <Pressable accessibilityRole="button" onPress={() => edit((o) => ({
                        ...o, fees: o.fees.filter((_r, j) => j !== i) }))}>
             <Text style={{ color: C.mut, fontSize: 12 }}>remove</Text>
           </Pressable>
         </View>
       ))}
-      <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
+      <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
                                               marginTop: 6 }]}
                  onPress={() => edit((o) => ({
                    ...o, fees: [...o.fees, { inst: "", pct: "" }] }))}>
@@ -1574,7 +1663,8 @@ function InvestmentFeesCard() {
       </Text>
       {/* a plain keyboard: some banks' masks carry letters, and a
           number pad cannot type them */}
-      <TextInput style={s.input} placeholder="1234, 5678"
+      <TextInput {...fieldA11y("Fee-free accounts (last characters, comma-separated)")}
+                 style={s.input} placeholder="1234, 5678"
                  placeholderTextColor={C.mut} keyboardType="default"
                  autoCapitalize="characters" autoCorrect={false}
                  value={form.exempt}
@@ -1591,38 +1681,40 @@ function InvestmentFeesCard() {
       </Text>
       {form.basis.map((r, i) => (
         <View key={i} style={row}>
-          <TextInput style={[s.input, { marginTop: 0, width: 110 }]}
+          <TextInput {...fieldA11y("Account last characters")}
+                     style={[s.input, { marginTop: 0, width: 110 }]}
                      placeholder="Account last characters"
                      placeholderTextColor={C.mut} keyboardType="default"
                      autoCapitalize="characters" autoCorrect={false}
                      value={r.mask}
                      onChangeText={(t) => setBasis(i, { mask: t })} />
           <Text style={sub}>Money in $</Text>
-          <TextInput style={[s.input, { marginTop: 0, flex: 1 }]}
+          <TextInput {...fieldA11y("Money in $")} style={[s.input, { marginTop: 0, flex: 1 }]}
                      placeholder="0" placeholderTextColor={C.mut}
                      keyboardType="decimal-pad" value={r.amount}
                      onChangeText={(t) => setBasis(i, { amount: t })} />
-          <Pressable onPress={() => edit((o) => ({
+          <Pressable accessibilityRole="button" onPress={() => edit((o) => ({
                        ...o, basis: o.basis.filter((_r, j) => j !== i) }))}>
             <Text style={{ color: C.mut, fontSize: 12 }}>remove</Text>
           </Pressable>
         </View>
       ))}
-      <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
+      <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet, { alignSelf: "flex-start",
                                               marginTop: 6 }]}
                  onPress={() => edit((o) => ({
                    ...o, basis: [...o.basis, { mask: "", amount: "" }] }))}>
         <Text style={s.btnText}>+ Add account</Text>
       </Pressable>
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 12,
-                                  opacity: save.isPending ? 0.5 : 1 }]}
-                 disabled={save.isPending} onPress={submit}>
+      <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start", marginTop: 12,
+                                  opacity: save.isPending ? 0.5 : 1 }, offlineGrey(offline)]}
+                 disabled={save.isPending || offline} onPress={submit}>
         <Text style={s.btnText}>{save.isPending ? "saving…" : "Save"}</Text>
       </Pressable>
+      <OfflineNote />
       </>)}
       {note ? (
-        <Text style={[sub, { marginTop: 6 },
-                      note.bad ? { color: C.bad } : null]}>{note.text}</Text>
+        <Note bad={!!note.bad} style={[sub, { marginTop: 6 },
+                      note.bad ? { color: C.bad } : null]}>{note.text}</Note>
       ) : null}
     </Card>
   );
@@ -1697,7 +1789,9 @@ function PlaidRecurringCard() {
             proposals beside ours — never applied without you
           </Text>
         </View>
-        <Switch value={on} onValueChange={(v) => toggle.set(v)}
+        <Switch value={on}
+                accessibilityLabel="Cross-check bills against Plaid's recurring streams"
+                onValueChange={(v) => toggle.set(v)}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
@@ -1731,7 +1825,9 @@ function LogosToggleCard() {
             plainer look (the daily email never carries images)
           </Text>
         </View>
-        <Switch value={on} onValueChange={(v) => {
+        <Switch value={on}
+                accessibilityLabel="Show merchant logos"
+                onValueChange={(v) => {
                   patchQuery<Me>(qc, ["me"], { merchant_logos: v });
                   toggle.set(v);
                 }}
@@ -1760,7 +1856,9 @@ function FeedbackToggleCard() {
         <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
           Feedback &amp; bug reports enabled on this instance
         </Text>
-        <Switch value={on} onValueChange={(v) => toggle.set(v)}
+        <Switch value={on}
+                accessibilityLabel="Feedback and bug reports enabled on this instance"
+                onValueChange={(v) => toggle.set(v)}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
@@ -1775,6 +1873,8 @@ export { DownloadButton } from "../components/download-button";
 // ---- theme — resolved at bundle load, so a change applies on the
 // next launch (every screen's styles capture the palette at import) ----
 function MyEmailCard() {
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const { client } = useSession();
   const qc = useQueryClient();
   const me = useQuery({ queryKey: ["me"], queryFn: () => client!.me(),
@@ -1789,12 +1889,13 @@ function MyEmailCard() {
   const [err, setErr] = useState<string | null>(null);
   const set = useMutation({
     mutationFn: (muted: boolean) => client!.meEmail(muted),
-    onSuccess: (r) => {
+    onSuccess: (r, muted) => {
       setErr(null);
       // the label reads me.daily_email.muted — the reply carries it, so
-      // the button flips now rather than after a refetch
+      // the button flips now rather than after a refetch (the mute door
+      // answers `muted`, the kind door `prefs`: one shape covers both)
       qc.setQueryData<Me>(["me"], (o) => o?.daily_email && {
-        ...o, daily_email: { ...o.daily_email, muted: r.muted } });
+        ...o, daily_email: { ...o.daily_email, muted: r.muted ?? muted } });
     },
     onError: (e) => setErr(errText(e)),
   });
@@ -1809,7 +1910,8 @@ function MyEmailCard() {
     onSuccess: (r) => {
       setErr(null);
       qc.setQueryData<Me>(["me"], (o) => o?.daily_email && {
-        ...o, daily_email: { ...o.daily_email, prefs: r.prefs } });
+        ...o, daily_email: { ...o.daily_email,
+                             prefs: r.prefs ?? o.daily_email.prefs } });
     },
     onError: (e) => {
       setErr(errText(e));
@@ -1824,6 +1926,8 @@ function MyEmailCard() {
     me: me.data?.email ?? "", on: d.on, muted: d.muted, prefs: d.prefs,
     verified: me.data?.verified, hosted: me.data?.hosted,
     recipients: sv?.email_recipients as string[] | null | undefined,
+    listConfigured: sv?.email_list_configured as boolean | undefined,
+    onList: sv?.email_on_list as boolean | undefined,
     status: sv?.email_recipient_status as
       Parameters<typeof myDailyLine>[0]["status"],
     needBaseUrl: notify.data?.invites_need_base_url });
@@ -1832,8 +1936,8 @@ function MyEmailCard() {
       <H>Daily email</H>
       <Text style={s.hintL}>
         The household's verdict email goes out at {hourLabel(d.hour)} as{" "}
-        {d.summary ? "the verdict-only card" : "the full report"} — the
-        owner sets that. Whether it reaches your inbox is yours:
+        {d.summary ? "the verdict-only card" : "the full report"} —
+        whether it reaches your inbox is yours:
       </Text>
       {!d.on && (
         <Text style={s.hintL}>The owner has the daily email turned off for
@@ -1845,42 +1949,42 @@ function MyEmailCard() {
       {/* a mute stops every kind of household mail, not just the daily
           one, so lifting it must stay reachable while the daily is off */}
       {(d.on || d.muted) && (
-        <Pressable style={[s.testBtn, set.isPending && { opacity: 0.5 }]}
-                   disabled={set.isPending}
+        <Pressable accessibilityRole="button"
+                   style={[s.testBtn, set.isPending && { opacity: 0.5 }, offlineGrey(offline)]}
+                   disabled={set.isPending || offline}
                    onPress={() => set.mutate(!d.muted)}>
           <Text style={{ color: C.text, fontWeight: "600" }}>
             {d.muted ? "Unmute me" : "Turn off for me"}
           </Text>
         </Pressable>
       )}
+      <OfflineNote />
       {d.muted && (
         <Text style={s.hintL}>Unmute to choose which emails you get.</Text>
       )}
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                      marginTop: 8, opacity: d.muted ? 0.6 : 1 }}>
         {EMAIL_KINDS.map((k) => {
-          const on = !d.muted && prefOn(d.prefs, k);
+          // a kind the household does not send reads as off; the choice
+          // returns when the owner turns it on
           const off = kindOffNote(k, d.cadences);
+          const on = !d.muted && !off && prefOn(d.prefs, k);
           return (
-            <Pressable key={k} disabled={d.muted || pref.isPending}
+            <Pressable key={k} disabled={d.muted || pref.isPending || !!off}
+              accessibilityRole="checkbox"
               accessibilityLabel={`${EMAIL_KIND_LABEL[k]} email`}
-              accessibilityState={{ checked: on, disabled: d.muted }}
+              accessibilityState={{ checked: on, disabled: d.muted || !!off }}
               style={[s.chip, on && s.chipOn, off ? { opacity: 0.5 } : null]}
               onPress={() => pref.mutate({ kind: k, on: !on })}>
               <Text style={{ color: on ? C.text : C.mut, fontSize: 12 }}>
                 {on ? "☑" : "☐"} {EMAIL_KIND_LABEL[k]}
+                {off ? (k === "daily" ? " · email off" : " · report off") : ""}
               </Text>
             </Pressable>
           );
         })}
       </View>
-      {EMAIL_KINDS.some((k) => kindOffNote(k, d.cadences)) && (
-        <Text style={s.hintL}>
-          {EMAIL_KINDS.map((k) => kindOffNote(k, d.cadences)).filter(Boolean)
-            .join(" · ")}
-        </Text>
-      )}
-      {err && <Text style={[s.hint, { color: C.warn }]}>{err}</Text>}
+      {err && <Note bad style={[s.hint, { color: C.warn }]}>{err}</Note>}
     </Card>
   );
 }
@@ -1912,9 +2016,14 @@ function MyPushCard() {
     <Card>
       <H>Push</H>
       <Text style={s.hintL}>
-        The household's push notices — the daily verdict, alerts, reports —
-        go to every signed-in phone and browser. Whether they reach yours is
-        yours; notices about your own login, household security warnings and your own test push always arrive.
+        Whether the household's push notices — the daily verdict, alerts,
+        reports — reach your phones and browsers is yours. Notices about
+        your own login, household security warnings and your own test push
+        always arrive.{" "}
+        <Text style={{ color: C.accent }}
+              onPress={() => router.push(
+                "/help?topic=security" as never)}>
+          How this works</Text>
       </Text>
       <View style={{ flexDirection: "row", alignItems: "center",
                      justifyContent: "space-between", marginTop: 8 }}>
@@ -1926,7 +2035,7 @@ function MyPushCard() {
                 accessibilityLabel="household push notices to my devices"
                 onValueChange={(on) => set.mutate(!on)} />
       </View>
-      {err && <Text style={[s.hint, { color: C.warn }]}>{err}</Text>}
+      {err && <Note bad style={[s.hint, { color: C.warn }]}>{err}</Note>}
     </Card>
   );
 }
@@ -1938,16 +2047,16 @@ function ThemeCard() {
     enabled: !!client, staleTime: 5 * 60_000 });
   const [mode, setMode] = useState<ThemeMode>(getThemeMode());
   const [pending, setPending] = useState(themeRestartPending());
-  // the web rule: the owner's theme follows the ACCOUNT (settings.theme,
-  // reconciled across devices); viewers keep a per-device choice —
-  // their POST would 403 and the reconcile would revert them anyway
-  const persist = me.data?.role === "owner" && !me.data.demo;
+  // the web rule: an owner's or member's theme follows the HOUSEHOLD
+  // (settings.theme, reconciled across devices); a viewer and the demo
+  // keep a per-device choice — their POST would 403
+  const persist = themeFollowsHousehold(me.data);
   return (
     <Card>
       <H>Appearance</H>
       <View style={{ flexDirection: "row", gap: 8, marginTop: 4 }}>
         {(["auto", "dark", "light"] as ThemeMode[]).map((m0) => (
-          <Pressable key={m0} style={[s.chip, mode === m0 && s.chipOn]}
+          <Pressable accessibilityRole="button" key={m0} style={[s.chip, mode === m0 && s.chipOn]}
                      onPress={() => { setThemeMode(m0); setMode(m0);
                                       setPending(themeRestartPending());
                                       if (persist) {
@@ -1974,7 +2083,7 @@ function ThemeCard() {
         {pending
           ? "Close and reopen the app to apply."
           : "Auto follows the system setting at each launch."}
-        {persist ? " Synced to your account, like the web." : ""}
+        {persist ? " Saved for the household, like the web." : ""}
       </Text>
     </Card>
   );
@@ -2016,7 +2125,11 @@ function SupportAccessCard({ owner }: { owner: boolean }) {
       <Text style={s.hintL}>
         Oikonome support can never see your data unless you grant it. A
         grant is time-boxed, revocable, and every access it allows is
-        logged.
+        logged.{" "}
+        <Text style={{ color: C.accent }}
+              onPress={() => router.push(
+                "/help?topic=security" as never)}>
+          How this works</Text>
       </Text>
       {g.granted ? (
         <>
@@ -2026,7 +2139,7 @@ function SupportAccessCard({ owner }: { owner: boolean }) {
             {g.reason ? `  Reason: ${g.reason}` : ""}
           </Text>
           {owner && (
-            <Pressable style={[s.btn, s.btnQuiet,
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                          { alignSelf: "flex-start", marginTop: 6 },
                          revoke.isPending && { opacity: 0.5 }]}
                        disabled={revoke.isPending}
@@ -2037,8 +2150,8 @@ function SupportAccessCard({ owner }: { owner: boolean }) {
             </Pressable>
           )}
           {msg ? (
-            <Text style={{ color: C.bad, fontSize: 12 }}
-                  onPress={() => setMsg(null)}>{msg}</Text>
+            <Note bad style={{ color: C.bad, fontSize: 12 }}
+                  onPress={() => setMsg(null)}>{msg}</Note>
           ) : null}
         </>
       ) : !owner ? (
@@ -2050,21 +2163,23 @@ function SupportAccessCard({ owner }: { owner: boolean }) {
           <View style={{ flexDirection: "row", gap: 6, marginTop: 6 }}>
             {([[1, "1 hour"], [24, "24 hours"], [72, "3 days"],
                [168, "7 days"]] as [number, string][]).map(([h, l]) => (
-              <Pressable key={h} style={[s.chip, hours === h && s.chipOn]}
+              <Pressable accessibilityRole="button"
+                         key={h} style={[s.chip, hours === h && s.chipOn]}
                          onPress={() => setHours(h)}>
                 <Text style={{ color: hours === h ? C.text : C.mut,
                                fontSize: 11 }}>{l}</Text>
               </Pressable>
             ))}
           </View>
-          <TextInput style={s.input} placeholder="reason (optional)"
+          <TextInput {...fieldA11y("Reason (optional)", msg)}
+                     style={s.input} placeholder="reason (optional)"
                      placeholderTextColor={C.mut}
                      value={reason} onChangeText={setReason} />
           {msg ? (
-            <Text style={{ color: C.bad, fontSize: 12 }}
-                  onPress={() => setMsg(null)}>{msg}</Text>
+            <Note bad style={{ color: C.bad, fontSize: 12 }}
+                  onPress={() => setMsg(null)}>{msg}</Note>
           ) : null}
-          <Pressable style={[s.btn, { alignSelf: "flex-start",
+          <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start",
                        marginTop: 6 },
                        grant.isPending && { opacity: 0.5 }]}
                      disabled={grant.isPending}
@@ -2082,6 +2197,8 @@ function SupportAccessCard({ owner }: { owner: boolean }) {
 // half (a collector's credential), Integrations the read half (a scraper's,
 // a sensor's, an MCP server's).
 function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const { client } = useSession();
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["tokens"],
@@ -2124,13 +2241,18 @@ function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
       <Text style={s.hintL}>
         {read
           ? "Read-only credentials for the programs that watch your "
-            + "money: a Prometheus scrape, a Home Assistant sensor, the "
-            + "local MCP server. A read token can read the integrations "
+            + "money. A read token can read the integrations "
             + "endpoints — nothing else: it can't import a row, change a "
             + "setting or see a credential."
           : "Credentials for your own collector scripts. A token can push "
             + "data through the import endpoints — nothing else: it can't "
             + "read your ledger or change settings."}
+        {" "}
+        <Text style={{ color: C.accent }}
+              onPress={() => router.push(
+                (read ? "/help?topic=integrations"
+                      : "/help?topic=community-scripts") as never)}>
+          How this works</Text>
       </Text>
       {fresh && (
         <View style={{ backgroundColor: C.bg, borderColor: C.good,
@@ -2148,6 +2270,11 @@ function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
                              onDone={() => setFresh(null)} />
         </View>
       )}
+      {/* a failed read is not "no tokens": the failed line sits where
+          the list would */}
+      <StaleLine query={q} />
+      {q.data === undefined && q.isError && (
+        <FailedLine q={q} what="the tokens" />)}
       {rows.map((t) => (
         <View key={t.id} style={{ flexDirection: "row",
                  alignItems: "center", gap: 8,
@@ -2178,24 +2305,26 @@ function ScriptTokensCard({ scope = "push" }: { scope?: TokenScope }) {
           </Text>
         </View>
       ))}
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y(read ? "What will use it" : "Script name", msg)} style={s.input}
                  placeholder={read ? "what will use it (e.g. grafana)"
                                    : "script name (e.g. my-bank)"}
                  placeholderTextColor={C.mut}
                  autoCapitalize="none" value={name}
                  onChangeText={setName} />
       {msg ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
-      <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
-                   (!name.trim() || mint.isPending) && { opacity: 0.5 }]}
-                 disabled={!name.trim() || mint.isPending}
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, { alignSelf: "flex-start", marginTop: 6 },
+                   (!name.trim() || mint.isPending) && { opacity: 0.5 }, offlineGrey(offline)]}
+                 disabled={!name.trim() || mint.isPending || offline}
                  onPress={() => mint.mutate()}>
         <Text style={s.btnText}>
           {mint.isPending ? "creating…" : "Create token"}
         </Text>
       </Pressable>
+      <OfflineNote />
     </Card>
   );
 }
@@ -2221,7 +2350,7 @@ function EventChips({ events, value, onChange }: {
         .map((ev) => {
           const on = all ? true : value.includes(ev.name);
           return (
-            <Pressable key={ev.name} style={[s.chip, on && s.chipOn,
+            <Pressable accessibilityRole="button" key={ev.name} style={[s.chip, on && s.chipOn,
                          all && ev.name !== ALL_EVENTS && { opacity: 0.5 }]}
                        onPress={() => toggle(ev.name)}>
               <Text style={{ color: on ? C.text : C.mut, fontSize: 12 }}>
@@ -2284,6 +2413,7 @@ function WebhookRow({ hook }: { hook: Webhook }) {
           <Text style={s.hintL2} numberOfLines={1}>{hook.url}</Text>
         </View>
         <Switch value={hook.enabled} disabled={busy}
+                accessibilityLabel={`${hook.name || "webhook"} enabled`}
                 onValueChange={(v) => toggle.mutate(v)}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
@@ -2300,11 +2430,11 @@ function WebhookRow({ hook }: { hook: Webhook }) {
         </Text>
       ) : null}
       {msg ? (
-        <Text style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg.text}</Text>
+        <Note bad={msg.bad} style={{ color: msg.bad ? C.bad : C.good, fontSize: 12 }}
+              onPress={() => setMsg(null)}>{msg.text}</Note>
       ) : null}
       <View style={{ flexDirection: "row", gap: 8, marginTop: 2 }}>
-        <Pressable style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
                    disabled={busy} onPress={() => test.mutate()}>
           <Text style={s.btnText}>
             {test.isPending ? "sending…" : "Send a test"}</Text>
@@ -2329,6 +2459,8 @@ function WebhookRow({ hook }: { hook: Webhook }) {
 }
 
 function WebhooksCard() {
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const { client } = useSession();
   const qc = useQueryClient();
   const q = useQuery({ queryKey: ["webhooks"],
@@ -2360,11 +2492,13 @@ function WebhooksCard() {
     <Card>
       <H>Webhooks</H>
       <Text style={s.hintL}>
-        Tell another program when something happens: new charges from a
-        sync, an alert, the daily verdict, a bill someone edited. Each
-        event is one signed HTTP POST to a URL you choose. Failed
-        deliveries retry for a day; a receiver that stays down gets
-        switched off and says so here.
+        Tell another program when something happens: a sync that brought
+        new charges, an alert, the daily verdict, a bill someone edited.
+        {" "}
+        <Text style={{ color: C.accent }}
+              onPress={() => router.push(
+                "/help?topic=integrations" as never)}>
+          How this works</Text>
       </Text>
       {fresh ? (
         <View style={{ backgroundColor: C.bg, borderColor: C.good,
@@ -2382,41 +2516,48 @@ function WebhooksCard() {
                              onDone={() => setFresh(null)} />
         </View>
       ) : null}
+      <StaleLine query={q} />
+      {q.data === undefined && q.isError && (
+        <FailedLine q={q} what="the webhooks" />)}
       {hooks.map((h) => <WebhookRow key={h.id} hook={h} />)}
-      {!hooks.length && !q.isPending ? (
+      {!hooks.length && q.data !== undefined ? (
         <Text style={[s.hintL2, { marginTop: 6 }]}>No webhooks yet.</Text>
       ) : null}
       {adding ? (
         <View style={{ marginTop: 6 }}>
-          <TextInput style={s.input} placeholder="name (e.g. home-assistant)"
+          <TextInput {...fieldA11y("Webhook name")}
+                     style={s.input} placeholder="name (e.g. home-assistant)"
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      value={name} onChangeText={setName} />
-          <TextInput style={s.input} placeholder="https://receiver.example/hook"
+          <TextInput {...fieldA11y("Webhook URL", msg)}
+                     style={s.input} placeholder="https://receiver.example/hook"
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      autoCorrect={false} keyboardType="url"
                      value={url} onChangeText={setUrl} />
           <EventChips events={q.data?.events ?? []} value={evs}
                       onChange={setEvs} />
           {msg ? (
-            <Text style={{ color: C.bad, fontSize: 12, marginTop: 4 }}
-                  onPress={() => setMsg(null)}>{msg}</Text>
+            <Note bad style={{ color: C.bad, fontSize: 12, marginTop: 4 }}
+                  onPress={() => setMsg(null)}>{msg}</Note>
           ) : null}
           <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-            <Pressable style={[s.btn, (create.isPending || !url.trim()
-                                        || !evs.length) && { opacity: 0.5 }]}
-                       disabled={create.isPending || !url.trim() || !evs.length}
+            <Pressable accessibilityRole="button" style={[s.btn, (create.isPending || !url.trim()
+                                        || !evs.length) && { opacity: 0.5 }, offlineGrey(offline)]}
+                       disabled={create.isPending || !url.trim() || !evs.length || offline}
                        onPress={() => create.mutate()}>
               <Text style={s.btnText}>
                 {create.isPending ? "creating…" : "Create webhook"}</Text>
             </Pressable>
-            <Pressable style={[s.btn, s.btnQuiet]}
+            <OfflineNote />
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                        onPress={() => setAdding(false)}>
               <Text style={s.btnText}>cancel</Text>
             </Pressable>
           </View>
         </View>
       ) : (
-        <Pressable style={[s.btn, { alignSelf: "flex-start", marginTop: 8 }]}
+        <Pressable accessibilityRole="button"
+                   style={[s.btn, { alignSelf: "flex-start", marginTop: 8 }]}
                    onPress={() => setAdding(true)}>
           <Text style={s.btnText}>Add a webhook</Text>
         </Pressable>
@@ -2434,10 +2575,7 @@ function EndpointsCard() {
     <Card>
       <H>Read endpoints</H>
       <Text style={s.hintL}>
-        Every one takes an integration token as a bearer. The summary is
-        one JSON document; /metrics is the same numbers in the Prometheus
-        text format; the query doors behind the MCP server search the
-        ledger, spending, bills and the net-worth series.
+        Every one takes a read token as a bearer.
       </Text>
       <KV k="summary" v={`${base}/api/integrations/summary`} tone="mut" />
       <KV k="metrics" v={`${base}/metrics`} tone="mut" />
@@ -2460,17 +2598,17 @@ const s = StyleSheet.create({
              paddingVertical: 10, alignItems: "center" },
   hintL: { color: C.mut, fontSize: 12, lineHeight: 17 },
   hintL2: { color: C.mut, fontSize: 11 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },
   chip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
           borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
   chipOn: { borderColor: C.accent, backgroundColor: C.hover },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8, marginTop: 6 },
-  search: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
+  search: { backgroundColor: C.card, borderColor: C.field, borderWidth: 1,
             borderRadius: 8, color: C.text, fontSize: 14,
             paddingHorizontal: 12, paddingVertical: 9,
             marginHorizontal: 12, marginTop: 14 },
@@ -2533,7 +2671,7 @@ function HomePageCard() {
       <View style={{ flexDirection: "row", gap: 8, marginTop: 4,
                      flexWrap: "wrap" }}>
         {opts.map(([v, l]) => (
-          <Pressable key={v} style={[s.chip, cur === v && s.chipOn]}
+          <Pressable accessibilityRole="button" key={v} style={[s.chip, cur === v && s.chipOn]}
                      onPress={() => set(key, v)}>
             <Text style={{ color: cur === v ? C.text : C.mut,
                            fontSize: 13 }}>{l}</Text>
@@ -2663,8 +2801,9 @@ function OutboundPausedBanner() {
           in the last days through your invites: {names}. Invite again the
           ones that are yours.
         </Text>) : null}
-      {err ? <Text style={{ color: C.bad, marginTop: 4 }}>{err}</Text> : null}
-      <Pressable onPress={() => resume.mutate()} disabled={resume.isPending}
+      {err ? <Note bad style={{ color: C.bad, marginTop: 4 }}>{err}</Note> : null}
+      <Pressable accessibilityRole="button"
+                 onPress={() => resume.mutate()} disabled={resume.isPending}
                  style={{ marginTop: 8, alignSelf: "flex-start",
                           backgroundColor: C.hover, borderColor: C.border,
                           borderWidth: 1, borderRadius: 8,

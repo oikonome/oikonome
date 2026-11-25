@@ -92,8 +92,15 @@ its own address, so a change made from a stolen session is never silent:
   sign-in page straight away and write to the instance's support address
   (the mail names it when one is set; otherwise tell whoever runs the
   instance). The same short notice can also arrive as a push notification
-  on your signed-in phone, and as a text to the household's confirmed
-  number when your account is the household's only owner.
+  on your signed-in phone — tapping it opens Security — and as a text to
+  the household's confirmed number when your account is the household's
+  only owner.
+- **AI service changed** — when someone changes where the household's
+  transactions, receipts and questions are sent (the AI endpoint, its
+  model, its key, or which backend a task uses), the person who made the
+  change gets the same kind of notice. A restore that changes any of
+  those tells the owner the same way. Saving the settings unchanged
+  sends nothing.
 - **Changing your sign-in email** (hosted) — the new address is only
   *asked for* at first: the account keeps signing in with the old one,
   Settings shows the new one as pending, and a link goes to the new
@@ -132,6 +139,11 @@ its own address, so a change made from a stolen session is never silent:
   reset, not the link, that removes anything a stranger enrolled, so an
   account with a second factor still asks for a recovery code there. The
   address the account was moved to is told it was moved back.
+  For **seven days** after the account is put back, a reset that removes
+  the second factor (the 7-day recovery below) cannot be requested —
+  whoever moved the account may still read that inbox. Sign in with your
+  authenticator, a passkey or a recovery code meanwhile; the reset page
+  says when the hold ends, and the operator can still clear the factor.
 
 An old address that was never confirmed is still told about the change,
 but gets no link — an address typed wrong at sign-up must not be able to
@@ -159,7 +171,10 @@ cookie, not your credentials.
 
 You prove it **once**, not per change: the first protected action opens
 a single confirmation, and for the next ten minutes on that device every
-other protected action just works. What the confirmation asks for is the
+other protected action just works. (A restore is judged by when its
+upload started arriving, up to thirty minutes earlier, so a large
+archive that takes minutes to send does not use up the window on the
+way.) What the confirmation asks for is the
 strongest factor you have enrolled:
 
 - **Password only** — your password.
@@ -290,8 +305,9 @@ issues none: there is no factor left for them to stand in for.
 
 **Which change takes what away.** Every security change falls into one of
 a few steps, and each step always takes the same things. A routine
-**regenerate** signs out your other browsers and devices and cancels
-pending recoveries — nothing else. **Turning the authenticator on or off,
+**regenerate** signs out your other browsers and devices, stops browser
+notifications everywhere but this browser, and cancels unspent reset
+links, emailed sign-in links and pending recoveries — nothing else. **Turning the authenticator on or off,
 a first passkey, or removing a passkey with a new sheet** add the rest of
 the hijack clean-up: script tokens, webhooks, the household's outbound
 settings and text number, invitations and recently invited members, and
@@ -381,11 +397,11 @@ The Sessions card lists everywhere you're signed in — device and
 browser, sign-in date, and last activity (dates as MM/DD/YY), with
 **this device** marked. A session dies after **30 days idle** (activity
 slides the deadline) and never outlives **90 days** from sign-in.
-**Sign out everywhere else** confirms your password — kicking sessions
-is a step-up action too. To drop a single device instead, each row but
-this one has its own **sign out** button; fill in the same password box
-first, because revoking one session is the same step-up action as
-revoking them all.
+**Sign out everywhere else** is a step-up action: unless you confirmed
+in the last ten minutes, the confirm-it's-you sheet opens first. To drop
+a single browser or phone instead, press **sign out** on its row (phones
+are listed under *Mobile devices* on the same card) — the same
+confirmation applies.
 
 ## Mobile devices
 
@@ -434,10 +450,23 @@ network or DNS filter blocks the Cloudflare script. In that case the
 sign-in page offers **"Email me a sign-in link"**:
 
 1. Give your email address; a one-time link is sent, valid 30 minutes.
-2. Open it. This does **not** sign you in — it grants your account one
-   exemption from the security check, good for ten minutes and spent by
-   your next sign-in attempt (one try, not ten minutes of guessing).
-3. Sign in normally with your password and your second factor.
+2. Open it and press **Continue to sign in**. This does **not** sign you
+   in — it grants your account one exemption from the security check, good
+   for ten minutes and spent by your next sign-in attempt (one try, not ten
+   minutes of guessing).
+3. Sign in normally with your password and your second factor, in the
+   browser where you opened the link. Signing in on the mobile app
+   instead? The page shows a **sign-in code**; enter it in the app's
+   sign-in screen — the field appears once the app asks for the security
+   check, or tap **Have a sign-in code from an emailed link?**.
+
+The exemption is tied to the browser that opened the link and to that
+code, so someone who only knows your address — even one who asked for the
+link themselves — cannot spend it before you do. Nothing else spends it,
+not even a sign-in from the same internet connection. A version of the
+mobile app with no code field cannot use the link: update the app, or sign
+in on the web in the browser that opened it. Changing your sign-in email
+ends every unlock link not yet used.
 
 Because it is not a sign-in, someone reading your mail still cannot get
 into your account without your password. The link works once, and you can
@@ -446,7 +475,7 @@ configured print the link to the server log instead.
 
 ## Household members
 
-**Invite** (Settings → Users on the web; **Security & household** in the
+**Invite** (Settings → Household on the web; **Security & household** in the
 mobile app) gives someone their own login on this household — their own
 password, their own second factor, the same accounts and history.
 Invitations are one-time and expire in 7 days. You pick what the new login
@@ -470,12 +499,20 @@ A member's login is theirs, not a shared one:
 - **They enrol their own second factor.** On an instance that requires
   one, a member is prompted to set up an authenticator app or a passkey
   on first sign-in exactly as the owner is; membership is not a way
-  around the requirement.
+  around the requirement. That set-up screen is not a toll, though: it
+  also offers **Leave household** (which removes only that person's
+  login) to a member or viewer, and **Delete account** to the owner, with
+  the same typed confirmation as in Settings.
 - **They control their own copy of the email.** A member's Email card
   turns *their* address on or off in the household's scheduled summaries,
   and picks which kinds they get (Daily, Monthly, Yearly, Alerts).
   The schedule itself — the hour, the shape, who else is on it — stays
-  the owner's.
+  the owner's. A member's recipient list shows only their own address
+  (the owner sees everyone), and their **Daily email** card says whether
+  the daily email reaches them and, when it does not, why: muted or
+  turned off by them, not on the owner's list, held until the owner
+  confirms the list, an invitation not yet accepted or declined, or an
+  address not yet confirmed.
 - **They can leave.** **Delete my login** removes that person's sign-in
   and nothing else: the household's accounts, transactions and settings
   are untouched, and it re-authenticates like any other destructive door.
@@ -538,13 +575,13 @@ one, and transferring it is not something an invite or a dropdown does.
 A view-only login's Settings holds two sections: **Email & Push** — whether
 the household's email reaches their inbox and which kinds, and whether
 its push notices reach their phones and browsers — and **Security** for
-their own login. It does not see the **Users** roster. A member finds the
+their own login. It does not see the **Household** roster. A member finds the
 same **Push** card under Email & Push: **Turn off for me** stops the
 household's push notices (the daily verdict, alerts, reports) reaching
 that person's devices without unregistering them, and **This browser:
 enable** subscribes the browser in hand. The owner sees and sets every
 member's email and push switches — their own included — on each row of
-the **Users** roster (**Settings → Users** on the web, the Family card
+the **Household** roster (**Settings → Household** on the web, the Household card
 under **Security & household** on the phone), beside how many browsers
 and phones each person has registered; a change made on either side
 shows on the other, because both write the same setting. Notices about
@@ -555,7 +592,7 @@ switch or no switch.
 ## Activity — who changed what
 
 When two people keep one set of books, "who changed this?" needs an
-answer. **Settings → Users → Activity** on the web, and **More →
+answer. **Settings → Household → Activity** on the web, and **More →
 Activity** in the mobile app, list the household's hand-made changes,
 newest first, each with the person and the time:
 
@@ -583,7 +620,11 @@ answers "who did this", and for the app's own work the answer is always
 the app.
 
 Filter by person or by kind; **show older** pages back. A change made
-through a script token is listed as that script. Someone removed from the
+through a script token is listed as that script. A change with neither a person
+nor a script token behind it — an operator's maintenance pass on the
+instance — is listed as the maintenance script, and the person filter
+offers it as one. Categories are named as the pages name them
+(*Food and Drink*, not a stored key), older entries included. Someone removed from the
 household keeps their name on the changes they made — that is the point
 of a log. The log travels in your data export and restores with it, and
 keeps two years.
@@ -596,8 +637,18 @@ out. Confirm with your password, your 2FA code if enrolled (passkey or
 recovery code for passkey-only), and by typing **delete everything**.
 Anything the household holds at an external service — bank connections,
 and whatever an operator's add-on holds for the account — is released
-before the rows go. Export your data first
-(Your data section) if you want a copy; there is no undo.
+before the rows go. A bank sign-in that could still bring a bank (one
+that lets you add several banks) leaves one record behind for at most
+30 hours, holding only the sign-in's token, which Plaid keys made it and
+fingerprints of the banks already handled — no bank names: any bank it
+brings in that time is handed straight back to Plaid, and the record is
+then deleted. Export your data first (Your data section) if you want a
+copy; there is no undo.
+
+The same card is offered on the screen that asks a new account to set
+up a second factor, and on any screen that holds an account out of the
+app, so wanting to leave never means enrolling a factor first. From
+there the export is not available until a factor is set up.
 
 ## Gotchas
 
@@ -624,7 +675,12 @@ before the rows go. Export your data first
 - Security doors are rate-limited — repeated wrong passwords lock the
   door for a while rather than allowing unlimited guesses. Wrong codes
   typed while already signed in (confirming a sensitive action) lock only
-  that signed-in session's confirmations, never your sign-in.
+  that signed-in session's confirmations, never your sign-in. Either lock
+  sends you a security notice the first time it happens in a day: after
+  a right password and wrong sign-in codes, that your password is known
+  to someone; after repeated failed confirmations in a signed-in browser
+  or device, that someone using it tried to confirm a sensitive change.
+  If it was not you, reset your password from the sign-in page.
 - On a demo instance the password, email, 2FA, passkey, sessions and
   delete-login controls are disabled, and the database dump is refused —
   the credentials are shared, so changing them would only

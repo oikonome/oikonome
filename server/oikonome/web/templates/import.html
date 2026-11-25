@@ -7,7 +7,7 @@
   {% if result.error %}{{ result.error }}
   {% elif result.source and 'restored' in result.source %}{{ result.source }}.
   <b><a href="/accounts">Reconnect your bank on the Accounts page →</a></b>
-  {% else %}{% if result.source and 'restored' not in (result.source or '') %}<b>{{ result.source }}</b> — {% endif %}Imported <b>{{ result.imported }}</b> transactions
+  {% else %}{% if result.source and 'restored' not in (result.source or '') %}<b>{{ result.source }}</b> — {% endif %}{% if not result.imported and result.matched %}Nothing new — <b>{{ result.matched }}</b> already here{% else %}Imported <b>{{ result.imported }}</b> transactions{% if result.matched %} · <b>{{ result.matched }}</b> already here{% endif %}{% endif %}
   {% if result.skipped_duplicates %} · skipped {{ result.skipped_duplicates }} already covered by a connected bank{% endif %}.
   <b><a href="/bills">Next: run the recurring-bills finder →</a></b>
   {% if result.warnings %}

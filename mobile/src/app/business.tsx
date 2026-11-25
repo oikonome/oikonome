@@ -15,26 +15,30 @@ import { Alert, Linking, Pressable, ScrollView, StyleSheet, Switch, Text,
          TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card, H, HelpLink, KV, Pill } from "../components/ui";
-import { ApiError, errText, Account, BizData, BizTxn, countsInTotals, Entity,
+import { EmptyState, FailedLine, StaleLine } from "../components/loaded";
+import { Card, H, HelpLink, KV, Pill, Note } from "../components/ui";
+import { ApiError, errText, Account, BizData, BizTxn, Entity,
          EstimatedTax,
-         Obligation, setHandedOffTxn, Txn,
+         Obligation,
          Vendor } from "../lib/api";
 import { patchList, patchQueries, patchQuery, removeFromList, bizKeys, personalKeys, invalidateAll } from "../lib/cache";
 import { ymd } from "../lib/dates";
-import { bizDefaultTaxYear, bizPeriodProfit, bizTaxStillDue, bizTaxYears,
+import { bizDefaultTaxYear, bizTaxYears,
   householdDay,
   isValidYmd, catLabel, numberDraft, parseMoneyDraft, bizShownBucket,
   bizNeedsLine,
-  numberFieldsPatch, bizMemberDoorMissing } from "../lib/pure";
+  numberFieldsPatch, bizMemberDoorMissing, figureGreyed, knownOr,
+  UNKNOWN_FIGURE, EMPTY_LINES, accountLabel, kindWords, bizViewWithout }
+  from "../lib/pure";
 import { DownloadButton } from "../components/download-button";
 import { useSession } from "../lib/session";
 import { useMe, useOwner, useViewer } from "../lib/viewer";
 import { C, mmddyy, money } from "../lib/theme";
+import { disclosure } from "../lib/a11y";
+import { fieldA11y } from "../components/field";
 
-const m$ = (n: number | null | undefined) =>
-  n == null ? "—" : money(n, false);
+// a figure not known prints the unknown mark, as on the web
+const m$ = (n: number | null | undefined) => money(n, false);
 // account kind is "type/subtype" — never compare with ===
 const kindIs = (a: { kind: string }, ...types: string[]) =>
   types.some((t) => a.kind === t || a.kind.startsWith(t + "/"));
@@ -182,15 +186,11 @@ export default function Business() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={refreshAll} />}>
-      <StaleBanner query={summary} />
+      <StaleLine query={summary} />
       <UnlinkedCapitalNotice />
       {summary.isPending && <Text style={s.center}>Loading…</Text>}
       {summary.isError && !summary.data && (
-        <Card>
-          <Text style={{ color: C.bad, fontSize: 13 }}>
-            Couldn&apos;t load: {String(summary.error)}
-          </Text>
-        </Card>
+        <FailedLine q={summary} what="your businesses" />
       )}
       {summary.data && entities.length === 0 && !viewer && (
         <Card>
@@ -200,7 +200,7 @@ export default function Business() {
           </Text>
           {/* guided setup owns the empty state, the same rule as the
               web: a flat form asks cold questions the wizard explains */}
-          <Pressable style={[s.btn, { alignSelf: "flex-start",
+          <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start",
                                       marginTop: 8 }]}
                      onPress={() => router.push(
                        "/business-wizard" as never)}>
@@ -214,7 +214,7 @@ export default function Business() {
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                          paddingHorizontal: 12, paddingTop: 10 }}>
             {TABS.map(([k, l]) => (
-              <Pressable key={k} style={[s.chip, tab === k && s.chipOn]}
+              <Pressable accessibilityRole="button" key={k} style={[s.chip, tab === k && s.chipOn]}
                          onPress={() => setTab(k)}>
                 <Text style={{ color: tab === k ? C.text : C.mut,
                                fontSize: 12 }}>{l}</Text>
@@ -240,7 +240,7 @@ export default function Business() {
               <View style={{ flexDirection: "row", flexWrap: "wrap",
                              gap: 6, marginTop: 6 }}>
                 {actives.map((e) => (
-                  <Pressable key={e.id}
+                  <Pressable accessibilityRole="button" key={e.id}
                              style={[s.chip, entityId === e.id && s.chipOn]}
                              onPress={() => setPicked(e.id)}>
                     <Text style={{ color: entityId === e.id
@@ -257,6 +257,7 @@ export default function Business() {
               </Text>
               <Switch value={!!summary.data?.combined}
                       disabled={combine.isPending}
+                      accessibilityLabel="Combined view"
                       onValueChange={(v) => combine.mutate(v)}
                       trackColor={{ true: C.accent, false: C.hover }}
                       thumbColor={C.text} />
@@ -325,7 +326,9 @@ function ArchivedBusinesses({ archived, viewer, onView }: {
   });
   return (
     <Card>
-      <Pressable onPress={() => setOpen((x) => !x)}>
+      <Pressable onPress={() => setOpen((x) => !x)}
+                 {...disclosure(open, `Archived — ${archived.length} business`
+                   + `${archived.length > 1 ? "es" : ""} (records kept)`)}>
         <Text style={{ color: C.mut, fontSize: 13 }}>
           {open ? "▾" : "▸"} Archived — {archived.length} business
           {archived.length > 1 ? "es" : ""} (records kept)
@@ -432,20 +435,21 @@ function DeleteForeverConfirm({ entity, onDone, onCancel }: {
       <Text style={[s.mut, { marginTop: 6 }]}>
         Type {entity.name} to confirm
       </Text>
-      <TextInput style={[s.input, { marginTop: 4 }]}
+      <TextInput {...fieldA11y(`Type ${entity.name} to confirm`)}
+                 style={[s.input, { marginTop: 4 }]}
                  placeholder={entity.name} placeholderTextColor={C.mut}
                  autoCapitalize="none" autoCorrect={false}
                  value={name} onChangeText={setName} />
       <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-        <Pressable style={[s.btn, { backgroundColor: C.bad,
+        <Pressable accessibilityRole="button" style={[s.btn, { backgroundColor: C.danger,
                      opacity: name === entity.name ? 1 : 0.5 }]}
                    disabled={nuke.isPending || name !== entity.name}
                    onPress={() => nuke.mutate()}>
-          <Text style={s.btnText}>
+          <Text style={[s.btnText, { color: C.onDanger }]}>
             {nuke.isPending ? "deleting…" : "Delete forever"}
           </Text>
         </Pressable>
-        <Pressable style={[s.btn, s.btnQuiet]} onPress={onCancel}>
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]} onPress={onCancel}>
           <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
         </Pressable>
       </View>
@@ -497,10 +501,6 @@ function Overview({ entity }: { entity: Entity }) {
   // deadline under the new name read as its figures — "—" is honest
   const pnl = useQuery({ queryKey: ["pnl", entity.id, year],
     queryFn: () => client!.entityPnl(entity.id, year), enabled: !!client });
-  const txns = useQuery({ queryKey: ["biztxns", entity.id, year],
-    queryFn: () => client!.bizTxns(entity.id, year), enabled: !!client });
-  const accounts = useQuery({ queryKey: ["accounts"],
-    queryFn: () => client!.accounts(), enabled: !!client });
   const compliance = useQuery({ queryKey: ["compliance", entity.id],
     queryFn: () => client!.entityCompliance(entity.id),
     enabled: !!client });
@@ -508,51 +508,66 @@ function Overview({ entity }: { entity: Entity }) {
     queryFn: () => client!.estTax(entity.id, year), enabled: !!client });
   const sugg = useQuery({ queryKey: ["biz-suggestions", entity.id],
     queryFn: () => client!.bizSuggestions(entity.id), enabled: !!client });
-  // shadow exclusion up front — a doubly-linked account must not count
-  // twice in the cash SUM or in the account COUNT, as on the web
-  const mine = (accounts.data?.accounts ?? [])
-    .filter((a) => a.entity_id === entity.id && countsInTotals(a));
-  const cash = mine.filter((a) => kindIs(a, "depository"))
-    .reduce((t, a) => t + (a.balance_current ?? 0), 0);
-  const thisMonth = ymd(day).slice(0, 7);
-  // the month figure sits directly under "Profit this year", so it is
-  // the server's P&L arithmetic on this month's rows — net of
-  // reimbursement links, capitalized §248/§195 costs out; the web's
-  // bizPeriodProfit, word for word
-  const monthProfit = bizPeriodProfit(txns.data?.transactions ?? [],
-    entity.business_start_date, thisMonth);
+  // this month's profit and the cash in the business are the P&L reply's
+  // (books.period_profit by the year's own rules, books.entity_cash with
+  // linked backups and hidden accounts out), as on the web; an older
+  // server sends neither and the screen leaves them out
+  const monthProfit = pnl.data?.this_month?.net_operating;
+  const cash = pnl.data?.cash;
   const today = ymd(day);
-  const next = (compliance.data?.obligations ?? [])
+  // "none" only from a calendar that answered: unread, it is unknown
+  const deadlines = knownOr(compliance, (d) => d.obligations ?? []);
+  const next = (deadlines ?? [])
     .filter((o) => o.due >= today)
     .sort((a, b) => a.due.localeCompare(b.due))[0];
   return (
     <Card>
+      <View style={figureGreyed(pnl) ? { opacity: 0.55 } : undefined}>
       <KV k="Profit this year" v={m$(pnl.data?.net_operating)} />
-      <Text style={s.mut}>{m$(monthProfit)} this month</Text>
-      <KV k="Cash in the business" v={m$(cash)} />
-      <Text style={s.mut}>
-        {mine.length} account{mine.length === 1 ? "" : "s"}
-      </Text>
+      {monthProfit != null && (
+        <Text style={s.mut}>{m$(monthProfit)} this month</Text>)}
+      <KV k="Cash in the business" v={m$(cash?.total)} />
+      {cash && (
+        <Text style={s.mut}>
+          {cash.accounts} account{cash.accounts === 1 ? "" : "s"}
+        </Text>)}
+      </View>
+      <View style={figureGreyed(compliance) ? { opacity: 0.55 } : undefined}>
       <KV k="Next deadline"
-          v={next ? mmddyy(next.due) : "none"} />
-      <Text style={s.mut}>
-        {m$(est.data?.next_payment ?? est.data?.quarterly)} est. quarterly
-      </Text>
+          v={deadlines === null ? UNKNOWN_FIGURE
+             : next ? mmddyy(next.due) : "none"} />
+      </View>
+      {est.data !== undefined && (
+        <Text style={s.mut}>
+          {m$(est.data.next_payment ?? est.data.quarterly)} est. quarterly
+        </Text>)}
       {(() => {
-        const n = sugg.isPending ? null
-          : ((sugg.data as { unclassified?: number } | undefined)
-              ?.unclassified ?? sugg.data?.suggestions.length ?? 0);
+        // the endpoint's real COUNT, as on the web — never the length of
+        // the capped page it returned, which would stick at the page size
+        const n = knownOr(sugg, (d) =>
+          (d as { unclassified?: number }).unclassified);
         return (
           <>
-            <KV k="Needs attention" v={n === null ? "…" : String(n)}
+            <KV k="Needs attention"
+                v={n === null ? UNKNOWN_FIGURE : String(n)}
                 tone={n ? "warn" : "mut"} />
-            <Text style={s.mut}>
-              {n === 0 ? "nothing outstanding"
-                : "unclassified transactions"}
-            </Text>
+            {n !== null && (
+              <Text style={s.mut}>
+                {n === 0 ? "nothing outstanding"
+                  : "unclassified transactions"}
+              </Text>)}
           </>
         );
       })()}
+      {/* each read the figures come from says so in place when it failed */}
+      {pnl.data === undefined && pnl.isError && (
+        <FailedLine q={pnl} what="this year's profit and cash" />)}
+      {compliance.data === undefined && compliance.isError && (
+        <FailedLine q={compliance} what="the filing deadlines" />)}
+      {est.data === undefined && est.isError && (
+        <FailedLine q={est} what="the tax estimate" />)}
+      {sugg.data === undefined && sugg.isError && (
+        <FailedLine q={sugg} what="the review queue" />)}
     </Card>
   );
 }
@@ -591,7 +606,14 @@ function ReviewQueue({ entityId, ro }: {
   const busyRow = (id: string) =>
     classify.isPending && classify.variables?.txnId === id;
   const d = sugg.data;
-  if (!d) return null;
+  // a failed queue is not an empty one: the web's card, with the reason
+  if (!d)
+    return sugg.isError ? (
+      <Card>
+        <H>Schedule C review</H>
+        <FailedLine q={sugg} what="the review queue" />
+      </Card>
+    ) : null;
   const total = (d as { unclassified?: number }).unclassified
     ?? d.suggestions.length;
   return (
@@ -622,10 +644,16 @@ function ReviewQueue({ entityId, ro }: {
               <Text style={{ color: C.text, fontSize: 13,
                              fontWeight: "600", flexShrink: 1 }}
                     numberOfLines={1}>{x.payee}</Text>
+              {/* learned: the owner's own earlier line for this vendor;
+                  a kind: the built-in list of business kinds (the bank's
+                  category is never a source) */}
               {(x as { source?: string | null }).source === "merchant"
                 ? <Pill text="learned" tone="good" />
-                : (x as { source?: string | null }).source === "category"
-                  ? <Pill text="guess" tone="warn" /> : null}
+                : (x as { source?: string | null }).source === "kind"
+                  ? <Pill text={(x as { kind_label?: string | null })
+                      .kind_label ?? "suggested"} tone="warn" />
+                  : (x as { source?: string | null }).source === "category"
+                    ? <Pill text="guess" tone="warn" /> : null}
             </View>
             <Text style={s.mut}>
               {(x as { date?: string }).date
@@ -637,7 +665,7 @@ function ReviewQueue({ entityId, ro }: {
               <View style={{ flexDirection: "row", flexWrap: "wrap",
                              gap: 4, marginTop: 4 }}>
                 {d.lines.map((ln) => (
-                  <Pressable key={ln}
+                  <Pressable accessibilityRole="button" key={ln}
                              style={[s.chip,
                                x.suggested_line === ln && s.chipOn]}
                              disabled={busyRow(x.txn_id)}
@@ -654,7 +682,7 @@ function ReviewQueue({ entityId, ro }: {
             )}
           </View>
           {!ro && (<>
-            <Pressable style={[s.sBtn,
+            <Pressable accessibilityRole="button" style={[s.sBtn,
                          (busyRow(x.txn_id) || !x.suggested_line)
                            && { opacity: 0.5 }]}
                        disabled={busyRow(x.txn_id) || !x.suggested_line}
@@ -704,17 +732,32 @@ function FlaggedLedger() {
     // a year chip swaps the key; keep the card up instead of collapsing
     placeholderData: (prev) => prev });
   type Row = BizData["rows"][number];
+  // every row an unflag is in flight for, not only the last one asked: a
+  // row whose request is out stays greyed, so it cannot be sent twice
+  const [unflagging, setUnflagging] = useState<ReadonlySet<string>>(
+    () => new Set());
+  const markUnflagging = (id: string, on: boolean) =>
+    setUnflagging((s) => {
+      const next = new Set(s);
+      if (on) next.add(id); else next.delete(id);
+      return next;
+    });
   const unflag = useMutation({
     mutationFn: (t: Row) => client!.bizFlag(t.id, false),
+    onMutate: (t) => markUnflagging(t.id, true),
+    onSettled: (_r, _e, t) => markUnflagging(t.id, false),
     onSuccess: (_r, t) => {
-      // the row leaves every cached year/limit view at once — the
-      // total and count with it — instead of after the refetch
-      patchQueries<BizData>(qc, ["business"], (o) => ({
-        ...o,
-        rows: o.rows.filter((r) => r.id !== t.id),
-        count: Math.max(0, o.count - 1),
-        total: o.total - t.amount,
-      }));
+      // the row leaves every cached view whose year holds it at once —
+      // the total and count with it — instead of after the refetch; a
+      // view of another year keeps its figures (the cache is persisted,
+      // so a wrong one would outlive the session)
+      for (const [key, o] of qc.getQueriesData<BizData>(
+          { queryKey: ["business"] })) {
+        if (!o || !Array.isArray(o.rows)) continue;
+        const scope = key[1];
+        qc.setQueryData<BizData>(key, bizViewWithout(
+          o, typeof scope === "number" ? scope : "all", t));
+      }
       qc.invalidateQueries({ queryKey: ["business"] });
       qc.invalidateQueries({ queryKey: ["transactions"], refetchType: "none" });
     },
@@ -724,7 +767,9 @@ function FlaggedLedger() {
   const unflagRow = useCallback((t: Row) => unflagMutate(t),
                                 [unflagMutate]);
   const openRow = useCallback((t: Row) => {
-    setHandedOffTxn(t as Txn);
+    // a flagged-business row is not a whole ledger row (it lacks the
+    // flags and receipt fields), so it is not handed over: the
+    // transaction screen reads the whole row from the server by its id
     router.push({ pathname: "/txn", params: { id: t.id } } as never);
   }, [router]);
   const d = q.data;
@@ -738,13 +783,13 @@ function FlaggedLedger() {
       {d && d.years.length > 0 && (
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                        marginTop: 4 }}>
-          <Pressable style={[s.chip, !year && s.chipOn]}
+          <Pressable accessibilityRole="button" style={[s.chip, !year && s.chipOn]}
                      onPress={() => setYear(undefined)}>
             <Text style={{ color: !year ? C.text : C.mut,
                            fontSize: 11 }}>all years</Text>
           </Pressable>
           {d.years.map((y) => (
-            <Pressable key={y} style={[s.chip, year === y && s.chipOn]}
+            <Pressable accessibilityRole="button" key={y} style={[s.chip, year === y && s.chipOn]}
                        onPress={() => setYear(y)}>
               <Text style={{ color: year === y ? C.text : C.mut,
                              fontSize: 11 }}>{y}</Text>
@@ -771,8 +816,7 @@ function FlaggedLedger() {
             style={q.isPlaceholderData ? { opacity: 0.5 } : null}>
       {(d?.rows ?? []).slice(0, rowLimit).map((t) => (
         <FlaggedRow key={t.id} t={t} viewer={viewer}
-                    pending={unflag.isPending
-                             && unflag.variables?.id === t.id}
+                    pending={unflagging.has(t.id)}
                     onOpen={openRow} onUnflag={unflagRow} />
       ))}
       </View>
@@ -819,7 +863,7 @@ const FlaggedRow = memo(function FlaggedRow({ t, viewer, pending, onOpen,
 }) {
   return (
     <View style={s.row}>
-      <Pressable style={{ flex: 1 }} onPress={() => onOpen(t)}>
+      <Pressable accessibilityRole="button" style={{ flex: 1 }} onPress={() => onOpen(t)}>
         <Text style={{ color: C.text, fontSize: 13,
                        fontWeight: "600" }} numberOfLines={1}>
           {t.payee}
@@ -972,6 +1016,17 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
     },
     onError: (e) => Alert.alert("Couldn't delete", errText(e)),
   });
+  // an owner transfer recorded as a contribution or a draw, at the row's
+  // own amount and date (the server decides which)
+  const ownerTx = useMutation({
+    mutationFn: (txnId: string) => client!.bizOwnerTransfer(entity.id, txnId),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["equity", entity.id] });
+      qc.invalidateQueries({ queryKey: ["balancesheet", entity.id] });
+      qc.invalidateQueries({ queryKey: ["biztxns", entity.id] });
+    },
+    onError: (e) => Alert.alert("Couldn't record", errText(e)),
+  });
   const p = pnl.data;
   // offset paging over a list that changed between pages can skip a row;
   // a page whose total disagrees with the first page's says it did, so the
@@ -993,7 +1048,11 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
   const total = year === undefined
     ? allTxns.data?.pages[0]?.total : undefined;
   const serverPaged = typeof total === "number";
-  const expenses = loaded.filter((x) => x.amount > 0);
+  // the costs only (the server's role): money the owner moved is listed
+  // under Owner equity; an older server sends no role and every money-out
+  // row stays listed as before
+  const expenses = loaded.filter((x) => x.amount > 0
+    && (x.role ?? "cost") === "cost");
   // a server-paged list shows every expense it has loaded; otherwise (one
   // year, or a server that sent everything) the render is capped instead
   const visible = serverPaged ? expenses : expenses.slice(0, shown);
@@ -1009,7 +1068,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
           <View style={{ flexDirection: "row", gap: 4,
                          marginLeft: "auto" }}>
             {[undefined, now, now - 1, now - 2].map((y) => (
-              <Pressable key={y ?? "all"}
+              <Pressable accessibilityRole="button" key={y ?? "all"}
                          style={[s.chip, year === y && s.chipOn]}
                          onPress={() => setYear(y)}>
                 <Text style={{ color: year === y ? C.text : C.mut,
@@ -1020,6 +1079,17 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
             ))}
           </View>
         </View>
+        {/* a failed P&L or list is said in place, never just left out */}
+        {!p && pnl.isError && (
+          <FailedLine q={pnl} what="the profit and loss" />)}
+        {(year !== undefined ? txns : allTxns).data === undefined
+          && (year !== undefined ? txns : allTxns).isError && (
+          <FailedLine q={year !== undefined ? txns : allTxns}
+                      what="the business transactions" />)}
+        {/* a new business: one line rather than a header over nothing */}
+        {(year !== undefined ? txns : allTxns).isSuccess
+          && loaded.length === 0 && (
+          <EmptyState title={EMPTY_LINES.businessBooks} />)}
         {p && (
           <>
             <Text style={{ color: C.text, fontSize: 13, marginTop: 4 }}>
@@ -1081,7 +1151,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                 <View style={{ flexDirection: "row", flexWrap: "wrap",
                                gap: 4, marginTop: 4 }}>
                   {BUCKETS.map(([v, l]) => (
-                    <Pressable key={v}
+                    <Pressable accessibilityRole="button" key={v}
                                style={[s.chip,
                                  bizShownBucket(x) === v && s.chipOn]}
                                disabled={classify.isPending
@@ -1100,7 +1170,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                 <View style={{ flexDirection: "row", flexWrap: "wrap",
                                gap: 4, marginTop: 4 }}>
                   {(lineList.data?.lines ?? []).map((ln) => (
-                    <Pressable key={ln}
+                    <Pressable accessibilityRole="button" key={ln}
                                style={[s.chip,
                                  x.sched_c_line === ln && s.chipOn]}
                                disabled={classify.isPending
@@ -1116,7 +1186,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                     </Pressable>
                   ))}
                   {x.sched_c_line ? (
-                    <Pressable style={s.chip}
+                    <Pressable accessibilityRole="button" style={s.chip}
                                disabled={classify.isPending
                                  && classify.variables?.txnId === x.id}
                                onPress={() => { setLineFor(null);
@@ -1196,6 +1266,8 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
                       <B>{m$(bs.data.household_capital)}</B></>
                   : null}
               </Text>
+              {(bs.data.reconcile ?? []).map((line) => (
+                <Text key={line} style={s.mut}>{line}</Text>))}
               <Text style={s.mut}>
                 Snapshot from business account balances — not
                 double-entry books.
@@ -1216,8 +1288,13 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
               {m$(cap.capital_balance)}
             </Text>
             <Text style={s.mut}>
-              {" "}(contributions {m$(cap.contributions)} + retained{" "}
-              {m$(cap.net_income ?? 0)} − draws{" "}
+              {" "}(contributions {m$(cap.contributions)}
+              {(cap.paid_personally ?? 0) > 0
+                ? `, ${m$(cap.paid_personally ?? 0)} of it costs paid personally`
+                : ""}
+              {cap.net_income != null
+                ? ` + retained earnings ${m$(cap.net_income)}` : ""}
+              {" "}− draws{" "}
               {m$(cap.draws + cap.distributions)})
               {cap.reimbursements > 0
                 ? ` · reimbursements ${m$(cap.reimbursements)}` : ""}
@@ -1228,6 +1305,39 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
             </Text>
           </Text>
         )}
+        {(equity.data?.owner_transfers ?? []).length > 0 && (
+          <Text style={[s.mut, { marginTop: 6 }]}>
+            Money you moved in or out — not business income or expenses
+          </Text>
+        )}
+        {(equity.data?.owner_transfers ?? []).map((t) => (
+          <View key={t.txn_id} style={s.row}>
+            <Text style={[s.mut, { width: 60 }]}>
+              {t.date ? mmddyy(t.date) : "·"}
+            </Text>
+            <Text style={{ color: C.text, fontSize: 13, flex: 1 }}>
+              {t.payee}
+              <Text style={s.mut}>
+                {` · ${money(Math.abs(t.amount))} ${
+                  t.role === "owner_in" ? "in" : "out"}`}
+              </Text>
+            </Text>
+            {t.owner_recorded ? (
+              <Text style={s.mut}>recorded as a {t.owner_recorded}</Text>
+            ) : !ro ? (
+              <Pressable accessibilityRole="button"
+                         style={[s.chip, ownerTx.isPending
+                           && ownerTx.variables === t.txn_id
+                           && { opacity: 0.5 }]}
+                         disabled={ownerTx.isPending}
+                         onPress={() => ownerTx.mutate(t.txn_id)}>
+                <Text style={{ color: C.text, fontSize: 11 }}>
+                  Record as a {t.offer}
+                </Text>
+              </Pressable>
+            ) : null}
+          </View>
+        ))}
         {(equity.data?.movements ?? []).map((mv) => (
           <View key={mv.id} style={s.row}>
             <Text style={[s.mut, { width: 60 }]}>
@@ -1245,6 +1355,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
               <Text style={{ color: C.mut, fontSize: 14, padding: 4,
                              opacity: eqDel.isPending
                                && eqDel.variables === mv.id ? 0.5 : 1 }}
+                    accessibilityRole="button" accessibilityLabel="Delete this movement"
                     onPress={() => !eqDel.isPending
                       && Alert.alert("Delete movement",
                       "Delete this equity movement? It changes the "
@@ -1262,7 +1373,8 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
             <View style={{ flexDirection: "row", flexWrap: "wrap",
                            gap: 6 }}>
               {EQUITY_KINDS.map(([v, l]) => (
-                <Pressable key={v} style={[s.chip, eqKind === v && s.chipOn]}
+                <Pressable accessibilityRole="button"
+                           key={v} style={[s.chip, eqKind === v && s.chipOn]}
                            onPress={() => setEqKind(v)}>
                   <Text style={{ color: eqKind === v ? C.text : C.mut,
                                  fontSize: 11 }}>{l}</Text>
@@ -1270,21 +1382,21 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
               ))}
             </View>
             <View style={{ flexDirection: "row", gap: 6 }}>
-              <TextInput style={[s.input, { flex: 1 }]}
+              <TextInput {...fieldA11y("Equity amount")} style={[s.input, { flex: 1 }]}
                          placeholder="amount" placeholderTextColor={C.mut}
                          keyboardType="decimal-pad" value={eqAmt}
                          onChangeText={setEqAmt} />
-              <TextInput style={[s.input, { flex: 1 }]}
+              <TextInput {...fieldA11y("Equity date (YYYY-MM-DD)")} style={[s.input, { flex: 1 }]}
                          placeholder="YYYY-MM-DD"
                          placeholderTextColor={C.mut} value={eqDate}
                          autoCapitalize="none" onChangeText={setEqDate} />
             </View>
             <View style={{ flexDirection: "row", gap: 6 }}>
-              <TextInput style={[s.input, { flex: 1 }]}
+              <TextInput {...fieldA11y("Form (Cash, ACH…)")} style={[s.input, { flex: 1 }]}
                          placeholder="form (Cash, ACH…)"
                          placeholderTextColor={C.mut} value={eqForm}
                          onChangeText={setEqForm} />
-              <Pressable style={[s.btn,
+              <Pressable accessibilityRole="button" style={[s.btn,
                            (!eqAmt || record.isPending)
                              && { opacity: 0.5 }]}
                          disabled={!eqAmt || record.isPending}
@@ -1304,7 +1416,7 @@ function Books({ entity, ro }: { entity: Entity; ro: boolean }) {
               </Pressable>
             </View>
             {eqErr && (
-              <Text style={{ color: C.bad, fontSize: 12 }}>{eqErr}</Text>
+              <Note bad style={{ color: C.bad, fontSize: 12 }}>{eqErr}</Note>
             )}
           </View>
         )}
@@ -1351,11 +1463,6 @@ function Tax({ entity, ro, onChanged }: {
   const year = day.getFullYear();
   const est = useQuery({ queryKey: ["esttax", entity.id, year],
     queryFn: () => client!.estTax(entity.id, year), enabled: !!client });
-  // the P&L reports the estimates already paid out of the business
-  const pnl = useQuery({ queryKey: ["pnl", entity.id, year],
-    queryFn: () => client!.entityPnl(entity.id, year), enabled: !!client });
-  const accounts = useQuery({ queryKey: ["accounts"],
-    queryFn: () => client!.accounts(), enabled: !!client });
   // the filing year the package and the 1099 list read together, so last
   // year's return can be put together in March
   const taxYears = bizTaxYears(day, entity.formation_date,
@@ -1457,7 +1564,8 @@ function Tax({ entity, ro, onChanged }: {
     onSuccess: (r, _v) => {
       // the row shows up now; the refetch brings the server's fee/url
       const row: Obligation = { id: r.id, title: oTitle.trim(), due: oDue,
-        fee: null, url: null, recurrence: oRec };
+        fee: null, url: null, note: null, source: "custom",
+        recurrence: oRec };
       qc.setQueryData<ObligationList>(["compliance", entity.id],
         (o) => o && { ...o, obligations: [...o.obligations, row] });
       setOTitle(""); setODue("");
@@ -1475,69 +1583,60 @@ function Tax({ entity, ro, onChanged }: {
     onError: (e) => Alert.alert("Couldn't remove", errText(e)),
   });
   const e0 = est.data;
-  // set-aside: measure the nominated reserve account when it exists —
-  // "is it ring-fenced" beats "is the money there somewhere"
-  const mine = (accounts.data?.accounts ?? []).filter(
-    (a) => a.entity_id === entity.id && kindIs(a, "depository")
-      && countsInTotals(a));
-  const reserve = mine.find(
-    (a) => a.id === entity.tax_reserve_account_id);
-  const ringFenced = !!reserve;
-  const stale = !!entity.tax_reserve_account_id && !reserve;
-  // Everything set against the estimate stands on its footing: when it is
-  // the household member's share, so are the profit it is a rate of, the
-  // payments already made toward it and the cash held for it. The
-  // business's own figures would halve the rate shown and take every
-  // partner's payments off one partner's bill.
+  // Every figure on the set-aside card is the server's
+  // (selfemploy.tax_set_aside), on the estimate's footing, as on the web:
+  // "Covered by" is the printed cash less the printed still to pay. An
+  // older server sends none, and the card prints the estimate alone.
+  const sa = e0?.set_aside;
   const share = e0?.covers === "household" && e0.household
     ? e0.household.ownership_pct : null;
-  const held = ringFenced ? (reserve!.balance_current ?? 0)
-    : mine.reduce((t, a) => t + (a.balance_current ?? 0), 0);
-  // the business's accounts hold every partner's money, so the household's
-  // claim on them is its ownership share
-  const cash = share != null ? held * share / 100 : held;
-  // measured against what is still to pay: a reserve that paid this
-  // year's earlier estimates is not short by them
-  const paid = e0?.covered_tax_paid
-    ?? (share != null ? null : pnl.data?.estimated_tax_paid) ?? 0;
-  const profit = e0?.covered_profit
-    ?? (share != null ? null : e0?.net_profit) ?? 0;
-  const due = e0 ? bizTaxStillDue(e0.total_estimated, paid) : 0;
-  const gap = e0 ? cash - due : 0;
+  const reserve = sa?.account ?? null;
+  const ringFenced = !!reserve;
   return (
     <>
+      {/* a failed estimate keeps the card's place */}
+      {!e0 && est.isError && (
+        <Card>
+          <H>Set aside for tax</H>
+          <FailedLine q={est} what="the tax set-aside" />
+        </Card>
+      )}
       {e0 && (
         <Card>
           <H>Set aside for tax</H>
           <KV k={`Estimated for ${e0.year}`}
               v={m$(e0.total_estimated)} />
-          {profit > 0 && (
+          {sa?.rate_of_profit != null && (
             <Text style={s.mut}>
-              {Math.round((100 * e0.total_estimated) / profit)}% of
+              {sa.rate_of_profit}% of
               {share != null ? " your share of" : ""} profit
             </Text>
           )}
-          {paid > 0 && (
+          {sa && sa.paid > 0 && (
             <Text style={s.mut}>
-              {m$(paid)} paid, {m$(due)} still to pay (a prior-year
-              balance paid in April counts as paid here)
+              {m$(sa.paid)} paid, {m$(sa.still_due)} still to pay (a
+              prior-year balance paid in April counts as paid here)
             </Text>
           )}
-          <KV k={share != null
-                   ? `Your ${share}% of ${ringFenced ? "the tax account"
-                                                     : "business cash"}`
-                   : ringFenced ? "In the tax account" : "Business cash"}
-              v={m$(cash)} />
-          {ringFenced && (
-            <Text style={s.mut}>
-              {reserve!.name}
-              {reserve!.mask ? ` ····${reserve!.mask}` : ""}
-            </Text>
+          {sa && (
+            <>
+              <KV k={share != null
+                       ? `Your ${share}% of ${ringFenced ? "the tax account"
+                                                         : "business cash"}`
+                       : ringFenced ? "In the tax account" : "Business cash"}
+                  v={m$(sa.held)} />
+              {reserve && (
+                <Text style={s.mut}>
+                  {reserve.name}
+                  {reserve.mask ? ` ····${reserve.mask}` : ""}
+                </Text>
+              )}
+              <KV k={sa.covered >= 0 ? "Covered by" : "Short by"}
+                  v={m$(Math.abs(sa.covered))}
+                  tone={sa.covered >= 0 ? "good" : "warn"} />
+            </>
           )}
-          <KV k={gap >= 0 ? "Covered by" : "Short by"}
-              v={m$(Math.abs(gap))}
-              tone={gap >= 0 ? "good" : "warn"} />
-          {stale && (
+          {sa?.stale && (
             <Text style={{ color: C.warn, fontSize: 12 }}>
               The account nominated as this business&apos;s tax reserve
               is no longer assigned to it, so this is showing all
@@ -1573,8 +1672,11 @@ function Tax({ entity, ro, onChanged }: {
             {e0.home_office_deduction > 0
               ? <> − <B>{m$(e0.home_office_deduction)}</B> home
                   office</> : null}
+            {/* the server names what the deduction is (an older server
+                does not: it read "start-up" there) */}
             {e0.startup_deduction > 0
-              ? <> − <B>{m$(e0.startup_deduction)}</B> start-up</> : null}
+              ? <> − <B>{m$(e0.startup_deduction)}</B>{" "}
+                  {e0.startup_label ?? "start-up"}</> : null}
             {" = "}<B>{m$(e0.taxable_profit)}</B> taxable ·{" "}
             {/* an S-corp owes no SE tax: a bare $0 line would read as a
                 bug */}
@@ -1597,6 +1699,13 @@ function Tax({ entity, ro, onChanged }: {
                   <B>{m$(e0.quarterly)}</B> per quarter.</>}
           </Text>
         )}
+        {/* a loss: whose return it lands on, in the server's words */}
+        {e0?.loss_note ? <Text style={s.mut}>{e0.loss_note}</Text> : null}
+        {/* which W-2 wages the SE tax's Social Security part starts
+            after, in the server's words, as on the web (an older server
+            sends none) */}
+        {e0?.ss_wages_note
+          ? <Text style={s.mut}>{e0.ss_wages_note}</Text> : null}
         <Text style={s.mut}>
           Estimate — set aside quarterly; confirm with your CPA.
           {/* the two car methods exclude each other; naming the one
@@ -1624,17 +1733,17 @@ function Tax({ entity, ro, onChanged }: {
             card is the estimate, that one is the deliverable */}
         {!ro && (
           <View style={{ flexDirection: "row", gap: 6, marginTop: 6 }}>
-            <TextInput style={[s.input, { flex: 1 }]}
+            <TextInput {...fieldA11y("Income-tax rate %")} style={[s.input, { flex: 1 }]}
                        placeholder="income-tax rate %"
                        placeholderTextColor={C.mut}
                        keyboardType="decimal-pad" value={rate}
                        onChangeText={setRate} />
-            <TextInput style={[s.input, { flex: 1 }]}
+            <TextInput {...fieldA11y("Home-office sq ft")} style={[s.input, { flex: 1 }]}
                        placeholder="home-office sq ft"
                        placeholderTextColor={C.mut}
                        keyboardType="number-pad" value={sqft}
                        onChangeText={setSqft} />
-            <Pressable style={[s.btn, saveTax.isPending
+            <Pressable accessibilityRole="button" style={[s.btn, saveTax.isPending
                          && { opacity: 0.5 }]}
                        disabled={saveTax.isPending}
                        onPress={() => saveTax.mutate()}>
@@ -1650,7 +1759,7 @@ function Tax({ entity, ro, onChanged }: {
           <View style={{ flexDirection: "row", gap: 4,
                          marginLeft: "auto" }}>
             {taxYears.map((y) => (
-              <Pressable key={y}
+              <Pressable accessibilityRole="button" key={y}
                          style={[s.chip, taxYear === y && s.chipOn]}
                          onPress={() => setTaxYear(y)}>
                 <Text style={{ color: taxYear === y ? C.text : C.mut,
@@ -1684,10 +1793,12 @@ function Tax({ entity, ro, onChanged }: {
           {vendors.data?.threshold != null
             ? `${m$(vendors.data.threshold)}+` : "over the threshold"}{" "}
           in {taxYear} need a 1099-NEC.
-          {(vendors.data?.vendors ?? []).length === 0
+          {vendors.data !== undefined && vendors.data.vendors.length === 0
             ? " No business payees yet — assign an account or "
               + "transactions to this entity first." : ""}
         </Text>
+        {vendors.data === undefined && vendors.isError && (
+          <FailedLine q={vendors} what="the 1099 payees" />)}
         {shownVendors.map((v) => (
           <View key={v.merchant} style={{ marginBottom: 2 }}>
           <View style={s.row}>
@@ -1701,6 +1812,7 @@ function Tax({ entity, ro, onChanged }: {
             <Switch value={v.reportable}
                     disabled={ro || (mark.isPending
                       && mark.variables?.merchant === v.merchant)}
+                    accessibilityLabel={`${v.merchant} is reportable`}
                     onValueChange={(on) => mark.mutate(
                       { merchant: v.merchant, reportable: on })}
                     trackColor={{ true: C.accent, false: C.hover }}
@@ -1724,7 +1836,7 @@ function Tax({ entity, ro, onChanged }: {
           <Text style={s.mut}>No payee is at the 1099 line yet.</Text>
         )}
         {(hiddenVendors > 0 || (showAllVendors && line1099 != null)) && (
-          <Pressable onPress={() => setShowAllVendors(!showAllVendors)}>
+          <Pressable accessibilityRole="button" onPress={() => setShowAllVendors(!showAllVendors)}>
             <Text style={{ color: C.accent, fontSize: 13, marginTop: 6 }}>
               {hiddenVendors > 0
                 ? `${hiddenVendors} more paid under ${m$(line1099!)} · ` : ""}
@@ -1736,7 +1848,11 @@ function Tax({ entity, ro, onChanged }: {
       </Card>
       <Card>
         <H>Compliance calendar</H>
-        {(compliance.data?.obligations ?? []).length === 0 ? (
+        {compliance.data === undefined ? (
+          compliance.isError
+            ? <FailedLine q={compliance} what="the filing deadlines" />
+            : <Text style={s.mut}>Loading…</Text>
+        ) : compliance.data.obligations.length === 0 ? (
           <Text style={s.mut}>
             No obligations tracked — add a filing deadline below.
           </Text>
@@ -1765,6 +1881,7 @@ function Tax({ entity, ro, onChanged }: {
               <Text style={{ color: C.mut, fontSize: 14, padding: 4,
                              opacity: delObl.isPending
                                && delObl.variables === o.id ? 0.5 : 1 }}
+                    accessibilityRole="button" accessibilityLabel="Remove this deadline"
                     onPress={() => !delObl.isPending
                       && Alert.alert("Remove obligation",
                       `Remove "${o.title}" from the compliance `
@@ -1779,17 +1896,19 @@ function Tax({ entity, ro, onChanged }: {
         ))}
         {!ro && (
           <View style={{ gap: 6, marginTop: 6 }}>
-            <TextInput style={s.input}
+            <TextInput {...fieldA11y("Obligation (e.g. franchise tax)")} style={s.input}
                        placeholder="obligation (e.g. franchise tax)"
                        placeholderTextColor={C.mut} value={oTitle}
                        onChangeText={setOTitle} />
             <View style={{ flexDirection: "row", gap: 6 }}>
-              <TextInput style={[s.input, { flex: 1 }]}
+              <TextInput {...fieldA11y("Obligation due (YYYY-MM-DD)")}
+                         style={[s.input, { flex: 1 }]}
                          placeholder="due (YYYY-MM-DD)"
                          placeholderTextColor={C.mut} value={oDue}
                          autoCapitalize="none" onChangeText={setODue} />
               {(["yearly", "once"] as const).map((r) => (
-                <Pressable key={r} style={[s.chip, oRec === r && s.chipOn,
+                <Pressable accessibilityRole="button"
+                           key={r} style={[s.chip, oRec === r && s.chipOn,
                              { alignSelf: "center" }]}
                            onPress={() => setORec(r)}>
                   <Text style={{ color: oRec === r ? C.text : C.mut,
@@ -1798,7 +1917,7 @@ function Tax({ entity, ro, onChanged }: {
                   </Text>
                 </Pressable>
               ))}
-              <Pressable style={[s.btn,
+              <Pressable accessibilityRole="button" style={[s.btn,
                            (!oTitle.trim() || !oDue || addObl.isPending)
                              && { opacity: 0.5 }]}
                          disabled={!oTitle.trim() || !oDue
@@ -1815,7 +1934,7 @@ function Tax({ entity, ro, onChanged }: {
               </Pressable>
             </View>
             {oErr && (
-              <Text style={{ color: C.bad, fontSize: 12 }}>{oErr}</Text>
+              <Note bad style={{ color: C.bad, fontSize: 12 }}>{oErr}</Note>
             )}
           </View>
         )}
@@ -1924,6 +2043,7 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
               <Text style={{ color: C.mut, fontSize: 14, padding: 4,
                              opacity: delTrip.isPending
                                && delTrip.variables === t.id ? 0.5 : 1 }}
+                    accessibilityRole="button" accessibilityLabel="Delete this trip"
                     onPress={() => !delTrip.isPending
                       && Alert.alert("Delete trip",
                       "Delete this mileage trip?",
@@ -1936,7 +2056,7 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
           </View>
         ))}
         {allTrips.length > 6 && (
-          <Pressable onPress={() => setShowAllTrips(!showAllTrips)}>
+          <Pressable accessibilityRole="button" onPress={() => setShowAllTrips(!showAllTrips)}>
             <Text style={s.mut}>
               {showAllTrips ? `all ${allTrips.length} trips`
                 : `the 6 most recent of ${allTrips.length} trips`}
@@ -1950,21 +2070,21 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
         {!ro && (
           <View style={{ gap: 6, marginTop: 6 }}>
             <View style={{ flexDirection: "row", gap: 6 }}>
-              <TextInput style={[s.input, { flex: 1 }]}
+              <TextInput {...fieldA11y("Mileage date (YYYY-MM-DD)")} style={[s.input, { flex: 1 }]}
                          placeholder="YYYY-MM-DD"
                          placeholderTextColor={C.mut} value={mDate}
                          autoCapitalize="none" onChangeText={setMDate} />
-              <TextInput style={[s.input, { width: 80 }]}
+              <TextInput {...fieldA11y("Miles")} style={[s.input, { width: 80 }]}
                          placeholder="miles" placeholderTextColor={C.mut}
                          keyboardType="decimal-pad" value={mMiles}
                          onChangeText={setMMiles} />
             </View>
             <View style={{ flexDirection: "row", gap: 6 }}>
-              <TextInput style={[s.input, { flex: 1 }]}
+              <TextInput {...fieldA11y("Trip purpose")} style={[s.input, { flex: 1 }]}
                          placeholder="purpose"
                          placeholderTextColor={C.mut} value={mPurpose}
                          onChangeText={setMPurpose} />
-              <Pressable style={[s.btn,
+              <Pressable accessibilityRole="button" style={[s.btn,
                            (!mMiles || addTrip.isPending)
                              && { opacity: 0.5 }]}
                          disabled={!mMiles || addTrip.isPending}
@@ -1984,7 +2104,7 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
               </Pressable>
             </View>
             {mErr && (
-              <Text style={{ color: C.bad, fontSize: 12 }}>{mErr}</Text>
+              <Note bad style={{ color: C.bad, fontSize: 12 }}>{mErr}</Note>
             )}
           </View>
         )}
@@ -1997,16 +2117,18 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
         </Text>
         <View style={{ flexDirection: "row", gap: 6, marginTop: 6,
                        alignItems: "center" }}>
-          <TextInput style={[s.input, { flex: 1 }]}
+          <TextInput {...fieldA11y("Tag for itemized expenses")} style={[s.input, { flex: 1 }]}
                      placeholder="tag" placeholderTextColor={C.mut}
                      autoCapitalize="none"
                      value={tagText} onChangeText={setTagText} />
           <Text style={{ color: C.accent, fontSize: 18, padding: 4 }}
+                accessibilityRole="button" accessibilityLabel="Previous month"
                 onPress={() => shiftRm(-1)}>‹</Text>
           <Text style={{ color: C.text, fontSize: 13 }}>
             {rm.m}/{rm.y}
           </Text>
           <Text style={{ color: C.accent, fontSize: 18, padding: 4 }}
+                accessibilityRole="button" accessibilityLabel="Next month"
                 onPress={() => shiftRm(1)}>›</Text>
         </View>
         {report.data && report.data.count === 0 && (
@@ -2016,16 +2138,22 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
         )}
         {(report.data?.rows ?? []).slice(0, 25).map((r, i) => (
           <View key={`${r.receipt_id}-${i}`}
-                style={[s.row, report.isPlaceholderData && { opacity: 0.5 }]}>
-            <Text style={[s.mut, { width: 60 }]}>{mmddyy(r.date)}</Text>
-            <Text style={{ color: C.text, fontSize: 13, flex: 1 }}
-                  numberOfLines={1}>
-              {r.payee} · {r.description}
-            </Text>
-            <Text style={{ color: C.text, fontSize: 13,
-                           fontVariant: ["tabular-nums"] }}>
-              ${r.amount.toFixed(2)}
-            </Text>
+                style={report.isPlaceholderData && { opacity: 0.5 }}>
+            <View style={s.row}>
+              <Text style={[s.mut, { width: 60 }]}>{mmddyy(r.date)}</Text>
+              <Text style={{ color: C.text, fontSize: 13, flex: 1 }}
+                    numberOfLines={1}>
+                {r.payee} · {r.description}
+              </Text>
+              <Text style={{ color: C.text, fontSize: 13,
+                             fontVariant: ["tabular-nums"] }}>
+                ${r.amount.toFixed(2)}
+              </Text>
+            </View>
+            {/* the server's words when the line may be counted twice */}
+            {r.note ? (
+              <Text style={[s.mut, { fontSize: 12 }]}>{r.note}</Text>
+            ) : null}
           </View>
         ))}
         {report.data && report.data.count > 0 && (
@@ -2034,6 +2162,9 @@ function ReceiptsTab({ entity, ro }: { entity: Entity; ro: boolean }) {
               <B>Total: ${report.data.total.toFixed(2)}</B>
               <Text style={s.mut}> across {report.data.count} items</Text>
             </Text>
+            {report.data.note ? (
+              <Text style={[s.mut, { marginTop: 2 }]}>{report.data.note}</Text>
+            ) : null}
             {/* the expense file is a download of the books: the door refuses
                 a member or a viewer, so neither gets the button (web: isOwner) */}
             {owner && (
@@ -2091,7 +2222,11 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
   const setReserve = useMutation({
     mutationFn: (id: string | null) =>
       client!.entityUpdate(entity.id, { tax_reserve_account_id: id }),
-    onSuccess: (r) => { putEntity(qc, r); onChanged(); },
+    onSuccess: (r) => {
+      putEntity(qc, r); onChanged();
+      // the set-aside card's held figure is the estimate reply's
+      qc.invalidateQueries({ queryKey: ["esttax", entity.id] });
+    },
     onError: (e) => Alert.alert("Couldn't nominate", errText(e)),
   });
   // archive / restore return the updated Entity — the pill, the
@@ -2159,14 +2294,14 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
         {!viewer && (
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           {!ro && (
-            <Pressable style={[s.btn, s.btnQuiet]}
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                        onPress={() => setEditing((x) => !x)}>
               <Text style={[s.btnText, { color: C.accent }]}>
                 {editing ? "Close" : "Edit details"}
               </Text>
             </Pressable>
           )}
-          <Pressable style={[s.btn, s.btnQuiet,
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                        lifecycle.isPending && { opacity: 0.5 }]}
                      disabled={lifecycle.isPending}
                      onPress={() => {
@@ -2189,14 +2324,14 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
             </Text>
           </Pressable>
           {owner && (
-          <Pressable style={[s.btn, s.btnQuiet]}
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                      onPress={() => setNuke((x) => !x)}>
             <Text style={[s.btnText, { color: C.bad }]}>
               Delete forever…
             </Text>
           </Pressable>
           )}
-          <Pressable style={[s.btn, s.btnQuiet]}
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                      onPress={() => setAddingEntity((x) => !x)}>
             <Text style={[s.btnText, { color: C.mut }]}>
               + Add business
@@ -2230,13 +2365,16 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
 
       <Card>
         <H>Accounts</H>
-        <Text style={s.mut}>
+        {/* unread accounts are not "No accounts yet" */}
+        {accounts.data === undefined && accounts.isError && (
+          <FailedLine q={accounts} what="the accounts" />)}
+        {accounts.data !== undefined && <Text style={s.mut}>
           {mine.length > 0
             ? "Everything in these accounts is this business's money — "
               + "out of your personal budget."
             : "No accounts yet. Assign one and all its transactions "
               + "become this business's money."}
-        </Text>
+        </Text>}
         {mine.map((a) => (
           <View key={a.id} style={s.row}>
             <Text style={{ color: C.text, fontSize: 13, flex: 1 }}
@@ -2258,7 +2396,7 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
           </View>
         ))}
         {!ro && (
-          <Pressable style={[s.btn, s.btnQuiet,
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                        { alignSelf: "flex-start", marginTop: 6 }]}
                      onPress={() => setPicking((x) => !x)}>
             <Text style={[s.btnText, { color: C.accent }]}>
@@ -2273,7 +2411,7 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
               transactions — past and future — become business money
               and leave your personal budget.
             </Text>
-            <TextInput style={[s.input, { marginTop: 6 }]}
+            <TextInput {...fieldA11y("Search accounts")} style={[s.input, { marginTop: 6 }]}
                        placeholder="search accounts"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        value={pickQ} onChangeText={setPickQ} />
@@ -2288,9 +2426,9 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
                 <View key={a.id} style={s.row}>
                   <Text style={{ color: C.text, fontSize: 13, flex: 1 }}
                         numberOfLines={1}>
-                    {a.institution_name} {a.name}
+                    {accountLabel(a)}
                     <Text style={s.mut}>
-                      {" "}{a.kind}
+                      {" "}{kindWords(a.kind)}
                       {a.balance_current != null
                         ? ` · ${m$(a.balance_current)}` : ""}
                     </Text>
@@ -2345,7 +2483,7 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
             )}
             <View style={{ flexDirection: "row", flexWrap: "wrap",
                            gap: 6, marginTop: 6 }}>
-              <Pressable style={[s.chip,
+              <Pressable accessibilityRole="button" style={[s.chip,
                            !entity.tax_reserve_account_id && s.chipOn]}
                          disabled={ro || setReserve.isPending}
                          onPress={() => setReserve.mutate(null)}>
@@ -2354,7 +2492,7 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
                 </Text>
               </Pressable>
               {eligible.map((a) => (
-                <Pressable key={a.id}
+                <Pressable accessibilityRole="button" key={a.id}
                            style={[s.chip,
                              entity.tax_reserve_account_id === a.id
                                && s.chipOn]}
@@ -2385,22 +2523,26 @@ function SettingsTab({ entity, ro, onChanged, onSelect }: {
         {!ro && owner && (<>
           <View style={{ flexDirection: "row", gap: 6, marginTop: 6,
                          alignItems: "center" }}>
-            <TextInput style={[s.input, { flex: 1 }]}
+            <TextInput {...fieldA11y("Member name")} style={[s.input, { flex: 1 }]}
                        placeholder="member name"
                        placeholderTextColor={C.mut} value={memberName}
                        onChangeText={setMemberName} />
-            <TextInput style={[s.input, { width: 60 }]}
+            <TextInput {...fieldA11y("Member share %")} style={[s.input, { width: 60 }]}
                        placeholder="%" placeholderTextColor={C.mut}
                        keyboardType="decimal-pad" value={memberPct}
                        onChangeText={setMemberPct} />
             <Text style={s.mut}>manager</Text>
-            <Switch value={memberManager} onValueChange={setMemberManager} />
+            <Switch value={memberManager}
+                    accessibilityLabel="Manager"
+                    onValueChange={setMemberManager} />
           </View>
           <View style={{ flexDirection: "row", alignItems: "center",
                          justifyContent: "space-between", marginTop: 6 }}>
             <Text style={s.mut}>this is us</Text>
-            <Switch value={memberHousehold} onValueChange={setMemberHousehold} />
-            <Pressable style={[s.btn,
+            <Switch value={memberHousehold}
+                    accessibilityLabel="This is us"
+                    onValueChange={setMemberHousehold} />
+            <Pressable accessibilityRole="button" style={[s.btn,
                          (!memberName.trim() || addMember.isPending)
                            && { opacity: 0.5 }]}
                        disabled={!memberName.trim()
@@ -2481,23 +2623,28 @@ function MemberList({ entityId, members, editable }: {
         <View key={m0.id} style={{ gap: 6, marginVertical: 4 }}>
           <View style={{ flexDirection: "row", gap: 6,
                          alignItems: "center" }}>
-            <TextInput style={[s.input, { flex: 1 }]} value={name}
+            <TextInput {...fieldA11y("Member name")} style={[s.input, { flex: 1 }]} value={name}
                        placeholder="member name"
                        placeholderTextColor={C.mut} onChangeText={setName} />
-            <TextInput style={[s.input, { width: 60 }]} value={pct}
+            <TextInput {...fieldA11y(`${name || "Member"} share %`)}
+                       style={[s.input, { width: 60 }]} value={pct}
                        placeholder="%" placeholderTextColor={C.mut}
                        keyboardType="decimal-pad" onChangeText={setPct} />
           </View>
           <View style={{ flexDirection: "row", gap: 6,
                          alignItems: "center" }}>
             <Text style={s.mut}>manager</Text>
-            <Switch value={manager} onValueChange={setManager} />
+            <Switch value={manager}
+                    accessibilityLabel="Manager"
+                    onValueChange={setManager} />
           </View>
           <View style={{ flexDirection: "row", alignItems: "center",
                          justifyContent: "space-between", marginTop: 6 }}>
             <Text style={s.mut}>this is us</Text>
-            <Switch value={household} onValueChange={setHousehold} />
-            <Pressable style={[s.btn, { marginLeft: "auto" },
+            <Switch value={household}
+                    accessibilityLabel="This is us"
+                    onValueChange={setHousehold} />
+            <Pressable accessibilityRole="button" style={[s.btn, { marginLeft: "auto" },
                                busy && { opacity: 0.5 }]}
                        disabled={busy} onPress={() => save.mutate(m0.id)}>
               <Text style={s.btnText}>save</Text>
@@ -2529,6 +2676,7 @@ function MemberList({ entityId, members, editable }: {
               </Text>
               <Text style={{ color: C.mut, fontSize: 14, padding: 4,
                              opacity: busy ? 0.5 : 1 }}
+                    accessibilityRole="button" accessibilityLabel={`Remove ${m0.member_name}`}
                     onPress={busy ? undefined : () => Alert.alert(
                       "Remove member",
                       `Remove ${m0.member_name} from this business? Their `
@@ -2562,6 +2710,10 @@ function EntityForm({ entity, onDone }: {
     useState(entity?.business_start_date ?? "");
   const [formed, setFormed] =
     useState(entity?.formation_date ?? "");
+  // whose business it is, with the server's labels, as on the web's Edit
+  // details; an older server sends no choices: nothing drawn or sent
+  const owners = entity?.owner_options ?? [];
+  const [owner, setOwner] = useState(entity?.owner ?? "unknown");
   const [err, setErr] = useState<string | null>(null);
   // the web's STRUCTURES, verbatim — order and labels
   const STRUCTURES: [string, string][] = [
@@ -2576,6 +2728,7 @@ function EntityForm({ entity, onDone }: {
           state: state.trim() || null,
           formation_date: formed.trim() || null,
           business_start_date: started.trim() || null,
+          ...(owners.length ? { owner } : {}),
           ...(ein.trim() ? { ein: ein.trim() } : {}) })
       : client!.entityCreate({ name: name.trim(), structure,
           ...(state.trim() ? { state: state.trim() } : {}),
@@ -2587,7 +2740,11 @@ function EntityForm({ entity, onDone }: {
       // the reply is the Entity: an edit lands on the summary row it
       // renders from, a new business joins the switcher before the
       // summary comes back
-      if (entity) putEntity(qc, r);
+      if (entity) {
+        putEntity(qc, r);
+        // whose business it is moves the estimate
+        qc.invalidateQueries({ queryKey: ["esttax", entity.id] });
+      }
       else qc.setQueryData<{ entities: Entity[] }>(["biz-summary"],
         (o) => o && { ...o, entities: [...o.entities, r] });
       // the Business door elsewhere keys on me.has_business
@@ -2603,12 +2760,13 @@ function EntityForm({ entity, onDone }: {
           Set up a business
         </Text>
       )}
-      <TextInput style={s.input} placeholder="business name"
+      <TextInput {...fieldA11y("Business name")} style={s.input} placeholder="business name"
                  placeholderTextColor={C.mut}
                  value={name} onChangeText={setName} />
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
         {STRUCTURES.map(([v, l]) => (
-          <Pressable key={v} style={[s.chip, structure === v && s.chipOn]}
+          <Pressable accessibilityRole="button"
+                     key={v} style={[s.chip, structure === v && s.chipOn]}
                      onPress={() => setStructure(v)}>
             <Text style={{ color: structure === v ? C.text : C.mut,
                            fontSize: 12 }}>{l}</Text>
@@ -2616,20 +2774,20 @@ function EntityForm({ entity, onDone }: {
         ))}
       </View>
       <View style={{ flexDirection: "row", gap: 6 }}>
-        <TextInput style={[s.input, { width: 70 }]}
+        <TextInput {...fieldA11y("State")} style={[s.input, { width: 70 }]}
                    placeholder="state" placeholderTextColor={C.mut}
                    maxLength={2} autoCapitalize="characters"
                    value={state} onChangeText={setState} />
-        <TextInput style={[s.input, { flex: 1 }]}
+        <TextInput {...fieldA11y("Business start date (YYYY-MM-DD)")} style={[s.input, { flex: 1 }]}
                    placeholder="business start date (YYYY-MM-DD)"
                    placeholderTextColor={C.mut} autoCapitalize="none"
                    value={started} onChangeText={setStarted} />
       </View>
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("Formation date (YYYY-MM-DD, optional)")} style={s.input}
                  placeholder="formation date (YYYY-MM-DD, optional)"
                  placeholderTextColor={C.mut} autoCapitalize="none"
                  value={formed} onChangeText={setFormed} />
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("EIN (optional, stored encrypted)")} style={s.input}
                  placeholder={entity?.ein_last4
                    ? `EIN •••••${entity.ein_last4} (unchanged)`
                    : "EIN (optional, stored encrypted)"}
@@ -2639,11 +2797,30 @@ function EntityForm({ entity, onDone }: {
         The EIN is encrypted at rest — only its last 4 digits are shown
         back.
       </Text>
+      {owners.length > 0 && (
+        <>
+          <Text style={s.mut}>
+            Whose business — whose W-2 wages the self-employment tax counts
+            against the Social Security wage base.
+          </Text>
+          <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
+            {owners.map((o) => (
+              <Pressable accessibilityRole="button"
+                         key={o.value}
+                         style={[s.chip, owner === o.value && s.chipOn]}
+                         onPress={() => setOwner(o.value)}>
+                <Text style={{ color: owner === o.value ? C.text : C.mut,
+                               fontSize: 12 }}>{o.label}</Text>
+              </Pressable>
+            ))}
+          </View>
+        </>
+      )}
       {err ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setErr(null)}>{err}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setErr(null)}>{err}</Note>
       ) : null}
-      <Pressable style={[s.btn, { alignSelf: "flex-start" },
+      <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start" },
                    (!name.trim() || save.isPending) && { opacity: 0.5 }]}
                  disabled={!name.trim() || save.isPending}
                  onPress={() => {
@@ -2680,13 +2857,13 @@ const s = StyleSheet.create({
   chip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
           borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
   chipOn: { borderColor: C.accent, backgroundColor: C.hover },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },
-  sBtn: { backgroundColor: C.accent, borderRadius: 8,
+  sBtn: { backgroundColor: C.btn, borderRadius: 8,
           paddingHorizontal: 12, paddingVertical: 6 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8 },
 });

@@ -10,10 +10,14 @@ None/empty and nothing is written to the alert log. Dates clamp to
 import datetime as dt
 import unittest
 import uuid
+from unittest import mock
 
 from .util import add_txn, seed_accounts, write_config
 
-TODAY = dt.date.today()                    # API path uses the real today
+# the API's real today is pinned to this for the whole class (setUpClass):
+# a run that straddles midnight must not read one day here and the next
+# in the handler
+TODAY = dt.date.today()
 # always a different month, pinned mid-month: on days 1–3 the engine
 # deliberately collapses UNDER into ON BUDGET (EARLY_MONTH_FRAC), so a
 # floating past day would fail this suite three days of every month
@@ -35,7 +39,11 @@ class TodayBacknavTests(unittest.TestCase):
         from fastapi.testclient import TestClient
 
         from oikonome.db import tenancy
+        from oikonome.web import api_today
         from oikonome.web.app import app
+        pin = mock.patch.object(api_today, "_today", return_value=TODAY)
+        pin.start()
+        cls.addClassCleanup(pin.stop)
         cls.client = TestClient(app)
         r = cls.client.post("/api/signup",
                             data={"email": f"back-{uuid.uuid4().hex[:8]}@x.dev",

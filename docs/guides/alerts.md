@@ -1,7 +1,8 @@
 # Alerts
 
 Alerts answer one question: **what needs your attention today?** The same
-list renders in several places — the strip at the top of the Today page,
+list renders in several places — the one-line **N things need you**
+row at the top of the Today page,
 the **Needs you** section at the foot of the daily email, the **bell** in
 the web header (its badge carries the count, coloured by the worst
 severity, and opens the Alerts page), the phone app's Alerts screen, and
@@ -12,7 +13,21 @@ The Alerts page and the phone app's Alerts screen open on what needs
 attention now — the live alerts, each with its link and its ✕ — and
 nothing else. Everything else the log holds, resolved and dismissed
 alerts included, waits behind **Show history** (the button counts the
-rows it hides) and folds away again with **Hide history**.
+lines it hides) and folds away again with **Hide history**.
+
+The history says each thing once. A count that moves — "19 proposed
+recurring changes", then 18, then 17 — is one line with its latest
+wording, and so is one bill's amount drifting more than once or one
+connection going stale again. A charge alert is about one occurrence: the
+same double charge or fee in another month (a subscription billed twice in
+March and again in September) is its own line. A charge or bonus line
+names its days with their year ("on 03/14/26"), so a yearly fee or bonus
+of the same amount on the same day reads as that year's. Each line shows the first day that subject
+was ever seen and the last (or "today" while it is live), and its link
+opens the page where it is acted on: a charge's alert opens Transactions
+searched for that charge (a double charge or a fee on its own days). The
+**Connection**, **Bills**, **Merchants** and **Cash** chips narrow the
+list; the AI model and script tokens sit under Connection.
 
 In the email the alerts go only to **owners and members** — the people
 who can act on them. A viewer's copy, and a copy sent to an address that
@@ -21,16 +36,19 @@ has no login on the household, carries no alerts at all.
 ## What can fire
 
 Each alert has a severity — red (bad), amber (warn), neutral (info) — and
-the strip always sorts worst first.
+the list always sorts worst first.
 
-- **Anomalies** (warn) — the "is something wrong?" watch. Two signals:
+- **Anomalies** (warn) — the "is something wrong?" watch. Three signals:
   a **possible double charge** (the same bank descriptor and the same
   amount, twice within 2 days, $10 minimum — pending rows are ignored,
   and two separate orders at a common price point don't count) and a
   **first-ever merchant** charging $200 or more — a merchant absent from
   your entire ledger history. Both scan the budget's own spend rows, so
   transfers and card payments can't false-positive, and accounts you've
-  excluded from the budget are skipped.
+  excluded from the budget are skipped. The third is a **fee or interest
+  charge** that just posted ("Fee charged: …", "Interest charged: …" —
+  an interest line says how long since the last one on that account),
+  $1 or more; a refund of one says nothing.
 - **Stale sync** (warn) — bank sync hasn't succeeded in the last
   6 hours, or has never completed. The never-completed alert points
   at the Accounts page; the stale alert reports the date of the last
@@ -68,7 +86,7 @@ the strip always sorts worst first.
   reached the model backend and got nothing back: the model was removed
   from the server, the endpoint is unreachable, or every call timed out.
   It names the date and the error, counts the merchants and store orders
-  waiting on it, and points at the Doctor page (whose **Smart
+  waiting on it, and points at the System health page (Doctor in the app; its **Smart
   categorization → last run** row carries the same verdict). Nothing else
   would tell you — the work simply stops — so this alert exists to make a
   silent backend loud. It clears on the next run that produces answers.
@@ -76,6 +94,11 @@ the strip always sorts worst first.
   finder when transactions exist but no bills are tracked, a count of
   proposals awaiting review, and a note when a bill's amount drifted
   and was auto-updated (see the Bills guide).
+- **Merchant pairs** (info) — "N new merchant pairs look like one merchant"
+  when the nightly pass finds names it would offer to merge. The count is
+  the pairs that pass found, not every offer still waiting (the Merchants
+  page counts those); it links to the offers on the Merchants page (see
+  the Merchants guide).
 
 Alerts are **now-facts**: viewing a past day on the Today page shows
 none, because they describe the present, not that date.
@@ -93,7 +116,7 @@ Alerts are built to say a thing once, not every morning:
   inactive — and any dismissal on it resets, so a later recurrence
   shows again. **Recurrence is news.**
 
-Separately from the strip, a broken bank connection sends an
+Separately from the alert list, a broken bank connection sends an
 **immediate email** — fired only on the healthy → broken transition
 (and again on recovery), so a multi-day outage emails exactly once, not
 every sync. It links to the Accounts page to re-link. Break and
@@ -105,7 +128,7 @@ emails off for one person without touching their daily or report mail.
 
 A community-script collector whose **script token was revoked** after its
 last push (a password change or reset revokes every token) gets its own
-alert on the strip, in the daily email and on the Doctor page, naming the
+alert on the Alerts page, in the daily email and on the System health page, naming the
 source and pointing at Settings → Connections → Script tokens to mint a replacement — a
 collector in that state is not stale, it is locked out until you do.
 
@@ -132,10 +155,10 @@ Buttons appear only when the instance has a public https address
 
 The ✕ on an alert hides it everywhere — Today, the email, and the
 active list — **while its condition persists**. Once the condition
-clears, the dismissal resets automatically. Following an alert's link
-from the Today strip counts as acting on it: for the owner or a member
-the alert is dismissed as you go (a view-only login just follows the
-link). Dismissed alerts keep their
+clears, the dismissal resets automatically. Today does not list the
+alerts one by one: a single line says how many need you and shows the
+most serious one, and tapping it opens the Alerts page, where each is
+fixed or dismissed. Dismissed alerts keep their
 row on the Alerts page with a **dismissed** pill and a **restore**
 button. Dismissing is household-wide, and the owner or a member
 can do it; a view-only login sees alerts but can't dismiss them.
@@ -143,15 +166,20 @@ can do it; a view-only login sees alerts but can't dismiss them.
 ## History
 
 **Show history** on the Alerts page (and on the phone app's Alerts
-screen) opens the log: the most recent 200 alerts with first-seen and
-last-seen dates (MM/DD/YY), the kind, and an **active** or
-**dismissed** pill; a condition that has since cleared shows a green
-**resolved** pill in place of its kind. The filter chips — **all**,
-**connection**, **bills**, **cash**, **dismissed** — sit inside the
-history and narrow the log; they appear only while it is open. Each active alert also carries a link to the page that deals with
-it: **fix this ›** for something broken (a dead connection, a funding
-gap), **review ›** for a queue waiting on your decision (bill proposals,
-drift, anomalies, reimbursements).
+screen) opens the log: up to 200 lines, one per subject, live ones
+first, each in today's wording with the first day the subject was seen
+and the last (MM/DD/YY, or "today" while it is live), its kind chip, an
+**open** link to where it is acted on, and an **active** or
+**dismissed** pill; a condition that has since cleared keeps its kind
+chip with a **resolved** pill beside it. The filter chips — **all**,
+**connection**, **bills**, **merchants**, **cash**, **dismissed** — sit
+inside the history and narrow the log; they appear only while it is open. The
+history keeps an alert for 400 days after it was last seen; an alert
+still active is never dropped, and one that comes back after that is
+news again. Each active alert also carries a link to the page that deals with
+it: **Fix ›** for something broken (a dead connection, a funding
+gap), **Review ›** for a queue waiting on your decision (bill proposals,
+drift, anomalies, reimbursements). The phone app uses the same words.
 
 ## Gotchas
 

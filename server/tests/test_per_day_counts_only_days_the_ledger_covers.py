@@ -52,7 +52,7 @@ class PerDayFromTheLedgersFirstDayTests(unittest.TestCase):
         finally:
             conn.close()
         cls.patches = [
-            mock.patch("oikonome.web.api._today", return_value=TODAY),
+            mock.patch("oikonome.web.api_ledger._today", return_value=TODAY),
             mock.patch("oikonome.localtime.now_local",
                        return_value=dt.datetime.combine(TODAY, dt.time(12)))]
         for p in cls.patches:

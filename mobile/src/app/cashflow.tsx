@@ -4,25 +4,33 @@
 // by month, investment funding, SSA career earnings, reported-income tax
 // table). Spending is its own screen; the tab links to it. Mirrors
 // webapp/src/pages/CashFlow.tsx — keep them in step.
-import { useQuery, type UseQueryResult } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient,
+         type UseQueryResult } from "@tanstack/react-query";
 import { useRouter } from "expo-router";
 import { useState } from "react";
-import { Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
+import { Alert, Pressable, ScrollView, StyleSheet, Text, View, useWindowDimensions } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
 import FlowChart from "../components/flow-chart";
 import MerchantAvatar from "../components/merchant-avatar";
 import NetBars from "../components/net-bars";
 import Sparkline from "../components/sparkline";
-import StaleBanner from "../components/stale-banner";
-import { Card, H, HelpLink, KV } from "../components/ui";
-import type { CashCostsReport, CashflowReport, FlowKey, IncomeWindow }
-  from "../lib/api";
-import { TREND_RANGES, cashflowCutoffMonth, RANGE_LABEL, RANGE_MONTHS,
-         savedFigure, type TrendRange, windowLabel }
+import { EmptyState, FailedLine, StaleLine } from "../components/loaded";
+import { Card, H, HelpLink, KV, Skeleton } from "../components/ui";
+import type { CashCostYear, CashCostsReport, CashflowReport, Change, FlowKey,
+              IncomeWindow, SourcePaycheck } from "../lib/api";
+import { errText } from "../lib/api";
+import { useViewer } from "../lib/viewer";
+import { TREND_RANGES, changeLook, fillMonthKeyGaps, graphWindow,
+         fillMonthLabelGaps, RANGE_MONTHS, rangeCaption,
+         savedFigure, type TrendRange, windowLabel, windowSoFar,
+         DEFAULT_TREND_RANGE, changeWords, monthWithYear,
+         EMPTY_LINES, netSign, signedMoney, signedPct }
   from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, money } from "../lib/theme";
+import { disclosure } from "../lib/a11y";
+import SegmentedControl, { RangePicker } from "../components/segmented-control";
 
 const m$ = (n: number) => money(n, false);
 // both pickers speak the site-wide 3m/6m/1y/3y/5y/all vocabulary (pure.ts
@@ -32,29 +40,38 @@ const MONTHS3 = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
 const pretty = (v: string) =>
   MONTHS3[Number(String(v).slice(5, 7))] || String(v);
 
-/** The saved-per-month series for a range — the web's savedSeries. */
+/** The left-over-per-month series for a range — the web's savedSeries:
+ *  the slots of the graph the server says the range draws. */
 function savedSeries(cf: CashflowReport, range: TrendRange):
-    { points: [string, number][]; estimatedFrom: number } {
+    { points: [string, number | null][]; keys: string[];
+      estimatedFrom: number; note: string } {
   const graph = cf.cash_graph;
   const months = RANGE_MONTHS[range];
-  // Cut on the household's month, which the report itself names (its
-  // first forecast point) — the device's clock is in a different month
-  // for hours around every boundary, and every server figure on this
-  // screen is windowed from the household's date.
-  const cutoff = cashflowCutoffMonth(graph, range) ?? "";
-  const history = graph.points.filter((p, i) => i < graph.forecast_from
-                                      && p[0] >= cutoff);
-  const tail = graph.points.slice(graph.forecast_from);
+  const w = graphWindow(graph, range);
+  const drawn = (key: string) => key >= w.first && key <= w.last;
+  // a month no bank feed covered keeps its place as an empty slot
+  // the month in progress (saved so far) is a solid bar after them
+  const history = fillMonthKeyGaps([...graph.points.filter(
+    (p, i) => i < graph.forecast_from && drawn(p[0])),
+    ...(graph.current && drawn(graph.current[0]) ? [graph.current] : [])]);
+  // the month in progress is drawn once: its saved-so-far bar, not a
+  // forecast bar beside it as well (the web's rule)
+  const tail = graph.points.slice(graph.forecast_from)
+    .filter((p) => drawn(p[0])
+      && (!graph.current || p[0] !== graph.current[0]));
   const all = [...history, ...tail];
-  const label = (key: string, i: number) => {
-    const m = pretty(key);
-    if (months !== null && months <= 12) return m;
-    const jan = key.slice(5, 7) === "01" || i === 0;
-    return jan ? `${m} ${key.slice(2, 4)}'` : m;
-  };
-  return { points: all.map((p, i) => [label(p[0], i), p[1]]),
-           estimatedFrom: history.length };
+  // up to a year a bare month; past a year every label names its year
+  // ("Mar '24"), since only every nth label is written there (the web's
+  // rule)
+  const label = (key: string) =>
+    months !== null && months <= 12 ? pretty(key) : monthWithYear(key);
+  return { points: all.map((p) => [label(p[0]), p[1]]),
+           keys: all.map((p) => p[0]), estimatedFrom: history.length,
+           note: w.note };
 }
+
+// years "Left over by year" shows before "Show all" (web: CashFlow.tsx)
+const SAVINGS_YEARS_SHORT = 5;
 
 export default function CashFlow() {
   const { client } = useSession();
@@ -64,9 +81,11 @@ export default function CashFlow() {
   // ONE timeframe for the whole screen — the flow picture, saved-by-month
   // and the Income tab all follow it (the web page does the same via the
   // URL), so switching tabs never resets a picked range
-  const [range, setRange] = useState<TrendRange>("1y");
+  const [range, setRange] = useState<TrendRange>(DEFAULT_TREND_RANGE);
   const period: FlowKey = range;
   const [open, setOpen] = useState<Record<string, boolean>>({});
+  // Left over by year opens on the latest few years (as on the web)
+  const [allYears, setAllYears] = useState(false);
   const query = useQuery({
     queryKey: ["report", "cashflow"],
     queryFn: () => client!.reportCashflow(),
@@ -99,11 +118,24 @@ export default function CashFlow() {
   const d = query.data;
   const flow = flowQ.data;
   const series = d ? savedSeries(d, range) : null;
-  const hist = series ? series.points.slice(0, series.estimatedFrom) : [];
-  const best = hist.length ? hist.reduce((a, b) => (b[1] > a[1] ? b : a)) : null;
-  const worst = hist.length ? hist.reduce((a, b) => (b[1] < a[1] ? b : a)) : null;
-  const bestFig = best ? savedFigure(best[1]) : null;
+  // The window's best and worst month are the server's (reporting.
+  // _saved_extremes), as on the web: finished months of this timeframe
+  // only, neither when the window is a single month. An older server
+  // sends none, and none is printed — this screen never ranks the bars.
+  const { best = null, worst = null } = d?.cash_graph.extremes?.[range] ?? {};
+  const fig = (v: number) => {
+    const cw = changeWords(v, m$);
+    return { text: cw.text,
+             color: cw.tone === "pos" ? C.good : cw.tone === "neg" ? C.bad
+               : C.text };
+  };
   const savings = [...(d?.savings_by_year ?? [])].reverse();
+  // a year's row in the whole dollars the server prints it in
+  const yd = (y: string, inc: number | null, sp: number, net: number | null) =>
+    d?.savings_by_year_dollars !== undefined
+      ? d.savings_by_year_dollars[y]
+      // older-server path: stands in for `savings_by_year_dollars`
+      : { income: inc, spend: sp, saved: net };
   const chartW = width - 24 - 28;
 
   return (
@@ -118,40 +150,30 @@ export default function CashFlow() {
                                         ...(tab === "income"
                                           ? [iq.refetch(), ccq.refetch()]
                                           : [])])} />}>
-      <StaleBanner query={query} />
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
-      {query.isError && !d && (
-        <Text style={s.center}>Couldn&apos;t reach the server.</Text>
-      )}
-      {d && (
+      <StaleLine query={query} />
+      {query.isPending && <Skeleton />}
+      {/* the tabs and the range picker stand while the overview loads
+          and when its read fails, as the web's strip does: the Income tab
+          is its own read, and another window is one tap away */}
+      {(
         <Card>
-          <View style={{ flexDirection: "row", gap: 6, flexWrap: "wrap" }}>
-            {([["overview", "Overview"], ["spending", "Spending"],
-               ["income", "Income"]] as const).map(([k, l]) => (
-              <Pressable key={k}
-                         style={[s.chip, tab === k && s.chipOn]}
-                         onPress={() => k === "spending"
-                           ? router.push("/spending" as never)
-                           : setTab(k)}>
-                <Text style={{ color: tab === k ? C.text : C.mut,
-                               fontSize: 12 }}>{l}</Text>
-              </Pressable>
-            ))}
-          </View>
+          <SegmentedControl label="Cash Flow view" value={tab}
+            onChange={(k) => k === "spending"
+              // the picked window rides along, as the web's URL keeps it
+              ? router.push(`/spending?range=${range}` as never)
+              : setTab(k)}
+            options={([["overview", "Overview"], ["spending", "Spending"],
+                       ["income", "Income"]] as const).map(([k, l]) => (
+                         { value: k, label: l }))} />
           {tab === "overview" && (
             <>
-              <View style={{ flexDirection: "row", gap: 4, marginTop: 8,
-                             flexWrap: "wrap" }}>
-                {TREND_RANGES.map((r) => (
-                  <Pressable key={r}
-                             style={[s.chip, range === r && s.chipOn]}
-                             onPress={() => setRange(r)}>
-                    <Text style={{ color: range === r ? C.text : C.mut,
-                                   fontSize: 11 }}>
-                      {RANGE_LABEL[r]}</Text>
-                  </Pressable>
-                ))}
-              </View>
+              <RangePicker value={range} onChange={setRange}
+                           style={{ marginTop: 8 }} />
+              {/* a failed switch keeps the previous window's picture
+                  (placeholderData): say so above it, as the web does */}
+              <StaleLine query={flowQ} />
+              {query.isError && !d && (
+                <FailedLine q={query} what="cash flow" />)}
               {flow && (
                 // while a wide window computes the previous picture stays,
                 // dimmed, with an honest line — the web does the same
@@ -169,28 +191,55 @@ export default function CashFlow() {
                   {(flow.income_unknown || flow.in.total === null
                     || flow.saved === null) ? (flow.out.total > 0 && (
                     <Text style={[s.mut, { marginTop: 6 }]}>
-                      {windowLabel(flow)}: income unknown for this range ·{" "}
-                      <Text style={s.big}>{m$(flow.out.total)}</Text> out
+                      {windowLabel(flow)}:{" "}
+                      <Text style={s.big}>{m$(flow.out.total)}</Text> went out
+                      {" "}(income unknown for this range)
                     </Text>
                   )) : (flow.in.total > 0 || flow.out.total > 0) && (
                     <Text style={[s.mut, { marginTop: 6 }]}>
                       {windowLabel(flow)}:{" "}
-                      <Text style={s.big}>{m$(flow.in.total)}</Text> in →{" "}
-                      <Text style={s.big}>{m$(flow.out.total)}</Text> out →{" "}
-                      <Text style={[s.big, { color: flow.saved >= 0 ? C.good : C.bad }]}>
-                        {flow.saved >= 0 ? "+" : ""}{m$(flow.saved)}
-                      </Text>{" "}{flow.saved >= 0 ? "stayed" : "overspent"}
-                      {flow.rate !== null && flow.rate >= 0
+                      <Text style={s.big}>{m$(flow.in.total)}</Text> came in →{" "}
+                      <Text style={s.big}>{m$(flow.out.total)}</Text> went out →{" "}
+                      {/* what was left over as printed: $0 is even,
+                          untoned, with no rate (the web's rule) */}
+                      <Text style={[s.big, netSign(flow.saved) !== 0
+                        && { color: netSign(flow.saved) === 1 ? C.good : C.bad }]}>
+                        {signedMoney(netSign(flow.saved) === 0 ? 0 : flow.saved,
+                                     m$, true)}
+                      </Text>{" "}{netSign(flow.saved) >= 0 ? "left over" : "overspent"}
+                      {savedOver(flow.saved_months_known, flow.saved_months_total)
+                        ? ` ${savedOver(flow.saved_months_known,
+                                         flow.saved_months_total)} with bank data`
+                        : ""}
+                      {/* the web's order: the paychecks still due, then
+                          the rate */}
+                      {flow.income_due ? ` · ${flow.income_due.text}` : ""}
+                      {flow.rate !== null && netSign(flow.saved) === 1
                         ? ` · ${flow.rate}% of income` : ""}
                     </Text>
                   )}
+                  {/* what moved to investments is its own figure, never
+                      part of what was left over (the server's line; an
+                      older server sends none) */}
+                  {flow.invested_text ? (
+                    <Text style={[s.mut, { marginTop: 2 }]}>
+                      {flow.invested_text}</Text>) : null}
+                  <IncompleteNote months={flow.incomplete_months} />
+                  {flow.out.unsplit_text ? (
+                    <Text style={[s.mut, { marginTop: 4, fontSize: 12 }]}>
+                      {flow.out.unsplit_text}</Text>) : null}
+                  {/* what Fixed means on a window before most of today's
+                      bills began, as the server says it.
+                      older-server path: stands in for `fixed_basis_text`
+                      — nothing is printed in its place */}
+                  {flow.out.fixed_basis_text ? (
+                    <Text style={[s.mut, { marginTop: 4, fontSize: 12 }]}>
+                      {flow.out.fixed_basis_text}</Text>) : null}
                 </View>
               )}
               {flowQ.isError && !flow && (
-                <Text style={s.center}>
-                  Couldn&apos;t load the flow picture — pull to retry.
-                </Text>
-              )}
+                <FailedLine q={flowQ} what={`the flow (${
+                  rangeCaption(period)})`} />)}
             </>
           )}
         </Card>
@@ -204,69 +253,124 @@ export default function CashFlow() {
                              gap: 6, flexWrap: "wrap" }}>
                 {/* follows the screen's one timeframe — the chips in the
                     flow card above own it */}
-                <H>Saved, by month</H>
+                <H>Left over, by month</H>
               </View>
               <NetBars width={chartW} points={series.points}
-                       estimatedFrom={series.estimatedFrom} />
+                       estimatedFrom={series.estimatedFrom}
+                       missing={d.incomplete_label} />
               <Text style={s.mut}>
-                {bestFig ? <>best {best![0]}{" "}
-                  <Text style={{ color: bestFig.tone === "good" ? C.good
-                                   : bestFig.tone === "bad" ? C.bad : C.text,
+                {best ? <>best {monthWithYear(best[0])}{" "}
+                  <Text style={{ color: fig(best[1]).color,
                                  fontWeight: "700" }}>
-                    {bestFig.text}</Text></> : null}
+                    {fig(best[1]).text}</Text></> : null}
                 {best && worst ? " · " : ""}
-                {worst ? <>worst {worst[0]}{" "}
-                  <Text style={{ color: worst[1] < 0 ? C.bad : C.text,
-                                 fontWeight: "700" }}>{m$(worst[1])}</Text></> : null}
+                {worst ? <>worst {monthWithYear(worst[0])}{" "}
+                  <Text style={{ color: fig(worst[1]).color,
+                                 fontWeight: "700" }}>
+                    {fig(worst[1]).text}</Text></> : null}
                 {series.points.length > series.estimatedFrom
-                  ? " · hollow bars are the 60-day forecast" : ""}
+                  ? `${best || worst ? " · " : ""}${forecastCaption(
+                      d.cash_graph.forecast_days)}`
+                  : ""}
               </Text>
+              {/* the server's line: it names this month only for a
+                  range whose bars reach it */}
+              {series.note ? (
+                <Text style={[s.mut, { fontSize: 11, marginTop: 2 }]}>
+                  {series.note}
+                </Text>) : null}
             </Card>
           )}
           <Card>
-            <H>Savings by year</H>
+            <View style={{ flexDirection: "row", alignItems: "baseline",
+                           justifyContent: "space-between", flexWrap: "wrap" }}>
+              <H>Left over by year</H>
+              <Text style={s.mut}>▸ open a year for its months</Text>
+            </View>
             <View style={s.tRow}>
               <Text style={[s.tHead, { flex: 1, textAlign: "left" }]}>
                 Year
               </Text>
               <Text style={s.tHead}>In</Text>
               <Text style={s.tHead}>Out</Text>
-              <Text style={s.tHead}>Saved</Text>
-              <Text style={[s.tHead, { width: 44 }]}>Rate</Text>
+              <Text style={s.tHead}>Left over</Text>
+              <Text style={[s.tHead, { width: 50 }]}>Rate</Text>
             </View>
-            {savings.map(([y, inc, sp, net, rt]) => (
+            {(allYears ? savings : savings.slice(0, SAVINGS_YEARS_SHORT))
+              .map(([y, inc, sp, net, rt]) => (
               <View key={y}>
                 <Pressable style={s.tRow}
+                           accessibilityRole="button"
+                           accessibilityState={d.monthly_by_year[y]
+                             ? { expanded: !!open[y] } : { disabled: true }}
                            onPress={() => d.monthly_by_year[y]
                              && setOpen((o) =>
                                ({ ...o, [y]: !o[y] }))}>
-                  <Text style={{ color: C.text, fontSize: 13, flex: 1 }}>
+                  {/* a year holding a month with incomplete income is
+                      greyed and carries the server's note (the web's
+                      YearRow) */}
+                  <Text style={{ color: d.savings_by_year_notes?.[y]
+                                   ? C.mut : C.text,
+                                 fontSize: 13, flex: 1 }}>
                     {d.monthly_by_year[y]
                       ? (open[y] ? "▾ " : "▸ ") : ""}{y}
                   </Text>
-                  <Text style={s.tNum}>
-                    {inc !== null ? m$(inc) : "no data"}
+                  <Text style={[s.tNum, !!d.savings_by_year_notes?.[y]
+                    && { color: C.mut }]}>
+                    {/* the server's whole dollars (reporting.year_dollars,
+                        the Year lens's rule) */}
+                    {inc !== null ? m$(yd(y, inc, sp, net).income ?? inc)
+                      : "no data"}
                   </Text>
-                  <Text style={s.tNum}>{m$(sp)}</Text>
+                  <Text style={[s.tNum, !!d.savings_by_year_notes?.[y]
+                    && { color: C.mut }]}>{m$(yd(y, inc, sp, net).spend)}</Text>
                   <Text style={[s.tNum, net !== null
-                    && { color: net >= 0 ? C.good : C.bad }]}>
-                    {net !== null ? m$(net) : "no data"}
+                    && { color: d.savings_by_year_notes?.[y] ? C.mut
+                           : netSign(yd(y, inc, sp, net).saved ?? net) === 1
+                             ? C.good
+                             : netSign(yd(y, inc, sp, net).saved ?? net) === -1
+                               ? C.bad : C.text }]}>
+                    {net !== null ? m$(yd(y, inc, sp, net).saved ?? net)
+                      : "no data"}
+                    {d.savings_by_year_notes?.[y]
+                      ? `\n${d.savings_by_year_notes[y]}` : ""}
                   </Text>
-                  <Text style={[s.tNum, { width: 44 },
-                                rt !== null && rt < 0
-                                  && { color: C.bad }]}>
-                    {rt !== null ? `${rt}%` : "·"}
+                  <Text style={[s.tNum, { width: 50 },
+                                d.savings_by_year_notes?.[y]
+                                  ? { color: C.mut }
+                                  : rt !== null && rt < 0
+                                    && { color: C.bad }]}>
+                    {/* the rate as the Year screen prints it */}
+                    {rt !== null && (net === null
+                      || netSign(yd(y, inc, sp, net).saved ?? net) !== 0)
+                      ? signedPct(rt) : "·"}
                   </Text>
                 </Pressable>
                 {open[y] && d.monthly_by_year[y] && (
                   <View style={{ paddingVertical: 6 }}>
-                    <Text style={s.mut}>Saved, by month — {y}</Text>
-                    <NetBars width={chartW} points={d.monthly_by_year[y]}
-                             height={150} />
+                    <Text style={s.mut}>Left over, by month — {y}</Text>
+                    {/* the server's slots, an incomplete month null */}
+                    <NetBars width={chartW}
+                             // older-server path: stands in for `months_by_year`
+                             points={d.months_by_year?.[y]
+                               ?? fillMonthLabelGaps(d.monthly_by_year[y])}
+                             missing={d.incomplete_label}
+                             height={150} subject={`Left over per month in ${y}`} />
                   </View>
                 )}
               </View>
             ))}
+            {savings.length > SAVINGS_YEARS_SHORT && (
+              <Pressable accessibilityRole="button"
+                         accessibilityState={{ expanded: allYears }}
+                         onPress={() => setAllYears(!allYears)}
+                         style={{ paddingVertical: 8 }}>
+                <Text style={{ color: C.accent, fontSize: 13 }}>
+                  {allYears ? "Show fewer"
+                    : `Show all ${savings.length} years`}
+                </Text>
+              </Pressable>
+            )}
           </Card>
         </>
       )}
@@ -276,11 +380,49 @@ export default function CashFlow() {
                    iq={iq} />
       )}
       {tab === "income" && ccq.data && <CashCosts r={ccq.data} />}
+      {/* a failed read keeps the card's place: gone, it read as nothing
+          paid */}
+      {tab === "income" && ccq.data === undefined && ccq.isError && (
+        <Card>
+          <H>Interest &amp; fees paid</H>
+          <FailedLine q={ccq} what="the interest and fees paid" />
+        </Card>
+      )}
       {d && tab === "income" && (
         <IncomeRecords d={d} chartW={chartW} />
       )}
       <HelpLink topic="cash-flow" />
     </ScrollView>
+  );
+}
+
+/** "over 7 of 9 months" — saved and the rate cover only the months with
+ *  bank data (the web's savedOver). */
+function savedOver(known?: number, total?: number): string {
+  return known !== undefined && total !== undefined && known < total
+    ? `over ${known} of ${total} months` : "";
+}
+
+/** The hollow bars' caption, naming the server's forecast horizon (the
+ *  web's forecastCaption). */
+function forecastCaption(days?: number): string {
+  return days ? `hollow bars are the ${days}-day forecast`
+              : "hollow bars are the forecast";
+}
+
+/** The months of a window the bank feed misses: still counted, so the
+ *  screen says their income is incomplete (the web's IncompleteNote). */
+function IncompleteNote({ months }: { months?: string[] }) {
+  if (!months || months.length === 0) return null;
+  const name = (k: string) => `${MONTHS3[Number(k.slice(5, 7))]} ${k.slice(0, 4)}`;
+  const shown = months.length <= 3 ? months.map(name).join(", ")
+    : `${name(months[0])} – ${name(months[months.length - 1])}`;
+  return (
+    <Text style={[s.mut, { marginTop: 4, fontSize: 12 }]}>
+      <Text style={{ color: C.warn, fontWeight: "600" }}>incomplete</Text>
+      {" "}{months.length === 1 ? "1 month" : `${months.length} months`} without
+      a bank feed ({shown}) — counted, but income there is missing or partial
+    </Text>
   );
 }
 
@@ -291,19 +433,65 @@ const KIND_COLORS = { paychecks: "#4f9bd6", interest: "#7fb8e6",
 const KIND_LABELS = { paychecks: "Paychecks", interest: "Interest & dividends",
                       other: "Other" } as const;
 
-/** "+$420 (+5%)", colored — income going up is good. */
-function IncDelta({ cur, prev }: { cur: number; prev: number | null }) {
-  if (prev === null) return null;
-  const d = cur - prev;
-  if (Math.abs(d) < 0.005) return null;
-  const sign = d >= 0 ? "+" : "−";
-  const p = prev ? Math.round((100 * d) / prev) : null;
+/** "+$420 (+5%)", colored — income going up is good. The server's change
+ *  (reporting.change), "unchanged" at $0 as on the web; an older server
+ *  sends none and the change is left out. */
+function IncDelta({ ch }: { ch: Change | null | undefined }) {
+  const c = changeLook(ch, false);
+  if (!c) return null;
+  if (c.unchanged)
+    return <Text style={{ color: C.mut, fontSize: 12 }}>unchanged</Text>;
   return (
-    <Text style={{ color: d > 0 ? C.good : C.bad, fontSize: 12,
+    <Text style={{ color: c.good ? C.good : C.bad, fontSize: 12,
                    fontWeight: "600" }}>
-      {sign}{m$(Math.abs(d))}{p !== null && Math.abs(p) < 1000
-        ? ` (${sign}${Math.abs(p)}%)` : ""}
+      {c.sign}{m$(c.dollars)}{c.pct !== null ? ` (${c.sign}${c.pct}%)` : ""}
     </Text>
+  );
+}
+
+/** One income source's paycheck chip: whether its deposits count as
+ *  paychecks, as the server decided, and — for an editor — the three
+ *  choices the web's select offers (automatic, paycheck, not a paycheck).
+ *  Mirrors the web's PaycheckChoice; nothing is worked out here.
+ *  specs/paychecks.md */
+function PaycheckChip({ payee, verdict }: {
+  payee: string; verdict: SourcePaycheck;
+}) {
+  const { client } = useSession();
+  const qc = useQueryClient();
+  const viewer = useViewer();
+  const save = useMutation({
+    mutationFn: (word: "paycheck" | "never" | "auto") =>
+      client!.incomePayer(verdict.key, word, payee),
+    onSuccess: () => {
+      // the split, the share and the flow picture all move: refetch them
+      qc.invalidateQueries({ queryKey: ["report", "income-window"] });
+      qc.invalidateQueries({ queryKey: ["report", "cashflow-flow"] });
+    },
+    onError: (e) => Alert.alert("Not saved", errText(e)),
+  });
+  const shown = verdict.paycheck ? "Paycheck" : "Not a paycheck";
+  const auto = verdict.override === null;
+  // the web select's own words: "Paycheck (automatic)" while the rules
+  // decide, the household's choice by itself; a viewer reads the verdict
+  if (viewer) return <Text style={{ color: C.mut, fontSize: 12 }}>{shown}</Text>;
+  const label = <Text style={{ color: C.mut, fontSize: 12 }}>
+    {auto ? `${shown} (automatic)` : shown} ▾</Text>;
+  const ask = () => Alert.alert(`Does ${payee} count as paychecks?`,
+    undefined,
+    [{ text: auto ? `${shown} (automatic)` : "Automatic",
+       onPress: () => save.mutate("auto") },
+     { text: "Paycheck", onPress: () => save.mutate("paycheck") },
+     { text: "Not a paycheck", onPress: () => save.mutate("never") }],
+    // Android shows at most three buttons, so there is no Cancel button:
+    // Back or a tap outside closes the question and changes nothing
+    { cancelable: true });
+  return (
+    <Pressable onPress={ask} disabled={save.isPending} hitSlop={8}
+               accessibilityRole="button"
+               accessibilityLabel={`${payee}: ${shown}. Change`}>
+      {label}
+    </Pressable>
   );
 }
 
@@ -317,18 +505,26 @@ function IncomeTab({ chartW, range, setRange, iq }: {
   const w = iq.data;
   if (iq.isPending) return <Text style={s.center}>Loading…</Text>;
   // a failed fetch must not render blank, with no retry
+  // a failed range keeps its card and the range picker, so another
+  // window is one tap away
   if (iq.isError && !w) {
     return (
-      <Text style={s.center}>Couldn&apos;t load income — pull to retry.</Text>
+      <Card>
+        <View style={{ flexDirection: "row", alignItems: "center",
+                       flexWrap: "wrap", gap: 6 }}>
+          <H>Income</H>
+          <RangePicker value={range} onChange={setRange}
+                       style={{ marginLeft: "auto", alignSelf: "center" }} />
+        </View>
+        <FailedLine q={iq} what={`income (${rangeCaption(range)})`} />
+      </Card>
     );
   }
   if (!w) return null;
-  // the pace divisor is the SERVER's month count for the window, not a
-  // client guess from the range key: "1m" covers one complete month
-  // while its chart reaches back two, and only the server knows how far
-  // the ledger actually goes (webapp/src/pages/CashFlow.tsx does the same)
-  const perMonth = w.total / Math.max(w.months, 1);
-  const payShare = w.total ? Math.round((100 * w.kinds.paychecks) / w.total) : 0;
+  // the per-month figure and the paycheck share are the SERVER's (an
+  // older server sends neither, and the line leaves them out)
+  const perMonth = w.per_month;
+  const payShare = w.paycheck_share;
   const kinds = (Object.keys(KIND_COLORS) as (keyof typeof KIND_COLORS)[])
     .map((k) => ({ k, v: w.kinds[k] })).filter((x) => x.v > 0);
   const maxSrc = w.sources[0]?.[1] || 1;
@@ -338,37 +534,39 @@ function IncomeTab({ chartW, range, setRange, iq }: {
         <View style={{ flexDirection: "row", alignItems: "center",
                        flexWrap: "wrap", gap: 6 }}>
           <H>Income</H>
-          <View style={{ flexDirection: "row", gap: 4, marginLeft: "auto",
-                         flexWrap: "wrap" }}>
-            {TREND_RANGES.map((r) => (
-              <Pressable key={r} style={[s.chip, range === r && s.chipOn]}
-                         onPress={() => setRange(r)}>
-                <Text style={{ color: range === r ? C.text : C.mut,
-                               fontSize: 11 }}>
-                  {RANGE_LABEL[r]}</Text>
-              </Pressable>
-            ))}
-          </View>
+          <RangePicker value={range} onChange={setRange}
+                       style={{ marginLeft: "auto", alignSelf: "center" }} />
         </View>
+        {/* nothing came in over the window: one line, not "$0 came in" */}
+        {w.total === 0 && w.sources.length === 0
+          ? <EmptyState title={EMPTY_LINES.incomeRange} /> : (
         <Text style={[s.mut, { marginTop: 8 }]}>
-          {windowLabel(w)}: <Text style={s.big}>{m$(w.total)}</Text> came in ·{" "}
-          {!w.live_month ? <>
+          {/* the web's one line, in its order: the pace, the paychecks
+              still due, the paycheck share, the change */}
+          {windowLabel(w)}: <Text style={s.big}>{m$(w.total)}</Text> came in
+          {!windowSoFar(w) && perMonth != null ? <>{" · "}
             <Text style={{ color: C.text, fontWeight: "600" }}>
-              {m$(perMonth)}</Text>/mo ·{" "}</> : null}
-          <Text style={{ color: C.text, fontWeight: "600" }}>
-            {payShare}%</Text> paychecks
-        </Text>
-        {w.prev_total !== null && (
-          <Text style={[s.mut, { marginTop: 2 }]}>
-            <IncDelta cur={w.total} prev={w.prev_total} />{" "}
-            vs the {range === "1y" ? "year before"
-              : range === "cur" ? "month before"
-              : range === "1m" ? "month before that"
-              : range === "3m" ? "3 months before"
-              : range === "6m" ? "6 months before"
-              : range === "3y" ? "3 years before" : "5 years before"}
-          </Text>
-        )}
+              {m$(perMonth)}</Text>/mo
+            {/* the server's words for what "/mo" divides by, as the web
+                prints them; an older server sends none */}
+            {w.per_month_basis ? ` ${w.per_month_basis}` : ""}</> : null}
+          {w.income_due ? ` · ${w.income_due.text}` : null}
+          {payShare != null ? <>{" · "}
+            <Text style={{ color: C.text, fontWeight: "600" }}>
+              {payShare}%</Text> paychecks</> : null}
+          {/* the server's words ("vs Oct 1–17"); a server that sends none
+              gets none — a caption worded here would be a second
+              definition of the comparison */}
+          {w.change ? <>{" · "}<IncDelta ch={w.change} />{" "}
+            {w.prev_text ?? ""}</> : null}
+        </Text>)}
+        {/* a payer of the previous window who paid nothing in this one, in
+            the server's words (dropped_text), beside the change it explains;
+            an older server sends none and nothing is said */}
+        {w.dropped_text ? (
+          <Text style={[s.mut, { marginTop: 4 }]}>{w.dropped_text}</Text>
+        ) : null}
+        <IncompleteNote months={w.incomplete_months} />
         {w.total > 0 && (
           <>
             <View style={{ flexDirection: "row", height: 10, borderRadius: 4,
@@ -380,9 +578,12 @@ function IncomeTab({ chartW, range, setRange, iq }: {
             <Text style={[s.mut, { marginTop: 4 }]}>
               {kinds.map(({ k, v }, i) => (
                 <Text key={k}>{i > 0 ? " · " : ""}
-                  {KIND_LABELS[k]} {m$(v)}
-                  {w.prev_kinds
-                    ? <> <IncDelta cur={v} prev={w.prev_kinds[k]} /></> : null}
+                  {/* the Overview picture's dollars for this kind, as
+                      on the web */}
+                  {/* older-server path: stands in for `kinds_shown` */}
+                  {KIND_LABELS[k]} {m$(w.kinds_shown?.[k] ?? v)}
+                  {w.kind_changes
+                    ? <> <IncDelta ch={w.kind_changes[k]} /></> : null}
                 </Text>
               ))}
             </Text>
@@ -391,7 +592,8 @@ function IncomeTab({ chartW, range, setRange, iq }: {
         {w.by_month.length >= 4 && (
           // the same pace line the Spending screen opens with
           <View style={{ marginTop: 8 }}>
-            <Sparkline width={chartW} height={140} data={w.by_month} />
+            <Sparkline width={chartW} height={140} data={w.by_month}
+                       subject="Income by month" />
           </View>
         )}
       </Card>
@@ -400,7 +602,7 @@ function IncomeTab({ chartW, range, setRange, iq }: {
           <H>Income by source{" "}
             <Text style={{ color: C.mut, fontSize: 12, fontWeight: "400" }}>
               — who paid, over the window</Text></H>
-          {w.sources.map(([payee, amt, n, p, logo]) => (
+          {w.sources.map(([payee, amt, n, , logo], i) => (
             <View key={payee} style={{ marginVertical: 4 }}>
               <View style={{ flexDirection: "row",
                              justifyContent: "space-between", gap: 8 }}>
@@ -414,10 +616,14 @@ function IncomeTab({ chartW, range, setRange, iq }: {
                 </View>
                 <View style={{ flexDirection: "row", gap: 8,
                                alignItems: "baseline" }}>
-                  <IncDelta cur={amt} prev={p} />
+                  <IncDelta ch={w.source_changes?.[i]} />
                   <Text style={{ color: C.mut, fontSize: 13,
                                  fontVariant: ["tabular-nums"] }}>
-                    {m$(amt)} · {n}×</Text>
+                    {/* the web's share column: the server's share of
+                        the window (source_shares, adding up to 100); an
+                        older server sends none */}
+                    {m$(amt)}{w.source_shares?.[i] != null
+                      ? ` · ${w.source_shares[i]}%` : ""} · {n}×</Text>
                 </View>
               </View>
               <View style={{ height: 5, borderRadius: 3,
@@ -427,6 +633,12 @@ function IncomeTab({ chartW, range, setRange, iq }: {
                                backgroundColor: "#4f9bd6",
                                width: `${Math.max(2, (100 * amt) / maxSrc)}%` }} />
               </View>
+              {/* an older server sends no verdicts: no chip */}
+              {w.source_paychecks?.[i] ? (
+                <View style={{ marginTop: 2, alignSelf: "flex-start" }}>
+                  <PaycheckChip payee={payee}
+                                verdict={w.source_paychecks[i]} />
+                </View>) : null}
             </View>
           ))}
         </Card>
@@ -436,6 +648,9 @@ function IncomeTab({ chartW, range, setRange, iq }: {
 }
 
 const mmdd = (iso: string) => `${iso.slice(5, 7)}/${iso.slice(8, 10)}`;
+// '2026-11-03' → 'Nov 2026' (the web's monYear)
+const monYear = (iso: string) =>
+  `${MONTHS3[Number(iso.slice(5, 7))]} ${iso.slice(0, 4)}`;
 
 /** Interest and fees paid — what holding money and carrying a balance cost,
  *  by year, net of refunds, beside what the same banks paid in interest.
@@ -445,8 +660,16 @@ const mmdd = (iso: string) => `${iso.slice(5, 7)}/${iso.slice(8, 10)}`;
 function CashCosts({ r }: { r: CashCostsReport }) {
   if (r.by_year.length === 0) return null;
   const ytd = r.ytd;
-  const net = ytd ? ytd.net : 0;
-  const vsEarned = r.earned_ytd - net;
+  // The tiles and every cell are the server's whole dollars (`shown`,
+  // reporting.compute_cash_costs), as on the web: a year's interest + fees
+  // − refunds give its net as printed. An older server sends no `shown`;
+  // the cent fields it does send are the same figures and are printed
+  // rounded one by one, and a tile it sends no figure for is left out.
+  // older-server path: stands in for `shown` (the year's and the tiles')
+  const cells = (y: CashCostYear) => y.shown ?? y;
+  const net = r.shown?.paid_ytd ?? r.paid_ytd ?? ytd?.net;
+  const vsEarned = r.shown?.vs_earned_ytd ?? r.vs_earned_ytd;
+  const earned = r.shown?.earned_ytd ?? r.earned_ytd;
   const tone = (v: number, upIsBad: boolean) =>
     v === 0 ? C.text : (v > 0) === upIsBad ? C.bad : C.good;
   const Kpi = ({ k, v, color, sub }: { k: string; v: string; color: string;
@@ -465,16 +688,20 @@ function CashCosts({ r }: { r: CashCostsReport }) {
           — what holding money costs you, by year</Text></H>
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 14,
                      marginTop: 6 }}>
-        <Kpi k={ytd ? `${ytd.year} so far` : r.by_year[0].year}
-             v={m$(net)} color={tone(net, true)}
-             sub={ytd
-               ? `${m$(ytd.interest)} interest · ${m$(ytd.fees)} fees`
-                 + (ytd.refunds > 0 ? ` − ${m$(ytd.refunds)} refunded` : "")
-               : "nothing charged this year"} />
-        <Kpi k="vs interest earned"
-             v={`${vsEarned > 0 ? "+" : ""}${m$(vsEarned)}`}
-             color={tone(vsEarned, false)}
-             sub={`earned ${m$(r.earned_ytd)} · paid ${m$(net)} this year`} />
+        {net != null && (
+          <Kpi k={ytd ? `${ytd.year} so far` : r.by_year[0].year}
+               v={signedMoney(net, m$)} color={tone(net, true)}
+               sub={ytd
+                 ? `${m$(cells(ytd).interest)} interest · ${m$(cells(ytd).fees)} fees`
+                   + (cells(ytd).refunds > 0
+                      ? ` − ${m$(cells(ytd).refunds)} refunded` : "")
+                 : "nothing charged this year"} />)}
+        {vsEarned != null && net != null && (
+          <Kpi k="vs interest earned on cash"
+               v={signedMoney(vsEarned, m$, true)}
+               color={tone(vsEarned, false)}
+               sub={`earned on cash ${m$(earned)} · ${net < 0 ? `refunded ${m$(-net)}` : `paid ${m$(net)}`} this year`} />
+        )}
         <Kpi k="card interest" v={m$(r.interest_ever)}
              color={r.interest_ever > 0 ? C.text : C.good}
              sub={r.interest_ever > 0 ? "ever, across every account"
@@ -491,16 +718,18 @@ function CashCosts({ r }: { r: CashCostsReport }) {
         <View key={y.year}>
           <View style={s.tRow}>
             <Text style={[s.tNum, { flex: 1, textAlign: "left" }]}>{y.year}</Text>
-            <Text style={s.tNum}>{y.interest ? m$(y.interest) : "·"}</Text>
-            <Text style={s.tNum}>{y.fees ? m$(y.fees) : "·"}</Text>
+            <Text style={s.tNum}>{cells(y).interest ? m$(cells(y).interest) : "·"}</Text>
+            <Text style={s.tNum}>{cells(y).fees ? m$(cells(y).fees) : "·"}</Text>
             <Text style={[s.tNum, { color: C.good }]}>
-              {y.refunds ? `−${m$(y.refunds)}` : "·"}</Text>
-            <Text style={[s.tNum, { fontWeight: "700" }]}>{m$(y.net)}</Text>
+              {cells(y).refunds ? `−${m$(cells(y).refunds)}` : "·"}</Text>
+            <Text style={[s.tNum, { fontWeight: "700" }]}>
+              {signedMoney(cells(y).net, m$)}</Text>
           </View>
-          {y.biggest && (
+          {/* the largest charge in the server's words, dated in full */}
+          {y.biggest_text ? (
             <Text style={[s.mut, { fontSize: 11, marginTop: -2, marginBottom: 2 }]}>
-              biggest: {y.biggest[0]} {m$(y.biggest[1])} · {mmdd(y.biggest[2])}</Text>
-          )}
+              biggest: {y.biggest_text}</Text>
+          ) : null}
         </View>
       ))}
       {r.latest && (
@@ -508,8 +737,8 @@ function CashCosts({ r }: { r: CashCostsReport }) {
           Latest: <Text style={{ color: C.text }}>{r.latest[4]}</Text>{" "}
           {r.latest[3] === "interest" ? "charged interest of" : `— ${r.latest[0]}`}{" "}
           <Text style={{ color: C.text }}>{money(r.latest[1], true)}</Text>{" "}
-          on {mmdd(r.latest[2])}. A new charge is also in the daily email the
-          day it posts.
+          on {mmdd(r.latest[2])} ({monYear(r.latest[2])}). A new charge is
+          also in the daily email the day it posts.
         </Text>
       )}
     </Card>
@@ -522,11 +751,14 @@ function IncomeRecords({ d, chartW }: { d: CashflowReport; chartW: number }) {
   const [open, setOpen] = useState(false);
   return (
     <>
-      <Pressable onPress={() => setOpen(!open)}>
+      <Pressable onPress={() => setOpen(!open)}
+                 {...disclosure(open, "Records — career earnings (SSA) · "
+                   + "reported income (tax returns) · investment funding")}>
         <Text style={{ color: C.mut, fontSize: 13, marginHorizontal: 14,
                        marginTop: 10 }}>
-          {open ? "▾" : "▸"} Records — career earnings (SSA) · tax returns ·
-          investment funding
+          {/* the web's summary words */}
+          {open ? "▾" : "▸"} Records — career earnings (SSA) · reported
+          income (tax returns) · investment funding
         </Text>
       </Pressable>
       {open && (
@@ -539,17 +771,9 @@ function IncomeRecords({ d, chartW }: { d: CashflowReport; chartW: number }) {
                   — SSA record, {d.career_income[0][0]} →
                 </Text>
               </H>
-              <Sparkline width={chartW}
+              <Sparkline width={chartW} subject="Career earnings, SSA record"
                          data={d.career_income.map(([y, v]) =>
                            [String(y), v] as [string, number])} />
-            </Card>
-          )}
-          {d.investment_funding.length > 0 && (
-            <Card>
-              <H>Investment funding by year</H>
-              {[...d.investment_funding].reverse().map(([y, v]) => (
-                <KV key={y} k={String(y)} v={m$(v)} tone="mut" />
-              ))}
             </Card>
           )}
           {d.reported_income.length > 0 && (
@@ -564,7 +788,7 @@ function IncomeRecords({ d, chartW }: { d: CashflowReport; chartW: number }) {
                 <Text style={[s.tHead, { flex: 1, textAlign: "left" }]}>
                   Year
                 </Text>
-                <Text style={s.tHead}>Income</Text>
+                <Text style={s.tHead}>Total income</Text>
                 <Text style={s.tHead}>Wages</Text>
                 <Text style={s.tHead}>Investment</Text>
                 <Text style={s.tHead}>Tax paid</Text>
@@ -583,6 +807,13 @@ function IncomeRecords({ d, chartW }: { d: CashflowReport; chartW: number }) {
               ))}
             </Card>
           )}
+          {/* after the tax returns and standing when empty, as the web's */}
+          <Card>
+            <H>Investment funding by year</H>
+            {[...d.investment_funding].reverse().map(([y, v]) => (
+              <KV key={y} k={String(y)} v={m$(v)} tone="mut" />
+            ))}
+          </Card>
         </>
       )}
     </>
@@ -594,9 +825,6 @@ const s = StyleSheet.create({
   center: { color: C.mut, textAlign: "center", padding: 20 },
   mut: { color: C.mut, fontSize: 12, lineHeight: 17 },
   big: { color: C.text, fontSize: 15, fontWeight: "700" },
-  chip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
-          borderRadius: 999, paddingHorizontal: 10, paddingVertical: 4 },
-  chipOn: { borderColor: C.accent, backgroundColor: C.hover },
   tRow: { flexDirection: "row", alignItems: "center", gap: 4,
           borderTopColor: C.border,
           borderTopWidth: StyleSheet.hairlineWidth,

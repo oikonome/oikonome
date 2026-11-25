@@ -88,6 +88,27 @@ class ManageApiTests(unittest.TestCase):
         me = next(a for a in accounts if a["id"] == aid)
         self.assertEqual(me["balance_current"], 1234.56)
 
+    def test_a_hand_set_balance_is_stamped_as_updated_now(self):
+        """A balance typed in is as fresh as a pull: the account's update
+        stamp moves, so the cash forecast's nightly record counts it as
+        fresh and grades it (specs/forecast-grading.md, "fresh")."""
+        r = self.client.post("/api/accounts/add", json={
+            "name": "Coin Jar Checking", "kind": "depository/checking"})
+        aid = r.json()["account_id"]
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            conn.execute("UPDATE accounts SET updated_at = now() - "
+                         "interval '5 days' WHERE id = %s", (aid,))
+            r = self.client.post("/api/accounts/balance", json={
+                "account_id": aid, "balance": "812.40"})
+            self.assertEqual(r.status_code, 200)
+            row = conn.execute(
+                "SELECT updated_at > now() - interval '1 hour' AS fresh "
+                "FROM accounts WHERE id = %s", (aid,)).fetchone()
+        finally:
+            conn.close()
+        self.assertTrue(row["fresh"])
+
     def test_manual_account_with_a_bare_subtype_is_a_depository_account(self):
         """A kind of just "checking" or "savings" is a subtype. Stored as
         the TYPE, the account matched no depository filter and dropped out
@@ -199,7 +220,9 @@ class AlertsApiTests(unittest.TestCase):
         row = next(x for x in rows if x["message"] == msg)
         self.assertEqual(set(row), {"kind", "severity", "message",
                                     "first_seen", "last_seen", "active",
-                                    "dismissed"})
+                                    "dismissed", "link", "kind_label", "text",
+                                    "group"})
+        self.assertEqual(row["link"], "/bills/history?payee=Gym")
         self.assertEqual(row["kind"], "drift")
         self.assertEqual(row["severity"], "info")
         self.assertEqual(row["first_seen"], "2026-07-16")
@@ -783,6 +806,96 @@ class RetWizardStepsTests(unittest.TestCase):
         self.client.post("/api/settings",
                          json={"wizard_steps": {"finish": "done"}})
         self.assertEqual({}, self._steps())
+
+    # ---- the answers typed at each step ---------------------------------
+    # Saved beside the marks so a wizard resumed on another device shows
+    # what was typed, not the defaults; merged per key like the marks.
+
+    _ANSWER_KEYS = ("age", "spend", "employer_mo", "taxable_mo", "ret",
+                    "infl", "end")
+
+    def _answers(self):
+        return self.client.get("/api/settings").json().get(
+            "ret_wizard_answers")
+
+    def _clear_answers(self):
+        r = self.client.post("/api/settings", json={"ret_wizard_answers": {
+            k: None for k in self._ANSWER_KEYS}})
+        self.assertEqual(200, r.status_code, r.text)
+
+    def test_answers_round_trip_and_merge(self):
+        self._clear_answers()
+        self.assertEqual({}, self._answers())
+        r = self.client.post("/api/settings", json={
+            "ret_wizard_steps": {"age": "done"},
+            "ret_wizard_answers": {"age": 41, "spend": 3800.5}})
+        self.assertEqual(200, r.status_code, r.text)
+        self.assertEqual({"age": 41, "spend": 3800.5},
+                         r.json()["ret_wizard_answers"])
+        self.client.post("/api/settings",
+                         json={"ret_wizard_answers": {"infl": 2.5}})
+        self.assertEqual({"age": 41, "spend": 3800.5, "infl": 2.5},
+                         self._answers())
+
+    def test_a_null_answer_clears_only_that_key(self):
+        self._clear_answers()
+        self.client.post("/api/settings", json={
+            "ret_wizard_answers": {"age": 41, "end": 95}})
+        self.client.post("/api/settings",
+                         json={"ret_wizard_answers": {"age": None}})
+        self.assertEqual({"end": 95}, self._answers())
+
+    def test_an_unknown_answer_is_refused(self):
+        r = self.client.post("/api/settings",
+                             json={"ret_wizard_answers": {"nope": 1}})
+        self.assertEqual(400, r.status_code)
+        self.assertIn("unknown retirement answer: nope", r.text)
+
+    def test_an_answer_that_is_not_a_number_is_refused(self):
+        self._clear_answers()
+        for bad in ("41", True, [1], {"x": 1}, -1, 100000001, 1e309):
+            with self.subTest(bad=bad):
+                r = self.client.post(
+                    "/api/settings", content=(
+                        '{"ret_wizard_answers": {"age": %s}}'
+                        % ("1e309" if bad == 1e309 else
+                           __import__("json").dumps(bad))),
+                    headers={"content-type": "application/json"})
+                self.assertEqual(400, r.status_code, r.text)
+        self.assertEqual({}, self._answers())
+
+    def test_a_negative_rate_the_projection_takes_round_trips(self):
+        """The projection takes return and inflation from -20 to 30, so a
+        deflation guess of -1 is an answer; refusing it would roll the
+        step's whole save back."""
+        self._clear_answers()
+        r = self.client.post("/api/settings", json={
+            "ret_wizard_steps": {"assumptions": "done"},
+            "ret_wizard_answers": {"infl": -1, "ret": -2.5}})
+        self.assertEqual(200, r.status_code, r.text)
+        self.assertEqual({"infl": -1, "ret": -2.5}, self._answers())
+
+    def test_an_answer_outside_its_range_names_the_range(self):
+        # the wizard shows this sentence as it comes, so it names the
+        # field the way the wizard labels it, never the stored key
+        for key, bad, text in (
+                ("infl", 31, "Inflation must be between \u221220% and 30%."),
+                ("ret", -21,
+                 "Expected return must be between \u221220% and 30%."),
+                ("age", 17, "Current age must be between 18 and 90."),
+                ("end", 111, "Plan to age must be between 19 and 110."),
+                ("employer_mo", 10 ** 8, "Employer retirement $/mo must be "
+                                         "between $0 and $10,000,000.")):
+            with self.subTest(key=key):
+                r = self.client.post("/api/settings", json={
+                    "ret_wizard_answers": {key: bad}})
+                self.assertEqual(400, r.status_code, r.text)
+                self.assertEqual(text, r.json()["detail"])
+
+    def test_the_answers_must_be_an_object(self):
+        r = self.client.post("/api/settings",
+                             json={"ret_wizard_answers": [41]})
+        self.assertEqual(400, r.status_code)
 
 
 class BizWizardStepsTests(unittest.TestCase):

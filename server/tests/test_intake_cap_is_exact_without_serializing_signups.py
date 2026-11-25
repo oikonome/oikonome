@@ -59,10 +59,10 @@ class IntakeCapTests(unittest.TestCase):
         finally:
             admin.close()
 
-    def _signup(self):
+    def _signup(self, email: str | None = None):
         return TestClient(self.appmod.app).post(
             "/api/signup",
-            data={"email": f"cap-{uuid.uuid4().hex[:10]}@x.dev",
+            data={"email": email or f"cap-{uuid.uuid4().hex[:10]}@x.dev",
                   "password": PW, "invite": "", "ref": ""})
 
     def test_no_advisory_lock_is_held_while_the_password_is_hashed(self):
@@ -71,6 +71,7 @@ class IntakeCapTests(unittest.TestCase):
         Observed from an independent connection, because a lock is only a
         problem for the requests that are waiting on it."""
         held = []
+        email = f"cap-{uuid.uuid4().hex[:10]}@x.dev"
 
         real = self.appmod.passwords.hash_password
 
@@ -78,9 +79,20 @@ class IntakeCapTests(unittest.TestCase):
             probe = tenancy.admin_connect()
             try:
                 held.append(probe.execute(
+                    # exactly the two locks the door takes — the instance
+                    # intake lock and this signup's own email lock — read
+                    # back by key (pg_locks shows a bigint advisory key as
+                    # its low 32 bits in objid). Any other advisory lock in
+                    # the database is another test's or another shard's.
                     "SELECT count(*) AS n FROM pg_locks "
                     "WHERE locktype = 'advisory' "
-                    "AND pid <> pg_backend_pid()").fetchone()["n"])
+                    "AND database = (SELECT oid FROM pg_database "
+                    "WHERE datname = current_database()) "
+                    "AND objid IN (hashtext(%s)::bigint & 4294967295, "
+                    "hashtext(%s)::bigint & 4294967295) "
+                    "AND pid <> pg_backend_pid()",
+                    (self.appmod._INTAKE_LOCK, "oikonome:signup:" + email)
+                ).fetchone()["n"])
             finally:
                 probe.close()
             return real(pw)
@@ -89,7 +101,7 @@ class IntakeCapTests(unittest.TestCase):
                                           "OIKONOME_OPEN_SIGNUP": "1"}):
             with mock.patch.object(self.appmod.passwords, "hash_password",
                                    side_effect=watched):
-                self.assertEqual(self._signup().status_code, 200)
+                self.assertEqual(self._signup(email).status_code, 200)
         self.assertEqual(held, [0],
                          "a signup hashed the password while holding an "
                          "advisory lock")

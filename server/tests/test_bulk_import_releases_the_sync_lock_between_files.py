@@ -11,13 +11,18 @@ from oikonome.db import staging, tenancy
 from oikonome.jobs import bulk_import_job
 
 from .bulk_job_util import csv_for, submit, tenant_of
-from .util import _ensure_db, make_db, write_config
+from .util import _ensure_db, make_db, outlive_no_threads, write_config
 
 
 class SyncLockPerFileTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         _ensure_db()
+
+    def setUp(self):
+        # the categorize pass after each import runs on its own thread,
+        # inside a transaction: it finishes before the next test begins
+        outlive_no_threads(self)
 
     def test_another_holder_gets_the_lock_between_files(self):
         conn = make_db()

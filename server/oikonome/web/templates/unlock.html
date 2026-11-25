@@ -17,6 +17,22 @@
     <input type="hidden" name="token" value="{{ confirm_token }}">
     <button class="pri">Continue to sign in</button>
   </form>
+  {% elif unlocked_code %}
+  {# The confirm POST is the only step that proves the mailbox, so it is the
+     only place the unlock's proof is handed out: as a cookie to THIS
+     browser, and as the sign-in code below for the app, whose own cookies
+     this browser cannot reach. #}
+  <p>Security check cleared for <b>{{ email }}</b> for the next ten minutes.</p>
+  <p class="sub">This does not sign you in — you will still enter your
+    password.</p>
+  <form method="get" action="/login">
+    <input type="hidden" name="unlocked" value="1">
+    <button class="pri">Sign in in this browser</button>
+  </form>
+  <p style="margin-top:1rem">Signing in on the Oikonome app? Enter this
+    sign-in code there:</p>
+  <p style="font-size:1.5rem;letter-spacing:.12em;font-family:monospace"><b>{{ unlocked_code }}</b></p>
+  <p class="sub">The code works once, for this account only.</p>
   {% elif confirmed and reopen_token %}
   {# The address is confirmed, but this household was frozen for never
      confirming and is on its way to deletion. Bringing it back is a

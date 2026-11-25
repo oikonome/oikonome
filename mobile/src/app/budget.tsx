@@ -11,23 +11,36 @@ import { Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput,
          View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import MoneyMap, { planRows } from "../components/money-map";
-import StaleBanner from "../components/stale-banner";
-import { Card, H, HelpLink } from "../components/ui";
-import { errText, Account, BudgetSettings, CustomBucket } from "../lib/api";
+import MoneyMap, { sentPlanRows, sentPlanTotal } from "../components/money-map";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { OfflineNote, offlineGrey, useOffline } from "../components/offline";
+import { Card, H, HelpLink, Note } from "../components/ui";
+import { errText, Account, BudgetSettings, CustomBucket, TodayFull } from "../lib/api";
 import { saveSettings, SETTINGS_SAVES } from "../lib/cache";
-import { goalHasWords, goalNeedsAccount, isPlanSavingsGoal,
+import { goalHasWords, goalNeedsAccount, isPlanOnlySavingsGoal,
+         isPlanSavingsGoal,
+         bucketRulesSaved, mergeBucketRules, plannerBucketsSaved,
+         savedMergeBase,
          mergeIncomeScenarios, mergePlannerBuckets,
-         mergeSavingsGoals, numv, type GoalDraft, type ScenarioDraft,
-         type PlannerRow, catLabel, historyBasisNote } from "../lib/pure";
+         mergeSavingsGoals, numv, savedAmount, type BucketRuleDraft, type GoalDraft,
+         type ScenarioDraft,
+         type PlannerRow, catLabel, historyBasisNote, inputPhase,
+         PLANNER_HISTORY_FAILED, plannerAtRest, plannerShares, plannerWaits,
+         SAVE_WAITS_LOADING, UNKNOWN_FIGURE }
+  from "../lib/pure";
 import { useRefetchWhenShown } from "../lib/focus";
-import { labelSavingsRow, monthSavings, plannerUnallocAuto }
+import { plannerPreview, plannerUnallocAuto }
   from "../lib/planner";
 import { useSession } from "../lib/session";
 import { useViewer } from "../lib/viewer";
 import { C, money } from "../lib/theme";
+import { disclosure } from "../lib/a11y";
+import { fieldA11y } from "../components/field";
 
 const m$ = (n: number) => money(n, false);
+// '2026-11-03' → '11/03': the web Budget page's dates (its mmdd)
+const mmdd = (iso: string | null | undefined) =>
+  iso && iso.length >= 10 ? `${iso.slice(5, 7)}/${iso.slice(8, 10)}` : "";
 
 // stable per-row ids for the draft lists below (Planner categories,
 // income scenarios, savings goals, bucket rules). Keying on array index
@@ -39,6 +52,20 @@ let rowIdSeq = 0;
 const newRowId = () => `row${++rowIdSeq}`;
 
 const TODAY_KEY = ["today"];
+
+// A server older than the plan's legs: the line from the figures it sends
+// (plan_line when it has an income, the raw figures otherwise).
+function olderPlanLegs(d: TodayFull) {
+  const pl = d.plan_line;
+  const saved = pl ? pl.saved !== null : (d.savings_plan ?? 0) > 0.005;
+  return {
+    income: d.income === null ? null : pl ? pl.income : d.income,
+    bills: pl ? pl.bills : d.avg_bills,
+    to_spend: pl ? pl.to_spend : d.plan_variable ?? d.variable_budget,
+    saved: !saved ? null : pl ? pl.saved : d.savings_plan ?? null,
+    excess: d.plan_surplus === null ? null : pl ? pl.excess : d.plan_surplus,
+  };
+}
 
 export default function Budget() {
   const { client } = useSession();
@@ -58,6 +85,11 @@ export default function Budget() {
     staleTime: 5 * 60_000 });
   const d = today.data;
   const s0 = settings.data;
+  // the summary line's legs are the server's (budget.plan_legs), a plan
+  // with no income included
+  const legs = !d ? null : d.plan_legs !== undefined ? d.plan_legs
+    // older-server path: stands in for `plan_legs`
+    : olderPlanLegs(d);
   // after a save the SIBLING cards remount so their mount-time seeds
   // pick up fresh settings — but a sibling holding unsaved edits is
   // skipped: the remount would silently discard the draft (web rule)
@@ -65,6 +97,18 @@ export default function Budget() {
   const dirty = useRef({ p: false, i: false, g: false, b: false });
   const markDirty = (k: "p" | "i" | "g" | "b") => (v: boolean) => {
     dirty.current[k] = v;
+    if (k === "p") setPlanDirty(v);
+  };
+  // the planner's unsaved edits, as state: while there are any, a bar with
+  // Save and Discard floats over the screen (the web planner's bar) — its
+  // own button sits at the foot of a long card
+  const [planDirty, setPlanDirty] = useState(false);
+  const planSave = useRef<{ save: () => void; saving: boolean } | null>(null);
+  const discardPlan = () => {
+    dirty.current.p = false;
+    setPlanDirty(false);
+    // a remount re-seeds every field from what is saved
+    setGens((g0) => ({ ...g0, p: g0.p + 1 }));
   };
   // every save here goes through saveSettings, which has already put the
   // server's reply into ["settings"] by the time this runs — so the
@@ -80,7 +124,9 @@ export default function Budget() {
     qc.invalidateQueries({ queryKey: ["lens"] });
     qc.invalidateQueries({ queryKey: ["budgets-suggest"] });
     qc.invalidateQueries({ queryKey: ["calendar"], refetchType: "none" });
-    dirty.current[saved] = false;
+    // the saved card clears its own unsaved flag, and only when nothing
+    // was typed while the save was in flight (the web's rule) — clearing
+    // it here let the next sibling save remount over those edits
     setGens((g0) => {
       const n = { ...g0 };
       for (const k of ["p", "i", "g", "b"] as const)
@@ -88,10 +134,6 @@ export default function Budget() {
       return n;
     });
   };
-  const goal = (d?.savings_goals ?? []).find((g) => isPlanSavingsGoal(g.name));
-  // the month's posted contribution when the server sends it; otherwise
-  // the goal's 90-day average, labelled as one (Today's rule)
-  const sav = goal ? monthSavings(goal) : null;
 
   const tweakBits: string[] = [];
   if (s0) {
@@ -104,58 +146,87 @@ export default function Budget() {
   }
 
   return (
-    <ScrollView style={st.wrap} contentContainerStyle={{ paddingBottom: 24 }}
+    <View style={{ flex: 1, backgroundColor: C.bg }}>
+    <ScrollView style={st.wrap}
+                contentContainerStyle={{ paddingBottom: planDirty ? 96 : 24 }}
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => Promise.all([
                                         settings.refetch(), today.refetch()])} />}>
-      <StaleBanner query={settings} />
+      <StaleLine query={settings} />
+      <StaleLine query={today} />
       {(today.isPending || settings.isPending) && (
         <Text style={st.center}>Loading…</Text>
       )}
-      {d && (
+      {/* each read that failed says so in its sections' place: the plan
+          and this month are one, the cards that edit settings the other */}
+      {d === undefined && today.isError && (
+        <FailedLine q={today} what="this month's plan" />)}
+      {s0 === undefined && settings.isError && (
+        <FailedLine q={settings} what="the budget settings" />)}
+      {d && legs && (
         <Card>
           <Text style={{ color: C.text, fontSize: 15, lineHeight: 22 }}>
-            {d.income !== null && (
-              <><B>{m$(d.income)}</B><M> in → </M></>
+            {/* the plan's legs in the whole dollars every surface prints
+                (budget.plan_legs), an income-less plan's too: the same
+                figures and words as the web */}
+            {legs.income !== null && (
+              <><B>{m$(legs.income)}</B><M> in → </M></>
             )}
-            {/* scheduled bills, not the fixed bar's cash basis, so the
-                chain balances (same figure and words as web) */}
-            <B>{m$(d.scheduled_month ?? d.buckets.fixed?.month_budget ?? 0)}</B><M> bills due → </M>
-            <B>{m$(d.variable_budget)}</B><M> to spend</M>
-            {(d.savings_plan ?? 0) > 0.005 && (
-              <><M> → </M><B>{m$(d.savings_plan!)}</B><M> saved</M></>
+            {/* an older server's unknown bills print as unknown, never $0 */}
+            {/* "bills & envelopes" with a pool; older-server path:
+                stands in for `plan_bills_label` — "bills" */}
+            <B>{money(legs.bills, false)}</B>
+            <M> {d?.plan_bills_label ?? "bills"} → </M>
+            <B>{m$(legs.to_spend)}</B><M> to spend</M>
+            {legs.saved !== null && (
+              <><M> → </M><B>{m$(legs.saved)}</B><M> saved</M></>
             )}
-            {d.plan_surplus !== null && (
+            {legs.excess !== null && (
               <>
                 <M> → </M>
-                <Text style={{ color: d.plan_surplus >= 0 ? C.good : C.bad,
+                {/* the server's words and tone after the figure
+                    (todayview.plan_excess_words) */}
+                <Text style={{ color: d.plan_excess_words !== undefined
+                                 ? (d.plan_excess_words?.tone === "neg" ? C.bad
+                                   : d.plan_excess_words?.tone === "mut" ? C.mut
+                                   : C.good)
+                                 // older-server path: stands in for `plan_excess_words`
+                                 : legs.excess >= 0 ? C.good : C.bad,
                                fontWeight: "700" }}>
-                  {m$(d.plan_surplus)}
+                  {m$(legs.excess)}
                 </Text>
-                <M> excess</M>
+                <M> {d.plan_excess_words !== undefined
+                  ? (d.plan_excess_words?.text ?? "excess")
+                  // older-server path: stands in for `plan_excess_words`
+                  : "excess"}</M>
               </>
             )}
           </Text>
-          {/* this month's income is what landed plus what is still due
-              (mirrors the web sub-line) */}
-          {d.income_expected != null && (
-            <Text style={st.mut}>
+          {/* the web's sub-line, in its order: the variable spending, the
+              income (what landed plus what is still due), manage bills.
+              "variable spending $0 of $0" is arithmetic, not news, and it
+              reads as progress against a plan nobody has made, so it is
+              hidden when budgets are unset, as on the Today hero.
+              Undefined onboarding data (still loading) keeps the line, so
+              it never flashes away. */}
+          <Text style={st.mut}>
+            {!(ob.data && !ob.data.budgets_set) && (<>
+              day {d.day_of_month} of {d.days_in_month} · variable spending{" "}
+              {m$(d.variable_actual)} of {money(d.variable_budget_paced ?? d.variable_budget, false)}
+              {/* the month's spendable share; when it is not the plan's
+                  figure the line says why (the web's words and dates) */}
+              {d.variable_scale
+                // older-server path: stands in for `variable_budget_paced`
+                ? ` (scaled to ${money(d.variable_budget_paced ?? d.variable_budget, false)} this month)`
+                : d.paced_from ? ` (paced from ${mmdd(d.paced_from)})` : ""}
+              {"   "}
+            </>)}
+            {d.income_expected != null && (<>
               income <Text style={{ color: C.text }}>{m$(d.income_received ?? 0)}</Text> landed
               {d.income_expected > 0 ? (
                 <> · <Text style={{ color: C.text }}>{m$(d.income_expected)}</Text> still due</>
               ) : null}
-            </Text>
-          )}
-          {/* "variable spending $0 of $0" is arithmetic, not news, and it
-              reads as progress against a plan nobody has made, so it is
-              hidden when budgets are unset, as on the Today hero.
-              Undefined onboarding data (still loading) keeps the
-              line, so it never flashes away. */}
-          <Text style={st.mut}>
-            {!(ob.data && !ob.data.budgets_set) && (<>
-              day {d.day_of_month} of {d.days_in_month} · variable spending{" "}
-              {m$(d.variable_actual)} of {m$(d.variable_budget)}
               {"   "}
             </>)}
             <Text style={{ color: C.accent }}
@@ -163,6 +234,13 @@ export default function Budget() {
               manage bills ›
             </Text>
           </Text>
+          {d.variable_scale && (
+            <Text style={{ color: C.warn, fontSize: 12, marginTop: 6 }}>
+              Variable budgets auto-scaled from{" "}
+              {m$(d.variable_scale.static_total)} to fit this
+              month&apos;s bills.
+            </Text>
+          )}
         </Card>
       )}
       {d && d.buckets?.fixed && (
@@ -174,28 +252,15 @@ export default function Budget() {
             </Text>
           </H>
           <MoneyMap
-            // the header row is the SERVER's variable budget/actual —
-            // never a row-sum (web Budget passes an explicit total)
-            total={{ label: "Variable spending", judged: true,
-                     actual: d.variable_actual,
-                     expected: (d.buckets.food?.expected ?? 0)
-                       + (d.buckets.other?.expected ?? 0),
-                     budget: d.variable_budget }}
-            rows={labelSavingsRow(planRows(d.buckets, {
-              // the Budget page shows the same month Today does, so its
-              // rows open the same doors
-              period: { y: Number(String(d.date).slice(0, 4)),
-                        m: Number(String(d.date).slice(5, 7)) },
-              fixedActual: d.buckets.fixed.actual,
-              fixedBudget: d.buckets.fixed.month_budget,
-              fixedPending: d.fixed_unpaid_due,
-              savings: sav,
-              excess: d.plan_surplus,
-            }), !!sav?.averaged)} />
+            // the server's rows and the bar over them (each figure the
+            // sum of its rows) — the web Budget page's
+            total={sentPlanTotal(d.plan_total)}
+            rows={sentPlanRows(d.plan_rows ?? [])} />
         </Card>
       )}
       {s0 && (
         <Planner key={`p${gens.p}`} s0={s0} viewer={viewer}
+                 saveRef={planSave}
                  onSaved={refresh("p")} onDirty={markDirty("p")} />
       )}
       {!viewer && s0 && (
@@ -234,6 +299,31 @@ export default function Budget() {
       <BudgetHistory viewer={viewer} />
       <HelpLink topic="budget" />
     </ScrollView>
+    {planDirty && !viewer && (
+      <View style={{ position: "absolute", left: 12, right: 12, bottom: 12,
+                     flexDirection: "row", alignItems: "center", gap: 8,
+                     backgroundColor: C.hover, borderColor: C.accent,
+                     borderWidth: 1, borderRadius: 12, padding: 8 }}>
+        <Text style={{ color: C.text, fontSize: 14, flex: 1 }}>
+          Unsaved changes</Text>
+        <Pressable accessibilityRole="button" onPress={discardPlan}
+                   style={{ minHeight: 44, justifyContent: "center",
+                            paddingHorizontal: 14, borderRadius: 8,
+                            borderWidth: 1, borderColor: C.border,
+                            backgroundColor: C.card }}>
+          <Text style={{ color: C.text, fontSize: 14 }}>Discard</Text>
+        </Pressable>
+        <Pressable accessibilityRole="button"
+                   onPress={() => planSave.current?.save()}
+                   style={{ minHeight: 44, justifyContent: "center",
+                            paddingHorizontal: 14, borderRadius: 8,
+                            backgroundColor: C.btn }}>
+          <Text style={{ color: C.text, fontSize: 14, fontWeight: "600" }}>
+            Save budgets</Text>
+        </Pressable>
+      </View>
+    )}
+    </View>
   );
 }
 
@@ -287,13 +377,16 @@ function BudgetHistory({ viewer }: { viewer: boolean }) {
     <Card>
       <H>Budget history</H>
       <M>Each month&apos;s budget and bill schedule, frozen as the month
-        closed.</M>
+        closed (this month&apos;s so far).</M>
       {rows.map((r) => (
         <View key={`${r.y}-${r.m}`} style={{ marginTop: 6 }}>
           <View style={{ flexDirection: "row", alignItems: "baseline",
                          gap: 8 }}>
             <Text style={{ color: C.text, fontSize: 13, flex: 1 }}>
               {HIST_MONTHS[r.m - 1]} {r.y}
+              {r.status_text ? (
+                <Text style={{ color: C.mut, fontSize: 11 }}>
+                  {"  "}· {r.status_text}</Text>) : null}
               {r.source === "backfill" && (
                 <Text style={{ color: C.mut, fontSize: 11 }}>
                   {"  "}· backfilled {r.captured_at.slice(0, 10)}
@@ -312,12 +405,12 @@ function BudgetHistory({ viewer }: { viewer: boolean }) {
             {/* the schedule frozen with the budget — absent on snapshots
                 that predate bill freezing (matches the web's "—") */}
             {r.bills_monthly !== undefined &&
-              ` · Fixed bills ${m$(Math.abs(r.bills_monthly))}`}
+              ` · Bills ${m$(Math.abs(r.bills_monthly))} evened out`}
           </Text>
         </View>
       ))}
       {d.months.length > 24 && !all && (
-        <Pressable onPress={() => setAll(true)}>
+        <Pressable accessibilityRole="button" onPress={() => setAll(true)}>
           <Text style={{ color: C.accent, fontSize: 13, marginTop: 8 }}>
             show all {d.months.length} months
           </Text>
@@ -356,7 +449,8 @@ function CollapsiblePane({ title, sub, children }: {
     <>
       {!open && (
         <Card>
-          <Pressable onPress={() => setOpen(true)}>
+          <Pressable onPress={() => setOpen(true)}
+                     {...disclosure(false, `${title} — ${sub}`)}>
             <Text style={{ color: C.text, fontSize: 15,
                            fontWeight: "700" }}>
               ▸ {title}
@@ -392,23 +486,45 @@ function M({ children }: { children: React.ReactNode }) {
 // ---- the planner: give every dollar a job ----
 type Row = PlannerRow & { id: string };
 
-export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
+export function Planner({ s0, viewer, onSaved, onDirty, wizard, saveRef }: {
+  /** the screen's handle on this card's save, for a Save button it draws
+   *  outside the card */
+  saveRef?: { current: { save: () => void; saving: boolean } | null };
   s0: BudgetSettings; viewer: boolean; onSaved: () => void;
   onDirty?: (v: boolean) => void;
   /** Set by the welcome wizard (the web's non-standalone BudgetPlanner):
    *  /api/settings always carries the provisional first-run seed once any
-   *  spend exists, and that seed can predate categorization, so in the
-   *  wizard only the person's own save of this step counts as a plan. */
+   *  spend exists, and the stored row keeps it once a month has closed,
+   *  so in the wizard the plan counts as saved by the server's
+   *  budgets_saved_by_user (wizard-logic planSaved), never by the
+   *  settings view's figures. */
   wizard?: { saved: boolean };
 }) {
   const { client } = useSession();
+  const router = useRouter();
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const qc = useQueryClient();
   const sug = useQuery({ queryKey: ["budgets-suggest"],
     queryFn: () => client!.budgetsSuggest(), enabled: !!client });
+  // the month the header shows: its income is the plan's income, and the
+  // server says where it comes from — the planner never works that out
+  const now = useQuery({ queryKey: ["today"],
+    queryFn: () => client!.todayFull(), enabled: !!client });
+  // the plan's bills leg in the server's words ("Bills & envelopes" with
+  // a pool); older-server path: stands in for `plan_bills_label`
+  const billsWord = now.data?.plan_bills_label ?? "bills";
+  const billsLabel = billsWord.charAt(0).toUpperCase() + billsWord.slice(1);
+  const tracked = now.data?.income_source === "paychecks"
+    || now.data?.income_source === "scenario";
   const [income, setIncome] = useState<string | null>(null);
   const [rows, setRows] = useState<Row[] | null>(null);
-  // the "other" buckets the planner was seeded with — the save-time merge
-  // tells "removed here" from "added elsewhere since" by this list
+  // the rows on screen now, for a save that lands after more typing
+  const rowsNow = useRef(rows);
+  rowsNow.current = rows;
+  // the "other" buckets the planner was last seeded with (at open, then
+  // each saved view) — the save-time merge tells "removed here" from
+  // "added elsewhere since" by this list
   const [baseNames, setBaseNames] = useState<string[]>([]);
   const [otherBase, setOtherBase] = useState(0);
   const [unallocEdited, setUnallocEdited] = useState<string | null>(null);
@@ -420,6 +536,35 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
   // does the history line describe what the person is looking at
   const [fromHistory, setFromHistory] = useState(false);
   const [msg, setMsg] = useState<string | null>(null);
+  // a plan opened from what is saved shows history's figure beside each
+  // row, as the server sends it (the web's hint); a plan seeded from
+  // history IS that figure, and a server without the field shows none
+  const hint = (v: number | undefined) =>
+    fromHistory || typeof v !== "number" ? null : (
+      <Text style={{ color: C.mut, fontSize: 11 }}
+            accessibilityLabel={`history about ${m$(v)}`}>
+        history ~{m$(v)}</Text>);
+  const rowHint = (r: Row) => hint(r.food
+    ? sug.data?.suggestions.food_monthly
+    : r.orig ? sug.data?.suggestions.buckets[r.orig] : undefined);
+  // A first run whose history names no income (the suggestion sent no
+  // income_monthly) asks the same door again with the take-home typed in
+  // the box, once typing pauses; the server measures the savings on it
+  // (the web's rule). An older server ignores the figure and sends no
+  // suggestion, so none is shown.
+  const asksTyped = fromHistory && !tracked && !!sug.data
+    && sug.data.suggestions.income_monthly == null;
+  const typedNow = (income ?? "").trim();
+  const [typedAsked, setTypedAsked] = useState("");
+  useEffect(() => {
+    if (!asksTyped) return;
+    const t = setTimeout(() => setTypedAsked(typedNow), 400);
+    return () => clearTimeout(t);
+  }, [asksTyped, typedNow]);
+  const sugTyped = useQuery({
+    queryKey: ["budgets-suggest", "typed", typedAsked],
+    queryFn: () => client!.budgetsSuggestTyped(typedAsked),
+    enabled: !!client && asksTyped && typedAsked !== "" });
   // one-time seed. An established user's plan comes entirely from s0 —
   // it doesn't need ["budgets-suggest"] (a median-over-history
   // computation) to show the plan card, so only a first-time user (whose
@@ -429,7 +574,9 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
       ? wizard.saved
       : !!(s0.food_monthly || s0.other_monthly
            || s0.budgeted_income_monthly);
-    if (rows !== null || (sug.isPending && !userSaved)) return;
+    // a first run waits for the suggestion's answer: a failed one is not
+    // a history of $0
+    if (rows !== null || (!sug.data && !userSaved)) return;
     const suggestions = sug.data?.suggestions;
     const pick = (saved: number | null, suggested?: number) =>
       userSaved && (saved ?? 0) > 0 ? saved!
@@ -437,13 +584,9 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
     setIncome(String(pick(s0.budgeted_income_monthly,
                           suggestions?.income_monthly) || 0));
     const foodVal = pick(s0.food_monthly, suggestions?.food_monthly);
-    const existing: Row[] = (s0.custom_buckets ?? [])
-      .filter((b) => b.parent === "other")
-      .map((b) => ({ id: newRowId(), name: b.name,
-                     monthly: String(b.monthly),
-                     cats: b.categories, merch: b.merchants,
-                     orig: b.name }));
-    setBaseNames(existing.map((b) => b.name));
+    const opened = plannerBucketsSaved(s0.custom_buckets ?? []);
+    const existing: Row[] = opened.rows.map((r) => ({ ...r, id: newRowId() }));
+    setBaseNames(opened.base);
     const seeded: Row[] = (!userSaved && existing.length === 0)
       ? (sug.data?.bucket_candidates ?? []).map((c) => ({
           id: newRowId(), name: c.name, monthly: String(Math.round(c.monthly)),
@@ -465,26 +608,33 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
       setSavingsTouched(true);
     }
     setFromHistory(!userSaved);
-  }, [rows, sug.isPending, sug.data, s0, wizard?.saved]);
+  }, [rows, sug.data, s0, wizard?.saved]);
 
   const save = useMutation({
     // every Budget-page list save reads the server fresh, merges and
     // writes the whole list back: one shared queue, so no two of them
     // interleave and erase each other's rows
     scope: SETTINGS_SAVES,
-    mutationFn: async () => {
+    // the rows being saved ride along, so success can tell whether the
+    // person kept typing while the save was in flight
+    mutationFn: async (sent: Row[] | null) => {
+      // a plan worked out from a missing input is never saved
+      if (holds) throw new Error(holds);
       // merge against a FRESH read — the planner owns only the
       // other-parent buckets and the "Savings" goal
       const cur = await client!.settingsFull();
       const body: Record<string, unknown> = {
         food_monthly: foodVal,
         other_monthly: unalloc + catsTotal,
-        budgeted_income_monthly: income ?? "0",
       };
+      // the typed figure is only the plan's income while nothing is
+      // tracked; a tracked one is changed where it comes from, so the
+      // stored stand-in is left as it was
+      if (!tracked) body.budgeted_income_monthly = income ?? "0";
       // the rows were seeded at mount and the Bucket-rules card (or
       // another device) may have saved since: merge, never rebuild — see
       // mergePlannerBuckets for who wins what
-      const merged = mergePlannerBuckets(rows ?? [],
+      const merged = mergePlannerBuckets(sent ?? [],
                                          cur.custom_buckets ?? [], baseNames);
       if (merged.length || (cur.custom_buckets ?? []).length)
         body.custom_buckets = merged;
@@ -500,16 +650,47 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
         { ...(curGoal ?? { name: "Savings", target: 0, tokens: [],
                            start_balance: 0 }),
           monthly_plan: numv(savingsShown) }];
-      return saveSettings(qc, client!, body);
+      return saveSettings(qc, client!, body, cur);
     },
-    onSuccess: () => { setMsg("Plan saved."); onSaved(); },
+    onSuccess: (v, sent) => {
+      // every edit makes a new rows array: the same array means nothing
+      // was typed since the save began, and only then do the saved
+      // buckets replace the rows — edits typed in flight stay, unsaved
+      const edited = rowsNow.current !== sent;
+      // the saved view is the new merge base; mid-edit, only the names
+      // the sent rows held (see plannerBucketsSaved)
+      const next = plannerBucketsSaved(v.custom_buckets ?? [],
+                                       edited ? (sent ?? []) : undefined);
+      setBaseNames(next.base);
+      if (!edited && sent)
+        setRows([...sent.filter((r) => r.food),
+                 ...next.rows.map((r) => ({ ...r, id: newRowId() }))]);
+      setMsg("Plan saved."); if (!edited) onDirty?.(false);
+      onSaved();
+    },
     onError: (e) => setMsg(errText(e)),
   });
 
-  if (rows === null || income === null)
-    return <Card><Text style={st.mut}>Loading the plan…</Text></Card>;
-  const bills = sug.data?.avg_bills_monthly ?? 0;
-  const billsCount = sug.data?.bills_count ?? 0;
+  // Every figure below is worked out from the header's bills; until that
+  // read has answered, none is shown and nothing is saved (the web
+  // planner's rule). A first run also waits for the suggestion its rows
+  // are filled in from.
+  const waits = plannerWaits(inputPhase(now),
+                             rows === null ? inputPhase(sug) : "ready");
+  if (rows === null && !sug.data && sug.isError)
+    return (
+      <Card>
+        <Text style={st.mut}>{PLANNER_HISTORY_FAILED}</Text>
+        <Text style={{ color: C.accent, marginTop: 6 }}
+              onPress={() => sug.refetch()}>Try again</Text>
+      </Card>
+    );
+  if (rows === null || income === null || now.isPending)
+    return <Card><Text style={st.mut}>loading…</Text></Card>;
+  // the header's bills (month_status avg_bills): pending proposals count
+  // once approved, never before (the web planner's rule)
+  const bills = now.data?.avg_bills ?? null;
+  const billsCount = now.data?.avg_bills_count ?? null;
   const foodVal = numv(rows.find((r) => r.food)?.monthly ?? "0");
   const catsTotal = rows.filter((r) => !r.food)
     .reduce((t, r) => t + numv(r.monthly), 0);
@@ -519,14 +700,70 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
     savingsTouched, savingsTyped: numv(savings), savingsSeed });
   const unalloc = unallocEdited !== null
     ? numv(unallocEdited) : unallocAuto;
-  const inc = numv(income);
-  const savingsAuto = Math.max(0,
-    Math.round(inc - bills - foodVal - catsTotal - unalloc));
+  // a tracked income is the server's figure; only a typed one is the box's
+  const inc = tracked ? (now.data?.income ?? 0) : numv(income);
+  // The excess is the server's (plan_surplus: every goal's plan comes off
+  // it); the planner only moves it by what is typed and not yet saved
+  // (plannerPreview, the web planner's rule). The goal this card owns
+  // counts when the server counts it, or when it does not exist yet.
+  const planGoals = now.data?.plan_goals ?? [];
+  const ownedPlan = planGoals.find((g) => isPlanSavingsGoal(g.name));
+  const ownedStored = (s0.savings_goals ?? [])
+    .some((g) => isPlanSavingsGoal(g.name));
+  const otherGoals = planGoals.filter((g) => !isPlanSavingsGoal(g.name)
+    && g.monthly_plan > 0.005);
+  const savedIncome = !tracked && now.data?.income_source === "typed"
+    ? (now.data?.income ?? 0) : 0;
+  const preview = (typedGoal: number) => plannerPreview({
+    planSurplus: now.data?.plan_surplus ?? null,
+    savingsPlan: now.data?.savings_plan ?? 0,
+    savedVariable: now.data?.plan_variable ?? 0,
+    typedVariable: foodVal + catsTotal + unalloc,
+    savedGoal: ownedPlan?.monthly_plan ?? 0, typedGoal,
+    goalCounted: !!ownedPlan || !ownedStored,
+    savedIncome, typedIncome: tracked ? savedIncome : numv(income ?? ""),
+    avgBills: bills ?? 0, incomeTyped: !tracked,
+  });
+  // The suggested savings is the server's, measured on the income an
+  // ordinary month brings (never this month's own deposits): history's
+  // figure when the plan was seeded from history, the saved plan's
+  // otherwise (the web's rule). Nothing is worked out here; none sent —
+  // an older server included — is no suggestion.
+  // only the reply for what the box holds now is printed
+  const savingsReply = !asksTyped ? sug.data
+    : typedNow !== "" && typedAsked === typedNow ? sugTyped.data : undefined;
+  const savingsSuggested = fromHistory
+    ? savingsReply?.suggestions.savings_monthly : now.data?.savings_suggested;
+  const savingsAuto = waits ? null : (savingsSuggested ?? null);
+  // an untouched box is saved as the suggestion, so Save waits for the
+  // reply to what is typed (a failed one is no suggestion, as before)
+  const savingsWaits = asksTyped && !savingsTouched && typedNow !== ""
+    && savingsReply === undefined && !sugTyped.isError
+    ? SAVE_WAITS_LOADING : null;
+  const holds = waits ?? savingsWaits;
   const savingsShown = savingsTouched ? savings
     : String(savingsAuto || "");
-  const outTotal = bills + foodVal + catsTotal + unalloc;
-  const leftover = Math.round(inc - outTotal - numv(savingsShown));
-  const pct = (v: number) => (inc > 0 ? Math.round((100 * v) / inc) : 0);
+  const outTotal = (bills ?? 0) + foodVal + catsTotal + unalloc;
+  const shown = preview(numv(savingsShown));
+  // null: no income to plan on yet, so no excess figure to show
+  const leftover = shown.excess === null ? null : Math.round(shown.excess);
+  const over = leftover ?? 0;
+  // the shares of the income, by the server's largest-remainder rule
+  // (plannerShares, the web planner's): out, save and the excess add up
+  // to 100 when they are the whole income
+  const livePct = plannerShares(
+    [outTotal, shown.saved, Math.max(over, 0)], inc).map((p) => p ?? 0);
+  // at rest — the figures are the saved plan's — the plan line's own
+  // whole dollars and shares (the web planner's rule); while something is
+  // typed away from it, the live figures
+  const rest = plannerAtRest(now.data?.plan_line,
+    { income: inc, out: outTotal, saved: shown.saved, excess: over });
+  const [outPct, savePct, overPct] = rest
+    ? [rest.outPct, rest.savePct, rest.overPct] : livePct;
+  const incShown = rest ? rest.income : inc;
+  const outShown = rest ? rest.out : outTotal;
+  const saveShown = rest ? rest.saved : shown.saved;
+  const overShown = rest ? rest.excess : over;
   const zeroed = rows.filter((r) => r.name.trim() && numv(r.monthly) <= 0)
     .map((r) => r.name.trim());
   const candidates = [
@@ -556,9 +793,7 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
         </Text>
       )}
       <Text style={st.mut}>
-        Give every dollar a job: start from income, cover the bills, put
-        a monthly number on each budget category, and what&apos;s left
-        becomes savings. Everything is pre-filled from your real history.
+        Give every dollar a job — the numbers start from your own history.
       </Text>
       {fromHistory && historyBasisNote(sug.data) && (
         <Text style={[st.mut, { fontSize: 13 }]}>
@@ -566,101 +801,125 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
         </Text>
       )}
 
-      {inc > 0 && (
+      {inc > 0 && !waits && (
         <View style={{ gap: 4, marginTop: 6 }}>
           <Text style={st.capLbl}>Where each dollar goes</Text>
-          <FlowBar label={`in ${m$(inc)} · 100%`} color={C.good} frac={1} />
-          <FlowBar label={`out ${m$(outTotal)} · ${pct(outTotal)}%`}
-                   color={C.warn} frac={inc > 0 ? outTotal / inc : 0} />
-          <FlowBar label={`save ${m$(numv(savingsShown))} · ${
-                     pct(numv(savingsShown))}%`}
-                   color={C.accent}
-                   frac={inc > 0 ? numv(savingsShown) / inc : 0} />
-          {leftover > 0 && (
+          <FlowBar label={`in ${m$(incShown)} · 100%`} color={C.good} frac={1} />
+          {/* the web's bars: money out in one segment per part (bills,
+              each category, everything else), save beside the excess */}
+          <SegBar label={`out ${m$(outShown)} · ${outPct}%`} inc={inc}
+                  segs={[bills ?? 0,
+                         ...rows.map((r) => numv(r.monthly)), unalloc]
+                    .filter((v) => v > 0).map((v) => ({ v, color: C.warn }))} />
+          <SegBar label={`save ${m$(saveShown)} · ${savePct}%`} inc={inc}
+                  segs={[{ v: shown.saved, color: C.accent },
+                         ...(over > 0 ? [{ v: over, color: C.border,
+                                           hatched: true }] : [])]} />
+          {over > 0 && (
             <Text style={st.mut}>
-              Excess cash {m$(leftover)} · {pct(leftover)}% — stays in
+              Excess cash {m$(overShown)} · {overPct}% — stays in
               checking.
             </Text>
           )}
-          {leftover < 0 && (
+          {over < 0 && (
             <Text style={{ color: C.bad, fontSize: 12 }}>
-              Plan exceeds income by {m$(-leftover)}
+              Plan exceeds income by {m$(-over)}
             </Text>
           )}
         </View>
       )}
 
       <Text style={[st.secHead, { color: C.good }]}>Money in</Text>
-      <Text style={st.lbl}>
-        Expected income / month (take-home; used only when no paycheck is tracked and no scenario is active)
-      </Text>
-      {/* the web planner's note: what the field is, and what reads it */}
-      <Text style={st.mut}>
-        Suggested from the paychecks in your ledger: the average of what
-        landed over the last twelve months. The plan&apos;s monthly
-        &ldquo;in&rdquo; does not read this field once a paycheck is tracked
-        on Bills — it counts this month&apos;s checks, landed plus still due,
-        each at your latest deposit. It sets the plan&apos;s income only
-        while no paycheck is tracked and no income scenario is active; the
-        cash forecast never reads it.
-      </Text>
-      <TextInput style={st.input} keyboardType="decimal-pad"
-                 editable={!viewer}
-                 value={income} onChangeText={setIncome} />
-      <Text style={st.mut}>
-        Inferred from the paychecks detected in your ledger.
-      </Text>
+      {tracked ? (<>
+        <Text style={st.lbl}>Money in this month (take-home)</Text>
+        <Text style={{ color: C.text, fontSize: 18, fontWeight: "700" }}>
+          {m$(incShown)}</Text>
+        <Text style={st.mut}>
+          {/* every deposit that landed, not paychecks alone: paychecks
+              are named only beside the portion the server sends — the
+              web planner's words */}
+          {now.data?.income_source === "paychecks"
+            ? "What landed this month"
+              + ((now.data?.income_expected ?? 0) >= 0.5
+                ? `, plus ${m$(now.data!.income_expected!)} of paychecks still due`
+                : "")
+              + ". Change them on Bills."
+            : "From the active income scenario. Change it under Income scenarios."}
+        </Text>
+      </>) : (<>
+        <Text style={st.lbl}>Expected income / month (take-home)</Text>
+        <Text style={st.mut}>
+          The plan counts this figure until a paycheck is tracked on
+          Bills; then it counts this month&apos;s checks.
+        </Text>
+        <TextInput {...fieldA11y("Expected income / month (take-home)")}
+                   style={st.input} keyboardType="decimal-pad"
+                   editable={!viewer}
+                   value={income}
+                   onChangeText={(v) => { onDirty?.(true); setIncome(v); }} />
+      </>)}
 
       <Text style={[st.secHead, { color: C.warn }]}>Money out</Text>
       <View style={st.rowLine}>
         <Text style={{ color: C.text, fontSize: 14, fontWeight: "700",
                        flex: 1 }}>
-          Bills{" "}
+          {billsLabel}{" "}
           <Text style={[st.mut, { fontWeight: "400" }]}>
-            ({billsCount} tracked, evened out)
+            ({billsCount !== null ? `${billsCount} tracked, ` : ""}evened out —{" "}
+            {/* the wizard has a Back step instead (the web's words) */}
+            {wizard ? "go Back to adjust" : (
+              <Text style={{ color: C.accent }} accessibilityRole="link"
+                    onPress={() => router.push("/bills" as never)}>adjust</Text>)})
           </Text>
         </Text>
-        <Text style={{ color: C.text, fontSize: 14 }}>{m$(bills)}</Text>
+        <Text style={{ color: C.text, fontSize: 14 }}>
+          {bills === null ? UNKNOWN_FIGURE : m$(bills)}</Text>
       </View>
       <Text style={st.capLbl}>+ Budget categories</Text>
       {rows.map((r, i) => (
         <View key={r.id} style={st.rowLine}>
-          <TextInput style={[st.input, { flex: 1, paddingVertical: 6 }]}
+          <TextInput {...fieldA11y("Budget category name")}
+                     style={[st.input, { flex: 1, paddingVertical: 6 }]}
                      placeholder="category name" placeholderTextColor={C.mut}
                      maxLength={40}
                      editable={!viewer && !r.food}
                      value={r.name}
                      onChangeText={(v) => patch(i, { name: v })} />
-          {!viewer && !r.food && (
+          {/* Food's name stays as it is (no save carries it), as on the
+              web; the row itself can go, and is offered back below */}
+          {!viewer && (
             <Text style={{ color: C.mut, fontSize: 16, padding: 4 }}
+                  accessibilityRole="button" accessibilityLabel="Remove this category"
                   onPress={() => { onDirty?.(true);
                     setRows((rs) => rs!.filter((_, j) => j !== i)); }}>
               ✕
             </Text>
           )}
-          <TextInput style={[st.input, { width: 90, paddingVertical: 6,
+          <TextInput {...fieldA11y(`${r.name || "Category"} per month`)}
+                     style={[st.input, { width: 90, paddingVertical: 6,
                                          textAlign: "right" }]}
                      keyboardType="decimal-pad" editable={!viewer}
                      value={r.monthly}
                      onChangeText={(v) => patch(i, { monthly: v })} />
+          {rowHint(r)}
         </View>
       ))}
       {!viewer && candidates.map((c) => (
         <Text key={c.category} style={{ color: C.accent, fontSize: 12 }}
-              onPress={() => setRows((rs) => [...rs!,
+              onPress={() => { onDirty?.(true); setRows((rs) => [...rs!,
                 c.category === "__food__"
                   ? { id: newRowId(), name: "Food",
                       monthly: String(c.monthly), food: true }
                   : { id: newRowId(), name: c.name,
                       monthly: String(c.monthly),
-                      category: c.category, cats: [c.category] }])}>
-          + {c.name} ~${c.monthly}/mo
+                      category: c.category, cats: [c.category] }]); }}>
+          + {c.name} ~{m$(c.monthly)}/mo
         </Text>
       ))}
       {!viewer && (
         <Text style={{ color: C.accent, fontSize: 12 }}
-              onPress={() => setRows((rs) =>
-                [...rs!, { id: newRowId(), name: "", monthly: "" }])}>
+              onPress={() => { onDirty?.(true); setRows((rs) =>
+                [...rs!, { id: newRowId(), name: "", monthly: "" }]); }}>
           + add category
         </Text>
       )}
@@ -669,13 +928,17 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
                                   paddingTop: 6 }]}>
         <Text style={{ color: C.text, fontSize: 13, flex: 1 }}>
           Everything else{" "}
-          <Text style={st.mut}>(unallocated — auto-shrinks)</Text>
+          <Text style={st.mut}>(unallocated — auto-shrinks as categories
+            claim it)</Text>
         </Text>
-        <TextInput style={[st.input, { width: 90, paddingVertical: 6,
+        <TextInput {...fieldA11y("Everything else (unallocated) per month")}
+                   style={[st.input, { width: 90, paddingVertical: 6,
                                        textAlign: "right" }]}
                    keyboardType="decimal-pad" editable={!viewer}
                    value={unallocEdited ?? String(unallocAuto || "")}
-                   onChangeText={setUnallocEdited} />
+                   onChangeText={(v) => { onDirty?.(true);
+                                          setUnallocEdited(v); }} />
+        {hint(sug.data?.suggestions.unallocated_monthly)}
       </View>
 
       <Text style={[st.secHead, { color: C.accent }]}>
@@ -684,12 +947,15 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
       <Text style={st.lbl}>
         Save / month (what&apos;s left of the money in)
       </Text>
-      <TextInput style={st.input} keyboardType="decimal-pad"
+      <TextInput {...fieldA11y("Save / month (what's left of the money in)")}
+                 style={st.input} keyboardType="decimal-pad"
                  editable={!viewer}
+                 placeholder={savingsAuto === null ? UNKNOWN_FIGURE : undefined}
+                 placeholderTextColor={C.mut}
                  value={savingsShown}
-                 onChangeText={(v) => { setSavings(v);
+                 onChangeText={(v) => { onDirty?.(true); setSavings(v);
                                         setSavingsTouched(true); }} />
-      {savingsTouched && savingsAuto > 0
+      {savingsTouched && savingsAuto !== null && savingsAuto > 0
         && savingsAuto !== numv(savingsShown) && !viewer && (
         <Text style={st.mut}>
           suggested {m$(savingsAuto)}{"  "}
@@ -700,9 +966,28 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
         </Text>
       )}
       <Text style={st.mut}>
-        {savingsTouched ? "Your number." : "What's left, automatically."}
+        {savingsTouched ? "Your number."
+          : savingsAuto !== null
+            ? "Suggested: what an ordinary month leaves."
+            : "No suggestion yet."}
         {" Saved as your “Savings” goal."}
       </Text>
+      {/* every other goal's plan comes off the excess too; they are edited
+          under Savings goals, so they are listed, not typed */}
+      {otherGoals.map((g) => (
+        <View key={g.name} style={st.rowLine}>
+          <Text style={[st.mut, { flex: 1 }]}>{g.name}</Text>
+          <Text style={{ color: C.text, fontSize: 13 }}>
+            {m$(g.monthly_plan)}/mo</Text>
+        </View>
+      ))}
+      {leftover !== null && !waits && (
+        <Text style={[st.mut, over < 0 ? { color: C.bad } : null]}>
+          Excess cash {m$(over)}/mo — {over < 0
+            ? "the plan spends more than comes in"
+            : "unplanned; stays in checking"}.
+        </Text>
+      )}
 
       {zeroed.length > 0 && (
         <Text style={{ color: C.warn, fontSize: 12, marginTop: 6 }}>
@@ -710,26 +995,69 @@ export function Planner({ s0, viewer, onSaved, onDirty, wizard }: {
           budget — saving now leaves{" "}
           {zeroed.length === 1 ? "it" : "them"} unbudgeted (spending
           there won&apos;t count toward the verdict).
+          {/* the web's rule: no food suggestion and no food history is the
+              categorize pass not having caught up yet */}
+          {!sug.data?.not_enough_history
+            && !(sug.data?.suggestions.food_monthly ?? 0)
+            ? " Smart categorization may still be running — reload in a minute for a suggestion."
+            : ""}
         </Text>
       )}
       {msg ? (
-        <Text style={{ color: msg === "Plan saved." ? C.good : C.bad,
+        <Note bad={!(msg === "Plan saved.")} style={{ color: msg === "Plan saved." ? C.good : C.bad,
                        fontSize: 12, marginTop: 6 }}
               onPress={() => setMsg(null)}>
           {msg}
-        </Text>
+        </Note>
       ) : null}
+      {(() => {
+        if (saveRef) saveRef.current = {
+          save: () => {
+            if (holds) { setMsg(holds); return; }
+            if (!save.isPending) save.mutate(rows);
+          },
+          saving: save.isPending };
+        return null;
+      })()}
       {!viewer && (
-        <Pressable style={[st.btn, { alignSelf: "flex-start",
-                     marginTop: 10 }, save.isPending && { opacity: 0.5 }]}
-                   disabled={save.isPending}
-                   onPress={() => save.mutate()}>
+        <Pressable accessibilityRole="button" style={[st.btn, { alignSelf: "flex-start",
+                     marginTop: 10 },
+                     (save.isPending || !!holds) && { opacity: 0.5 },
+                     offlineGrey(offline)]}
+                   disabled={save.isPending || !!holds || offline}
+                   onPress={() => save.mutate(rows)}>
           <Text style={st.btnText}>
             {save.isPending ? "saving…" : "Save budgets"}
           </Text>
         </Pressable>
       )}
+      {!viewer && <OfflineNote />}
+      {!viewer && holds && <Text style={st.mut}>{holds}</Text>}
     </Card>
+  );
+}
+
+/** A bar of parts, each its share of the income — the web planner's
+ *  out and save bars; an excess segment is drawn hollow (the web's
+ *  hatching). Geometry only: every figure printed is in the label. */
+function SegBar({ label, inc, segs }: {
+  label: string; inc: number;
+  segs: { v: number; color: string; hatched?: boolean }[];
+}) {
+  return (
+    <View style={{ gap: 2 }}>
+      <Text style={st.mut}>{label}</Text>
+      <View style={[st.flowTrack, { flexDirection: "row", gap: 2,
+                                    backgroundColor: "transparent" }]}>
+        {segs.map((x, i) => (
+          <View key={i} style={{
+            width: `${inc > 0 ? Math.min(100, Math.max(0, 100 * x.v / inc)) : 0}%`,
+            height: 8, borderRadius: 3,
+            backgroundColor: x.hatched ? "transparent" : x.color,
+            borderWidth: x.hatched ? 1 : 0, borderColor: x.color }} />
+        ))}
+      </View>
+    </View>
   );
 }
 
@@ -755,6 +1083,8 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
   onDirty?: (v: boolean) => void;
 }) {
   const { client } = useSession();
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const qc = useQueryClient();
   const [rows, setRows] = useState<ScenarioRow[]>(
     () => (s0.income_scenarios ?? []).map((r) => (
@@ -764,6 +1094,9 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
   // the copy this card was seeded from: the merge base at save time
   const baseline = useRef(s0.income_scenarios ?? []);
   const baseActive = useRef(s0.active_scenario ?? "");
+  // what is saved now: the one "Active now" speaks for
+  const [saved, setSaved] = useState({
+    list: s0.income_scenarios ?? [], active: s0.active_scenario ?? "" });
   const [msg, setMsg] = useState<string | null>(null);
   // every draft edit marks the card dirty so a sibling save's remount
   // loop skips it — otherwise the remount wipes the unsaved scenario
@@ -789,7 +1122,7 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
       // the active pick is sent only when it was changed here; omitted,
       // the server keeps whichever one is live now
       if (active !== baseActive.current) body.active_scenario = active;
-      return saveSettings(qc, client!, body);
+      return saveSettings(qc, client!, body, cur);
     },
     onSuccess: (v) => {
       // the saved view is the new merge base, and the card shows what was
@@ -797,19 +1130,30 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
       const scen = v.income_scenarios ?? [];
       baseline.current = scen;
       baseActive.current = v.active_scenario ?? "";
+      setSaved({ list: scen, active: v.active_scenario ?? "" });
       setRows(scen.map((x) => ({ id: newRowId(), name: x.name,
         take_home: String(x.take_home), cadence: x.cadence })));
       setActive(v.active_scenario ?? "");
-      setMsg("Income scenario saved."); onSaved();
+      // the rows above were just replaced by the saved view
+      setMsg("Income scenario saved."); onDirty?.(false); onSaved();
     },
     onError: (e) => setMsg(errText(e)),
   });
   const CAD = ["weekly", "biweekly", "semimonthly", "monthly"];
+  // "Active now" is the SAVED active scenario's month, as the server
+  // converts it for the plan (each scenario's `monthly`); an unsaved edit
+  // changes nothing until it is saved, and a server without the figure
+  // gets no line rather than a second conversion worked out here (web:
+  // IncomeScenarioCard.tsx)
+  const live = saved.list.find((x) => x.name === saved.active);
+  // older-server path: stands in for `monthly` (each scenario's; the
+  // server's own CADENCE_MONTHLY conversion, on the saved active one)
   const MULT: Record<string, number> =
     { weekly: 4, biweekly: 2, semimonthly: 2, monthly: 1 };
-  const activeRow = rows.find((r) => r.name === active) ?? rows[0];
-  const monthly = activeRow
-    ? numv(activeRow.take_home) * (MULT[activeRow.cadence] ?? 2) : 0;
+  const liveMonthly = live
+    ? live.monthly !== undefined ? live.monthly
+      : (live.take_home ? live.take_home * (MULT[live.cadence] ?? 2) : null)
+    : null;
   return (
     <Card>
       <H>
@@ -825,21 +1169,26 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
           <View style={st.rowLine}>
             <Text style={{ color: active === r.name ? C.accent : C.mut,
                            fontSize: 16 }}
+                  accessibilityRole="radio" accessibilityLabel="Use this income"
+                  accessibilityState={{ checked: active === r.name }}
                   onPress={() => { onDirty?.(true); setActive(r.name); }}>
               {active === r.name ? "◉" : "○"}
             </Text>
-            <TextInput style={[st.input, { flex: 1, paddingVertical: 6 }]}
+            <TextInput {...fieldA11y("Income scenario name")}
+                       style={[st.input, { flex: 1, paddingVertical: 6 }]}
                        placeholder="full salary" placeholderTextColor={C.mut}
                        value={r.name}
                        onChangeText={(v) => {
                          if (active === r.name) setActive(v);
                          patch(i, { name: v });
                        }} />
-            <TextInput style={[st.input, { width: 90, paddingVertical: 6,
+            <TextInput {...fieldA11y(`${r.name || "Scenario"} take-home`)}
+                       style={[st.input, { width: 90, paddingVertical: 6,
                                            textAlign: "right" }]}
                        keyboardType="decimal-pad" value={r.take_home}
                        onChangeText={(v) => patch(i, { take_home: v })} />
             <Text style={{ color: C.mut, fontSize: 16, padding: 4 }}
+                  accessibilityRole="button" accessibilityLabel="Remove this income"
                   onPress={() => { onDirty?.(true);
                     setRows((rs) => rs.filter((_, j) => j !== i)); }}>
               ✕
@@ -847,7 +1196,7 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
           </View>
           <View style={{ flexDirection: "row", gap: 6, marginLeft: 26 }}>
             {CAD.map((c) => (
-              <Pressable key={c}
+              <Pressable accessibilityRole="button" key={c}
                          style={[st.chip, r.cadence === c && st.chipOn]}
                          onPress={() => patch(i, { cadence: c })}>
                 <Text style={{ color: r.cadence === c ? C.text : C.mut,
@@ -865,27 +1214,26 @@ function IncomeScenarios({ s0, onSaved, onDirty }: {
         + Add scenario
       </Text>
       <Text style={st.mut}>
-        {activeRow && monthly > 0
-          ? `Active now: ${m$(monthly)}/mo (${activeRow.name}). ` : ""}
-        Applies to the cash forecast and daily email: the paycheck it
-        describes is walked in at no more than its take-home. It sets the
-        plan&apos;s income only until a paycheck is tracked on Bills — from
-        then the plan counts this month&apos;s own checks. No scenarios →
-        the plan&apos;s own income figure is used.
+        {live && liveMonthly != null
+          ? `Active now: ${m$(liveMonthly)}/mo (${live.name}). ` : ""}
+        The active scenario caps that paycheck in the cash forecast and
+        daily email.
       </Text>
       {msg ? (
-        <Text style={{ color: msg.includes("saved") ? C.good : C.bad,
+        <Note bad={!(msg.includes("saved"))} style={{ color: msg.includes("saved") ? C.good : C.bad,
                        fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
-      <Pressable style={[st.btn, { alignSelf: "flex-start", marginTop: 8 },
-                   save.isPending && { opacity: 0.5 }]}
-                 disabled={save.isPending}
+      <Pressable accessibilityRole="button"
+                 style={[st.btn, { alignSelf: "flex-start", marginTop: 8 },
+                   save.isPending && { opacity: 0.5 }, offlineGrey(offline)]}
+                 disabled={save.isPending || offline}
                  onPress={() => save.mutate()}>
         <Text style={st.btnText}>
           {save.isPending ? "saving…" : "Save income scenarios"}
         </Text>
       </Pressable>
+      <OfflineNote />
     </Card>
   );
 }
@@ -907,20 +1255,23 @@ const GoalAccountPicker = memo(function GoalAccountPicker({
 }) {
   return (
     <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
-      <Pressable style={[st.chip, !selected && st.chipOn]}
+      <Pressable accessibilityRole="button" style={[st.chip, !selected && st.chipOn]}
                  onPress={() => onPick(index, "")}>
         <Text style={{ color: !selected ? C.text : C.mut,
                        fontSize: 11 }}>no account (plan only)</Text>
       </Pressable>
-      {/* every account — a goal bound to a hidden/archived one
-          must still show its selection */}
-      {(accounts ?? []).map((a) => (
-        <Pressable key={a.id}
+      {/* open cash and investment accounts a transfer can reach (the
+          server's goal_destination; an older server sends none, so all),
+          with their last four — and the one already chosen, whatever it
+          is, so a goal bound to a hidden account still shows it */}
+      {(accounts ?? []).filter((a) => a.goal_destination !== false
+                                      || a.id === selected).map((a) => (
+        <Pressable accessibilityRole="button" key={a.id}
                    style={[st.chip, selected === a.id && st.chipOn]}
                    onPress={() => onPick(index, a.id)}>
           <Text style={{ color: selected === a.id ? C.text : C.mut,
                          fontSize: 11 }}>
-            {a.name}
+            {a.name}{a.mask ? ` ···${a.mask}` : ""}
           </Text>
         </Pressable>
       ))}
@@ -933,6 +1284,8 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
   onDirty?: (v: boolean) => void;
 }) {
   const { client } = useSession();
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const qc = useQueryClient();
   const baseline = useRef((s0.savings_goals ?? []).map((g) => g.name));
   const accounts = useQuery({ queryKey: ["accounts"],
@@ -940,7 +1293,7 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
   const today = useQuery({ queryKey: ["today"],
     queryFn: () => client!.todayFull(), enabled: !!client });
   const goalRow = (g: NonNullable<BudgetSettings["savings_goals"]>[number]): GoalRow => ({
-    id: newRowId(), name: g.name, target: String(g.target || ""),
+    id: newRowId(), name: g.name, target: String(g.target ?? ""),
     target_date: g.target_date ?? "",
     monthly_plan: String(g.monthly_plan ?? ""),
     account_id: g.account_id ?? "",
@@ -966,6 +1319,11 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
       j === i ? { ...r, account_id: id, touched: true } : r));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+  // the plan's Savings line: "no account" is where it already is, so only
+  // a real account binds it (and opens it as a goal)
+  const pickPlanAccount = useCallback((i: number, id: string) => {
+    if (id) pickAccount(i, id);
+  }, [pickAccount]);
   const save = useMutation({
     // every Budget-page list save reads the server fresh, merges and
     // writes the whole list back: one shared queue, so no two of them
@@ -980,18 +1338,20 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
       const cur = await client!.settingsFull();
       return saveSettings(qc, client!, {
         savings_goals: mergeSavingsGoals(sent, cur.savings_goals ?? [],
-                                         baseline.current) });
+                                         baseline.current) }, cur);
     },
     onSuccess: (v, sent) => {
       // the saved view is the new merge base: a goal added here and saved
       // is no longer "added elsewhere", so removing or renaming it in a
       // later save must not carry it back through
       const goals = v.savings_goals ?? [];
-      baseline.current = goals.map((g) => g.name);
       // every edit makes a new rows array: the same array means nothing
       // was typed since the save began, and only then does the saved view
       // replace the rows — edits typed in flight stay, still unsaved
       const edited = rowsNow.current !== sent;
+      // mid-edit, only the names the sent rows held (see savedMergeBase)
+      baseline.current = savedMergeBase(goals.map((g) => g.name),
+        edited ? sent : undefined, baseline.current);
       if (!edited) setRows(goals.map(goalRow));
       setMsg("Savings goals saved."); if (!edited) onDirty?.(false);
       onSaved();
@@ -1003,32 +1363,50 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
       <H>
         Savings goals{" "}
         <Text style={[st.mut, { fontWeight: "400" }]}>
-          — progress comes from real transfers
+          — trip fund, emergency fund; progress comes from real transfers
         </Text>
       </H>
       <Text style={st.mut}>
-        A goal watches transfers on its account (add match words to
-        carve several goals out of one account). A goal with no account
-        is a plan only: it lowers the excess cash line but shows no
-        progress. The monthly plan
-        lowers the excess cash line and rides the cash forecast — it
-        never makes the daily verdict go over. A sweep goal contributes
-        at month end instead, and only what the month&apos;s surplus
-        covers.
+        A goal tracks transfers into its account; its monthly plan comes
+        out of excess cash.
       </Text>
       {rows.map((r, i) => {
         const p = (today.data?.savings_goals ?? [])
           .find((x) => x.name === r.name.trim());
+        // the budget plan's own Savings line, with no account to measure
+        // it yet: its amount is set on the planner, and the one thing to
+        // choose here is the account it lands in — once chosen it is a
+        // goal like any other (web: SavingsGoalsCard); unbound, it rides
+        // along untouched on a save
+        if (isPlanOnlySavingsGoal(r) && !r.touched)
+          return (
+            <View key={r.id} style={{ paddingVertical: 6, gap: 6 }}>
+              <Text style={st.mut}>
+                <Text style={{ color: C.text, fontWeight: "600" }}>Savings</Text>
+                {" "}— the plan&apos;s savings line
+                {Number(r.monthly_plan) > 0
+                  ? ` (${m$(Number(r.monthly_plan))}/month)` : ""}, set on the
+                planner above. Pick the account it lands in to measure it.
+              </Text>
+              {accounts.data === undefined && accounts.isError ? (
+                <FailedLine q={accounts} what="the accounts" />
+              ) : (
+              <GoalAccountPicker accounts={accounts.data?.accounts}
+                                 index={i} selected=""
+                                 onPick={pickPlanAccount} />)}
+            </View>);
         return (
         <View key={r.id} style={{ borderTopColor: C.border,
                                borderTopWidth: StyleSheet.hairlineWidth,
                                paddingVertical: 8, gap: 6 }}>
           <View style={st.rowLine}>
-            <TextInput style={[st.input, { flex: 1, paddingVertical: 6 }]}
+            <TextInput {...fieldA11y("Savings goal name")}
+                       style={[st.input, { flex: 1, paddingVertical: 6 }]}
                        placeholder="Trip fund" placeholderTextColor={C.mut}
                        value={r.name}
                        onChangeText={(v) => patch(i, { name: v })} />
             <Text style={{ color: C.mut, fontSize: 16, padding: 4 }}
+                  accessibilityRole="button" accessibilityLabel="Remove this goal"
                   onPress={() => {
                     // deleting is an edit — without the dirty mark a
                     // sibling save remounts this card and the deleted
@@ -1062,7 +1440,7 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
             {([["monthly", "every month (fixed plan)"],
                ["sweep", "only when the month worked out (sweep)"]] as
                const).map(([val, label]) => (
-              <Pressable key={val}
+              <Pressable accessibilityRole="button" key={val}
                          style={[st.chip, r.mode === val && st.chipOn]}
                          onPress={() => patch(i, { mode: val })}>
                 <Text style={{ color: r.mode === val ? C.text : C.mut,
@@ -1070,9 +1448,14 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
               </Pressable>
             ))}
           </View>
+          {/* an unread account list is not "no account": the failed
+              line in the picker's place */}
+          {accounts.data === undefined && accounts.isError ? (
+            <FailedLine q={accounts} what="the accounts" />
+          ) : (
           <GoalAccountPicker accounts={accounts.data?.accounts}
                              index={i} selected={r.account_id}
-                             onPick={pickAccount} />
+                             onPick={pickAccount} />)}
           {goalNeedsAccount(r) && (
             <Text style={{ color: C.bad, fontSize: 12 }}>
               Match words need an account — pick the account the money
@@ -1081,9 +1464,9 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
           )}
           {p && p.pct != null && (
             <Text style={st.mut}>
-              {m$(p.saved ?? 0)} of {m$(p.target)} ({p.pct}%)
+              {money(p.saved, false)} of {money(p.target, false)} ({p.pct}%)
               {/* A sweep goal contributes in one lump at month end, so
-                  the trailing-90-day pace text reads "off pace" all
+                  the last-3-months pace text reads "off pace" all
                   month on a goal that is fine. Say what this goal's
                   month actually did instead — the Today line's wording,
                   per goal, since the pooled sentence there cannot tell
@@ -1095,32 +1478,34 @@ function SavingsGoals({ s0, onSaved, onDirty }: {
                       + `${m$(p.monthly_plan)} this month`)
                 : p.on_pace === false ? " — off pace"
                 : p.on_pace ? " — on pace"
-                : p.eta && p.pct < 100 ? ` — ~${p.eta.slice(5, 10)}` : ""}
+                : p.eta && p.pct < 100 ? ` — ~${mmdd(p.eta)}` : ""}
             </Text>
           )}
         </View>
         );
       })}
       <Text style={{ color: C.accent, fontSize: 12 }}
-            onPress={() => setRows((rs) => [...rs,
+            onPress={() => { onDirty?.(true); setRows((rs) => [...rs,
               { id: newRowId(), name: "", target: "", target_date: "",
                 monthly_plan: "", account_id: "", tokens: "",
-                start_balance: "", mode: "monthly", touched: true }])}>
+                start_balance: "", mode: "monthly", touched: true }]); }}>
         + Add goal
       </Text>
       {msg ? (
-        <Text style={{ color: msg.includes("saved") ? C.good : C.bad,
+        <Note bad={!(msg.includes("saved"))} style={{ color: msg.includes("saved") ? C.good : C.bad,
                        fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
-      <Pressable style={[st.btn, { alignSelf: "flex-start", marginTop: 8 },
-                   save.isPending && { opacity: 0.5 }]}
-                 disabled={save.isPending}
+      <Pressable accessibilityRole="button"
+                 style={[st.btn, { alignSelf: "flex-start", marginTop: 8 },
+                   save.isPending && { opacity: 0.5 }, offlineGrey(offline)]}
+                 disabled={save.isPending || offline}
                  onPress={() => save.mutate(rows)}>
         <Text style={st.btnText}>
           {save.isPending ? "saving…" : "Save savings goals"}
         </Text>
       </Pressable>
+      <OfflineNote />
     </Card>
   );
 }
@@ -1133,7 +1518,7 @@ function Field({ label, value, onChange, num, placeholder, wide,
   return (
     <View style={{ width: wide ? "100%" : "47%" }}>
       <Text style={{ color: C.mut, fontSize: 10 }}>{label}</Text>
-      <TextInput style={[st.input, { paddingVertical: 5 },
+      <TextInput {...fieldA11y(label)} style={[st.input, { paddingVertical: 5 },
                          disabled && { opacity: 0.5 }]}
                  keyboardType={num ? "decimal-pad" : "default"}
                  placeholder={placeholder} placeholderTextColor={C.mut}
@@ -1144,17 +1529,22 @@ function Field({ label, value, onChange, num, placeholder, wide,
 }
 
 // ---- bucket rules (fine-tune) ----
-type BucketRow = { id: string; name: string; parent: "food" | "other";
-                   monthly: string; categories: string[];
-                   merchants: string; touched?: boolean };
+// `id` is local — a stable React key that mergeBucketRules never needs
+type BucketRow = BucketRuleDraft & { id: string };
+const bucketRows = (saved: readonly CustomBucket[]): BucketRow[] =>
+  bucketRulesSaved(saved).rows.map((r) => ({ ...r, id: newRowId() }));
 
 function BucketRules({ s0, onSaved, onDirty }: {
   s0: BudgetSettings; onSaved: () => void;
   onDirty?: (v: boolean) => void;
 }) {
   const { client } = useSession();
+  // offline, the saves here are greyed with "You're offline." beside them
+  const offline = useOffline();
   const qc = useQueryClient();
-  const baseline = useRef((s0.custom_buckets ?? []).map((b) => b.name));
+  // the server copy the rows were last seeded from — at mount, then each
+  // saved view: the save-time merge base
+  const baseline = useRef(bucketRulesSaved(s0.custom_buckets ?? []).base);
   const [editing, setEditingRaw] = useState<number | null>(null);
   // the category chips only render inside an open row editor — no need
   // to fetch the tenant's whole category list before the first one opens
@@ -1166,11 +1556,10 @@ function BucketRules({ s0, onSaved, onDirty }: {
   const cats = useQuery({ queryKey: ["categories"],
     queryFn: () => client!.categories(), enabled: !!client && everEdited });
   const [rows, setRows] = useState<BucketRow[]>(
-    () => (s0.custom_buckets ?? []).map((b) => ({
-      id: newRowId(), name: b.name, parent: b.parent,
-      monthly: String(b.monthly || ""),
-      categories: b.categories ?? [],
-      merchants: (b.merchants ?? []).join(", ") })));
+    () => bucketRows(s0.custom_buckets ?? []));
+  // the rows on screen now, for a save that lands after more typing
+  const rowsNow = useRef(rows);
+  rowsNow.current = rows;
   // absent means on, the way the budget engine reads it: an unchecked
   // switch here would be posted back as false by the next bucket save
   const [dynamic, setDynamic] =
@@ -1184,36 +1573,34 @@ function BucketRules({ s0, onSaved, onDirty }: {
     // writes the whole list back: one shared queue, so no two of them
     // interleave and erase each other's rows
     scope: SETTINGS_SAVES,
-    mutationFn: async (dyn: boolean) => {
+    // the rows being saved ride along with the switch's value, so
+    // success can tell whether the person kept typing in flight
+    mutationFn: async ({ dyn, sent }: { dyn: boolean; sent: BucketRow[] }) => {
+      // fresh-read merge (pure.ts, shared with the web card): touched rows
+      // win, untouched rows follow the server's copy, buckets added
+      // elsewhere since the base are carried through
       const cur = await client!.settingsFull();
-      const curBy = new Map((cur.custom_buckets ?? [])
-        .map((b) => [b.name, b]));
-      const baseNames = new Set(baseline.current);
-      const out: CustomBucket[] = [];
-      for (const b of rows) {
-        const name = b.name.trim();
-        if (!name) continue;
-        if (!b.touched) {
-          const live = curBy.get(name);
-          if (live) { out.push(live); continue; }
-          if (baseNames.has(name)) continue;
-        }
-        out.push({ name, parent: b.parent, monthly: numv(b.monthly),
-                   categories: b.categories,
-                   merchants: b.merchants.split(",").map((x) => x.trim())
-                     .filter(Boolean) });
-      }
-      for (const b of cur.custom_buckets ?? [])
-        if (!baseNames.has(b.name) && !out.some((o) => o.name === b.name))
-          out.push(b);
+      const out = mergeBucketRules(sent, cur.custom_buckets ?? [],
+                                   baseline.current, savedAmount);
       // partial body on purpose — food/other/income/savings belong to
       // the planner
       return saveSettings(qc, client!, { dynamic_variable_budget: dyn,
-                                         custom_buckets: out });
+                                         custom_buckets: out }, cur);
     },
-    onSuccess: (_v, dyn) => {
+    onSuccess: (v, { dyn, sent }) => {
       committedDyn.current = dyn;
-      setMsg("Bucket rules saved."); onSaved();
+      // every edit makes a new rows array: the same array means nothing
+      // was typed since the save began, and only then does the saved view
+      // replace the rows — edits typed in flight stay, still unsaved
+      const edited = rowsNow.current !== sent;
+      // the saved view is the new merge base; mid-edit, only the names
+      // the sent rows held (see bucketRulesSaved)
+      const saved = v.custom_buckets ?? [];
+      baseline.current = bucketRulesSaved(saved, edited ? sent : undefined,
+                                          baseline.current).base;
+      if (!edited) setRows(bucketRows(saved));
+      setMsg("Bucket rules saved."); if (!edited) onDirty?.(false);
+      onSaved();
     },
     onError: (e) => {
       setDynamic(committedDyn.current);
@@ -1227,9 +1614,12 @@ function BucketRules({ s0, onSaved, onDirty }: {
   };
   // median-of-history suggestions, approve-each — never auto-applied
   const [sugg, setSugg] = useState<Record<string, number> | null>(null);
+  // how many months the medians are taken over (the web's footnote)
+  const [suggMonths, setSuggMonths] = useState<number | null>(null);
   const suggest = useMutation({
     mutationFn: () => client!.budgetsSuggest(),
-    onSuccess: (r) => setSugg(r.suggestions.buckets ?? {}),
+    onSuccess: (r) => { setSugg(r.suggestions.buckets ?? {});
+                        setSuggMonths(r.months.length); },
     onError: (e) => setMsg(errText(e)),
   });
   return (
@@ -1237,7 +1627,7 @@ function BucketRules({ s0, onSaved, onDirty }: {
       <H>
         Bucket rules{" "}
         <Text style={[st.mut, { fontWeight: "400" }]}>
-          — what counts toward each bucket
+          — what counts toward each bucket; a merchant match wins
         </Text>
       </H>
       {rows.length === 0 && (
@@ -1251,12 +1641,14 @@ function BucketRules({ s0, onSaved, onDirty }: {
                                borderTopWidth: StyleSheet.hairlineWidth,
                                paddingVertical: 8, gap: 6 }}>
           <View style={st.rowLine}>
-            <TextInput style={[st.input, { flex: 1, paddingVertical: 6 }]}
+            <TextInput {...fieldA11y("Bucket name")}
+                       style={[st.input, { flex: 1, paddingVertical: 6 }]}
                        placeholder="Coffee" placeholderTextColor={C.mut}
                        maxLength={40}
                        value={r.name}
                        onChangeText={(v) => patch(i, { name: v })} />
-            <TextInput style={[st.input, { width: 80, paddingVertical: 6,
+            <TextInput {...fieldA11y(`${r.name || "Bucket"} per month`)}
+                       style={[st.input, { width: 80, paddingVertical: 6,
                                            textAlign: "right" }]}
                        keyboardType="decimal-pad" value={r.monthly}
                        onChangeText={(v) => patch(i, { monthly: v })} />
@@ -1264,7 +1656,8 @@ function BucketRules({ s0, onSaved, onDirty }: {
           </View>
           <View style={{ flexDirection: "row", gap: 6 }}>
             {(["other", "food"] as const).map((p) => (
-              <Pressable key={p} style={[st.chip, r.parent === p && st.chipOn]}
+              <Pressable accessibilityRole="button"
+                         key={p} style={[st.chip, r.parent === p && st.chipOn]}
                          onPress={() => patch(i, { parent: p })}>
                 <Text style={{ color: r.parent === p ? C.text : C.mut,
                                fontSize: 11 }}>
@@ -1275,7 +1668,7 @@ function BucketRules({ s0, onSaved, onDirty }: {
           </View>
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
             {r.categories.map((c) => (
-              <Pressable key={c} style={st.chip}
+              <Pressable accessibilityRole="button" key={c} style={st.chip}
                          onPress={() => patch(i, { categories:
                            r.categories.filter((x) => x !== c) })}>
                 <Text style={{ color: C.text, fontSize: 11 }}>
@@ -1286,7 +1679,7 @@ function BucketRules({ s0, onSaved, onDirty }: {
             {(cats.data?.categories ?? [])
               .filter((c) => !r.categories.includes(c))
               .map((c) => (
-              <Pressable key={c} style={[st.chip, { opacity: 0.7 }]}
+              <Pressable accessibilityRole="button" key={c} style={[st.chip, { opacity: 0.7 }]}
                          onPress={() => patch(i, { categories:
                            [...r.categories, c] })}>
                 <Text style={{ color: C.mut, fontSize: 11 }}>
@@ -1300,31 +1693,35 @@ function BucketRules({ s0, onSaved, onDirty }: {
               suggested {m$(sugg[r.name.trim()])}{"  "}
               <Text style={{ color: C.accent }}
                     onPress={() => patch(i, { monthly:
-                      String(Math.round(sugg[r.name.trim()])) })}>
+                      String(sugg[r.name.trim()]) })}>
                 use
               </Text>
             </Text>
           )}
           <View style={st.rowLine}>
-            <TextInput style={[st.input, { flex: 1, paddingVertical: 6 }]}
+            <TextInput {...fieldA11y(`${r.name || "Bucket"} merchants, comma-separated`)}
+                       style={[st.input, { flex: 1, paddingVertical: 6 }]}
                        placeholder="＋ merchant, comma-separated"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        value={r.merchants}
                        onChangeText={(v) => patch(i, { merchants: v })} />
           </View>
           <View style={{ flexDirection: "row", gap: 8 }}>
-            <Pressable style={[st.btn, save.isPending && { opacity: 0.5 }]}
-                       disabled={save.isPending}
+            <Pressable accessibilityRole="button"
+                       style={[st.btn, save.isPending && { opacity: 0.5 },
+                               offlineGrey(offline)]}
+                       disabled={save.isPending || offline}
                        onPress={() => { setEditing(null);
-                                        save.mutate(dynamic); }}>
+                                        save.mutate({ dyn: dynamic,
+                                                      sent: rows }); }}>
               <Text style={st.btnText}>save</Text>
             </Pressable>
-            <Pressable style={[st.btn, st.btnQuiet]}
+            <Pressable accessibilityRole="button" style={[st.btn, st.btnQuiet]}
                        onPress={() => setEditing(null)}>
               <Text style={[st.btnText, { color: C.mut }]}>cancel</Text>
             </Pressable>
-            <Pressable style={[st.btn, st.btnQuiet]}
-                       onPress={() => { setRows((rs) =>
+            <Pressable accessibilityRole="button" style={[st.btn, st.btnQuiet]}
+                       onPress={() => { onDirty?.(true); setRows((rs) =>
                          rs.filter((_, j) => j !== i));
                          setEditing(null); }}>
               <Text style={[st.btnText, { color: C.bad }]}>remove</Text>
@@ -1351,6 +1748,7 @@ function BucketRules({ s0, onSaved, onDirty }: {
             </Text>
           </View>
           <Text style={{ color: C.accent, fontSize: 14, padding: 6 }}
+                accessibilityRole="button" accessibilityLabel={`Edit ${r.name || "this budget"}`}
                 onPress={() => setEditing(i)}>✎</Text>
         </View>
       ))}
@@ -1370,9 +1768,7 @@ function BucketRules({ s0, onSaved, onDirty }: {
       </View>
       {sugg && (
         <Text style={st.mut}>
-          Suggestions are the median of recent months, this one so far
-          included (outlier months excluded) — tap “use” beside a bucket
-          to take one.
+          Suggestions are the median of the last {suggMonths} months.
         </Text>
       )}
       <View style={[st.rowLine, { marginTop: 6 }]}>
@@ -1380,15 +1776,18 @@ function BucketRules({ s0, onSaved, onDirty }: {
           Dynamic budget{" "}
           <Text style={st.mut}>— adapts to the month so far</Text>
         </Text>
-        <Switch value={dynamic} disabled={save.isPending}
-                onValueChange={(v) => { setDynamic(v); save.mutate(v); }}
+        <Switch value={dynamic} disabled={save.isPending || offline}
+                accessibilityLabel="Dynamic budget"
+                onValueChange={(v) => { setDynamic(v);
+                                         save.mutate({ dyn: v, sent: rows }); }}
                 trackColor={{ true: C.accent, false: C.hover }}
                 thumbColor={C.text} />
       </View>
+      <OfflineNote />
       {msg ? (
-        <Text style={{ color: msg.includes("saved") ? C.good : C.bad,
+        <Note bad={!(msg.includes("saved"))} style={{ color: msg.includes("saved") ? C.good : C.bad,
                        fontSize: 12 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
     </Card>
   );
@@ -1402,12 +1801,12 @@ const st = StyleSheet.create({
   capLbl: { color: C.mut, fontSize: 11, textTransform: "uppercase",
             letterSpacing: 1, marginTop: 8 },
   secHead: { fontSize: 14, fontWeight: "700", marginTop: 12 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8 },
   rowLine: { flexDirection: "row", alignItems: "center", gap: 8,
              marginTop: 4 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 16, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },

@@ -453,7 +453,7 @@ def render_pdf(p: dict) -> bytes:
                          f"····{d['mask']}" if d["mask"] else "",
                          _money(d["balance"]),
                          (f"{d['apr']:.2f}%" if d["apr"] else "—")
-                         + (" (est.)" if d["apr_source"] == "none" else ""),
+                         + (" (est.)" if d["apr_source"] == "typical" else ""),
                          due])
         story.append(table(["Debt", "Number", "Balance", "Rate",
                             "Monthly payment"],

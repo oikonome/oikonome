@@ -5,6 +5,7 @@
 // Also SimpleFIN connect, Plaid hosted link and manual accounts.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { openPlaidHostedLink, PendingLinkRows, plaidLinkOutcome,
+         BankLinkLine,
          startPlaidLink, usePlaidLinkResume, useRelinkPending,
          firstSyncPending, useFirstSyncLanding }
   from "../components/ConnectHub";
@@ -16,16 +17,18 @@ import ImportPage from "./Import";
 import { Fragment, useEffect, useState } from "react";
 import { ext } from "../ext";
 import { Link, useSearchParams } from "react-router";
-import { ago, api, errText, linkCardVisible, removedConnectionNote, mmdd, money, type Account,
+import { ago, api, errText, holdingSymbol, linkCardVisible, removedConnectionNote, mmdd, money, type Account,
          type Connection, type HistoryMonths, type Me, type Settings }
   from "../api/client";
 import { historyRowNote, windowNarrower } from "../components/HistoryChoice";
-import { parseMoneyDraft, signedBalance } from "../moneymath";
+import { accountSwitches, kindWords, parseMoneyDraft } from "../moneymath";
+import { FailedLine, StaleLine } from "../components/Loaded";
 import { patchList, removeFromList } from "../api/cache";
 import { canEdit, isOwner, isViewer } from "../role";
 import { hueOf, monogram, useLogosOn } from "../components/MerchantAvatar";
 import { KINDS, RemoveAccountPanel, type DoneFn, type Moved }
   from "../components/RemoveAccountPanel";
+import Note from "../components/Note";
 
 type AccountsData = { accounts: Account[] };
 
@@ -34,7 +37,16 @@ interface Group {
   institution: string;
   conn: Connection | null;
   accounts: Account[];
-  total: number;
+  // the institution's subtotal and each account's balance in the whole
+  // dollars the page prints (reporting.account_totals → `shown`): the
+  // accounts add up to the subtotal, the subtotals to the section. A
+  // linked backup is in no sum; it is here in its serving account's
+  // dollars when the two balances agree (`backup_shown`)
+  total?: number;
+  shown?: Record<string, number>;
+  // a login whose accounts are all linked backups: the server's words
+  // ("backup of Plaid — not counted") in place of a subtotal
+  backup?: string;
 }
 
 // top-level account categories with per-group totals. A crypto account
@@ -59,8 +71,7 @@ function Dot({ conn }: { conn: Connection | null }) {
   // red is reserved for something the person has to DO. A bank that is
   // down is amber like any other "not right now" state — it resolves
   // itself, and red for it would make red stop meaning anything.
-  const kind = conn.status_kind
-    ?? (conn.status && conn.status !== "ok" ? "attention" : "ok");
+  const kind = conn.status_kind;
   if (kind === "ok") {
     // the item is fine, but the BANK's own login rail is DOWN fleet-wide —
     // amber with context, so a reconnect that dies on the bank's error
@@ -221,8 +232,14 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
 
   if (accounts.isPending || settings.isPending)
     return <div className="centered"><span className="mut">loading…</span></div>;
+  // a failed read keeps the page's name over the line (the embedded copy
+  // sits under its host's own heading)
   if (accounts.isLoadingError)
-    return <div className="card">Couldn't load accounts: {String(accounts.error)}</div>;
+    return (
+      <>
+        {!embedded && <h1>Accounts</h1>}
+        <div className="card"><FailedLine q={accounts} what="accounts" /></div>
+      </>);
 
   // the pin as saved (the editor's switch) and the account the cash
   // forecast actually starts from: a pin on an excluded account or on a
@@ -235,11 +252,10 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
   const pinUnused = accounts.data.primary_pin_unused ?? null;
   const excluded = new Set(settings.data?.excluded_accounts ?? []);
   // A linked pair is ONE real account fed by two sources: the serving row
-  // carries the balance and the backup shadows it. Every server-side money
-  // aggregate excludes the shadow for that reason, so every total on this
-  // page does too — the backup rows still render (with their pill saying
+  // carries the balance and the backup shadows it. Every total on this
+  // page is the server's (reporting.account_totals), which leaves the
+  // shadow out — the backup rows still render (with their pill saying
   // they don't count), they just never add twice.
-  const counts = (a: Account) => !a.link || a.link.primary;
   const connById = new Map((conns.data?.connections ?? []).map((c) => [c.id, c]));
 
   // group by item (institution); balance-less OR user-removed accounts →
@@ -264,9 +280,8 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
     const closed = accs.filter((a) =>
       a.balance_current === null && !a.user_removed_at);
     if (live.length)
-      groups.push({ itemId, institution: inst, conn, accounts: live,
-                    total: live.filter(counts)
-                      .reduce((s, a) => s + (a.balance_current ?? 0), 0) });
+      // the institution's subtotals are read per section below (server)
+      groups.push({ itemId, institution: inst, conn, accounts: live, total: 0 });
     if (closed.length)
       archGroups.push({ itemId, institution: inst, conn, accounts: closed, total: 0 });
     if (hidden.length)
@@ -296,7 +311,12 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
   // product, so they get separate PANES here too — mixed in one list, an
   // assigned account looked like any other and its balance read as the
   // user's own. Built by the same bucketing, run over each side.
-  const buildCategories = (keep: (a: Account) => boolean) => {
+  // the section and institution subtotals are the server's
+  // (reporting.account_totals), for the same counted accounts, read in
+  // the whole dollars they are printed in so each list adds up as shown
+  const totals = accounts.data.totals;
+  const buildCategories = (keep: (a: Account) => boolean,
+                           pane: "personal" | "business") => {
     const buckets = new Map<Category, Map<string, Account[]>>();
     for (const g of groups) {
       for (const a of g.accounts) {
@@ -315,42 +335,42 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
         const catGroups: Group[] = [];
         for (const [itemId, accs] of byInst) {
           const src = groups.find((g) => g.itemId === itemId)!;
+          const shown = totals?.sections[pane][cat]?.shown;
           catGroups.push({ itemId, institution: src.institution, conn: src.conn,
             accounts: accs,
-            total: accs.filter(counts)
-              .reduce((s, a) => s + (a.balance_current ?? 0), 0) });
+            total: shown?.by_item[itemId],
+            backup: totals?.backups?.[itemId],
+            shown: { ...totals?.backup_shown, ...shown?.by_account } });
         }
         catGroups.sort((a, b) => a.institution.toLowerCase()
           .localeCompare(b.institution.toLowerCase()));
-        const total = catGroups.reduce((s, g) => s + g.total, 0);
-        return { cat, total, groups: catGroups };
+        // no section from the server (every account in it a backup): no
+        // figure, never a $0 over balances it does not count
+        const total = totals?.sections[pane][cat]?.shown.total;
+        // the server's words when the headline counts other than the
+        // section's total (a card's debt comes off it, a loan is not in it)
+        const note = totals?.sections[pane][cat]?.shown.counted_text ?? null;
+        return { cat, total, note, groups: catGroups };
       });
   };
-  const categories = buildCategories((a) => !a.entity_id);
-  const bizCategories = buildCategories((a) => !!a.entity_id);
+  const categories = buildCategories((a) => !a.entity_id, "personal");
+  const bizCategories = buildCategories((a) => !!a.entity_id, "business");
 
+  // an account under no known connection is a manual one only when the
+  // connections read answered: unread, it is unknown, never "Import"
+  const connsKnown = conns.data !== undefined;
   const rowProps = { mayEdit, owner, primary, anchor, pinUnused, excluded,
+                     connsKnown,
                      editId,
                      setEditId,
                      historyWindow: settings.data?.history_months ?? null,
                      onDone: done };
-  // every hero figure derives from payloads this page already loads
-  const liveAccts = groups.flatMap((g) => g.accounts)
-    .filter((a) => !a.entity_id && counts(a));
-  // card and loan balances are amounts OWED — they come off the total
-  const liveTotal = liveAccts.reduce((t, a) => t + signedBalance(a), 0);
-  const liveCount = liveAccts.length;
-  // same scope as the total beside it — a business-only institution is
-  // not in the figure, so it is not in the count
-  const instCount = new Set(liveAccts.map(
-    (a) => a.institution_name || "Other")).size;
+  // the hero is the Net Worth page's Financial accounts figure, under the
+  // same label, with its account and institution counts — all the
+  // server's; loans are listed under it as owed, not taken off it
   // only connections a PERSON can act on — a bank outage retrying by
   // itself is not something to count in a "needs attention" badge
-  const needsAttention = (conns.data?.connections ?? [])
-    .filter((c) => (c.status_kind
-                    ?? (c.status && c.status !== "ok" ? "attention" : "ok"))
-                   !== "ok"
-                   && c.status_kind !== "retrying").length;
+  const needsAttention = conns.data?.attention ?? 0;
   // the payload carries ONE last_sync for the tenant — not per connection.
   // It arrives already phrased ("synced 12m ago"), not as a timestamp —
   // parsing it as a date would blank this line.
@@ -370,10 +390,17 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
                         flexWrap: "wrap" }}>
             <span style={{ fontSize: "1.5rem", fontWeight: 700,
                            letterSpacing: "-.01em" }}>
-              {money(liveTotal)}
-              <span className="sub" style={{ fontWeight: 400 }}>
-                {" "}across {liveCount} account{liveCount === 1 ? "" : "s"} ·{" "}
-                {instCount} institution{instCount === 1 ? "" : "s"}</span>
+              {totals ? <>
+                <span className="sub" style={{ fontWeight: 400, fontSize: 13,
+                                               display: "block" }}>
+                  {totals.label}</span>
+                {money(totals.financial_total)}
+                <span className="sub" style={{ fontWeight: 400 }}>
+                  {" "}across {totals.account_count} account
+                  {totals.account_count === 1 ? "" : "s"} ·{" "}
+                  {totals.institution_count} institution
+                  {totals.institution_count === 1 ? "" : "s"}</span>
+              </> : null}
             </span>
             {mayEdit && (
               <a className="btn" href="#connect" style={{ marginLeft: "auto",
@@ -385,8 +412,11 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
             {needsAttention > 0 && (
               <span><span className="pill a" style={{ marginRight: ".3rem" }}>
                 {needsAttention}</span>
-                connection{needsAttention === 1 ? "" : "s"} need attention</span>
+                connection{needsAttention === 1 ? " needs" : "s need"} attention</span>
             )}
+            {totals && totals.loan_count > 0 && (
+              <span>loans <b className="neg">{money(totals.loans_owed)}</b> owed
+                {" "}— listed, not taken off the total</span>)}
             {lastSync && <span>{lastSync}</span>}
           </div>
         </div>
@@ -396,9 +426,12 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
           pills in the table below carry the read view for viewers */}
       {mayEdit && <LinkSuggestions />}
       {notice && (
-        <div className="card" style={{ borderColor: "var(--green)", cursor: "pointer" }}
+        <div className="card" role="status"
+             style={{ borderColor: "var(--green)", cursor: "pointer" }}
              onClick={() => setNotice(null)}>
           <span className="pill g">action</span> {notice}
+          <button type="button" className="note-x" aria-label="Dismiss"
+                  onClick={(e) => { e.stopPropagation(); setNotice(null); }}>✕</button>
         </div>
       )}
 
@@ -406,6 +439,16 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
           connect-and-import section */}
       <div className="card">
         <h2>Accounts</h2>
+        {/* each read the rows are labelled from says so in place when it
+            failed: unread connections are not manual accounts, unread
+            settings are not "nothing excluded, no primary" */}
+        <StaleLine query={accounts} />
+        {!connsKnown && conns.isError && (
+          <FailedLine q={conns} what="your bank connections" />
+        )}
+        {settings.data === undefined && settings.isError && (
+          <FailedLine q={settings} what="which accounts are excluded or primary" />
+        )}
         {/*.accts-table + c-* cell classes drive the ≤620px
             row-restack in index.css; desktop rendering is untouched */}
         <table className="accts-table">
@@ -414,15 +457,15 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
                 <th className="num">Balance</th><th className="num hide-m">Txns</th></tr>
           </thead>
           <tbody>
-            {categories.map(({ cat, total, groups: catGroups }) => (
+            {categories.map(({ cat, total, note, groups: catGroups }) => (
               <Fragment key={cat}>
                 <tr className="cat-head">
                   <td colSpan={2} className="c-acct" style={{ paddingTop: "1.1rem",
                         fontSize: 12, textTransform: "uppercase",
                         letterSpacing: ".05em", color: "var(--mut)" }}>
-                    {cat}</td>
+                    {cat}<CountedNote note={note} /></td>
                   <td className="num c-bal" style={{ paddingTop: "1.1rem",
-                        fontWeight: 700 }}>{money(total)}</td>
+                        fontWeight: 700 }}>{total !== undefined ? money(total) : ""}</td>
                   <td className="c-pad" style={{ paddingTop: "1.1rem" }}></td>
                 </tr>
                 {catGroups.map((g) => (
@@ -447,26 +490,30 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
           <>
             <h2 style={{ marginTop: "1.6rem" }}>Business accounts</h2>
             <p className="sub" style={{ marginTop: 0 }}>
-              Excluded from personal totals; managed on{" "}
+              {totals?.business_counted
+                ? "In the Financial accounts total — you combine business and personal money"
+                : "Not in the Financial accounts total"}; managed on{" "}
               <Link to="/business">Business</Link>.
             </p>
-            <table className="txn-table">
+            {/* the same restack as the personal list: the transactions
+                table's phone grid has no place for these cells */}
+            <table className="accts-table">
               <thead>
                 <tr><th>Account</th><th className="hide-m">Kind</th>
                     <th className="num">Balance</th>
                     <th className="num hide-m">Txns</th></tr>
               </thead>
               <tbody>
-                {bizCategories.map(({ cat, total, groups: catGroups }) => (
+                {bizCategories.map(({ cat, total, note, groups: catGroups }) => (
                   <Fragment key={`biz-${cat}`}>
                     <tr className="cat-head">
                       <td colSpan={2} className="c-acct"
                           style={{ paddingTop: "1.1rem", fontSize: 12,
                                    textTransform: "uppercase",
                                    letterSpacing: ".05em",
-                                   color: "var(--mut)" }}>{cat}</td>
-                      <td className="num c-amt" style={{ paddingTop: "1.1rem",
-                            fontWeight: 700 }}>{money(total)}</td>
+                                   color: "var(--mut)" }}>{cat}<CountedNote note={note} /></td>
+                      <td className="num c-bal" style={{ paddingTop: "1.1rem",
+                            fontWeight: 700 }}>{total !== undefined ? money(total) : ""}</td>
                       <td className="c-pad" style={{ paddingTop: "1.1rem" }}></td>
                     </tr>
                     {catGroups.map((g) => (
@@ -483,8 +530,8 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
         )}
 
         {hiddenGroups.length > 0 && (
-          <details style={{ marginTop: "1rem" }}>
-            <summary style={{ cursor: "pointer", color: "var(--mut)" }}>
+          <details className="disclosure" style={{ marginTop: "1rem" }}>
+            <summary className="mut">
               Hidden ({hiddenCount}) — excluded from every total; the
               connection is still live and the history is kept
             </summary>
@@ -499,8 +546,8 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
         )}
 
         {archGroups.length > 0 && (
-          <details style={{ marginTop: "1rem" }}>
-            <summary style={{ cursor: "pointer", color: "var(--mut)" }}>
+          <details className="disclosure" style={{ marginTop: "1rem" }}>
+            <summary className="mut">
               Archived ({archCount}) — closed / historical, not syncing
             </summary>
             <table className="accts-table" style={{ marginTop: ".6rem" }}>
@@ -514,9 +561,17 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
         )}
       </div>
 
-      {(holds.data?.holdings.length ?? 0) > 0 && (
+      {((holds.data?.holdings.length ?? 0) > 0 || holds.data?.hidden_text) && (
         <div className="card">
-          <h2>Top holdings</h2>
+          <h2>Top holdings{holds.data?.as_of_text && (
+            <span className="sub" style={{ fontWeight: 400 }}>
+              {" "}— {holds.data.as_of_text}</span>)}</h2>
+          {holds.data?.hidden_text && (
+            <p className="sub" style={{ margin: "0 0 .4rem" }}>
+              {holds.data.hidden_text}</p>)}
+          {/* nothing listed is the title and the reason alone: a header
+              row over no rows reads as a table that failed to fill */}
+          {holds.data!.holdings.length > 0 && (
           <table className="holds-table">
             <thead><tr><th>Account</th><th>Symbol</th><th className="hide-m">Fund</th>
               <th className="num hide-m">Qty</th><th className="num hide-m">Price</th>
@@ -525,15 +580,23 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
               {holds.data!.holdings.map((h, i) => (
                 <tr key={i}>
                   <td className="c-hacct">{h.acct}</td>
-                  <td className="c-hsym">{h.symbol}</td>
-                  <td className="mut hide-m">{(h.fund || "").slice(0, 34)}</td>
-                  <td className="num hide-m">{(h.qty ?? 0).toFixed(3)}</td>
+                  <td className="c-hsym">{holdingSymbol(h.symbol)}</td>
+                  <td className="mut hide-m" title={h.fund || undefined}
+                      style={{ maxWidth: "22rem", overflow: "hidden",
+                               textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {h.fund || ""}</td>
+                  {/* the quantity as the server prints it; none sent is
+                      a blank, never 0.000 */}
+                  <td className="num hide-m">{h.qty_text ?? ""}</td>
                   <td className="num hide-m">{money(h.price)}</td>
-                  <td className="num c-hval">{money(h.value)}</td>
+                  <td className="num c-hval">{money(h.value)}
+                    {h.priced_text && (
+                      <div className="sub" style={{ fontSize: 11 }}>
+                        {h.priced_text}</div>)}</td>
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table>)}
         </div>
       )}
       {!embedded && <OwnerImport onDone={done} />}
@@ -543,7 +606,7 @@ export default function Accounts({ embedded }: { embedded?: boolean } = {}) {
 
 // the Import page lives INSIDE Accounts — the /import route stays for
 // deep links, but there is no nav item. The section is "Connect accounts
-// and import transactions", with the Account-management card on top.
+// and import", with the Account-management card on top.
 function OwnerImport({ onDone }: { onDone: DoneFn }) {
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   if (isViewer(me)) return null;
@@ -559,8 +622,8 @@ function OwnerImport({ onDone }: { onDone: DoneFn }) {
           manual accounts here, and the card that spends a connection
           slot simply is not part of their page */}
       <ImportPage heading={isOwner(me)
-                    ? "Connect accounts and import transactions"
-                    : "Import transactions"}
+                    ? "Connect accounts and import"
+                    : "Import"}
                   connect={isOwner(me)
                     /* both doors on the card (the bank link and the
                        SimpleFIN token) plant a credential that outlives the
@@ -580,8 +643,11 @@ function OwnerImport({ onDone }: { onDone: DoneFn }) {
 
 function GroupRows({ g, archived, hidden, mayEdit, owner, primary, anchor,
                      pinUnused, excluded, editId, setEditId, historyWindow,
-                     onDone, onSync, syncing }: {
+                     onDone, onSync, syncing, connsKnown = true }: {
   g: Group; archived?: boolean; hidden?: boolean;
+  // false while the connections read has not answered: no connection on
+  // file then says nothing about the account
+  connsKnown?: boolean;
   mayEdit: boolean; owner: boolean; primary: string | null;
   anchor: string | null; pinUnused: string | null;
   excluded: Set<string>;
@@ -635,10 +701,8 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, anchor,
   // (status_kind): 'reauth' is the only state a person can act on, and
   // 'retrying' is a bank outage that the next poll clears — offering
   // update mode for THAT is a button that appears to work and teaches
-  // people the warning means nothing. Fall back to the status test only
-  // for a server that does not send the field.
-  const kind = g.conn?.status_kind
-    ?? (g.conn && g.conn.status !== "ok" ? "attention" : "ok");
+  // people the warning means nothing.
+  const kind = g.conn?.status_kind ?? "ok";
   const needsFix = owner && !reaped && !hidden &&
     g.conn?.aggregator === "plaid" && (kind === "reauth"
                                        || kind === "attention");
@@ -663,6 +727,7 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, anchor,
                           : "")
                        + ". Banks refresh on their own schedule, so a sync "
                        + "that finds nothing usually means nothing new."}
+                aria-label="Sync this connection"
                 onClick={() => onSync(g.itemId)}>↻</button>
       )}
     </span>
@@ -673,7 +738,7 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, anchor,
           actionable on a healthy row — it is provenance, and provenance that
           MATTERS (a community script, a manual account) keeps its pill while
           the rest moves into the ✎ editor. */}
-      {(script || !g.conn) && (
+      {(script || (!g.conn && connsKnown)) && (
       <>{" "}<span className="pill m" title={script
         ? `community script (${script.kind ?? "?"} collection) — pushes via `
           + (script.via === "token" ? "script token over HTTP"
@@ -840,6 +905,7 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, anchor,
     const a = g.accounts[0];
     return (
       <AcctRow a={a} institution={g.institution} leftBox={left} badge={badge}
+               shown={g.shown?.[a.id]} backup={g.backup}
                mayEdit={mayEdit} owner={owner}
                primary={primary} anchor={anchor} pinUnused={pinUnused}
                excluded={excluded.has(a.id)}
@@ -856,11 +922,15 @@ function GroupRows({ g, archived, hidden, mayEdit, owner, primary, anchor,
           <span className="acct-pills">{badge}</span>
         </td>
         <td className="num c-bal" style={{ paddingTop: ".85rem" }}>
-          {quiet ? "" : <strong>{money(g.total)}</strong>}</td>
+          {quiet ? "" : g.backup
+            ? <span className="sub">{g.backup}</span>
+            : g.total !== undefined ? <strong>{money(g.total)}</strong> : ""}</td>
         <td className="c-pad"></td>
       </tr>
       {g.accounts.map((a) => (
-        <AcctRow key={a.id} a={a} indent mayEdit={mayEdit} owner={owner}
+        <AcctRow key={a.id} a={a} indent shown={g.shown?.[a.id]}
+                 dim={!!g.backup}
+                 mayEdit={mayEdit} owner={owner}
                  primary={primary} anchor={anchor} pinUnused={pinUnused}
                  excluded={excluded.has(a.id)}
                  editId={editId} setEditId={setEditId} onDone={onDone} />
@@ -887,10 +957,25 @@ function InstMark({ a }: { a: Account }) {
       background: a.inst_color || `hsl(${hueOf(name)} 40% 30%)` }}>{monogram(name)}</span>;
 }
 
-function AcctRow({ a, institution, indent, leftBox, badge, mayEdit, owner,
-                   primary, anchor, pinUnused, excluded, editId, setEditId,
-                   onDone }: {
+
+/** A section's "−$250 in the total" / "not in the total", as sent. */
+function CountedNote({ note }: { note: string | null }) {
+  if (!note) return null;
+  return (
+    <span style={{ textTransform: "none", letterSpacing: 0,
+                   marginLeft: ".5rem" }}>· {note}</span>);
+}
+
+function AcctRow({ a, institution, indent, leftBox, badge, shown, mayEdit,
+                   owner, primary, anchor, pinUnused, excluded, editId,
+                   setEditId, onDone, backup, dim }: {
   a: Account; institution?: string; indent?: boolean;
+  // a backup login's words, said on its one row; `dim`: a row a backup
+  // login's heading already speaks for
+  backup?: string; dim?: boolean;
+  // the balance in the whole dollars its section adds up in; absent for
+  // an account the section does not count (a linked backup)
+  shown?: number;
   leftBox?: React.ReactNode; badge?: React.ReactNode;
   mayEdit: boolean; owner: boolean; primary: string | null;
   anchor: string | null; pinUnused: string | null; excluded: boolean;
@@ -900,7 +985,7 @@ function AcctRow({ a, institution, indent, leftBox, badge, mayEdit, owner,
   const editing = mayEdit && editId === a.id;
   return (
     <>
-      <tr>
+      <tr style={dim || backup ? { opacity: 0.6 } : undefined}>
         {/* the indent moved from an inline style to .indent so the phone
             layout can shrink it (index.css keeps 4.4rem on desktop) */}
         <td className={indent ? "c-acct indent" : "c-acct"}>
@@ -912,9 +997,11 @@ function AcctRow({ a, institution, indent, leftBox, badge, mayEdit, owner,
             {a.name}{a.mask ? ` ${a.mask}` : ""}
           </Link>{" "}
           {mayEdit && (
-          <a className="mut acct-edit" style={{ textDecoration: "none", fontSize: 12, cursor: "pointer" }}
-             title="rename / classify account"
-             onClick={() => setEditId(editing ? null : a.id)}>✎</a>
+          <button type="button" className="as-link mut acct-edit"
+             style={{ textDecoration: "none", fontSize: 12, cursor: "pointer" }}
+             aria-expanded={editing}
+             title="rename / classify account" aria-label="Rename or classify this account"
+             onClick={() => setEditId(editing ? null : a.id)}>✎</button>
           )}
           {/* inert inline span on desktop; the phone layout turns it into
               the row's second line so pills never wrap under the buttons */}
@@ -937,21 +1024,28 @@ function AcctRow({ a, institution, indent, leftBox, badge, mayEdit, owner,
           {badge}
           </span>
         </td>
-        <td className="mut hide-m">{a.kind}</td>
+        <td className="mut hide-m" title={a.kind}>{kindWords(a.kind)}</td>
         <td className="num c-bal">
-          {a.balance_current !== null ? money(a.balance_current) : "—"}
+          {shown !== undefined ? money(shown)
+            : a.balance_current !== null ? money(a.balance_current) : "—"}
           {/* a card's next due date, right where the card is — from the
               liabilities pull, so a bank that shares nothing shows
               nothing (the forecast handles the guess) */}
-          {a.card_due && (a.balance_current ?? 0) > 0.5 && (
+          {backup && <div className="sub">{backup}</div>}
+          {/* the server's words: "due 11/25", or once that date has gone
+              by "paid 11/14" / "past due since 11/15" */}
+          {a.card_due && a.card_due_text && (
             <div className="sub" title={a.card_statement != null
               ? `statement balance ${money(a.card_statement)}, due ${mmdd(a.card_due)}`
               : undefined}>
-              due {mmdd(a.card_due)}
-              {a.card_statement != null && <> · {money(a.card_statement)}</>}
+              {a.card_due_text}
+              {/* the statement figure at every width: the line is its
+                  own, under the name, and a phone has no hover to show it */}
+              {a.card_statement != null && (
+                <span> · {money(a.card_statement)}</span>)}
             </div>
           )}</td>
-        <td className="num mut hide-m">{a.txns}</td>
+        <td className="num mut hide-m">{(a.txns ?? 0).toLocaleString()}</td>
       </tr>
       {editing && <EditRow a={a} owner={owner} primary={primary}
                            excluded={excluded}
@@ -1038,18 +1132,20 @@ function LinkSuggestions() {
                   onClick={() => putAway.mutate()}>dismiss</button>
         )}
       </h2>
-      <p className="mut">Two sources feeding the same real-world account get
-        linked: the best live source serves the data, the others stay in
-        sync as backups — never double-counted, and they take over
-        automatically (with an email) if the primary breaks. Reorder or
-        unlink from the account's ✎ editor.</p>
-      {linkErr && <p className="note bad" onClick={() => setLinkErr(null)}
-        style={{ cursor: "pointer" }}>{linkErr}</p>}
+      <p className="mut">Two sources for the same account are linked so
+        nothing is counted twice.{" "}
+        <Link to="/help?topic=accounts">How this works</Link></p>
+      {linkErr && <Note as="p" tone="bad" onDismiss={() => setLinkErr(null)}
+        style={{ cursor: "pointer" }}>{linkErr}</Note>}
       {q.data.suggestions.map((s) => (
-        <div key={s.key} className="note" style={{ margin: ".4rem 0" }}>
-          These look like the same account:{" "}
-          <b>{label(s.a)}</b> and <b>{label(s.b)}</b>
-          <span style={{ marginLeft: ".7rem", whiteSpace: "nowrap" }}>
+        <div key={s.key} className="note"
+             style={{ margin: ".4rem 0", flexWrap: "wrap" }}>
+          {/* the sentence is ONE flex item: as loose text and two <b>s it
+              was five, each folding in its own column at a phone width */}
+          <span style={{ flex: "1 1 14rem" }}>
+            These look like the same account:{" "}
+            <b>{label(s.a)}</b> and <b>{label(s.b)}</b></span>
+          <span style={{ whiteSpace: "nowrap" }}>
             <button className="pri" disabled={suggBusy(s)}
               style={{ padding: ".1rem .6rem" }}
               onClick={() => link.mutate([s.a.id, s.b.id])}>Link them</button>
@@ -1173,6 +1269,9 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
   const pullAgg = ["plaid", "mx", "simplefin", "simplefin-org"]
     .includes(a.aggregator || "");
   const liveConn = pullAgg && (a.status || "ok") !== "archived";
+  const offered = accountSwitches({
+    can_pin: a.can_pin, can_exclude: a.can_exclude,
+    pinned: a.id === primary, excluded });
 
   // An empty name — or retyping the bank's own — CLEARS the override: the
   // server then serves the bank's name again and follows the bank's future
@@ -1289,7 +1388,7 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
         <form style={{ display: "flex", gap: ".5rem", alignItems: "center",
                        flexWrap: "wrap", padding: ".2rem 0" }}
               onSubmit={(e) => { e.preventDefault(); save.mutate(); }}>
-          <input type="text" value={name} style={{ width: "14rem" }}
+          <input aria-label="Display name" type="text" value={name} style={{ width: "14rem" }}
                  title="display name — sync never overwrites it; empty
                         reverts to the bank's own name"
                  placeholder={a.bank_name || undefined}
@@ -1303,27 +1402,34 @@ function EditRow({ a, owner, primary, excluded, onDone, onCancel }: {
                       onClick={() => setName("")}>revert</button>
             </span>
           )}
-          <input type="text" value={ownerLbl} style={{ width: "8rem" }}
+          <input aria-label="Owner" type="text" value={ownerLbl} style={{ width: "8rem" }}
                  title="owner — whose money (yours / mine / ours). A reporting
                         filter; never affects the budget."
                  placeholder="owner"
                  onChange={(e) => setOwnerLbl(e.target.value)} />
-          <select value={kind} onChange={(e) => setKind(e.target.value)}>
+          <select aria-label="Account type" value={kind} onChange={(e) => setKind(e.target.value)}>
             {KINDS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+            {/* a type the five choices cannot express keeps its own
+                option, in the words the Type column uses for it */}
             {!KINDS.some(([v]) => v === a.kind) &&
-              <option value={a.kind}>{a.kind}</option>}
+              <option value={a.kind}>{kindWords(a.kind)}</option>}
           </select>
+          {/* each switch only where the server says it applies
+              (accountSwitches): the forecast anchor on a bank account,
+              the budget exclusion on any account whose rows can count */}
+          {offered.primary && (
           <label className="mut" title="anchor the cash forecast on this account"
                  style={{ cursor: "pointer", whiteSpace: "nowrap" }}>
             <input type="checkbox" checked={isPrimary}
                    onChange={(e) => setIsPrimary(e.target.checked)} /> primary checking
-          </label>
+          </label>)}
+          {offered.excluded && (
           <label className="mut"
                  title="exclude from budget math — its spending never counts"
                  style={{ cursor: "pointer", whiteSpace: "nowrap" }}>
             <input type="checkbox" checked={isExcl}
                    onChange={(e) => setIsExcl(e.target.checked)} /> excl. from budget
-          </label>
+          </label>)}
           {manual && (
             <label className="mut">$ <input value={bal} size={9}
                    onChange={(e) => setBal(e.target.value)} placeholder="balance"
@@ -1464,6 +1570,7 @@ function ConnectCard({ onDone, me, hosted = false, used, cap }: {
           {linking ? "opening your bank…"
             : hosted ? "+ Connect an account ↗" : "+ Add via Plaid ↗"}</button>
       </div>
+      <BankLinkLine />
       <PendingLinkRows />
       {/* The two cards are peers, so they carry the same SHAPE: a
           heading, a line saying what this is, the action, then the
@@ -1491,9 +1598,10 @@ function ConnectCard({ onDone, me, hosted = false, used, cap }: {
           one-click one. */}
       {!hosted && (
         <div style={{ marginTop: ".7rem" }}>
-          <a className="mut" style={{ cursor: "pointer", fontSize: 13 }}
+          <button type="button" className="as-link mut"
+             style={{ cursor: "pointer", fontSize: 13 }} aria-expanded={more}
              onClick={() => setMore((v) => !v)}>
-            {more ? "▾" : "▸"} more ways to connect</a>
+            {more ? "▾" : "▸"} more ways to connect</button>
           {more && (
             <div style={{ marginTop: ".45rem" }}>
               <p className="sub" style={{ marginTop: 0 }}>
@@ -1502,7 +1610,8 @@ function ConnectCard({ onDone, me, hosted = false, used, cap }: {
                   bridge.simplefin.org</a>.</p>
               <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                             alignItems: "center" }}>
-                <input value={token} placeholder="SimpleFIN setup token"
+                <input aria-label="SimpleFIN setup token"
+                       value={token} placeholder="SimpleFIN setup token"
                        style={{ flex: "1 1 14rem" }}
                        onChange={(e) => setToken(e.target.value)} />
                 <button className="pri"
@@ -1540,13 +1649,13 @@ export function ManualAccountRow({ onDone }: { onDone: DoneFn }) {
       </p>
       <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                     alignItems: "center" }}>
-        <input value={name} placeholder="e.g. Everyday Checking"
+        <input aria-label="Account name" value={name} placeholder="e.g. Everyday Checking"
                style={{ flex: "1 1 11rem" }}
                onChange={(e) => setName(e.target.value)} />
-        <select value={kind} onChange={(e) => setKind(e.target.value)}>
+        <select aria-label="Account type" value={kind} onChange={(e) => setKind(e.target.value)}>
           {KINDS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
         </select>
-        <input value={bal} placeholder="opening balance (0)"
+        <input aria-label="Opening balance" value={bal} placeholder="opening balance (0)"
                inputMode="decimal" style={{ width: "9rem" }}
                onChange={(e) => setBal(e.target.value)} />
         <button className="pri" disabled={!name.trim() || add.isPending}

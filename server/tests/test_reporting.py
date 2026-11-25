@@ -388,6 +388,11 @@ class CashflowTests(unittest.TestCase):
                 primary="FOOD_AND_DRINK", txn_id=tid("cf"))
         # a card-only year: spend exists, no bank rows → income unknowable
         add_txn(c, dt.date(2023, 6, 1), 50, "OLD CARD SPEND", txn_id=tid("cf"))
+        # checking is on file from March 2025 through the year's end: a
+        # month it covers carries a row even when nothing was deposited
+        # (here a transfer to savings, neither spend nor income) — a month
+        # with no checking row at all is a hole in the feed
+        self._feed(3, 12)
         # bank-side investment funding (+out to provider, −back from it)
         add_txn(c, dt.date(2025, 4, 2), 1000, "ACH BETTERMENT INVEST",
                 account="chk", primary="TRANSFER_OUT", txn_id=tid("cf"))
@@ -410,13 +415,18 @@ class CashflowTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
+    def _feed(self, first_month, last_month, year=2025):
+        for m in range(first_month, last_month + 1):
+            add_txn(self.conn, dt.date(year, m, 2), 25, "TO SAVINGS",
+                    account="chk", primary="TRANSFER_OUT",
+                    txn_id=f"feed-{year}-{m:02d}")
+
     def test_savings_by_year(self):
         # the checking feed covers all of 2025 (income is known only for
         # months on or after its first row; Jan 1 never posts, so a feed
-        # from Jan 1 shows its first row on Jan 2), opened by a transfer
-        # that is neither spend nor income
-        add_txn(self.conn, dt.date(2025, 1, 2), 25, "FEED OPENED",
-                account="chk", primary="TRANSFER_OUT", txn_id="feed-open")
+        # from Jan 1 shows its first row on Jan 2): January and February
+        # carry a transfer that is neither spend nor income
+        self._feed(1, 2)
         cf = reporting.compute_cashflow(self.conn)
         rows = {r[0]: r for r in cf["savings_by_year"]}
         # 2023: card spend but no bank data → income unknown, not $0
@@ -432,10 +442,9 @@ class CashflowTests(unittest.TestCase):
         # to the effective-category test, but it is still not income.
         # the checking feed covers all of 2025 (income is known only for
         # months on or after its first row; Jan 1 never posts, so a feed
-        # from Jan 1 shows its first row on Jan 2), opened by a transfer
-        # that is neither spend nor income
-        add_txn(self.conn, dt.date(2025, 1, 2), 25, "FEED OPENED",
-                account="chk", primary="TRANSFER_OUT", txn_id="feed-open")
+        # from Jan 1 shows its first row on Jan 2): January and February
+        # carry a transfer that is neither spend nor income
+        self._feed(1, 2)
         self.conn.execute(
             """INSERT INTO transactions (id, account_id, date, amount, name,
                    merchant_name, category_primary, category_plaid,
@@ -495,6 +504,21 @@ class CashflowTests(unittest.TestCase):
         # flows are all 2024/2025, so both figures are zero today
         self.assertEqual(cf["brokerage_funding_mtd"], 0)
         self.assertEqual(cf["brokerage_funding_ytd"], 0)
+
+
+    def test_a_w2_only_year_shows_its_wages_in_reported_income(self):
+        """A year whose return was removed keeps the W-2 wages each
+        person's column holds; Reported income shows their sum with a
+        blank Total income, as it does for any wage-only year."""
+        self.conn.execute(
+            "INSERT INTO income_annual (year, primary_wages, spouse_wages) "
+            "VALUES (2022, 60000, 20000), (2021, 45000, NULL)")
+        cf = reporting.compute_cashflow(self.conn)
+        rows = {r[0]: r for r in cf["reported_income"]}
+        self.assertEqual(rows[2022][1:3], [None, 80000.0])
+        self.assertEqual(rows[2021][1:3], [None, 45000.0])
+        # a year with a return keeps the return's household wages
+        self.assertEqual(rows[2020][2], 70000.0)
 
 
 class FeesTests(unittest.TestCase):
@@ -742,9 +766,11 @@ class BrokeragePLTests(unittest.TestCase):
             pl = reporting._brokerage_pl(conn)
             self.assertEqual(pl, [
                 {"name": "Managed Portfolio", "institution": "Northwind Brokerage",
-                 "basis": 1500.0, "value": 2000.0, "pl": 500.0, "pct": 33.3},
+                 "basis": 1500.0, "value": 2000.0, "pl": 500.0, "pct": 33.3,
+                 "pl_as_of": None},
                 {"name": "Roth IRA", "institution": "Northwind Brokerage",
-                 "basis": 400.0, "value": 1000.0, "pl": 600.0, "pct": 150.0},
+                 "basis": 400.0, "value": 1000.0, "pl": 600.0, "pct": 150.0,
+                 "pl_as_of": None},
                 {"name": "Total", "basis": 1900.0, "value": 3000.0,
                  "pl": 1100.0, "pct": 57.9},
             ])
@@ -833,6 +859,10 @@ class ReportingApiTests(unittest.TestCase):
                   "career_income", "income_by_month", "investment_funding",
                   "brokerage_funding_mtd", "brokerage_funding_ytd"):
             self.assertIn(k, r)
+        # the funding figures go out under one name each, no alias beside
+        self.assertEqual({k for k in r if k.endswith(("funding_mtd",
+                                                      "funding_ytd"))},
+                         {"brokerage_funding_mtd", "brokerage_funding_ytd"})
         r = self.client.get("/api/reports/fees").json()
         for k in ("by_platform", "by_year", "total"):
             self.assertIn(k, r)

@@ -84,16 +84,26 @@ class GoalProgressTests(unittest.TestCase):
         self.assertEqual(p["rate_90d"], round(800 / 3, 2))
         self.assertEqual(p["pct"], 60.0)
         self.assertIsNotNone(p["eta"])              # rate > 0 → projected
-        # dated goal: needs 1200 in ~2 months at ~267/mo → off pace
-        cfg["savings_goals"][0]["target_date"] = (
-            TODAY + dt.timedelta(days=61)).isoformat()
-        p = savings.progress(self.conn, cfg, TODAY)[0]
-        self.assertFalse(p["on_pace"])
-        # a year out → comfortably on pace
-        cfg["savings_goals"][0]["target_date"] = (
-            TODAY + dt.timedelta(days=365)).isoformat()
-        p = savings.progress(self.conn, cfg, TODAY)[0]
-        self.assertTrue(p["on_pace"])
+        # dated goal, plan set 80 days ago at the $1,000 it started with:
+        # $2,000 to add in 141 days asks for $596 by 38 days ago, and $800
+        # is saved → on pace
+        goal = cfg["savings_goals"][0]
+        goal["target_date"] = (TODAY + dt.timedelta(days=61)).isoformat()
+
+        def plan_set(days_ago, saved):
+            cfg["savings_goal_state"] = {goal["name"]: {"plan": {
+                "day": (TODAY - dt.timedelta(days=days_ago)).isoformat(),
+                "saved": saved, "for": savings._plan_terms(goal)}}}
+            return savings.progress(self.conn, cfg, TODAY)[0]["on_pace"]
+
+        self.assertIs(plan_set(80, 1000.0), True)
+        # the same $800 against a line drawn from 400 days back, which
+        # asked for nearly all of it by now → off pace
+        self.assertIs(plan_set(400, 1000.0), False)
+        # a plan made for another target is not this goal's plan
+        goal["target"] += 1
+        self.assertIsNone(
+            savings.progress(self.conn, cfg, TODAY)[0]["on_pace"])
 
     def test_tokens_carve_one_account(self):
         _xfer(self.conn, TODAY - dt.timedelta(days=5), -200.0,
@@ -152,18 +162,23 @@ class MilestoneTests(unittest.TestCase):
         self.assertIn("100%", msgs[0])
 
     def test_off_pace_flip_fires_once(self):
-        # slow saver, near-term date → off pace after an initial on-pace state
+        # slow saver, near-term date, last recorded as on pace under a plan
+        # set 80 days ago: the first night mails, the next is silent
         _xfer(self.conn, TODAY - dt.timedelta(days=80), -50.0,
               "TRANSFER TO SAVINGS")
-        cfg = {"savings_goals": [dict(
-            GOAL, target_date=(TODAY + dt.timedelta(days=45)).isoformat())],
-            "savings_goal_state": {"trip fund": {"milestone": 25,
-                                                 "on_pace": True}}}
-        msgs, state = savings.check_milestones(self.conn, cfg, TODAY)
-        self.assertTrue(any("off pace" in m for m in msgs))
-        cfg["savings_goal_state"] = state
-        msgs, _ = savings.check_milestones(self.conn, cfg, TODAY)
-        self.assertFalse(any("off pace" in m for m in msgs))
+        goal = dict(
+            GOAL, target_date=(TODAY + dt.timedelta(days=45)).isoformat())
+        plan = {"day": (TODAY - dt.timedelta(days=81)).isoformat(),
+                "saved": 0.0, "for": savings._plan_terms(goal)}
+        cfg = {"savings_goals": [goal],
+               "savings_goal_state": {"trip fund": {
+                   "milestone": 0, "on_pace": True, "plan": plan}}}
+        mailed = []
+        for night in range(2):
+            msgs, cfg["savings_goal_state"] = savings.check_milestones(
+                self.conn, cfg, TODAY + dt.timedelta(days=night))
+            mailed.append(any("off pace" in m for m in msgs))
+        self.assertEqual(mailed, [True, False])
 
 
 if __name__ == "__main__":

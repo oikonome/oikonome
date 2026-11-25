@@ -7,16 +7,21 @@ import { memo, useMemo, useState } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card } from "../components/ui";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, Skeleton } from "../components/ui";
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
+import { disclosure } from "../lib/a11y";
+import { fieldA11y } from "../components/field";
 
 // the web sidebar's grouping order
 // the server emits group IDS — map to labels, order by id
-const GROUP_ORDER = ["guides", "setup", "reference"];
+// the docs for running and extending an instance come last, folded away
+const GROUP_ORDER = ["guides", "setup", "reference", "selfhost"];
 const GROUP_LABEL: Record<string, string> = {
-  guides: "Guides", setup: "Setup & data", reference: "Reference" };
+  guides: "Guides", setup: "Your data", reference: "Reference",
+  selfhost: "Self-hosting & developers" };
+const FOLDED = new Set(["selfhost"]);
 
 // strip inline markdown down to readable text: links keep their label,
 // emphasis marks drop (RN Text can't nest arbitrary spans cheaply and
@@ -89,6 +94,8 @@ export default function Help() {
   const p = useLocalSearchParams<{ topic?: string }>();
   const [open, setOpen] = useState<string | null>(p.topic ?? null);
   const [q, setQ] = useState("");
+  // folded groups the reader opened
+  const [unfolded, setUnfolded] = useState<Set<string>>(new Set());
   const query = useQuery({
     queryKey: ["help"],
     queryFn: () => client!.help(),
@@ -111,20 +118,22 @@ export default function Help() {
                      (g) => !GROUP_ORDER.includes(g))];
     return { topics, groups, order };
   }, [index, needle]);
+  // a folded group shows while a search runs, when its topic is open, or
+  // once the reader unfolds it
+  const shown = (g: string) => !FOLDED.has(g) || !!needle || unfolded.has(g)
+    || (groups.get(g) ?? []).some((t) => t.id === open);
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
-      <TextInput style={s.search} placeholder="search the docs…"
+      <TextInput {...fieldA11y("Search the docs")} style={s.search} placeholder="search the docs…"
                  placeholderTextColor={C.mut} autoCapitalize="none"
                  value={q} onChangeText={setQ} />
-      <StaleBanner query={query} />
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      <StaleLine query={query} />
+      {query.isPending && <Skeleton />}
       {query.isError && !query.data && (
-        <Text style={[s.center, { color: C.bad }]}>
-          Couldn't reach the server — pull down to retry.
-        </Text>
+        <FailedLine q={query} what="help" />
       )}
       {!!query.data && topics.length === 0 && (
         <Text style={s.center}>No topics match “{q.trim()}”.</Text>
@@ -136,10 +145,23 @@ export default function Help() {
       )}
       {order.map((g) => (
         <View key={g}>
-          <Text style={s.group}>{GROUP_LABEL[g] ?? g}</Text>
-          {groups.get(g)!.map((t) => (
+          {FOLDED.has(g) ? (
+            <Pressable {...disclosure(shown(g), GROUP_LABEL[g] ?? g)}
+                       onPress={() => setUnfolded((u) => {
+                         const n = new Set(u);
+                         if (n.has(g)) n.delete(g); else n.add(g);
+                         return n;
+                       })}>
+              <Text style={s.group}>
+                {shown(g) ? "▾ " : "▸ "}{GROUP_LABEL[g] ?? g}</Text>
+            </Pressable>
+          ) : (
+            <Text style={s.group}>{GROUP_LABEL[g] ?? g}</Text>
+          )}
+          {shown(g) && groups.get(g)!.map((t) => (
             <Card key={t.id}>
-              <Pressable onPress={() => setOpen(open === t.id ? null : t.id)}>
+              <Pressable onPress={() => setOpen(open === t.id ? null : t.id)}
+                         {...disclosure(open === t.id, t.title)}>
                 <Text style={s.title}>
                   {open === t.id ? "▾" : "▸"} {t.title}
                 </Text>
@@ -174,7 +196,7 @@ const s = StyleSheet.create({
   title: { color: C.text, fontSize: 15, fontWeight: "600" },
   group: { color: C.mut, fontSize: 12, textTransform: "uppercase",
            letterSpacing: 1, marginHorizontal: 12, marginTop: 14 },
-  search: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
+  search: { backgroundColor: C.card, borderColor: C.field, borderWidth: 1,
             borderRadius: 10, color: C.text, fontSize: 14,
             marginHorizontal: 12, marginTop: 10,
             paddingHorizontal: 12, paddingVertical: 8 },

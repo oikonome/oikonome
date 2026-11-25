@@ -1,18 +1,17 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useRef, useState } from "react";
-import { api, errText, money, type BudgetSuggestions, type CustomBucket,
+import { api, errText, money, type BudgetSuggestions,
          type Settings as SettingsData, catLabel } from "../api/client";
 import { saveSettings, SETTINGS_SAVES } from "../api/cache";
-import { parseMoneyDraft } from "../moneymath";
+import { bucketRulesSaved, mergeBucketRules, savedAmount,
+         type BucketRuleDraft } from "../moneymath";
+import Note from "./Note";
 
 // editable row form of a config custom_bucket: numbers and the
 // merchant list are strings while being typed. `touched` marks rows the
 // user actually edited here — the save-time merge lets untouched rows
 // follow the server's live copy.
-interface BucketRow {
-  name: string; parent: "food" | "other"; monthly: string;
-  categories: string[]; merchants: string; touched?: boolean;
-}
+type BucketRow = BucketRuleDraft;
 
 // the precision controls the planner deliberately doesn't carry.
 // The planner up-page owns the money model (income → bills → categories →
@@ -39,15 +38,15 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
   // here would be posted back as false by the next bucket save
   const [dynamic, setDynamic] = useState(data.dynamic_variable_budget !== false);
   const [buckets, setBuckets] = useState<BucketRow[]>(
-    (data.custom_buckets ?? []).map((b) => ({
-      name: b.name, parent: b.parent,
-      monthly: b.monthly ? String(b.monthly) : "",
-      categories: b.categories ?? [],
-      merchants: (b.merchants ?? []).join(", "),
-    })));
-  // the mount-time server copy (for change detection at save) and the
-  // dirty signal the page's remount guard reads
-  const baseline = useRef<CustomBucket[]>(data.custom_buckets ?? []);
+    () => bucketRulesSaved(data.custom_buckets ?? []).rows);
+  // the rows on screen now, for a save that lands after more typing
+  const rowsNow = useRef(buckets);
+  rowsNow.current = buckets;
+  // the server copy the rows were last seeded from — at mount, then each
+  // saved view (the save-time merge base); and the dirty signal the
+  // page's remount guard reads
+  const baseline = useRef<string[]>(
+    bucketRulesSaved(data.custom_buckets ?? []).base);
   const touch = () => onDirtyChange?.(true);
 
   const save = useMutation({
@@ -60,56 +59,40 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
     // in the same tick, so reading `dynamic` from this closure sent the
     // PREVIOUS render's value — the box flipped on screen and the server
     // stored the opposite.
-    mutationFn: async (dyn?: boolean) => {
-      // blank is 0. Text that is not a number stops the save here: sent
-      // on, NaN travels as JSON null and would be stored as $0 without a
-      // word, replacing the figure the person meant to type.
-      const num = (s: string, name: string) => {
-        if (s.replace(/[$\s]/g, "") === "") return 0;
-        const n = parseMoneyDraft(s);
-        if (n === null)
-          throw new Error(`${name}: "${s.trim()}" is not an amount — `
-                          + "type it like 1,250.50.");
-        return n;
-      };
+    // The rows being saved ride along too, so success can tell whether
+    // the person kept typing while the save was in flight.
+    mutationFn: async ({ dyn, sent }: { dyn?: boolean; sent: BucketRow[] }) => {
       // partial body on purpose: food/other/income and the savings plan are
       // the planner's to write — sending them here would fight it.
-      // the bucket LIST is still replaced wholesale, and these
-      // rows were seeded at mount — the planner or another tab may have
-      // saved since. Merge against the server's CURRENT list: rows the
-      // user touched here win, untouched rows follow the live copy
-      // (changed elsewhere → take theirs; deleted elsewhere → drop), and
-      // buckets added elsewhere since mount are carried through.
+      // the bucket LIST is still replaced wholesale, and these rows
+      // were seeded from the last copy this card saw — the planner or
+      // another tab may have saved since. mergeBucketRules lays them over
+      // the server's CURRENT list.
       const cur = await api.settings();
-      const curB = cur.custom_buckets ?? [];
-      const baseNames = new Set(baseline.current.map((b) => b.name));
-      const curByName = new Map(curB.map((b) => [b.name, b]));
-      const out: CustomBucket[] = [];
-      for (const b of buckets) {
-        const name = b.name.trim();
-        if (!name) continue;
-        if (!b.touched) {
-          const live = curByName.get(name);
-          if (live) { out.push(live); continue; }
-          if (baseNames.has(name)) continue;   // deleted elsewhere
-        }
-        out.push({ name, parent: b.parent, monthly: num(b.monthly, name),
-                   categories: b.categories,
-                   merchants: b.merchants.split(",").map((m) => m.trim())
-                     .filter(Boolean) });
-      }
-      for (const b of curB)
-        if (!baseNames.has(b.name) && !out.some((o) => o.name === b.name))
-          out.push(b);                          // added elsewhere since mount
+      const out = mergeBucketRules(sent, cur.custom_buckets ?? [],
+                                   baseline.current, savedAmount);
       // returns the full settings view and seeds the cache with it, so the
       // page's other cards see the new buckets as the response lands
       return saveSettings(qc, {
         dynamic_variable_budget: dyn ?? dynamic,
         custom_buckets: out,
-      });
+      }, cur);
     },
-    onSuccess: () => { setErr(null); onDirtyChange?.(false); onSaved(); },
-    onError: (e, dyn) => {
+    onSuccess: (v, { sent }) => {
+      // every edit makes a new rows array: the same array means nothing
+      // was typed since the save began, and only then does the saved view
+      // replace the rows — edits typed in flight stay, still unsaved
+      const edited = rowsNow.current !== sent;
+      // the saved view is the new merge base; mid-edit, only the names
+      // the sent rows held (see bucketRulesSaved)
+      const next = bucketRulesSaved(v.custom_buckets ?? [],
+                                    edited ? sent : undefined,
+                                    baseline.current);
+      baseline.current = next.base;
+      if (!edited) setBuckets(next.rows);
+      setErr(null); if (!edited) onDirtyChange?.(false); onSaved();
+    },
+    onError: (e, { dyn }) => {
       setErr(errText(e));
       // the checkbox flipped before the request went out — put it back
       if (dyn !== undefined) setDynamic(!dyn);
@@ -148,7 +131,7 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
       <h2 style={{ marginTop: 0 }}>Bucket rules
         <span className="mut" style={{ fontSize: 13, fontWeight: 400 }}>
           {" "}— what counts toward each bucket; a merchant match wins</span></h2>
-      {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+      {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
 
       {buckets.length === 0 && (
         <p className="sub">No buckets yet — a bucket carves named spend out of
@@ -233,7 +216,7 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
             <div style={{ display: "flex", gap: ".5rem", alignItems: "center",
                           marginTop: ".6rem" }}>
               <button className="pri" disabled={save.isPending}
-                      onClick={() => { save.mutate(undefined); setEditing(null); }}>
+                      onClick={() => { save.mutate({ sent: buckets }); setEditing(null); }}>
                 {save.isPending ? "saving…" : "save"}</button>
               <button onClick={() => setEditing(null)}>cancel</button>
               <button style={{ marginLeft: "auto", border: "none",
@@ -275,16 +258,14 @@ export default function BudgetFineTune({ data, onSaved, onDirtyChange }: {
               gap: ".4rem", alignItems: "center" }}>
           <input type="checkbox" checked={dynamic} disabled={save.isPending}
                  onChange={(e) => { touch(); setDynamic(e.target.checked);
-                                    save.mutate(e.target.checked); }} />
+                                    save.mutate({ dyn: e.target.checked,
+                                                 sent: buckets }); }} />
           dynamic budget <span className="mut">— adapts to the month so far</span>
         </label>
       </div>
       {sugg && (
         <p className="mut" style={{ fontSize: 13, marginTop: ".4rem" }}>
-          Suggestions are the median of the last {sugg.months.length} months,
-          this one so far included (outlier months excluded). Click “use”
-          beside a bucket's
-          amount to take one.</p>
+          Suggestions are the median of the last {sugg.months.length} months.</p>
       )}
     </div>
   );

@@ -1,0 +1,4 @@
+# Test-only dependencies: the suite's property tests (specs/invariants-and-fuzzing.md).
+# Never installed into the image. `make lock` resolves this file, against the
+# server's own pins, into the hashed server/requirements-test.txt.
+hypothesis==6.170.14

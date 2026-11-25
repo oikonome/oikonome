@@ -338,10 +338,13 @@ def _llm_plan(conn) -> list[dict]:
             for base, p in probes.items()]
 
 
-def _llm_probe_rows(plan: list[dict], public: bool = False) -> list[dict]:
+def _llm_probe_rows(plan: list[dict], public: bool = False,
+                    owner: bool = True) -> list[dict]:
     """The endpoint and model rows: one probe per distinct backend, made
     with no database connection held — the probed server decides how long
-    it takes to answer."""
+    it takes to answer. A member or viewer (`owner` false) reads whether
+    the backend answers, not its address or models: Settings shows those
+    to the owner only."""
     from ..engine import llm_categorize as llm
     out = []
     if not plan:
@@ -364,6 +367,8 @@ def _llm_probe_rows(plan: list[dict], public: bool = False) -> list[dict]:
         out.append(_row(
             "Smart categorization", f"endpoint{suffix}", True,
             "provided by the host" if operators else
+            "configured (address and model shown to the owner)"
+            if not owner else
             f"{where} · model {' / '.join(models) or '(unset)'}"))
         # same use-time gate as _chat: a tenant-sourced
         # URL is re-checked before we fetch it — the probe must not be an
@@ -383,7 +388,7 @@ def _llm_probe_rows(plan: list[dict], public: bool = False) -> list[dict]:
         if blocked:
             out.append(_row("Smart categorization", f"model{suffix}", False,
                             "endpoint not probed — the outbound guard "
-                            "refuses its address" if public else
+                            "refuses its address" if public or not owner else
                             f"endpoint not probed — {blocked}", "warn"))
             continue
         try:
@@ -405,10 +410,11 @@ def _llm_probe_rows(plan: list[dict], public: bool = False) -> list[dict]:
             ids = [str(m.get("id"))[:60] for m in (data or [])
                    if isinstance(m, dict) and m.get("id")]
             missing = [m for m in models if m not in ids] if ids else []
-            if missing and operators:
+            if missing and (operators or not owner):
                 out.append(_row(
                     "Smart categorization", f"model{suffix}", False,
-                    "the host's AI endpoint is up but its model is not "
+                    ("the host's" if operators else "the")
+                    + " AI endpoint is up but its model is not "
                     "loaded", "warn"))
             elif missing:
                 out.append(_row(
@@ -430,7 +436,7 @@ def _llm_probe_rows(plan: list[dict], public: bool = False) -> list[dict]:
 
 
 def _llm_tail_rows(conn, configured: bool,
-                   public: bool = False) -> list[dict]:
+                   public: bool = False, owner: bool = True) -> list[dict]:
     """The rows read from this household's own data: the last run, the
     merchant map, the receipt queue and a running sync's progress."""
     from ..engine import llm_categorize as llm
@@ -445,7 +451,8 @@ def _llm_tail_rows(conn, configured: bool,
             out.append(_row(
                 "Smart categorization", "last run", False,
                 f"failed {_ago(last['at'], dt.datetime.now(dt.timezone.utc), public)}"
-                + ("" if public else f" — {last.get('error')}")
+                + ("" if public or not owner
+                   else f" — {last.get('error')}")
                 + " · merchant categories and Amazon "
                 "summaries are stalled until it is fixed", "warn"))
         elif last:
@@ -458,7 +465,8 @@ def _llm_tail_rows(conn, configured: bool,
         "GROUP BY source").fetchall()}
     backlog = _pending_backlog(conn)
     parts = [f"{by_src.get('seed', 0)} by brand rules",
-             f"{by_src.get('llm', 0)} by the model",
+             f"{by_src.get('llm', 0)} by an AI pass",
+             f"{by_src.get('model', 0)} by your trained model",
              f"{by_src.get('user', 0)} by your corrections"]
     out.append(_row(
         "Smart categorization", "merchant map",
@@ -537,12 +545,15 @@ def _nightly_at(public: bool = False) -> str:
     return f"{job.hour:02d}:{job.minute:02d} {zone}"
 
 
-def checks(tenant_id: str, public: bool = False) -> list[dict]:
+def checks(tenant_id: str, public: bool = False,
+           owner: bool = True) -> list[dict]:
     """Every row. `public` is the diagnostic bundle's view, which is meant
     to be attached to a public issue: the rows that would name a host (the
     base URL, the mail relay, an AI endpoint), a bank, or a label the
     household typed carry only their shape. The signed-in page shows them
-    in full.
+    in full to the owner; a member or viewer (`owner` false) is not shown
+    the household's setup that Settings keeps to the owner — the mail
+    relay, the AI endpoint and its models, the email reach.
 
     The probes of servers outside the database (an AI endpoint, an Ollama
     service) run after the tenant connection is handed back: the probed
@@ -644,8 +655,15 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
         elif daily_on:
             from ..jobs import worker as _worker
             from ..notify import email_prefs
+            from ..notify import reach as _reach
             ok, d = age_ok("daily-email", 50)
             note = hb_note.get("daily-email")
+            try:
+                # who receives it is the owner's to read (Settings)
+                _daily_reach = (_reach.cadence_reach(
+                    conn, tenant_id, _cfg)["daily"] if owner else None)
+            except Exception:                    # noqa: BLE001
+                _daily_reach = None
             if ok and note == email_prefs.NOBODY_OPTED_IN:
                 # the worker ran and decided: everyone unticked the daily
                 out.append(_row("Jobs", "daily email (worker)", True,
@@ -668,6 +686,23 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
                                 d + " · not sent: no budget is set yet, so "
                                 "there is no daily verdict to mail "
                                 "(set one on the Budget page)"))
+            elif _daily_reach is not None and _daily_reach["warn"]:
+                # switched on, and nothing would arrive anywhere — the
+                # worker's own reason above, when it stamped one, says it
+                # better; otherwise the Settings list's words (notify/reach)
+                _txt = _daily_reach["text"]
+                why = ("no mail relay is configured (Settings → Email)"
+                       if _reach.NO_RELAY in _txt else
+                       f"the {_reach.RELAY_HELD} (the banner on Settings)"
+                       if _reach.RELAY_HELD in _txt else
+                       f"the {_reach.RELAY_REFUSED} (Settings → Email)"
+                       if _reach.RELAY_REFUSED in _txt else
+                       "every address is muted, unconfirmed or has turned "
+                       "it off")
+                out.append(_row("Jobs", "daily email (worker)", False,
+                                d + f" · {_reach.NOBODY}: {why}, and "
+                                "no browser or phone takes its push "
+                                "(Settings → Email & Push)", "warn"))
             else:
                 out.append(_row("Jobs", "daily email (worker)", ok,
                                 d + " · expected daily; check SMTP settings",
@@ -710,8 +745,8 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
 
         _plan = _llm_plan(conn)
         deferred.append((len(out),
-                         lambda: _llm_probe_rows(_plan, public)))
-        out += _llm_tail_rows(conn, bool(_plan), public)
+                         lambda: _llm_probe_rows(_plan, public, owner)))
+        out += _llm_tail_rows(conn, bool(_plan), public, owner)
 
         # email configuration (presence, not delivery) — Settings-card
         # config or the operator's env, same order delivery resolves
@@ -758,6 +793,8 @@ def checks(tenant_id: str, public: bool = False) -> list[dict]:
                             if env_flag("OIKONOME_HOSTED")
                             else "configured (relay host withheld from "
                                  "the bundle)" if public
+                            else "configured (relay host shown to the "
+                                 "owner)" if not owner
                             else f"delivery via {smtp['host']}"))
         else:
             out.append(_row("Email", "SMTP", False,
@@ -892,7 +929,7 @@ BUNDLE_REDACTED = ("Host names (the instance's base URL, the mail relay, AI "
                    "bundle; the Doctor page on the instance shows them.")
 
 
-def bundle(tenant_id: str) -> dict:
+def bundle(tenant_id: str, owner: bool = True) -> dict:
     """The diagnostic-bundle payload (issue templates require it, and ask
     for it on a public issue). NO tokens, NO transaction contents, and no
     host, bank or household-typed names — check output + versions only."""
@@ -906,6 +943,6 @@ def bundle(tenant_id: str) -> dict:
             ver = "dev"
     return {"oikonome_version": ver,
             "python": platform.python_version(),
-            "checks": checks(tenant_id, public=True),
+            "checks": checks(tenant_id, public=True, owner=owner),
             "redacted": BUNDLE_REDACTED,
             "generated_at": dt.datetime.now(dt.timezone.utc).isoformat()}

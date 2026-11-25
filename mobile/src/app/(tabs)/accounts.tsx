@@ -12,9 +12,9 @@ import { Alert, Image, KeyboardAvoidingView, Modal, Platform, Pressable,
   from "react-native";
 import PullRefresh from "../../components/pull-refresh";
 
-import StaleBanner from "../../components/stale-banner";
-import { Card, H, HelpLink, KV, Pill, SharedLock } from "../../components/ui";
-import { Account, AccountRemoveMode, countsInTotals, errText,
+import { FailedLine, StaleLine } from "../../components/loaded";
+import { Card, H, HelpLink, KV, Pill, SharedLock, Skeleton, Note } from "../../components/ui";
+import { Account, AccountRemoveMode, type Connection, errText,
          linkCardVisible, releasedHoldDays,
          removedConnectionNote } from "../../lib/api";
 import { patchList, patchQuery, removeFromList } from "../../lib/cache";
@@ -24,17 +24,19 @@ import { PendingLinkRows } from "../../components/pending-links";
 import { ago } from "../../lib/dates";
 import { CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "../../components/verify-email-card";
-import { firstSyncPending, linkedLine, accountRemoveMoved, accountRemoveNote, bankAwaitsConfirm, hueOf, keptRowsQuestion, institutionAllowance, lastSyncPhrase,
-         listPhase, monogram, parseMoneyDraft, purgeKeptRows, signedBalance,
-         classifyChange }
+import { firstSyncPending, groupByLogin, holdingSymbol, addedLine, accountRemoveMoved, accountRemoveNote, bankAwaitsConfirm, hueOf, keptRowsQuestion, institutionAllowance, lastSyncPhrase,
+         listPhase, monogram, parseMoneyDraft, purgeKeptRows,
+         classifyChange, accountSwitches, kindWords }
   from "../../lib/pure";
 import { useLogosOn } from "../../components/merchant-avatar";
 import { historyMonthsOf, historyRowNote, windowNarrower }
   from "../../components/wizard-logic";
 import { useSession } from "../../lib/session";
 import { useMe, useOwner, useSharedLock, useViewer } from "../../lib/viewer";
-import { C, money } from "../../lib/theme";
+import { C, mmddyy, money } from "../../lib/theme";
+import { disclosure, useSheetAnimation } from "../../lib/a11y";
 import { LogoSpinner } from "../../components/logo-spinner";
+import { fieldA11y } from "../../components/field";
 
 // the web add-form's kinds, verbatim
 const KINDS: [string, string][] = [
@@ -54,19 +56,37 @@ function statusDot(a: Account): string {
   return a.status === "restored" || a.status === "stale" ? C.warn : C.bad;
 }
 
-function AccountRow({ a, onPress, primary, pinnedUnused, excluded, badge }:
+/** A stamp's day on this device's calendar, as the web's toLocaleString
+ *  reads it: a push at 11pm here is not dated tomorrow from its UTC. */
+function seenDay(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  const p = (n: number) => String(n).padStart(2, "0");
+  return mmddyy(`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`);
+}
+
+function AccountRow({ a, onPress, primary, pinnedUnused, excluded, badge,
+                      shown, dim }:
     { a: Account; onPress?: () => void;
+      // a row of a login whose accounts are all linked backups
+      dim?: boolean;
+      // the balance in the whole dollars its section adds up in (the
+      // server's `shown.by_account`, or `backup_shown` for a linked
+      // backup that agrees with its serving account); absent for any
+      // other account the section does not count, or from an older server
+      shown?: number;
       // the server's words for why the pin is passed over ("" when it
       // sent none); undefined when this row is not a passed-over pin
       primary?: boolean; pinnedUnused?: string; excluded?: boolean;
       badge?: string }) {
   const bal = a.balance_current;
   const dot = statusDot(a);
-  // linked-source state rides the row (the web's pills): the healthy
-  // primary is serving, others are backups, a sick primary is down
+  // linked-source state rides the row (the web's pills): the primary is
+  // serving, others are backups, and any sick source — a backup included
+  // — is flagged down
   const linkFlag = a.link
-    ? (a.link.primary
-        ? (a.link.healthy ? "serving" : "source down") : "backup")
+    ? [a.link.primary ? "serving" : "backup",
+       a.link.healthy ? "" : "source down"].filter(Boolean).join(" · ")
     : "";
   const flags = [
     primary ? "primary" : "",
@@ -78,12 +98,13 @@ function AccountRow({ a, onPress, primary, pinnedUnused, excluded, badge }:
     // the web's red-dot tooltip: a collector whose script token was
     // revoked after its last good push (a password change or reset
     // revokes them all) is being refused, not broken — name it
+    // dated as the web's tooltip dates it
     a.script && !a.script.ok && a.script.token_revoked_at
-      ? "token revoked" : "",
+      ? `token revoked ${seenDay(a.script.token_revoked_at)}` : "",
   ].filter(Boolean).join(" · ");
   return (
-    <Pressable onPress={onPress}
-               style={({ pressed }) => [s.row,
+    <Pressable accessibilityRole="button" onPress={onPress}
+               style={({ pressed }) => [s.row, dim && { opacity: 0.6 },
                  pressed && onPress ? { backgroundColor: C.hover } : null]}>
       <View style={{ flex: 1 }}>
         <Text style={s.name} numberOfLines={1}>
@@ -91,19 +112,33 @@ function AccountRow({ a, onPress, primary, pinnedUnused, excluded, badge }:
           {a.name}{a.mask ? <Text style={s.mut}> ··{a.mask}</Text> : null}
         </Text>
         <Text style={s.mut}>
-          {a.kind}{a.owner ? ` · ${a.owner}` : ""} · {a.txns} txns
+          {/* the type in the web's words ("Checking", "403(b)"), not
+              the feed's "depository/checking" pair */}
+          {kindWords(a.kind)}{a.owner ? ` · ${a.owner}` : ""} · {a.txns} txns
           {badge ? ` · ${badge}` : ""}
           {flags ? <Text style={{ color: C.warn }}>  {flags}</Text> : null}
         </Text>
+        {/* a collector's last good run, the web dot's tooltip: a quiet
+            one says since when */}
+        {a.script?.last_push ? (
+          <Text style={[s.mut, !a.script.ok && { color: C.bad }]}>
+            {a.script.ok ? "last run" : "no successful run since"}{" "}
+            {seenDay(a.script.last_push)}
+          </Text>) : null}
       </View>
       <View style={{ alignItems: "flex-end" }}>
         <Text style={s.bal}>
-          {bal === null ? "—" : money(bal, false)}
+          {shown !== undefined ? money(shown, false)
+            : bal === null ? "—" : money(bal, false)}
         </Text>
         {/* a card's next due date, right where the card is (web parity) */}
-        {a.card_due && (bal ?? 0) > 0.5 ? (
+        {/* the server's words: "due 11/25", or once that date has gone
+            by "paid 11/14" / "past due since 11/15". The server decides
+            whether there is a line at all; a server that sends none gets
+            none, never a "due" worded here from the bare date */}
+        {a.card_due && a.card_due_text ? (
           <Text style={s.mut}>
-            due {a.card_due.slice(5, 7)}/{a.card_due.slice(8, 10)}
+            {a.card_due_text}
             {a.card_statement != null
               ? ` · ${money(a.card_statement, false)}` : ""}
           </Text>
@@ -141,6 +176,7 @@ function InstMark({ a, size = 20 }: { a?: Account; size?: number }) {
 }
 
 export default function Accounts() {
+  const sheetAnim = useSheetAnimation();
   const { client } = useSession();
   // re-tapping the active tab scrolls back to the top
   const topRef = useRef<ScrollView>(null);
@@ -246,10 +282,12 @@ export default function Accounts() {
       // backing out is normal, never red — and nothing changed
       setNotice("No change — the sign-in window was closed.");
       changed = false;
-    } else if (s0.kind === "add_failed" || s0.kind === "update_failed")
+    } else if (s0.kind === "add_failed" && s0.summary)
+      setNotice(s0.summary, true);
+    else if (s0.kind === "add_failed" || s0.kind === "update_failed")
       setNotice(`Link failed: ${s0.error ?? "unknown"}`, true);
     else if (s0.kind === "update") setNotice("Reconnected.");
-    else { setNotice(linkedLine(s0.institution, s0.first_sync)); added = true; }
+    else { setNotice(addedLine(s0)); added = true; }
     return { changed, added };
   };
   const plaid = async (itemId = "", manage = false, relinkItemId = "") => {
@@ -505,6 +543,21 @@ export default function Accounts() {
     },
     onError: (e) => setNotice(errText(e), true),
   });
+  // a link the bank feed removed that the household has since linked
+  // again: history, not work — forgetting it is the disconnect door,
+  // which on a removed link only stops listing it (the web's
+  // ReplacedConnections)
+  const forget = useMutation({
+    mutationFn: (id: string) => client!.connectionDisconnect(id),
+    onSuccess: (_r, id) => {
+      removeFromList<{ connections: Connection[] }, Connection>(
+        qc, ["connections"], "connections", (c) => c.id === id);
+      setNotice("Forgotten — its history stays.");
+      qc.invalidateQueries({ queryKey: ["connections"] });
+    },
+    onError: (e) => setNotice(errText(e), true),
+  });
+  const replaced = (conns.data?.connections ?? []).filter((c) => c.replaced);
   const confirmHide = () => {
     const a = editing!;
     if (a.user_removed_at) { setHidden.mutate(false); return; }
@@ -614,7 +667,7 @@ export default function Accounts() {
   const isLive = (a: Account) =>
     a.balance_current !== null && !a.user_removed_at;
   // rebuilt on every poll response / notice / modal open otherwise —
-  // harmless at 20 accounts, quadratic (groupBy's spread-per-push) at
+  // harmless at 20 accounts, quadratic (a spread-per-push grouping) at
   // one institution's worth of them
   const { hiddenList, archived, live, personal, business } = useMemo(() => {
     const liveList = accounts.filter(isLive);
@@ -628,15 +681,9 @@ export default function Accounts() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [accounts]);
-  const groupBy = (list: Account[]) => {
-    const g = new Map<string, Account[]>();
-    for (const a of list) {
-      const key = a.institution_name || "Other";
-      g.set(key, [...(g.get(key) ?? []), a]);
-    }
-    return [...g.entries()].sort((x, y) =>
-      x[0].toLowerCase().localeCompare(y[0].toLowerCase()));
-  };
+  // one card per bank LOGIN, as the web: two logins at one bank are two
+  // cards, each with the subtotal the server sends for it
+  type Inst = { key: string; inst: string; list: Account[] };
   // the web's category tier: Bank / Credit Cards / Investments / Loans,
   // each with its own total, institutions nested inside
   const catOf = (kind: string): string => {
@@ -646,56 +693,76 @@ export default function Accounts() {
       : t === "loan" ? "Loans" : "Bank";
   };
   const CATEGORY_ORDER = ["Bank", "Credit Cards", "Investments", "Loans"];
-  const { groups, bizGroups, categories } = useMemo(() => {
-    const groups0 = groupBy(personal);
-    const bizGroups0 = groupBy(business);
-    const categories0 = CATEGORY_ORDER.map((cat) => {
-      const insts = groups0
-        .map(([inst, list]) =>
-          [inst, list.filter((a) => catOf(a.kind) === cat)] as const)
-        .filter(([, list]) => list.length > 0);
-      const total = insts.reduce((t, [, list]) =>
-        t + list.filter(countsInTotals)
-          .reduce((u, a) => u + (a.balance_current ?? 0), 0), 0);
-      return { cat, insts, total };
-    }).filter((c) => c.insts.length > 0);
-    return { groups: groups0, bizGroups: bizGroups0, categories: categories0 };
+  // the headline and the section subtotals are the server's
+  // (reporting.account_totals); an older server sends none and the
+  // figures are left out rather than worked out here
+  const totals = query.data?.totals;
+  const { bizCategories, categories, shownBalance } = useMemo(() => {
+    const groups0 = groupByLogin(personal);
+    const bizGroups0 = groupByLogin(business);
+    // the web's category tier, per pane: each section's total and each
+    // login's subtotal in it are the server's whole dollars
+    // (reporting.account_totals → shown.total / shown.by_item); an older
+    // server sends no `shown`, and the subtotal is left out
+    const tiers = (pane: "personal" | "business", gs: Inst[]) =>
+      CATEGORY_ORDER.map((cat) => {
+        const sec = totals?.sections[pane]?.[cat];
+        const insts = gs
+          .map((g) => ({ ...g, list: g.list.filter((a) => catOf(a.kind) === cat),
+                         sub: sec?.shown?.by_item[g.key] }))
+          .filter((g) => g.list.length > 0);
+        // the whole dollars the screen prints, so the rows below add up
+        // to it as shown; an older server sends none and prints none
+        const total = sec?.shown?.total ?? null;
+        // the server's words when the headline counts other than the
+        // section's total (a card's debt comes off it, a loan is not in it)
+        const counted = sec?.shown?.counted_text ?? null;
+        return { cat, insts, total, counted };
+      }).filter((c) => c.insts.length > 0);
+    const categories0 = tiers("personal", groups0);
+    const bizCategories0 = tiers("business", bizGroups0);
+    // each counted account's balance in the whole dollars its section
+    // adds up in (reporting.account_totals → shown.by_account)
+    const shownBalance0 = new Map<string, number>();
+    for (const pane of Object.values(totals?.sections ?? {}))
+      for (const sec of Object.values(pane))
+        for (const [id, d] of Object.entries(sec.shown?.by_account ?? {}))
+          shownBalance0.set(id, d);
+    // a linked backup whose balance is its serving account's prints that
+    // account's dollars (reporting.account_totals → backup_shown)
+    for (const [id, d] of Object.entries(totals?.backup_shown ?? {}))
+      shownBalance0.set(id, d);
+    return { bizCategories: bizCategories0,
+             categories: categories0, shownBalance: shownBalance0 };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [personal, business]);
+  }, [personal, business, totals]);
   const connById = useMemo(() => new Map((conns.data?.connections ?? [])
     .map((c) => [c.id, c])), [conns.data]);
   // provenance: what feeds each institution's rows (the web's badge)
-  const badgeLabel = (a: Account): string => {
+  // An account under no known connection is a manual one only when the
+  // connections read answered; unread, nothing is said about it.
+  const connsKnown = conns.data !== undefined;
+  const badgeLabel = (a: Account): string | undefined => {
     if (a.script) return "Script";
     const conn = a.item_id ? connById.get(a.item_id) : null;
-    if (!conn) return "Import";
+    if (!conn) return connsKnown ? "Import" : undefined;
     return conn.aggregator === "plaid" ? "Plaid"
       : conn.aggregator === "mx" ? "MX"
       : conn.aggregator.startsWith("simplefin") ? "SimpleFIN"
       : conn.aggregator;
   };
-  // hero math — personal live accounts only, and a doubly-linked
-  // account counts ONCE: its backup sources are shadows of the same
-  // money, excluded from the sum and from the account count the way
-  // the server excludes them from every aggregate. The backup rows
-  // still list below, badged.
-  const counted = personal.filter(countsInTotals);
-  // card and loan balances are amounts OWED — they come off the total
-  const liveTotal = counted.reduce((t, a) => t + signedBalance(a), 0);
-  const instCount = new Set(counted.map(
-    (a) => a.institution_name || "Other")).size;
-  // mirrors the web: a self-clearing bank outage is not "needs attention"
-  const needsAttention = useMemo(() => (conns.data?.connections ?? [])
-    .filter((c) => {
-      const k = c.status_kind
-        ?? (c.status && c.status !== "ok" ? "attention" : "ok");
-      return k !== "ok" && k !== "retrying";
-    }).length, [conns.data]);
+  // the hero is the Net Worth screen's Financial accounts figure, under
+  // the same label, with its counts — the server's; loans are listed
+  // under it as owed, not taken off it
+  // the server's count, as on the web: a self-clearing bank outage and a
+  // removed link the household has linked again are not "needs attention"
+  const needsAttention = conns.data?.attention ?? 0;
   // one broken Plaid connection per item gets its fix affordance
   // only the ones a PERSON can act on: a bank that is down retries by
   // itself, and offering re-auth for it is a button that appears to work
   const brokenPlaid = (conns.data?.connections ?? []).filter(
     (c) => c.aggregator === "plaid"
+      // older-server path: stands in for `status_kind`
       && ((c.status_kind ?? (c.status && c.status !== "ok" ? "attention"
                              : "ok")) === "reauth"
           || (c.status_kind ?? "ok") === "attention"));
@@ -712,7 +779,15 @@ export default function Accounts() {
       refreshControl={<PullRefresh tintColor={C.accent} colors={[C.accent]}
                                       progressBackgroundColor={C.card}
                                       onRefresh={() => query.refetch()} />}>
-      <StaleBanner query={query} />
+      <StaleLine query={query} />
+      {/* the reads the rows are labelled from: unread connections are not
+          manual accounts, unread settings are not "nothing excluded" */}
+      {!!query.data && !connsKnown && conns.isError && (
+        <FailedLine q={conns} what="your bank connections" />
+      )}
+      {!!query.data && settings.data === undefined && settings.isError && (
+        <FailedLine q={settings} what="which accounts are excluded or primary" />
+      )}
       {/* There is no global "Sync now". A sync reads the aggregator's
           copy; it cannot make a bank send anything, and
           on a webhook-fed instance transactions land within seconds
@@ -732,7 +807,7 @@ export default function Accounts() {
             // server refuses past it anyway, but on the hosted link path
             // that refusal can land after the bank was authorized
             <SharedLock note={credentialLock}>
-              <Pressable style={[s.syncBtn, (plaidBusy || instFull
+              <Pressable accessibilityRole="button" style={[s.syncBtn, (plaidBusy || instFull
                                              || confirmFirst)
                                             && { opacity: 0.5 }]}
                          disabled={plaidBusy || instFull || confirmFirst}
@@ -746,7 +821,7 @@ export default function Accounts() {
             </SharedLock>
           )}
           <PendingLinkRows />
-          <Pressable style={s.syncBtn} onPress={() => setAdding(true)}>
+          <Pressable accessibilityRole="button" style={s.syncBtn} onPress={() => setAdding(true)}>
             <Text style={s.syncText}>＋ Add account</Text>
           </Pressable>
           {owner && !hosted && !credentialLock && (
@@ -799,27 +874,39 @@ export default function Accounts() {
           {lastSyncPhrase(conns.data?.last_sync)}
         </Text>
       ) : null}
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      {query.isPending && <Skeleton />}
       {notice ? (
-        <Text style={{ color: notice.bad ? C.bad : C.good, fontSize: 12,
+        <Note bad={notice.bad} style={{ color: notice.bad ? C.bad : C.good, fontSize: 12,
                        marginHorizontal: 12, marginTop: 4 }}
               onPress={() => setNotice(null)}>
           {notice.text}
-        </Text>
+        </Note>
       ) : null}
       {live.length > 0 && (
         <Card>
-          <Text style={{ color: C.text, fontSize: 24, fontWeight: "700",
-                         fontVariant: ["tabular-nums"] }}>
-            {money(liveTotal, false)}
-          </Text>
+          {totals ? <>
+            <Text style={s.mut}>{totals.label}</Text>
+            <Text style={{ color: C.text, fontSize: 24, fontWeight: "700",
+                           fontVariant: ["tabular-nums"] }}>
+              {money(totals.financial_total, false)}
+            </Text>
+          </> : null}
           <Text style={s.mut}>
-            across {counted.length} account
-            {counted.length === 1 ? "" : "s"} · {instCount} institution
-            {instCount === 1 ? "" : "s"}
+            {totals ? `across ${totals.account_count} account${
+              totals.account_count === 1 ? "" : "s"} · ${
+              totals.institution_count} institution${
+              totals.institution_count === 1 ? "" : "s"}` : ""}
             {lastSyncPhrase(conns.data?.last_sync)
-              ? ` · ${lastSyncPhrase(conns.data?.last_sync)}` : ""}
+              ? `${totals ? " · " : ""}${lastSyncPhrase(conns.data?.last_sync)}`
+              : ""}
           </Text>
+          {totals && totals.loan_count > 0 && (
+            <Text style={s.mut}>
+              loans <Text style={{ color: C.bad }}>
+                {money(totals.loans_owed, false)}</Text> owed — listed, not
+              taken off the total
+            </Text>
+          )}
           {needsAttention > 0 && (
             <Text style={{ color: C.warn, fontSize: 12 }}>
               ⚠ {needsAttention} connection
@@ -848,7 +935,8 @@ export default function Accounts() {
                       ? "new accounts to share"
                       : "sync failing"}
               </Text>
-              <Pressable style={[s.btn, (plaidBusy || (c.status === "reaped"
+              <Pressable accessibilityRole="button"
+                         style={[s.btn, (plaidBusy || (c.status === "reaped"
                                                       && confirmFirst))
                                         && { opacity: 0.5 }]}
                          // a fresh link is a new connection, closed to a
@@ -893,11 +981,8 @@ export default function Accounts() {
             )}
           </View>
           <Text style={s.mut}>
-            Two sources feeding the same real-world account get linked:
-            the best live source serves the data, the others stay in
-            sync as backups — never double-counted, and they take over
-            automatically (with an email) if the primary breaks. Reorder
-            or unlink from the account's editor.
+            Two sources for the same account are linked so nothing is
+            counted twice.
           </Text>
           {(links.data?.suggestions ?? []).map((sg) => (
             <View key={sg.key} style={s.linkRow}>
@@ -915,7 +1000,7 @@ export default function Accounts() {
                   {sg.b.mask ? ` (${sg.b.mask})` : ""}
                 </Text>
               </Text>
-              <Pressable style={[s.btn,
+              <Pressable accessibilityRole="button" style={[s.btn,
                            linkBusy(sg.key) && { opacity: 0.5 }]}
                          disabled={linkBusy(sg.key)}
                          onPress={() => linkAct.mutate({ id: sg.key,
@@ -923,7 +1008,7 @@ export default function Accounts() {
                            client!.accountLinkCreate([sg.a.id, sg.b.id]) })}>
                 <Text style={s.btnText}>Link them</Text>
               </Pressable>
-              <Pressable style={[s.btn, s.btnQuiet,
+              <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                            linkBusy(sg.key) && { opacity: 0.5 }]}
                          disabled={linkBusy(sg.key)}
                          onPress={() => linkAct.mutate({ id: sg.key,
@@ -956,7 +1041,27 @@ export default function Accounts() {
         </Card>
       )}
 
-      {categories.map(({ cat, insts, total }) => (
+      {owner && replaced.length > 0 && (
+        <Card>
+          {replaced.map((c) => (
+            <View key={c.id} style={{ flexDirection: "row", gap: 8,
+                                      alignItems: "center", flexWrap: "wrap" }}>
+              <Text style={{ color: C.text, fontSize: 13, fontWeight: "600" }}>
+                {c.institution_name || c.id}</Text>
+              <Text style={[s.mut, { flex: 1 }]}>{c.removed_text}</Text>
+              <Pressable accessibilityRole="button"
+                         disabled={forget.isPending || !!credentialLock}
+                         onPress={() => forget.mutate(c.id)}>
+                <Text style={{ color: C.accent, fontSize: 13,
+                               opacity: credentialLock ? 0.55 : 1 }}>
+                  forget</Text>
+              </Pressable>
+            </View>
+          ))}
+        </Card>
+      )}
+
+      {categories.map(({ cat, insts, total, counted }) => (
         <View key={cat}>
           {/* the web's category tier — a header row with its own total */}
           <View style={{ flexDirection: "row", alignItems: "baseline",
@@ -964,18 +1069,25 @@ export default function Accounts() {
             <Text style={{ color: C.mut, fontSize: 12, fontWeight: "700",
                            textTransform: "uppercase", flex: 1 }}>
               {cat}
+              {counted ? (
+                <Text style={{ textTransform: "none", fontWeight: "400" }}>
+                  {` · ${counted}`}</Text>
+              ) : null}
             </Text>
-            <Text style={{ color: C.text, fontSize: 14, fontWeight: "700",
-                           fontVariant: ["tabular-nums"] }}>
-              {money(total, false)}
-            </Text>
+            {total !== null && (
+              <Text style={{ color: C.text, fontSize: 14, fontWeight: "700",
+                             fontVariant: ["tabular-nums"] }}>
+                {money(total, false)}
+              </Text>
+            )}
           </View>
-          {insts.map(([inst, list]) => {
+          {insts.map(({ key, inst, list, sub }) => {
             const itemId = list[0]?.item_id ?? null;
             const conn = itemId ? connById.get(itemId) : null;
             // real statuses look like "error:ITEM_LOGIN_REQUIRED" —
             // match the class, not an exact string
             const st0 = conn?.status ?? "ok";
+            // older-server path: stands in for `status_kind`
             const kind = conn?.status_kind
               ?? (st0 !== "ok" ? "attention" : "ok");
             const reaped = kind === "gone" || st0 === "reaped";
@@ -991,11 +1103,21 @@ export default function Accounts() {
             const loginExpired =
               st0.toUpperCase().includes("LOGIN_REQUIRED");
             return (
-            <Card key={`${cat}-${inst}`}>
+            <Card key={`${cat}-${key}`}>
               <View style={{ flexDirection: "row", alignItems: "center",
                              gap: 8, flexWrap: "wrap" }}>
                 <InstMark a={list[0]} />
                 <H>{inst}</H>
+                {/* the login's subtotal, as the web's institution row —
+                    a login of one account shows its balance on its row
+                    alone, as the web does */}
+                {sub !== undefined && list.length > 1 && (
+                  <Text style={{ color: C.text, fontSize: 14, fontWeight: "700",
+                                 fontVariant: ["tabular-nums"],
+                                 marginLeft: "auto" }}>
+                    {money(sub, false)}
+                  </Text>
+                )}
                 {broken && (
                   <Pill text={newAccounts ? "new accounts to share"
                                 : loginExpired ? "sign-in expired"
@@ -1056,7 +1178,7 @@ export default function Accounts() {
                             button renders — mirror the web's grant ↗:
                             an update-mode re-link lets the bank share it */}
                         {consent && owner && !broken && (
-                          <Pressable
+                          <Pressable accessibilityRole="button"
                             style={[s.btn, { paddingVertical: 5 },
                                     (plaidBusy || !!credentialLock)
                                       && { opacity: 0.5 }]}
@@ -1096,7 +1218,7 @@ export default function Accounts() {
                   && windowNarrower(conn.history_months,
                                     settings.data?.history_months)
                   && !relinking.has(itemId!) && (
-                  <Pressable style={[s.btn, { paddingVertical: 5 },
+                  <Pressable accessibilityRole="button" style={[s.btn, { paddingVertical: 5 },
                                (plaidBusy || !!credentialLock)
                                  && { opacity: 0.5 }]}
                              disabled={plaidBusy || !!credentialLock}
@@ -1111,7 +1233,7 @@ export default function Accounts() {
                   </Pressable>
                 )}
                 {owner && reaped && (
-                  <Pressable style={[s.btn, { paddingVertical: 5 },
+                  <Pressable accessibilityRole="button" style={[s.btn, { paddingVertical: 5 },
                                (plaidBusy || !!credentialLock)
                                  && { opacity: 0.5 }]}
                              disabled={plaidBusy || !!credentialLock}
@@ -1120,7 +1242,7 @@ export default function Accounts() {
                   </Pressable>
                 )}
                 {owner && broken && conn!.aggregator === "plaid" && (
-                  <Pressable style={[s.btn, { paddingVertical: 5 },
+                  <Pressable accessibilityRole="button" style={[s.btn, { paddingVertical: 5 },
                                (plaidBusy || !!credentialLock)
                                  && { opacity: 0.5 }]}
                              disabled={plaidBusy || !!credentialLock}
@@ -1136,14 +1258,20 @@ export default function Accounts() {
                 {!viewer && conn && !reaped && (
                   <Text style={{ color: C.accent, fontSize: 14,
                                  padding: 4 }}
+                        accessibilityRole="button" accessibilityLabel="Sync this connection"
                         onPress={() => !syncingItems.has(itemId!)
                           && syncItem.mutate(itemId!)}>
                     {syncingItems.has(itemId!) ? "…" : "↻"}
                   </Text>
                 )}
               </View>
+              {totals?.backups?.[key] ? (
+                <Text style={[s.mut, { marginTop: 2 }]}>
+                  {totals.backups[key]}</Text>) : null}
               {list.map((a) => (
                 <AccountRow key={a.id} a={a} badge={badgeLabel(a)}
+                  shown={shownBalance.get(a.id)}
+                  dim={!!totals?.backups?.[key]}
                   primary={a.id === anchor}
                   pinnedUnused={a.id === primary && a.id !== anchor
                     ? (query.data?.primary_pin_unused ?? "") : undefined}
@@ -1158,44 +1286,83 @@ export default function Accounts() {
         </View>
       ))}
 
-      {bizGroups.length > 0 && (
+      {bizCategories.length > 0 && (
         <Card>
           <H>Business accounts</H>
           <Text style={s.mut}>
-            Excluded from personal totals; managed on{" "}
+            {totals?.business_counted
+              ? "In the Financial accounts total — you combine business and personal money"
+              : "Not in the Financial accounts total"}; managed on{" "}
             <Text style={{ color: C.accent }}
                   onPress={() => router.push("/business" as never)}>
               Business ›
             </Text>
           </Text>
-          {bizGroups.map(([inst, list]) => (
-            <View key={inst}>
-              <View style={{ flexDirection: "row", alignItems: "center", gap: 6,
-                             marginTop: 6 }}>
-                <InstMark a={list[0]} size={16} />
-                <Text style={[s.mut, { fontWeight: "600" }]}>{inst}</Text>
+          {bizCategories.map(({ cat, insts, total, counted }) => (
+            <View key={`biz-${cat}`}>
+              {/* the web's category tier, as in the personal list */}
+              <View style={{ flexDirection: "row", alignItems: "baseline",
+                             marginTop: 10 }}>
+                <Text style={{ color: C.mut, fontSize: 12, fontWeight: "700",
+                               textTransform: "uppercase", flex: 1 }}>
+                  {cat}
+                  {counted ? (
+                    <Text style={{ textTransform: "none", fontWeight: "400" }}>
+                      {` · ${counted}`}</Text>
+                  ) : null}
+                </Text>
+                {total !== null && (
+                  <Text style={{ color: C.text, fontSize: 14, fontWeight: "700",
+                                 fontVariant: ["tabular-nums"] }}>
+                    {money(total, false)}
+                  </Text>
+                )}
               </View>
-              {list.map((a) => (
-                <AccountRow key={a.id} a={a}
-                  onPress={viewer ? undefined : () => openEditor(a)} />))}
+              {insts.map(({ key, inst, list, sub }) => (
+                <View key={`biz-${cat}-${key}`}>
+                  <View style={{ flexDirection: "row", alignItems: "center",
+                                 gap: 6, marginTop: 6 }}>
+                    <InstMark a={list[0]} size={16} />
+                    <Text style={[s.mut, { fontWeight: "600", flex: 1 }]}>
+                      {inst}</Text>
+                    {sub !== undefined && list.length > 1 && (
+                      <Text style={{ color: C.text, fontWeight: "600",
+                                     fontVariant: ["tabular-nums"] }}>
+                        {money(sub, false)}
+                      </Text>
+                    )}
+                  </View>
+                  {list.map((a) => (
+                    <AccountRow key={a.id} a={a} shown={shownBalance.get(a.id)}
+                      onPress={viewer ? undefined : () => openEditor(a)} />))}
+                </View>
+              ))}
             </View>
           ))}
         </Card>
       )}
 
-      {(holdings.data?.holdings ?? []).length > 0 && (
+      {((holdings.data?.holdings ?? []).length > 0
+        || holdings.data?.hidden_text) && (
         <Card>
-          <H>Top holdings</H>
+          <H>Top holdings{holdings.data?.as_of_text ? (
+            <Text style={[s.mut, { fontWeight: "400" }]}>
+              {" "}— {holdings.data.as_of_text}</Text>) : null}</H>
+          {holdings.data?.hidden_text ? (
+            <Text style={s.mut}>{holdings.data.hidden_text}</Text>) : null}
           {holdings.data!.holdings.slice(0, 20).map((h, i) => (
             <View key={`${h.acct}-${h.symbol}-${i}`}>
-              <KV k={`${h.symbol}${h.fund
+              <KV k={`${holdingSymbol(h.symbol)}${h.fund
                       ? ` · ${h.fund.slice(0, 30)}` : ""}`}
                   v={money(h.value, false)} tone="mut" />
               {/* the web table's Account / Qty / Price columns */}
               <Text style={[s.mut, { marginTop: -2 }]}>
                 {h.acct}
-                {h.qty != null ? ` · ${h.qty.toFixed(2)}` : ""}
+                {/* the quantity and the pricing day as the server prints
+                    them (the web's cells); an older server sends neither */}
+                {h.qty_text ? ` · ${h.qty_text}` : ""}
                 {h.price != null ? ` @ ${money(h.price)}` : ""}
+                {h.priced_text ? ` · ${h.priced_text}` : ""}
               </Text>
             </View>
           ))}
@@ -1211,7 +1378,10 @@ export default function Accounts() {
           hidden/archived last */}
       {hiddenList.length > 0 && (
         <Card>
-          <Pressable onPress={() => setShowHidden((x) => !x)}>
+          <Pressable onPress={() => setShowHidden((x) => !x)}
+                     {...disclosure(showHidden, `Hidden (${hiddenList.length}) — `
+                       + "excluded from every total; the connection is still "
+                       + "live and the history is kept")}>
             <Text style={s.archHead}>
               {showHidden ? "▾" : "▸"} Hidden ({hiddenList.length}) —
               excluded from every total; the connection is still live and the history is kept
@@ -1225,7 +1395,9 @@ export default function Accounts() {
       )}
       {archived.length > 0 && (
         <Card>
-          <Pressable onPress={() => setShowArchived((x) => !x)}>
+          <Pressable onPress={() => setShowArchived((x) => !x)}
+                     {...disclosure(showArchived, `Archived (${archived.length}) — `
+                       + "closed / historical, not syncing")}>
             <Text style={s.archHead}>
               {showArchived ? "▾" : "▸"} Archived ({archived.length}) —
               closed / historical, not syncing
@@ -1239,9 +1411,7 @@ export default function Accounts() {
       )}
 
       {acctPhase === "failed" && (
-        <Text style={[s.center, { color: C.bad }]}>
-          Couldn't reach the server — pull down to retry.
-        </Text>
+        <FailedLine q={query} what="accounts" />
       )}
       {acctPhase === "empty" && (
         <Text style={s.center}>
@@ -1250,7 +1420,7 @@ export default function Accounts() {
         </Text>
       )}
 
-      <Modal visible={!!editing} animationType="slide" transparent
+      <Modal visible={!!editing} animationType={sheetAnim} transparent
              onRequestClose={() => setEditing(null)}
              onDismiss={() => {
                const a = removeAfterEdit.current;
@@ -1300,7 +1470,7 @@ export default function Accounts() {
                   <View style={{ flexDirection: "row", gap: 8,
                                  justifyContent: "center" }}>
                     {!me.primary && (
-                      <Pressable style={[s.btn, s.btnQuiet,
+                      <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                                    (busy || !me.healthy) && { opacity: 0.5 }]}
                                  disabled={busy || !me.healthy}
                                  onPress={() => linkAct.mutate({
@@ -1312,7 +1482,8 @@ export default function Accounts() {
                         <Text style={s.btnText}>Make primary</Text>
                       </Pressable>
                     )}
-                    <Pressable style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
+                    <Pressable accessibilityRole="button"
+                               style={[s.btn, s.btnQuiet, busy && { opacity: 0.5 }]}
                                disabled={busy}
                                onPress={() => Alert.alert(
                                  `Unlink ${editing.name}?`,
@@ -1338,7 +1509,7 @@ export default function Accounts() {
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8,
                            justifyContent: "center" }}>
               {owner && (
-              <Pressable style={[s.btn, s.btnQuiet,
+              <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                                  setHidden.isPending && { opacity: 0.5 }]}
                          disabled={setHidden.isPending}
                          onPress={confirmHide}>
@@ -1348,7 +1519,7 @@ export default function Accounts() {
               </Pressable>
               )}
               {owner && (
-              <Pressable style={[s.btn, s.btnQuiet]}
+              <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                          onPress={() => {
                            const a = editing!;
                            const liveConn = !!a.item_id && isPullAgg(a)
@@ -1366,7 +1537,7 @@ export default function Accounts() {
                 <Text style={[s.btnText, { color: C.bad }]}>Remove…</Text>
               </Pressable>
               )}
-              <Pressable style={[s.btn, s.btnQuiet]}
+              <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                          onPress={() => setEditing(null)}>
                 <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
               </Pressable>
@@ -1433,7 +1604,7 @@ export default function Accounts() {
         </KeyboardAvoidingView>
       </Modal>
 
-      <Modal visible={!!removing} animationType="slide" transparent
+      <Modal visible={!!removing} animationType={sheetAnim} transparent
              onRequestClose={() => setRemoving(null)}>
         <View style={s.sheetWrap}>
           <View style={s.sheet}>
@@ -1506,7 +1677,7 @@ export default function Accounts() {
                               note={gi === 0 && group.length
                                     ? credentialLock : null}>
                   {group.map(([mode, title, sub]) => (
-                    <Pressable key={mode} style={{ flexDirection: "row",
+                    <Pressable accessibilityRole="button" key={mode} style={{ flexDirection: "row",
                                  gap: 8, paddingVertical: 6 }}
                                onPress={() => setRmMode(mode)}>
                       <Text style={{ color: rmMode === mode
@@ -1529,15 +1700,15 @@ export default function Accounts() {
             })()}
             <View style={{ flexDirection: "row", gap: 8,
                            justifyContent: "center" }}>
-              <Pressable style={[s.btn, { backgroundColor: C.bad },
+              <Pressable accessibilityRole="button" style={[s.btn, { backgroundColor: C.danger },
                            remove.isPending && { opacity: 0.5 }]}
                          disabled={remove.isPending}
                          onPress={confirmRemove}>
-                <Text style={s.btnText}>
+                <Text style={[s.btnText, { color: C.onDanger }]}>
                   {remove.isPending ? "removing…" : "Confirm remove"}
                 </Text>
               </Pressable>
-              <Pressable style={[s.btn, s.btnQuiet]}
+              <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                          onPress={() => setRemoving(null)}>
                 <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
               </Pressable>
@@ -1546,7 +1717,7 @@ export default function Accounts() {
         </View>
       </Modal>
 
-      <Modal visible={adding} animationType="slide" transparent
+      <Modal visible={adding} animationType={sheetAnim} transparent
              onRequestClose={() => setAdding(false)}>
         <KeyboardAvoidingView style={s.sheetWrap} behavior="padding">
           <View style={s.sheet}>
@@ -1593,11 +1764,14 @@ function EditorFields({ a, primary, excluded, manual, saving, error,
   const [eExcl, setEExcl] = useState(excluded);
   // what the switches showed on open (the props can move under a refetch)
   const [seed] = useState({ primary, excluded });
+  const offered = accountSwitches({
+    can_pin: a.can_pin, can_exclude: a.can_exclude,
+    pinned: seed.primary, excluded: seed.excluded });
   const [editBal, setEditBal] = useState(
     a.balance_current !== null ? String(a.balance_current) : "");
   return (
     <>
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("Display name")} style={s.input}
                  placeholder={a.bank_name || "display name"}
                  placeholderTextColor={C.mut} value={eName}
                  onChangeText={setEName} />
@@ -1606,21 +1780,21 @@ function EditorFields({ a, primary, excluded, manual, saving, error,
           <Text style={{ color: C.mut, fontSize: 12, flexShrink: 1 }}>
             bank name “{a.bank_name}”
           </Text>
-          <Pressable onPress={() => setEName("")}
+          <Pressable accessibilityRole="button" onPress={() => setEName("")}
                      hitSlop={8}>
             <Text style={{ color: C.accent, fontSize: 12 }}>Revert</Text>
           </Pressable>
         </View>
       )}
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("Owner (yours / mine / ours)")} style={s.input}
                  placeholder="owner (yours / mine / ours)"
                  placeholderTextColor={C.mut} value={eOwner}
                  onChangeText={setEOwner} />
       <View style={s.kindRow}>
         {(KINDS.some(([v]) => v === eKind)
-          ? KINDS : [...KINDS, [eKind, a.kind]] as
+          ? KINDS : [...KINDS, [eKind, kindWords(a.kind)]] as
             [string, string][]).map(([v, l]) => (
-          <Pressable key={v}
+          <Pressable accessibilityRole="button" key={v}
                      style={[s.kind, eKind === v && s.kindOn]}
                      onPress={() => setEKind(v)}>
             <Text style={{ color: eKind === v ? C.text : C.mut,
@@ -1628,6 +1802,11 @@ function EditorFields({ a, primary, excluded, manual, saving, error,
           </Pressable>
         ))}
       </View>
+      {/* each switch only where the server says it applies
+          (accountSwitches, as on the web): the forecast anchor on a bank
+          account, the budget exclusion on any account whose rows can
+          count; an older server says neither and both are offered */}
+      {offered.primary && (
       <View style={s.toggleRow}>
         <View style={{ flex: 1 }}>
           <Text style={s.toggleLabel}>Primary checking</Text>
@@ -1635,10 +1814,13 @@ function EditorFields({ a, primary, excluded, manual, saving, error,
             anchor the cash forecast on this account
           </Text>
         </View>
-        <Switch value={ePrimary} onValueChange={setEPrimary}
+        <Switch value={ePrimary}
+                accessibilityLabel="Primary checking"
+                onValueChange={setEPrimary}
                 trackColor={{ false: C.hover, true: C.accent }}
                 thumbColor={C.text} />
-      </View>
+      </View>)}
+      {offered.excluded && (
       <View style={s.toggleRow}>
         <View style={{ flex: 1 }}>
           <Text style={s.toggleLabel}>Exclude from budget</Text>
@@ -1646,22 +1828,24 @@ function EditorFields({ a, primary, excluded, manual, saving, error,
             its spending never counts toward the verdict
           </Text>
         </View>
-        <Switch value={eExcl} onValueChange={setEExcl}
+        <Switch value={eExcl}
+                accessibilityLabel="Exclude from budget"
+                onValueChange={setEExcl}
                 trackColor={{ false: C.hover, true: C.accent }}
                 thumbColor={C.text} />
-      </View>
+      </View>)}
       {/* not decimal-pad: it has no minus key on iOS (nor on Android
           without the signed flag), and a manual account can be overdrawn */}
       {manual && (
-        <TextInput style={s.input} placeholder="balance ($)"
+        <TextInput {...fieldA11y("Balance ($)")} style={s.input} placeholder="balance ($)"
                    placeholderTextColor={C.mut} value={editBal}
                    onChangeText={setEditBal}
                    keyboardType="numbers-and-punctuation" />
       )}
       {error ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}>{error}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}>{error}</Note>
       ) : null}
-      <Pressable style={[s.btn, { alignSelf: "center" },
+      <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "center" },
                          saving && { opacity: 0.5 }]}
                  disabled={saving}
                  onPress={() => onSave({ name: eName, owner: eOwner,
@@ -1685,12 +1869,12 @@ function AddFields({ pending, error, onAdd, onCancel }: {
   const [newBal, setNewBal] = useState("");
   return (
     <>
-      <TextInput style={s.input} placeholder="name (e.g. HSA)"
+      <TextInput {...fieldA11y("Account name")} style={s.input} placeholder="name (e.g. HSA)"
                  placeholderTextColor={C.mut} value={newName}
                  onChangeText={setNewName} />
       <View style={s.kindRow}>
         {KINDS.map(([v, l]) => (
-          <Pressable key={v}
+          <Pressable accessibilityRole="button" key={v}
                      style={[s.kind, newKind === v && s.kindOn]}
                      onPress={() => setNewKind(v)}>
             <Text style={{ color: newKind === v ? C.text : C.mut,
@@ -1698,23 +1882,24 @@ function AddFields({ pending, error, onAdd, onCancel }: {
           </Pressable>
         ))}
       </View>
-      <TextInput style={s.input} placeholder="starting balance ($)"
+      <TextInput {...fieldA11y("Starting balance ($)")}
+                 style={s.input} placeholder="starting balance ($)"
                  placeholderTextColor={C.mut} value={newBal}
                  onChangeText={setNewBal}
                  keyboardType="numbers-and-punctuation" />
       {error ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}>{error}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}>{error}</Note>
       ) : null}
       <View style={{ flexDirection: "row", gap: 8,
                      justifyContent: "center" }}>
-        <Pressable style={[s.btn, (!newName.trim() || pending)
+        <Pressable accessibilityRole="button" style={[s.btn, (!newName.trim() || pending)
                             && { opacity: 0.5 }]}
                    disabled={!newName.trim() || pending}
                    onPress={() => onAdd({ name: newName, kind: newKind,
                                           bal: newBal })}>
           <Text style={s.btnText}>Add</Text>
         </Pressable>
-        <Pressable style={[s.btn, s.btnQuiet]} onPress={onCancel}>
+        <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]} onPress={onCancel}>
           <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
         </Pressable>
       </View>
@@ -1728,11 +1913,11 @@ function SimplefinPaste({ pending, onConnect }: {
   const [sfToken, setSfToken] = useState("");
   return (
     <View style={{ flexDirection: "row", gap: 8, marginTop: 8 }}>
-      <TextInput style={[s.input, { flex: 1 }]}
+      <TextInput {...fieldA11y("SimpleFIN setup token")} style={[s.input, { flex: 1 }]}
                  placeholder="SimpleFIN setup token"
                  placeholderTextColor={C.mut} autoCapitalize="none"
                  value={sfToken} onChangeText={setSfToken} />
-      <Pressable style={[s.btn,
+      <Pressable accessibilityRole="button" style={[s.btn,
                    (!sfToken.trim() || pending) && { opacity: 0.5 }]}
                  disabled={!sfToken.trim() || pending}
                  onPress={() => onConnect(sfToken.trim())}>
@@ -1758,7 +1943,7 @@ const s = StyleSheet.create({
   sheet: { backgroundColor: C.card, borderTopLeftRadius: 16,
            borderTopRightRadius: 16, padding: 16, gap: 10 },
   sheetTitle: { color: C.text, fontSize: 16, fontWeight: "700" },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 15,
            paddingHorizontal: 10, paddingVertical: 8 },
   kindRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
@@ -1768,7 +1953,7 @@ const s = StyleSheet.create({
   kind: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
           borderRadius: 999, paddingHorizontal: 10, paddingVertical: 5 },
   kindOn: { borderColor: C.accent, backgroundColor: C.hover },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 18, paddingVertical: 9 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 14, fontWeight: "600" },

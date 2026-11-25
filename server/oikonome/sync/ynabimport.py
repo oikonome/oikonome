@@ -17,7 +17,7 @@ from typing import NamedTuple
 
 from ..engine.compat import as_date
 from . import flowmap, reimport
-from .base import (FileImportIds, Transaction, drop_before_history, mask_file_raw,
+from .base import (FileRowCount, FileImportIds, Transaction, drop_before_history, mask_file_raw,
                    upsert_transactions)
 from .csvimport import (bounded_dict_reader, date_order, parse_money_text,
                         scrub_identifiers)
@@ -451,8 +451,10 @@ def _import_mapped(conn, lines: list[_Line], dest_of: list,
             from . import batches
             batches.tag(conn, txns, batch_id)
         txns_all.extend(txns)
-    added = upsert_transactions(conn, txns_all)
-    return {"imported": added, "rows": len(txns_all),
+    count = FileRowCount(conn, txns_all)
+    upsert_transactions(conn, txns_all)
+    added, matched = count.after()
+    return {"imported": added, "matched": matched, "rows": len(txns_all),
             "skipped_duplicates": skipped_dupes, "corrected": corrected,
             "skipped_older": skipped_older,
             "_ids": {t.id for t in txns_all}, "_landed": landed}

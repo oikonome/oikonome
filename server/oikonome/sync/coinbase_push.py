@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import re
 
 from ..engine.compat import MAX_AMOUNT, as_date, strip_nul
 from . import base
@@ -77,6 +78,40 @@ def _money(value, what: str) -> float:
     return num
 
 
+# Coinbase's own sign is the WALLET's: + is value arriving in it. The ledger's
+# is the other way round (+ is money out), so a Coinbase record's ledger
+# amount is its native_amount negated. The record itself (`raw`) is the
+# authority: it is what every door stores, so the rule reads the same row
+# the same way at push, at the native pull, in migration 229 and on a
+# restore. A plain decimal only — the migration's SQL reads exactly this
+# shape, so the two can never disagree about a value.
+# a plain decimal, digit-capped like migration 229's twin of this rule, so
+# no digit string long enough to overflow a float reaches float()
+_NATIVE_RE = re.compile(r"^-?[0-9]{1,13}(\.[0-9]{1,12})?$")
+
+
+def ledger_amount(raw) -> float | None:
+    """The ledger amount of a Coinbase transaction record: its
+    native_amount with the ledger's sign (positive = money out of the
+    account). None when the record carries no readable native amount."""
+    nat = raw.get("native_amount") if isinstance(raw, dict) else None
+    v = nat.get("amount") if isinstance(nat, dict) else None
+    if isinstance(v, bool) or not isinstance(v, (str, int, float)):
+        return None
+    s = str(v)
+    if not _NATIVE_RE.match(s):
+        return None
+    n = float(s)
+    if abs(n) > MAX_AMOUNT:
+        return None
+    return -n if n else 0.0
+
+
+def transfer_label(amount: float) -> str:
+    """Money moved, by the ledger's sign: arriving is TRANSFER_IN."""
+    return "TRANSFER_IN" if amount < 0 else "TRANSFER_OUT"
+
+
 def _money_or_none(value, what: str) -> float | None:
     """A balance is optional — the collector sends an explicit null for
     the ones Coinbase does not report. Absent stays absent; present must
@@ -112,6 +147,39 @@ def _list_of_objects(value, what: str) -> list:
             isinstance(x, dict) for x in value):
         raise ValueError(f"{what}: must be a list of objects")
     return value
+
+
+def _pushed_txn(t: dict) -> base.Transaction:
+    """One pushed row, coerced. A row whose record carries Coinbase's own
+    native amount takes its amount and its transfer direction from that
+    record (ledger_amount): a collector sends the wallet's sign, which is
+    the ledger's reversed, and the record is the one thing every door
+    agrees on. A row with no such record keeps the amount it was sent,
+    in the ledger's sign (positive = money out)."""
+    tid = t["id"]
+    raw = _obj(t.get("raw"), f"transaction {tid} raw")
+    amount = _money(t.get("amount"), f"transaction {tid} amount")
+    category = _text(t.get("category_primary"),
+                     f"transaction {tid} category_primary")
+    from_record = ledger_amount(raw)
+    if from_record is not None:
+        amount = from_record
+        if category in (None, "TRANSFER_IN", "TRANSFER_OUT"):
+            category = transfer_label(amount)
+    return base.Transaction(
+        id=str(tid), account_id=str(t["account_id"]),
+        # as_date refuses a year the app cannot read, as a ValueError the
+        # route reports as a bad payload
+        date=as_date(str(t["date"])[:10]),
+        amount=amount,
+        name=_text(t["name"], f"transaction {tid} name", required=True),
+        merchant_name=_text(t.get("merchant_name"),
+                            f"transaction {tid} merchant_name"),
+        pending=bool(t.get("pending")),
+        category_primary=category,
+        category_detailed=_text(t.get("category_detailed"),
+                                f"transaction {tid} category_detailed"),
+        raw=raw)
 
 
 def import_payload(conn, payload: dict) -> dict:
@@ -203,22 +271,7 @@ def import_payload(conn, payload: dict) -> dict:
         currency=_text(a.get("currency"), f"account {a['id']} currency"),
         raw=_obj(a.get("raw"), f"account {a['id']} raw")))
         for a in accounts]
-    txns = [base.Transaction(
-        id=str(t["id"]), account_id=str(t["account_id"]),
-        # as_date refuses a year the app cannot read, as a ValueError the
-        # route reports as a bad payload
-        date=as_date(str(t["date"])[:10]),
-        amount=_money(t.get("amount"), f"transaction {t['id']} amount"),
-        name=_text(t["name"], f"transaction {t['id']} name", required=True),
-        merchant_name=_text(t.get("merchant_name"),
-                            f"transaction {t['id']} merchant_name"),
-        pending=bool(t.get("pending")),
-        category_primary=_text(t.get("category_primary"),
-                               f"transaction {t['id']} category_primary"),
-        category_detailed=_text(t.get("category_detailed"),
-                                f"transaction {t['id']} category_detailed"),
-        raw=_obj(t.get("raw"), f"transaction {t['id']} raw"))
-        for t in txns_in]
+    txns = [_pushed_txn(t) for t in txns_in]
 
     before = counts()
     # One transaction for the whole push. The connection is autocommit,

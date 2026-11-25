@@ -67,11 +67,11 @@ import string
 
 from . import card_number
 
-#: the door every hand-made account answers to: the folder and single-file
-#: imports' new-account names and the account-add doors
+# The door every hand-made account answers to: the folder and single-file
+# imports' new-account names and the account-add doors.
 DOOR_MANUAL = "manual"
 
-#: the split importers whose ids carry their own prefix
+# The split importers whose ids carry their own prefix.
 SPLIT_PREFIXES = ("qif", "mint", "monarch", "copilot", "simplifi", "ofx")
 
 _LOCK_KEY = "oikonome:ensure-account:"

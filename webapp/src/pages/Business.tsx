@@ -14,10 +14,15 @@ function useBusy() {
 }
 import { Link, useSearchParams } from "react-router";
 import BusinessWizard from "../components/BusinessWizard";
-import { bizDefaultTaxYear, bizPeriodProfit, bizTaxStillDue, bizTaxYears,
-  countsInTotals, bizShownBucket, bizNeedsLine, numberFieldsPatch,
+import { bizDefaultTaxYear, bizTaxYears,
+  bizShownBucket, bizNeedsLine, numberFieldsPatch,
   numberDraft, bizMemberDoorMissing } from "../bizmath";
-import { householdDay, localYmd } from "../moneymath";
+import { EMPTY_LINES, failLine, figureGreyed, householdDay, kindWords, knownOr,
+         localYmd,
+         UNKNOWN_FIGURE, bizViewWithout }
+  from "../moneymath";
+import { FailedLine } from "../components/Loaded";
+import EmptyState from "../components/EmptyState";
 
 // the household's day, not the browser's: near midnight across zones the
 // browser would date a trip, a payment or a tax year on the wrong day
@@ -35,6 +40,7 @@ import { api, errText, kindIs, mmdd, money, toast, type Account, type BizData,
 import { patchList, patchQueries, patchQuery, removeFromList }
   from "../api/cache";
 import { canEdit, isOwner, isViewer } from "../role";
+import SegmentedControl from "../components/SegmentedControl";
 
 // Assigning an account moves its money between the personal and business
 // sides, so everything derived from that entity's ledger shifts with it.
@@ -94,24 +100,19 @@ const BIZ_TAB_KEYS: readonly BizTab[] = [...BIZ_TABS.map((x) => x.key),
 
 function BizNav({ tab, onTab }: { tab: BizTab; onTab: (t: BizTab) => void }) {
   return (
-    <div style={{ display: "flex", gap: ".3rem", flexWrap: "wrap",
-                  margin: ".2rem 0 1rem", overflowX: "auto" }}>
-      {BIZ_TABS.map((x) => (
-        <button key={x.key} className={tab === x.key ? "pri" : ""}
-                onClick={() => onTab(x.key)}>{x.label}</button>
-      ))}
-      {/* Pushed right and quieter than its siblings, because setup is
-          something you finish rather than a place you work — but still a
-          BUTTON. Stripped of background and border it reads as a caption
-          nobody would think to press, and then turns into a solid blue pill
-          on click: the one control that looks inert is the one that moves.
-          Same chrome as the other tabs; only the colour is softer while it
-          is unselected. */}
-      <button className={tab === "settings" ? "pri" : ""}
-              style={{ marginLeft: "auto",
-                       ...(tab === "settings" ? {}
-                         : { color: "var(--mut)" }) }}
-              onClick={() => onTab("settings")}>Settings</button>
+    <div style={{ display: "flex", gap: ".5rem", alignItems: "center",
+                  margin: ".2rem 0 1rem" }}>
+      <SegmentedControl label="Business view"
+        value={tab === "settings" ? null : tab} onChange={onTab}
+        options={BIZ_TABS.map((x) => ({ value: x.key, label: x.label }))} />
+      {/* Pushed right, apart from the working tabs, because setup is
+          something you finish rather than a place you work — but still the
+          same control, so it reads as a place to go and shows the same
+          chosen state when you are there. */}
+      <SegmentedControl label="Business setup" style={{ marginLeft: "auto",
+                                                         flex: "none" }}
+        value={tab === "settings" ? "settings" : null} onChange={onTab}
+        options={[{ value: "settings" as BizTab, label: "Settings" }]} />
     </div>
   );
 }
@@ -171,7 +172,11 @@ function EditEntityForm({ entity, onDone, onCancel }:
   const [f, setF] = useState({
     name: entity.name, structure: entity.structure, state: entity.state || "",
     ein: "", formation_date: entity.formation_date || "",
-    business_start_date: entity.business_start_date || "" });
+    business_start_date: entity.business_start_date || "",
+    owner: entity.owner ?? "unknown" });
+  // whose business it is, with the server's labels; an older server sends
+  // no choices, and then nothing is drawn or sent
+  const owners = entity.owner_options ?? [];
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const set = (k: string) => (e: { target: { value: string } }) =>
@@ -184,6 +189,7 @@ function EditEntityForm({ entity, onDone, onCancel }:
         formation_date: f.formation_date || null,
         business_start_date: f.business_start_date || null };
       if (f.ein.trim()) body.ein = f.ein.trim();   // EIN is write-only; only send if changing
+      if (owners.length) body.owner = f.owner;
       await api.entityUpdate(entity.id, body);
       onDone();
     } catch (e) { setErr(errText(e)); } finally { setBusy(false); }
@@ -205,7 +211,17 @@ function EditEntityForm({ entity, onDone, onCancel }:
           onChange={set("formation_date")} /></label>
         <label>Business start<input type="date" value={f.business_start_date}
           onChange={set("business_start_date")} /></label>
+        {owners.length > 0 && (
+          <label>Whose business<select value={f.owner}
+            onChange={set("owner")}>
+            {owners.map(o => <option key={o.value} value={o.value}>
+              {o.label}</option>)}
+          </select></label>)}
       </div>
+      {owners.length > 0 && (
+        <p className="mut" style={{ marginBottom: 0, fontSize: ".85rem" }}>
+          Whose W-2 wages the self-employment tax counts against the Social
+          Security wage base.</p>)}
       <div style={{ marginTop: ".8rem", display: "flex", gap: ".5rem" }}>
         <button className="pri" disabled={busy || !f.name.trim()}
           onClick={save}>Save</button>
@@ -247,51 +263,32 @@ function TaxSetAside({ entity }: { entity: Entity }) {
   const year = useHouseholdDay().getFullYear();
   const tax = useQuery({ queryKey: ["esttax", entity.id, year],
     queryFn: () => api.estTax(entity.id, year) });
-  // the P&L reports the estimates already paid out of the business
-  const pnl = useQuery({ queryKey: ["pnl", entity.id, year],
-    queryFn: () => api.entityPnl(entity.id, year) });
-  const accts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
 
-  if (tax.isPending) return null;
-  const owed = tax.data?.total_estimated ?? 0;
-  // Everything set against the estimate stands on its footing: when it is
-  // the household member's share, so are the profit it is a rate of, the
-  // payments already made toward it and the cash held for it. The
-  // business's own figures would halve the rate shown and take every
-  // partner's payments off one partner's bill.
-  const share = tax.data?.covers === "household" && tax.data.household
+  // a failed estimate keeps the card's place; it is not "no tax to set aside"
+  if (!tax.data)
+    return tax.isError ? (
+      <div className="card">
+        <h4 style={{ marginTop: 0 }}>Set aside for tax</h4>
+        <FailedLine q={tax} what="the tax set-aside" />
+      </div>
+    ) : null;
+  const owed = tax.data.total_estimated;
+  // Every figure on the card is the server's (selfemploy.tax_set_aside),
+  // on the estimate's footing: when it is the household member's share,
+  // so are the profit it is a rate of, the payments made toward it and
+  // the cash held for it. "Covered by" is the printed cash less the
+  // printed still to pay, so the card adds up as shown.
+  const sa = tax.data.set_aside;
+  const share = tax.data.covers === "household" && tax.data.household
     ? tax.data.household.ownership_pct : null;
-  const paid = tax.data?.covered_tax_paid
-    ?? (share != null ? null : pnl.data?.estimated_tax_paid) ?? 0;
-  const due = bizTaxStillDue(owed, paid);
-  const profit = tax.data?.covered_profit
-    ?? (share != null ? null : tax.data?.net_profit) ?? 0;
-  // Shadow exclusion, the same rule the server applies to every money sum:
-  // an account linked through two aggregators leaves two rows sharing one
-  // group, and both can carry entity_id, so the fallback "all business
-  // cash" counted one real balance twice.
-  // A hidden account is out too: hiding a manual one keeps its last
-  // balance, and "set aside" must not count money the owner switched off.
-  const mine = (accts.data?.accounts || [])
-    .filter(a => a.entity_id === entity.id && kindIs(a, "depository"))
-    .filter(countsInTotals);
-  // A nomination pointing at an account that has since been purged or
-  // reassigned must not read as $0 saved — that would be a scarier number
-  // than the truth. Fall back, and say so.
-  const reserve = entity.tax_reserve_account_id
-    ? mine.find(a => a.id === entity.tax_reserve_account_id) : undefined;
+  const paid = sa.paid;
+  const due = sa.still_due;
+  const reserve = sa.account;
   const ringFenced = !!reserve;
-  const held = ringFenced
-    ? (reserve!.balance_current ?? 0)
-    : mine.reduce((s, a) => s + (a.balance_current ?? 0), 0);
-  // the business's accounts hold every partner's money, so the household's
-  // claim on them is its ownership share
-  const cash = share != null ? held * share / 100 : held;
-  const stale = !!entity.tax_reserve_account_id && !reserve;
-  // measured against what is still to pay: a reserve that paid this
-  // year's earlier estimates is not short by them
-  const gap = cash - due;
-  const pct = profit > 0 ? Math.round((owed / profit) * 100) : null;
+  const cash = sa.held;
+  const stale = sa.stale;
+  const gap = sa.covered;
+  const pct = sa.rate_of_profit;
 
   return (
     <div className="card">
@@ -313,8 +310,8 @@ function TaxSetAside({ entity }: { entity: Entity }) {
                         : (share != null ? "business cash" : "Business cash")}
           </div>
           <div className="kpi sm">{money(cash)}</div>
-          {ringFenced && <div className="sub">{reserve!.name}
-            {reserve!.mask ? ` ····${reserve!.mask}` : ""}</div>}
+          {reserve && <div className="sub">{reserve.name}
+            {reserve.mask ? ` ····${reserve.mask}` : ""}</div>}
         </div>
         <div>
           <div className="sub">{gap >= 0 ? "Covered by" : "Short by"}</div>
@@ -382,6 +379,8 @@ function TaxReservePicker({ entity, accounts, ro }: {
           old && { ...old, ...e });
         qc.invalidateQueries({ queryKey: ["biz-summary"] });
         qc.invalidateQueries({ queryKey: ["entity", entity.id] });
+        // the set-aside card's held figure is the estimate reply's
+        qc.invalidateQueries({ queryKey: ["esttax", entity.id] });
       })
       .catch(toastErr));
 
@@ -437,9 +436,10 @@ function TaxReservePicker({ entity, accounts, ro }: {
  *  learned merchant category because a wrong one is cosmetic; a wrong
  *  Schedule C line is a wrong number on a filed return. So every row is
  *  committed by a human, and the queue says WHERE each suggestion came
- *  from — "merchant" is your own prior decision for that vendor, "category"
- *  is a weak guess from the ledger, and no badge means it had no basis and
- *  declined to guess rather than inventing one.
+ *  from — "merchant" is your own prior decision for that vendor, a kind
+ *  badge names the vendor's business kind (never the bank's category), and
+ *  no badge means it had no basis and declined to guess rather than
+ *  inventing one.
  */
 function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
   const qc = useQueryClient();
@@ -489,6 +489,14 @@ function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
   };
 
   if (q.isPending) return <p className="mut">loading…</p>;
+  // a failed queue is not an empty one
+  if (q.data === undefined)
+    return (
+      <div className="card">
+        <h4 style={{ marginTop: 0 }}>Schedule C review</h4>
+        <FailedLine q={q} what="the review queue" />
+      </div>
+    );
   if (!rows.length)
     return (
       <div className="card">
@@ -514,20 +522,23 @@ function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
             <tr key={s.txn_id}>
               <td style={{ whiteSpace: "nowrap" }} className="mut">
                 {s.date ? mmdd(s.date) : ""}</td>
-              <td>{s.payee}
+              {/* the space keeps the payee and its badge two words to a
+                  screen reader */}
+              <td>{s.payee}{" "}
                 {s.source === "merchant" && (
                   <span className="pill g" style={{ marginLeft: 6 }}
                         title="you classified this merchant before">learned</span>)}
-                {s.source === "category" && (
+                {s.source === "kind" && (
                   <span className="pill m" style={{ marginLeft: 6 }}
-                        title="guessed from the ledger category — check it">guess</span>)}
+                        title="suggested from what this vendor is — check it">
+                    {s.kind_label ?? "suggested"}</span>)}
               </td>
               <td className="num">{money(s.amount)}</td>
               <td>
                 {/* viewer-gated like every other Business write — these
                     controls 403 server-side, so they must not render
                     enabled */}
-                <select value={chosen} disabled={ro}
+                <select aria-label={`Schedule C line for ${s.payee}`} value={chosen} disabled={ro}
                         onChange={(e) => setOverride(
                           { ...override, [s.txn_id]: e.target.value })}>
                   <option value="">choose a line…</option>
@@ -558,17 +569,12 @@ function ReviewQueue({ entity, ro }: { entity: Entity; ro?: boolean }) {
  *  and not an empty-when-clean inbox — a real dashboard, because "how is
  *  the business doing" is one of the four jobs people come here for.
  *
- *  Every figure is sourced from an endpoint that already exists; nothing is
- *  recomputed here beyond summing this month's rows, which the P&L does not
- *  break out by month.
+ *  Every figure is the server's; nothing is summed or recomputed here.
  */
 function OverviewSection({ entity }: { entity: Entity }) {
   const year = useHouseholdDay().getFullYear();
   const pnl = useQuery({ queryKey: ["pnl", entity.id, year],
     queryFn: () => api.entityPnl(entity.id, year) });
-  const txns = useQuery({ queryKey: ["biz-txns", entity.id, year],
-    queryFn: () => api.bizTxns(entity.id, year) });
-  const accts = useQuery({ queryKey: ["accounts"], queryFn: api.accounts });
   const comp = useQuery({ queryKey: ["compliance", entity.id],
     queryFn: () => api.entityCompliance(entity.id) });
   const tax = useQuery({ queryKey: ["esttax", entity.id, year],
@@ -579,34 +585,27 @@ function OverviewSection({ entity }: { entity: Entity }) {
   // LOCAL date, not toISOString() — that is UTC, so west of Greenwich it
   // reports the next day/month for most of the evening
   const ymd = localYmd;
-  const ym = ymd(useHouseholdDay()).slice(0, 7);
-  // The month figure sits directly under the year's profit, so it is the
-  // server's P&L arithmetic (books._pnl_core) on this month's rows: net of
-  // reimbursement links, transfers and card payments out, capitalized
-  // start-up and organizational costs out — see bizPeriodProfit.
-  const monthProfit = bizPeriodProfit(txns.data?.transactions || [],
-    entity.business_start_date, ym);
-
-  // Shadow and hidden rows out, same as TaxSetAside below: an account
-  // linked through two aggregators leaves two rows sharing one group, and
-  // a hidden manual account keeps its last balance — see countsInTotals.
-  const counted = (accts.data?.accounts || [])
-    .filter(a => a.entity_id === entity.id && countsInTotals(a));
-  const cash = counted.filter(a => kindIs(a, "depository"))
-    .reduce((s, a) => s + (a.balance_current ?? 0), 0);
+  // This month's profit and the cash in the business are the P&L reply's
+  // (books.period_profit by the year's own rules, books.entity_cash with
+  // linked backups and hidden accounts out)
+  const monthProfit = pnl.data?.this_month.net_operating;
+  const cash = pnl.data?.cash;
 
   const today = ymd(useHouseholdDay());        // local, per ymd() above
-  const next = (comp.data?.obligations || [])
+  // "none" only from a calendar that answered: unread, it is unknown
+  const deadlines = knownOr(comp, (d) => d.obligations || []);
+  const next = (deadlines ?? [])
     .filter(o => (o.due || "") >= today)
     .sort((a, b) => (a.due || "").localeCompare(b.due || ""))[0];
 
   // the endpoint's real COUNT, not the length of the capped page it
-  // returned — that would stick the tile at the page size
-  const attention = sugg.data?.unclassified ?? 0;
+  // returned — that would stick the tile at the page size. Unread, it is
+  // unknown: never "0 — nothing outstanding".
+  const attention = knownOr(sugg, (d) => d.unclassified);
 
-  const Tile = ({ label, value, sub }: {
-    label: string; value: string; sub?: string }) => (
-    <div className="tile">
+  const Tile = ({ label, value, sub, greyed }: {
+    label: string; value: string; sub?: string; greyed?: boolean }) => (
+    <div className="tile" style={greyed ? { opacity: 0.55 } : undefined}>
       <div className="sub">{label}</div>
       <div className="kpi sm">{value}</div>
       {sub && <div className="sub">{sub}</div>}
@@ -614,21 +613,37 @@ function OverviewSection({ entity }: { entity: Entity }) {
   );
 
   return (
+    <>
     <div className="grid cols4" style={{ gap: ".6rem", marginTop: ".7rem" }}>
-      <Tile label="Profit this year"
-            value={pnl.data ? money(pnl.data.net_operating) : "—"}
-            sub={`${money(monthProfit)} this month`} />
-      <Tile label="Cash in the business" value={money(cash)}
-            sub={`${counted.length} account(s)`} />
-      <Tile label="Next deadline"
-            value={next ? mmdd(next.due) : "none"}
+      <Tile label="Profit this year" greyed={figureGreyed(pnl)}
+            value={pnl.data ? money(pnl.data.net_operating) : UNKNOWN_FIGURE}
+            sub={pnl.data ? `${money(monthProfit)} this month` : undefined} />
+      <Tile label="Cash in the business" greyed={figureGreyed(pnl)}
+            value={cash ? money(cash.total) : UNKNOWN_FIGURE}
+            sub={cash ? `${cash.accounts} account${cash.accounts === 1 ? "" : "s"}`
+                      : undefined} />
+      <Tile label="Next deadline" greyed={figureGreyed(comp)}
+            value={deadlines === null ? UNKNOWN_FIGURE
+                   : next ? mmdd(next.due) : "none"}
             sub={tax.data ? `${money(tax.data.next_payment
                                      ?? tax.data.quarterly)} est. quarterly`
                           : undefined} />
-      <Tile label="Needs attention"
-            value={sugg.isPending ? "…" : String(attention)}
-            sub={attention ? "unclassified transactions" : "nothing outstanding"} />
+      <Tile label="Needs attention" greyed={figureGreyed(sugg)}
+            value={attention === null ? UNKNOWN_FIGURE : String(attention)}
+            sub={attention === null ? undefined
+                 : attention ? "unclassified transactions"
+                 : "nothing outstanding"} />
     </div>
+    {/* each read the tiles come from says so in place when it failed */}
+    {pnl.data === undefined && pnl.isError && (
+      <FailedLine q={pnl} what="this year's profit and cash" />)}
+    {comp.data === undefined && comp.isError && (
+      <FailedLine q={comp} what="the filing deadlines" />)}
+    {tax.data === undefined && tax.isError && (
+      <FailedLine q={tax} what="the tax estimate" />)}
+    {sugg.data === undefined && sugg.isError && (
+      <FailedLine q={sugg} what="the review queue" />)}
+    </>
   );
 }
 
@@ -690,7 +705,7 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
           {entity.state ? ` · ${entity.state}` : ""}
           {entity.ein_last4 ? ` · EIN •••••${entity.ein_last4}` : ""}
           {entity.business_start_date
-            ? ` · operating since ${entity.business_start_date}` : ""}</span>
+            ? ` · operating since ${mmdd(entity.business_start_date)}` : ""}</span>
         {ro && <span className="pill m">archived · read-only</span>}
         <label className="sub" style={{ marginLeft: "auto", display: "flex",
               gap: ".35rem", alignItems: "center" }}
@@ -754,14 +769,16 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
       )}
       {tab === "settings" && editing && !ro && <EditEntityForm entity={entity}
         onDone={() => { setEditing(false); onChange();
-          qc.invalidateQueries({ queryKey: ["entity", entity.id] }); }}
+          qc.invalidateQueries({ queryKey: ["entity", entity.id] });
+          // whose business it is moves the estimate
+          qc.invalidateQueries({ queryKey: ["esttax", entity.id] }); }}
         onCancel={() => setEditing(false)} />}
 
       {flaggedUnassigned > 0 && !ro && (
         <div className="note" style={{ marginTop: ".4rem" }}>
-          <span style={{ flex: 1 }}>{flaggedUnassigned} transaction
-            {flaggedUnassigned === 1 ? "" : "s"} carry the old business flag.
-            Import them into this entity?</span>
+          <span style={{ flex: 1 }}>{flaggedUnassigned === 1
+            ? "1 transaction carries the old business flag. Import it into this entity?"
+            : `${flaggedUnassigned} transactions carry the old business flag. Import them into this entity?`}</span>
           <button disabled={busy}
             onClick={() => act(api.entityImportFlags(entity.id).then((r) => {
               // the flagged rows are now this entity's books — and gone
@@ -790,17 +807,21 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
           shows dozens of unrelated, non-business accounts. Default to this
           entity's own accounts; the picker is a deliberate action behind a
           button. */}
+      {/* unread accounts are not "No accounts yet" */}
+      {accts.data === undefined && accts.isError && (
+        <FailedLine q={accts} what="the accounts" />)}
       {!picking ? (
         <>
+          {accts.data !== undefined && (
           <p className="mut" style={{ marginTop: 0, fontSize: ".85rem" }}>
             {assigned.length
               ? "Everything in these accounts is this business's money — out of your personal budget."
               : "No accounts yet. Assign one and all its transactions become this business's money."}
-          </p>
+          </p>)}
           <table><tbody>
             {assigned.map(a => (
               <tr key={a.id}>
-                <td>{a.name} <span className="mut">{a.kind}</span></td>
+                <td>{a.name} <span className="mut">{kindWords(a.kind)}</span></td>
                 <td className="num mut">{a.balance_current != null
                   ? money(a.balance_current) : ""}</td>
                 <td style={{ width: "1%", whiteSpace: "nowrap" }}>
@@ -828,7 +849,7 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
         future — become business money and leave your personal budget.</p>
       <div style={{ display: "flex", gap: ".5rem", alignItems: "center",
                     flexWrap: "wrap", margin: ".3rem 0 .5rem" }}>
-        <input value={acctQ} placeholder="search accounts"
+        <input aria-label="Search accounts" value={acctQ} placeholder="search accounts"
                onChange={(e) => setAcctQ(e.target.value)}
                style={{ flex: "1 1 12rem" }} />
         <button className="linklike mut"
@@ -838,7 +859,8 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
           {showAllAccts ? "hide closed/archived" : "show closed/archived"}
         </button>
       </div>
-      {(accts.data?.accounts || []).length === 0
+      {accts.data === undefined ? null
+        : accts.data.accounts.length === 0
         ? <p className="mut">No accounts yet.</p>
         : (
         <table><tbody>
@@ -855,7 +877,7 @@ function EntityDetail({ entity, flaggedUnassigned, onChange, tab,
             const other = a.entity_id && a.entity_id !== entity.id;
             return (
               <tr key={a.id}>
-                <td>{a.name} <span className="mut">{a.kind}</span></td>
+                <td>{a.name} <span className="mut">{kindWords(a.kind)}</span></td>
                 <td className="num mut">{a.balance_current != null
                   ? money(a.balance_current) : ""}</td>
                 <td style={{ width: "1%", whiteSpace: "nowrap" }}>
@@ -987,6 +1009,17 @@ function EquitySection({ entityId, readOnly }:
     }).catch(toastErr).finally(() => setDeleting(null));
   };
   const cap = q.data?.capital;
+  // an owner transfer recorded as a contribution or a draw: one tap, the
+  // server takes the row's own amount and date
+  const [recording, setRecording] = useState<string | null>(null);
+  const recordTransfer = (txnId: string) => {
+    setRecording(txnId);
+    api.bizOwnerTransfer(entityId, txnId).then(() => {
+      refresh();
+      qc.invalidateQueries({ queryKey: ["biz-txns", entityId] });
+    }).catch(toastErr).finally(() => setRecording(null));
+  };
+  const transfers = q.data?.owner_transfers ?? [];
   return (
     <>
       <h4 style={{ marginBottom: ".3rem" }}>Owner equity</h4>
@@ -996,7 +1029,9 @@ function EquitySection({ entityId, readOnly }:
           <b className={cap.capital_balance < 0 ? "neg" : "pos"}>
             {money(cap.capital_balance)}</b>
           {" "}(contributions {money(cap.contributions)}
-          {" "}+ retained earnings {money(cap.net_income ?? 0)} − draws{" "}
+          {(cap.paid_personally ?? 0) > 0 &&
+            <>, {money(cap.paid_personally ?? 0)} of it costs paid personally</>}
+          {" "}+ retained earnings {money(cap.net_income)} − draws{" "}
           {money(cap.draws + cap.distributions)})
           {cap.reimbursements > 0 &&
             <> · reimbursements {money(cap.reimbursements)}</>}
@@ -1016,7 +1051,7 @@ function EquitySection({ entityId, readOnly }:
                 {m.form ? <span className="mut"> · {m.form}</span> : ""}</td>
               <td className="num">{money(m.amount)}</td>
               <td style={{ width: "1%" }}>{!readOnly &&
-                <button title="delete" disabled={deleting === m.id}
+                <button title="delete" aria-label="Delete this movement" disabled={deleting === m.id}
                   onClick={() => confirmThen(
                   "Delete this equity movement? It changes the capital-account balance.",
                   () => del(m.id))}>
@@ -1025,19 +1060,44 @@ function EquitySection({ entityId, readOnly }:
           ))}
         </tbody></table>
       )}
+      {transfers.length > 0 && (
+        <>
+          <div className="sub" style={{ margin: ".3rem 0 .2rem" }}>
+            Money you moved in or out — not business income or expenses</div>
+          <table style={{ marginBottom: ".5rem" }}><tbody>
+            {transfers.map((t) => (
+              <tr key={t.txn_id}>
+                <td className="mut" style={{ whiteSpace: "nowrap" }}>
+                  {t.date ? mmdd(t.date) : ""}</td>
+                <td>{t.payee}</td>
+                <td className="num">{money(Math.abs(t.amount))}
+                  <span className="mut"> {t.role === "owner_in" ? "in" : "out"}</span></td>
+                <td style={{ whiteSpace: "nowrap" }}>
+                  {t.owner_recorded
+                    ? <span className="mut">recorded as a {t.owner_recorded}</span>
+                    : !readOnly && (
+                      <button disabled={recording === t.txn_id}
+                              onClick={() => recordTransfer(t.txn_id)}>
+                        Record as a {t.offer}</button>)}
+                </td>
+              </tr>
+            ))}
+          </tbody></table>
+        </>
+      )}
       {!readOnly && (
         <div style={{ display: "flex", gap: ".4rem", flexWrap: "wrap",
           alignItems: "center" }}>
-          <select value={f.kind}
+          <select aria-label="Equity movement kind" value={f.kind}
             onChange={(e) => setF({ ...f, kind: e.target.value })}>
             {EQUITY_KINDS.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
           </select>
-          <input type="number" value={f.amount} placeholder="amount"
+          <input aria-label="Amount" type="number" value={f.amount} placeholder="amount"
             style={{ maxWidth: "7rem" }}
             onChange={(e) => setF({ ...f, amount: e.target.value })} />
-          <input type="date" value={f.date}
+          <input aria-label="Date" type="date" value={f.date}
             onChange={(e) => setF({ ...f, date: e.target.value })} />
-          <input value={f.form} placeholder="form (Cash, ACH…)"
+          <input aria-label="Form (Cash, ACH…)" value={f.form} placeholder="form (Cash, ACH…)"
             style={{ maxWidth: "9rem" }}
             onChange={(e) => setF({ ...f, form: e.target.value })} />
           <button disabled={busy || !f.amount} onClick={add}>record</button>
@@ -1173,7 +1233,11 @@ function BooksSection({ entityId, readOnly }:
       });
   };
   const p = pnl.data;
-  const expenses = loaded.filter(t => t.amount > 0);
+  const listQ = year !== undefined ? txns : allTxns;
+  // the costs only (books.row_roles): money the owner moved is listed
+  // under Owner equity, and a card payment or a transfer between the
+  // business's own accounts is no expense at all
+  const expenses = loaded.filter(t => t.role === "cost" && t.amount > 0);
   // a server-paged list shows every expense it has loaded; otherwise (one
   // year, or a server that sent everything) the render is capped instead
   const visible = serverPaged ? expenses : expenses.slice(0, shown);
@@ -1186,7 +1250,7 @@ function BooksSection({ entityId, readOnly }:
       <div style={{ display: "flex", alignItems: "center", gap: ".5rem",
         marginTop: ".6rem", flexWrap: "wrap" }}>
         <h4 style={{ margin: 0 }}>Books &amp; P&amp;L</h4>
-        <select value={year ?? ""} onChange={(e) => {
+        <select aria-label="Books year" value={year ?? ""} onChange={(e) => {
           setYear(e.target.value ? Number(e.target.value) : undefined);
           setShown(BOOKS_PAGE); }}>
           <option value="">all years</option>
@@ -1222,6 +1286,14 @@ function BooksSection({ entityId, readOnly }:
           )}
         </div>
       )}
+      {/* a failed P&L or list is said in place, never just left out */}
+      {p === undefined && pnl.isError && (
+        <FailedLine q={pnl} what="the profit and loss" />)}
+      {listQ.data === undefined && listQ.isError && (
+        <FailedLine q={listQ} what="the business transactions" />)}
+      {/* a new business: one line rather than a header over nothing */}
+      {listQ.isSuccess && loaded.length === 0 && (
+        <EmptyState title={EMPTY_LINES.businessBooks} />)}
       {expenses.length > 0 && (
         <>
         <p className="mut" style={{ fontSize: ".82rem", margin: ".2rem 0" }}>
@@ -1240,13 +1312,13 @@ function BooksSection({ entityId, readOnly }:
                 fontStyle: "italic" }}>📝 {t.note}</div>}</td>
               <td className="num">{money(t.amount)}</td>
               <td>{readOnly ? bizShownBucket(t) : (
-                <select value={bizShownBucket(t)}
+                <select aria-label={`Bucket for ${t.payee}`} value={bizShownBucket(t)}
                   onChange={(e) => setBucket(t.id, e.target.value)}>
                   {BUCKETS.map(([v, l]) =>
                     <option key={v} value={v}>{l}</option>)}
                 </select>)}
                 {!readOnly && lineEditable(t) && (
-                  <select value={t.sched_c_line ?? ""}
+                  <select aria-label={`Schedule C line for ${t.payee}`} value={t.sched_c_line ?? ""}
                           style={{ display: "block", marginTop: 2 }}
                           onChange={(e) => setLine(t,
                             e.target.value === CLEAR_LINE
@@ -1339,8 +1411,10 @@ function TaxSection({ entity, readOnly }:
             <> − {money(e.mileage_deduction)} mileage</>}
           {e.home_office_deduction > 0 &&
             <> − {money(e.home_office_deduction)} home office</>}
+          {/* the server names what the deduction is: the §248
+              organizational costs, the §195 start-up costs, or both */}
           {e.startup_deduction > 0 &&
-            <> − {money(e.startup_deduction)} start-up</>}
+            <> − {money(e.startup_deduction)} {e.startup_label}</>}
           {" = "}{money(e.taxable_profit)} taxable ·{" "}
           {/* an S-corp owes no SE tax: a bare $0 line would read as a bug */}
           {e.se_tax_applies === false
@@ -1359,6 +1433,17 @@ function TaxSection({ entity, readOnly }:
                 quarter.</>
             : <>{" → "}<b className="pos">{money(e.total_estimated)}</b>/yr,{" "}
                 <b>{money(e.quarterly)}</b> per quarter.</>}
+          {/* a loss is not "$0 taxable" with nothing said: whose return
+              it lands on, in the server's words */}
+          {e.loss_note && (
+            <span style={{ display: "block", fontSize: ".82rem" }}>
+              {e.loss_note}</span>)}
+          {/* which W-2 wages the SE tax's Social Security part starts
+              after, and whose business that assumes, in the server's
+              words (an older server sends none) */}
+          {e.ss_wages_note && (
+            <span style={{ display: "block", fontSize: ".82rem" }}>
+              {e.ss_wages_note}</span>)}
           <span style={{ display: "block", fontSize: ".82rem" }}>
             Estimate — set aside quarterly; confirm with your CPA.
             {/* the two car methods exclude each other; naming the one
@@ -1452,7 +1537,7 @@ function MileageSection({ entityId, readOnly }:
           <span>{t.date ? mmdd(t.date) : ""}</span>
           <span>{t.miles} mi</span>
           <span style={{ flex: 1 }}>{t.purpose || ""}</span>
-          {!readOnly && <button title="delete" disabled={deleting === t.id}
+          {!readOnly && <button title="delete" aria-label="Delete this trip" disabled={deleting === t.id}
             onClick={() => confirmThen(
             "Delete this mileage trip?", () => del(t.id))}>✕
           </button>}
@@ -1470,12 +1555,12 @@ function MileageSection({ entityId, readOnly }:
       {!readOnly && (
         <div style={{ display: "flex", gap: ".4rem", flexWrap: "wrap",
           marginTop: ".3rem" }}>
-          <input type="date" value={f.date}
+          <input aria-label="Trip date" type="date" value={f.date}
             onChange={(e) => setF({ ...f, date: e.target.value })} />
-          <input type="number" value={f.miles} placeholder="miles"
+          <input aria-label="Miles" type="number" value={f.miles} placeholder="miles"
             style={{ maxWidth: "6rem" }}
             onChange={(e) => setF({ ...f, miles: e.target.value })} />
-          <input value={f.purpose} placeholder="purpose"
+          <input aria-label="Purpose" value={f.purpose} placeholder="purpose"
             style={{ maxWidth: "10rem" }}
             onChange={(e) => setF({ ...f, purpose: e.target.value })} />
           <button disabled={busy || !f.miles} onClick={add}>log trip</button>
@@ -1507,6 +1592,10 @@ function BalanceSheetSection({ entityId }: { entityId: string }) {
         {b.household_capital != null && b.household_share_pct != null &&
           <>{"  ·  "}your capital account ({b.household_share_pct}% owner){" "}
             {money(b.household_capital)}</>}
+        {/* why capital and net differ, in the server's sentences */}
+        {(b.reconcile ?? []).map((line) => (
+          <span key={line} style={{ display: "block", fontSize: ".82rem" }}>
+            {line}</span>))}
         <span style={{ display: "block", fontSize: ".82rem" }}>
           Snapshot from business account balances — not double-entry books.</span>
       </p>
@@ -1564,8 +1653,11 @@ function VendorSection({ entityId, year, readOnly }:
         Mark who's a contractor — those paid{" "}
         {q.data?.threshold != null ? `${money(q.data.threshold)}+` : "over the threshold"}{" "}
         in {year} need a 1099-NEC.
-        {all.length === 0 && " No business payees yet — assign an account or "
+        {q.data !== undefined && all.length === 0
+          && " No business payees yet — assign an account or "
           + "transactions to this entity first."}</p>
+      {q.data === undefined && q.isError && (
+        <FailedLine q={q} what="the 1099 payees" />)}
       <table style={{ fontSize: ".9rem" }}><tbody>
         {vendors.map(v => (
           <tr key={v.merchant}>
@@ -1647,7 +1739,10 @@ function ComplianceSection({ entityId, readOnly }:
           href={`/api/business/entities/${entityId}/compliance.ics`}
           style={{ marginLeft: "auto" }}>add to calendar (.ics)</a>}
       </div>
-      {obls.length === 0
+      {q.data === undefined
+        ? (q.isError ? <FailedLine q={q} what="the filing deadlines" />
+           : <p className="mut" style={{ marginTop: ".2rem" }}>Loading…</p>)
+        : obls.length === 0
         ? <p className="mut" style={{ marginTop: ".2rem" }}>No obligations
           tracked{" "}— add a filing deadline below.</p>
         : (
@@ -1666,7 +1761,7 @@ function ComplianceSection({ entityId, readOnly }:
                   : o.fee ? <span className="mut"> · {money(o.fee)}</span> : ""}
               </td>
               <td style={{ width: "1%" }}>{!readOnly && o.id &&
-                <button title="remove" disabled={deleting === o.id}
+                <button title="remove" aria-label="Remove this deadline" disabled={deleting === o.id}
                   onClick={() => confirmThen(
                   `Remove "${o.title}" from the compliance calendar?`,
                   () => del(o.id!))}>✕</button>}</td>
@@ -1677,12 +1772,13 @@ function ComplianceSection({ entityId, readOnly }:
       {!readOnly && (
         <div style={{ display: "flex", gap: ".4rem", flexWrap: "wrap",
           marginTop: ".3rem" }}>
-          <input value={f.title} placeholder="obligation (e.g. franchise tax)"
+          <input aria-label="Obligation (e.g. franchise tax)"
+                 value={f.title} placeholder="obligation (e.g. franchise tax)"
             style={{ maxWidth: "16rem" }}
             onChange={(e) => setF({ ...f, title: e.target.value })} />
-          <input type="date" value={f.due_date}
+          <input aria-label="Due date" type="date" value={f.due_date}
             onChange={(e) => setF({ ...f, due_date: e.target.value })} />
-          <select value={f.recurrence}
+          <select aria-label="Repeats" value={f.recurrence}
             onChange={(e) => setF({ ...f, recurrence: e.target.value })}>
             <option value="yearly">every year</option>
             <option value="once">one-time</option>
@@ -1726,9 +1822,9 @@ function AddMember({ entityId, onDone }:
   return (
     <div style={{ display: "flex", gap: ".4rem", marginTop: ".4rem",
       flexWrap: "wrap", alignItems: "center" }}>
-      <input value={name} onChange={(e) => setName(e.target.value)}
+      <input aria-label="Member name" value={name} onChange={(e) => setName(e.target.value)}
         placeholder="member name" style={{ maxWidth: "12rem" }} />
-      <input value={pct} onChange={(e) => setPct(e.target.value)}
+      <input aria-label="Ownership share %" value={pct} onChange={(e) => setPct(e.target.value)}
         placeholder="%" inputMode="decimal" style={{ maxWidth: "5rem" }} />
       <label className="mut" style={{ fontSize: ".9rem" }}>
         <input type="checkbox" checked={manager}
@@ -1807,9 +1903,9 @@ function MemberList({ entityId, members, editable }:
       {members.map((m) => editing === m.id ? (
         <div key={m.id} style={{ display: "flex", gap: ".4rem",
           flexWrap: "wrap", alignItems: "center", fontSize: ".9rem" }}>
-          <input value={f.name} onChange={(e) => setF({ ...f,
+          <input aria-label="Member name" value={f.name} onChange={(e) => setF({ ...f,
             name: e.target.value })} style={{ maxWidth: "12rem" }} />
-          <input value={f.pct} onChange={(e) => setF({ ...f,
+          <input aria-label="Ownership share %" value={f.pct} onChange={(e) => setF({ ...f,
             pct: e.target.value })} placeholder="%" inputMode="decimal"
             style={{ maxWidth: "5rem" }} />
           <label className="mut">
@@ -1878,7 +1974,7 @@ function DeleteForeverCard({ entity, onDone, onCancel }:
         everything.</p>
       {impact.isError && (
         <p className="bad" style={{ marginTop: 0 }}>
-          Couldn't load what this would destroy — {String(impact.error)}.
+          {failLine(impact.error, "what this would destroy", "web").text}{" "}
           Deleting is blocked until it loads.{" "}
           <button onClick={() => impact.refetch()}>try again</button></p>
       )}
@@ -1890,7 +1986,7 @@ function DeleteForeverCard({ entity, onDone, onCancel }:
                         marginTop: ".2rem" }}
                onChange={(e) => setName(e.target.value)} /></label>
       <div style={{ display: "flex", gap: ".5rem", marginTop: ".7rem" }}>
-        <button className="pri" style={{ background: "var(--red)" }}
+        <button className="pri" style={{ background: "var(--danger)" }}
                 disabled={busy || !ready || name !== entity.name}
                 title={ready ? "" : "waiting for what this would destroy"}
                 onClick={() => run(api.entityDeleteForever(entity.id, name)
@@ -1929,7 +2025,7 @@ function EntitiesSection({ tab }: { tab: BizTab }) {
   };
   if (sum.isPending) return null;
   if (sum.isLoadingError)
-    return <div className="card">Couldn't load: {String(sum.error)}</div>;
+    return <div className="card"><FailedLine q={sum} what="your businesses" /></div>;
   const s = sum.data;
   // an archived business is out of active use but never out of reach: it
   // keeps its books readable and restorable, so it lives in a collapsed
@@ -1950,13 +2046,9 @@ function EntitiesSection({ tab }: { tab: BizTab }) {
           you work. That is this page's own doctrine, applied to its own
           furniture. */}
       {actives.length > 1 && (
-        <div style={{ display: "flex", gap: ".4rem", marginBottom: ".5rem",
-                      flexWrap: "wrap" }}>
-          {actives.map(e => (
-            <button key={e.id} className={entity?.id === e.id ? "pri" : ""}
-              onClick={() => setSel(e.id)}>{e.name}</button>
-          ))}
-        </div>
+        <SegmentedControl label="Business" style={{ marginBottom: ".5rem" }}
+          value={entity?.id ?? null} onChange={setSel}
+          options={actives.map(e => ({ value: e.id, label: e.name }))} />
       )}
 
       {adding && <AddEntity
@@ -2019,8 +2111,8 @@ function EntitiesSection({ tab }: { tab: BizTab }) {
         flaggedUnassigned={s.flagged_unassigned} onChange={refresh} />}
 
       {archived.length > 0 && (
-        <details className="card" style={{ marginTop: "1rem" }}>
-          <summary style={{ cursor: "pointer", color: "var(--mut)" }}>
+        <details className="card disclosure" style={{ marginTop: "1rem" }}>
+          <summary className="mut">
             Archived — {archived.length} business
             {archived.length > 1 ? "es" : ""} (records kept)
           </summary>
@@ -2086,11 +2178,11 @@ function ExpenseReportCard() {
         Schedule-C companion to the transaction-level list above.</p>
       <div style={{ display: "flex", gap: ".5rem", alignItems: "center",
                     flexWrap: "wrap" }}>
-        <input value={tag} onChange={(e) => setTag(e.target.value)}
+        <input aria-label="Tag" value={tag} onChange={(e) => setTag(e.target.value)}
           style={{ width: "9rem" }} placeholder="tag" />
-        <input type="number" value={y} style={{ width: "6rem" }}
+        <input aria-label="Year" type="number" value={y} style={{ width: "6rem" }}
           onChange={(e) => setY(Number(e.target.value))} />
-        <select value={m} onChange={(e) => setM(Number(e.target.value))}>
+        <select aria-label="Month" value={m} onChange={(e) => setM(Number(e.target.value))}>
           {Array.from({ length: 12 }, (_, i) => (
             <option key={i + 1} value={i + 1}>{i + 1}</option>))}
         </select>
@@ -2109,12 +2201,18 @@ function ExpenseReportCard() {
           : <>
               <table style={{ fontSize: 13, marginTop: ".6rem" }}>
                 <thead><tr><th>Date</th><th>Payee</th><th>Item</th>
-                  <th className="num">Amount</th><th></th></tr></thead>
+                  <th className="num">Amount</th>
+                    <th><span className="sr-only">Actions</span></th></tr></thead>
                 <tbody>
                   {q.data.rows.map((r, i) => (
                     <tr key={i}>
                       <td>{mmdd(r.date)}</td><td>{r.payee}</td>
-                      <td>{r.description}</td>
+                      <td>{r.description}
+                        {/* the server's words when the line may be
+                            counted twice (specs/receipts.md) */}
+                        {r.note && (
+                          <span className="mut" style={{ fontSize: 12 }}>
+                            {" "}· {r.note}</span>)}</td>
                       <td className="num">${r.amount.toFixed(2)}</td>
                       <td><a href={`/api/receipts/${r.receipt_id}/image`}
                              target="_blank" rel="noreferrer">receipt</a></td>
@@ -2124,6 +2222,9 @@ function ExpenseReportCard() {
               </table>
               <p style={{ marginBottom: 0 }}><b>Total:
                 ${q.data.total.toFixed(2)}</b> across {q.data.count} items</p>
+              {q.data.note && (
+                <p className="mut" style={{ fontSize: 12, marginBottom: 0 }}>
+                  {q.data.note}</p>)}
             </>
       )}
     </div>
@@ -2178,23 +2279,29 @@ export default function Business() {
   // one request per click, and the row leaves the worksheet as the server
   // agrees — the list is up to a thousand rows, and waiting for it to
   // refetch leaves the unflagged row sitting there with a live button
-  const [unflagging, setUnflagging] = useState<string | null>(null);
+  // every row an unflag is in flight for, not only the last one clicked:
+  // a row whose request is out stays disabled, so it cannot be sent twice
+  const [unflagging, setUnflagging] = useState<ReadonlySet<string>>(
+    () => new Set());
+  const markUnflagging = (id: string, on: boolean) =>
+    setUnflagging((s) => {
+      const next = new Set(s);
+      if (on) next.add(id); else next.delete(id);
+      return next;
+    });
   const unflag = (id: string) => {
-    setUnflagging(id);
+    markUnflagging(id, true);
     api.bizFlag(id, false).then(() => {
       qc.setQueryData<BizData>(["biz", year ?? "all", limit], (old) => {
-        if (!old) return old;
-        const gone = old.rows.find((r) => r.id === id);
-        return { ...old, rows: old.rows.filter((r) => r.id !== id),
-                 count: Math.max(0, old.count - (gone ? 1 : 0)),
-                 total: gone ? old.total - gone.amount : old.total };
+        const gone = old?.rows.find((r) => r.id === id);
+        return old && gone ? bizViewWithout(old, year ?? "all", gone) : old;
       });
       qc.invalidateQueries({ queryKey: ["biz"] });
       qc.invalidateQueries({ queryKey: ["txns"] });
       // the flag keeps the row out of personal spend, so the verdict moves
       qc.invalidateQueries({ queryKey: ["today"] });
     }).catch((e) => toast(`Unflag failed: ${errText(e)}`))
-      .finally(() => setUnflagging(null));
+      .finally(() => markUnflagging(id, false));
   };
 
   // No entitlement check here: the page's own "No businesses yet" empty
@@ -2204,7 +2311,8 @@ export default function Business() {
   if (q.isPending)
     return <div className="centered"><span className="mut">loading…</span></div>;
   if (q.isLoadingError)
-    return <div className="card">Couldn't load: {String(q.error)}</div>;
+    return <div className="card">
+      <FailedLine q={q} what="the business transactions" /></div>;
 
   const d = q.data;
   const exportHref = "/api/business/export.csv" + (year ? `?year=${year}` : "");
@@ -2220,7 +2328,8 @@ export default function Business() {
           <h2 style={{ margin: 0 }}>Flagged on personal cards</h2>
           <span className="sub">the biz tag from Transactions — separate from
             the entity's own books; import them to merge</span>
-          <select style={{ marginLeft: "auto" }} value={year ?? ""} onChange={(e) =>
+          <select aria-label="Year"
+                  style={{ marginLeft: "auto" }} value={year ?? ""} onChange={(e) =>
             setYear(e.target.value ? Number(e.target.value) : undefined)}>
             <option value="">all years</option>
             {d.years.map((y) => <option key={y} value={y}>{y}</option>)}
@@ -2255,7 +2364,7 @@ export default function Business() {
                   <th className="num" style={{ width: "1%" }}>Amount</th>
                   <th>Merchant</th><th>Category</th>
                   <th className="hide-m">Account</th>
-                  <th style={{ width: "1%" }}></th></tr>
+                  <th style={{ width: "1%" }}><span className="sr-only">Actions</span></th></tr>
             </thead>
             <tbody>
               {d.rows.flatMap((r) => {
@@ -2286,6 +2395,7 @@ export default function Business() {
                       📝</button>
                     )}{" "}
                     <button className="clip-btn" title="receipts — attach or view"
+                            aria-label="Receipts"
                             style={receiptFor === r.id
                               ? {} : { opacity: 0.6 }}
                             onClick={() => setReceiptFor(
@@ -2293,7 +2403,7 @@ export default function Business() {
                       📎</button>{" "}
                     {mayEdit && (
                     <button title="remove the business flag"
-                            disabled={unflagging === r.id}
+                            disabled={unflagging.has(r.id)}
                             onClick={() => unflag(r.id)}>
                       unflag</button>
                     )}

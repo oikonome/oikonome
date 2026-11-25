@@ -20,6 +20,8 @@ import { passkeyMaybeAvailable, PasskeySheetError,
 import { useSession } from "../lib/session";
 import { C } from "../lib/theme";
 import { LogoSpinner } from "../components/logo-spinner";
+import { Note } from "../components/ui";
+import { fieldA11y } from "../components/field";
 
 /** One of the devices already holding a sign-in, as the device-limit
  *  refusal reports them. */
@@ -61,6 +63,13 @@ export default function Login() {
   // link, so the screen offers that instead of "use a browser"
   const [challenged, setChallenged] = useState(false);
   const [unlockSent, setUnlockSent] = useState(false);
+  // the sign-in code the confirmed emailed link shows; the sign-in carries
+  // it, since only a sign-in holding it can spend the emailed unlock
+  const [unlockCode, setUnlockCode] = useState("");
+  // the code field on request: someone back from the confirm page after
+  // the app restarted holds a code but is no longer `challenged`, and must
+  // not have to fail a sign-in first to get somewhere to type it
+  const [codeOpen, setCodeOpen] = useState(false);
   // How someone WITHOUT an account gets one here: self-service signup or
   // the operator's site — asked of the server
   // (GET /api/access, public) so the screen never sends a person to a
@@ -165,9 +174,9 @@ export default function Login() {
         // failed passkey (the web login says the restarting line too)
         setErr(signInErrText(e));
       } else if (e instanceof PasskeySheetError) {
-        // the platform refused before any key was used — say what it said,
-        // because a bare "didn't work" gives the person nothing to act on
-        setErr("Passkey sign-in couldn't start (" + e.message + "). "
+        // the platform refused before any key was used — say why in plain
+        // words, because a bare "didn't work" gives the person nothing to act on
+        setErr("Passkey sign-in couldn't start (" + e.why + "). "
                + "Use your password, or add a passkey for this phone "
                + "in the web app (Settings → Security), then try again.");
       } else {
@@ -187,7 +196,8 @@ export default function Login() {
     try {
       const { token } = await loginAndMintDevice(
         serverUrl, email.trim(), password, totp.trim(),
-        Device.modelName || "mobile device", Platform.OS, replacing);
+        Device.modelName || "mobile device", Platform.OS, replacing,
+        unlockCode.trim());
       setPendingReplace("");
       await completeLogin(serverUrl, token);
     } catch (e) {
@@ -212,7 +222,7 @@ export default function Login() {
         setChallenged(true);
         setErr(unlockSent
           ? "Still asking for the human check — open the emailed link "
-            + "first, then sign in here."
+            + "first, then enter the sign-in code it shows below."
           : "The server wants a human check it can't show here. Email "
             + "yourself a sign-in link below: open it, then sign in here "
             + "as usual.");
@@ -293,7 +303,7 @@ export default function Login() {
           device just has to sign in again to come back.
         </Text>
         {limit.devices.map((d) => (
-          <Pressable key={d.id} style={[s.input, busy && s.btnOff]}
+          <Pressable accessibilityRole="button" key={d.id} style={[s.input, busy && s.btnOff]}
                      disabled={busy}
                      onPress={() => { void replaceAndFinish(limit, d.id); }}>
             <Text style={{ color: C.text, fontSize: 15 }}>
@@ -305,8 +315,8 @@ export default function Login() {
             </Text>
           </Pressable>
         ))}
-        {err && <Text style={s.err}>{err}</Text>}
-        <Pressable disabled={busy}
+        {err && <Note bad style={s.err}>{err}</Note>}
+        <Pressable accessibilityRole="button" disabled={busy}
                    onPress={() => {
                      if (serverUrl && limit.grant)
                        void abandonMintGrant(serverUrl, limit.grant);
@@ -323,16 +333,17 @@ export default function Login() {
       <Text style={s.h1}>Sign in</Text>
       {/* the server is worth showing only when the person chose it */}
       {!PINNED_SERVER_URL && <Text style={s.mut}>{serverUrl}</Text>}
-      <TextInput style={s.input} placeholder="email"
+      <TextInput {...fieldA11y("Email", err)} style={s.input} placeholder="email"
                  placeholderTextColor={C.mut} autoCapitalize="none"
                  autoCorrect={false} keyboardType="email-address"
                  autoComplete="email" value={email} onChangeText={setEmail} />
-      <TextInput style={s.input} placeholder="password"
+      <TextInput {...fieldA11y("Password", err)} style={s.input} placeholder="password"
                  placeholderTextColor={C.mut} secureTextEntry
                  autoComplete="current-password"
                  value={password} onChangeText={setPassword} />
       {needsTotp && (
-        <TextInput style={s.input}
+        <TextInput {...fieldA11y(recoveryMode ? "Recovery code" : "6-digit code", err)}
+                   style={s.input}
                    // remount on mode switch — a focused field keeps its
                    // old keyboard otherwise, and the number pad has no
                    // letter keys for a dashed base32 recovery code
@@ -345,12 +356,26 @@ export default function Login() {
                    value={totp} onChangeText={setTotp}
                    onSubmitEditing={() => submit()} />
       )}
-      {err && <Text style={s.err}>{err}</Text>}
+      {(challenged || codeOpen) && (
+        // the code the confirm page shows ("Signing in on the Oikonome
+        // app? Enter this sign-in code there") — the app cannot see that
+        // browser's cookie, so the person carries the proof across
+        <TextInput {...fieldA11y("Sign-in code", err)} style={s.input} placeholder="sign-in code"
+                   placeholderTextColor={C.mut} autoCapitalize="characters"
+                   autoCorrect={false} value={unlockCode}
+                   onChangeText={setUnlockCode} />
+      )}
+      {!challenged && !codeOpen && (
+        <Pressable accessibilityRole="button" disabled={busy} onPress={() => setCodeOpen(true)}>
+          <Text style={s.link}>Have a sign-in code from an emailed link?</Text>
+        </Pressable>
+      )}
+      {err && <Note bad style={s.err}>{err}</Note>}
       {/* the web login's "Email me a sign-in link" (its /unlock page), in
           the app: the link is not a sign-in, it lifts the human check for
           this account so the password form above works again */}
       {challenged && (
-        <Pressable disabled={busy || !email.trim()}
+        <Pressable accessibilityRole="button" disabled={busy || !email.trim()}
                    onPress={() => {
                      if (!serverUrl) return;
                      setBusy(true);
@@ -358,9 +383,9 @@ export default function Login() {
                        .then(() => {
                          setUnlockSent(true);
                          setErr("If that address exists, a sign-in link was "
-                                + "sent. Open it, then sign in here as "
-                                + "usual — the link itself does not sign "
-                                + "you in.");
+                                + "sent. Open it, enter the sign-in code it "
+                                + "shows below, then sign in here as usual "
+                                + "— the link itself does not sign you in.");
                        })
                        .catch((e) => setErr(signInErrText(e)))
                        .finally(() => setBusy(false));
@@ -371,7 +396,8 @@ export default function Login() {
           </Text>
         </Pressable>
       )}
-      <Pressable style={[s.btn, (busy || !email.trim() || !password) && s.btnOff]}
+      <Pressable accessibilityRole="button"
+                 style={[s.btn, (busy || !email.trim() || !password) && s.btnOff]}
                  disabled={busy || !email.trim() || !password}
                  onPress={() => submit()}>
         {busy ? <LogoSpinner color={C.text} />
@@ -384,7 +410,7 @@ export default function Login() {
           placeholder says "recovery code" over a stale 6-digit string
           that just failed. */}
       {needsTotp && (
-        <Pressable disabled={busy}
+        <Pressable accessibilityRole="button" disabled={busy}
                    onPress={() => { setRecoveryMode((m) => !m);
                                     setTotp(""); setErr(null); }}>
           <Text style={s.link}>
@@ -401,7 +427,7 @@ export default function Login() {
           hands off to a browser tab like "Forgot password?". */}
       {needsTotp && (
         <View style={{ gap: 4 }}>
-          <Pressable disabled={busy}
+          <Pressable accessibilityRole="button" disabled={busy}
                      onPress={() => serverUrl
                        && WebBrowser.openBrowserAsync(serverUrl + "/forgot")}>
             <Text style={s.link}>
@@ -410,7 +436,7 @@ export default function Login() {
             </Text>
           </Pressable>
           {access?.support_email ? (
-            <Pressable disabled={busy}
+            <Pressable accessibilityRole="button" disabled={busy}
                        onPress={() => Linking.openURL(
                          `mailto:${access.support_email}`
                          + "?subject=Locked%20out%20of%20my%20account")}>
@@ -422,7 +448,7 @@ export default function Login() {
       {/* the same door the web login has — the reset flow is mail-driven
           and lives on the server, so the app hands off to it in a browser
           tab, so a locked-out person has a way out of this screen */}
-      <Pressable disabled={busy}
+      <Pressable accessibilityRole="button" disabled={busy}
                  onPress={() => serverUrl && WebBrowser.openBrowserAsync(serverUrl + "/forgot")}>
         <Text style={s.link}>Forgot password?</Text>
       </Pressable>
@@ -430,7 +456,7 @@ export default function Login() {
           when it is open, else the operator's site. Accounts are made on the server, never in the app —
           the link hands off to a browser tab like "Forgot password?". */}
       {noAccount && (
-        <Pressable disabled={busy}
+        <Pressable accessibilityRole="button" disabled={busy}
                    onPress={() => WebBrowser.openBrowserAsync(noAccount.href)}>
           <Text style={s.link}>{noAccount.label}</Text>
         </Pressable>
@@ -440,7 +466,7 @@ export default function Login() {
       {canPasskey && (
         <>
           <Text style={s.or}>or</Text>
-          <Pressable style={[s.btnAlt, busy && s.btnOff]} disabled={busy}
+          <Pressable accessibilityRole="button" style={[s.btnAlt, busy && s.btnOff]} disabled={busy}
                      onPress={() => passkey()}>
             <Text style={s.btnText}>Sign in with a passkey</Text>
           </Pressable>
@@ -455,10 +481,10 @@ const s = StyleSheet.create({
           justifyContent: "center" },
   h1: { color: C.text, fontSize: 28, fontWeight: "700" },
   mut: { color: C.mut, fontSize: 14 },
-  input: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.card, borderColor: C.field, borderWidth: 1,
            borderRadius: 10, color: C.text, fontSize: 16, padding: 14 },
   err: { color: C.bad, fontSize: 14 },
-  btn: { backgroundColor: C.accent, borderRadius: 10, padding: 14,
+  btn: { backgroundColor: C.btn, borderRadius: 10, padding: 14,
          alignItems: "center" },
   or: { color: C.mut, fontSize: 14, textAlign: "center" },
   link: { color: C.accent, fontSize: 14, textAlign: "center" },

@@ -11,11 +11,15 @@ import { UNKNOWN_STORE, api, errText, mmdd, money, type ReceiptItemRow }
 import { patchList } from "../api/cache";
 import { canEdit } from "../role";
 import WaitingReceipts from "../components/WaitingReceipts";
+import EmptyState from "../components/EmptyState";
+import { EMPTY_LINES } from "../moneymath";
+import { FailedLine, StaleLine } from "../components/Loaded";
+import SegmentedControl from "../components/SegmentedControl";
 
 const GROUPS = [
-  { id: "item", label: "by item" },
-  { id: "merchant", label: "by store" },
-  { id: "month", label: "by month" },
+  { id: "item", label: "By item" },
+  { id: "merchant", label: "By store" },
+  { id: "month", label: "By month" },
 ] as const;
 
 export default function Items() {
@@ -40,14 +44,12 @@ export default function Items() {
         <form style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                        alignItems: "center" }}
               onSubmit={(e) => { e.preventDefault(); setLive(q); }}>
-          <input placeholder="search items… (shampoo, milk)" value={q}
+          <input aria-label="Search items" placeholder="search items… (shampoo, milk)" value={q}
                  size={26} onChange={(e) => setQ(e.target.value)} />
           <button className="pri" type="submit">Search</button>
-          {GROUPS.map((g) => (
-            <button key={g.id} type="button"
-                    className={group === g.id ? "pri" : ""}
-                    onClick={() => setGroup(g.id)}>{g.label}</button>
-          ))}
+          <SegmentedControl label="Group items" value={group}
+            onChange={setGroup}
+            options={GROUPS.map((g) => ({ value: g.id, label: g.label }))} />
           <Link className="btn" to="/transactions"
                 style={{ marginLeft: "auto" }}>‹ transactions</Link>
         </form>
@@ -59,10 +61,18 @@ export default function Items() {
       </div>
 
       {query.isPending && <p className="mut">loading…</p>}
+      {/* a failed search says so under the form, which stays */}
+      <StaleLine query={query} />
+      {d === undefined && query.isError && (
+        <FailedLine q={query} what="line items" />)}
       {d && d.groups.length === 0 && (
-        <div className="card"><p className="mut" style={{ margin: 0 }}>
-          No line items{live ? ` matching “${live}”` : ""} yet — parsed
-          receipts land here.</p></div>
+        <div className="card">
+          {/* a search that matches nothing says so, with no action (the
+              phone's words) */}
+          {live ? <EmptyState title={EMPTY_LINES.filtered} />
+            : <EmptyState title={EMPTY_LINES.lineItems} to="/transactions"
+                          action={EMPTY_LINES.lineItemsAction} />}
+        </div>
       )}
 
       {d && d.groups.length > 0 && (
@@ -72,7 +82,10 @@ export default function Items() {
             <thead>
               <tr><th>{group === "month" ? "Month"
                     : group === "merchant" ? "Store" : "Item"}</th>
-                  <th className="num">Times</th>
+                  {/* how many were bought (quantity), and on how many
+                      receipts (receipts.search_items) */}
+                  <th className="num">bought</th>
+                  <th className="num">receipts</th>
                   <th className="num">Total</th>
                   <th className="hide-m">Last bought</th></tr>
             </thead>
@@ -80,11 +93,20 @@ export default function Items() {
               {d.groups.map((g) => (
                 <tr key={g.key ?? "\u0000unknown"}>
                   <td>{g.key ?? UNKNOWN_STORE}</td>
-                  <td className="num">{g.n}</td>
+                  <td className="num">{g.bought}</td>
+                  <td className="num">{g.receipts}</td>
                   <td className="num">{money(g.total)}</td>
                   <td className="mut hide-m">{g.last_date ? mmdd(g.last_date) : ""}</td>
                 </tr>
               ))}
+              {/* a total that may hold a purchase twice says so, in the
+                  server's words (specs/receipts.md) */}
+              {d.groups.some((g) => g.note) && (
+                <tr><td colSpan={5} className="mut" style={{ fontSize: 12 }}>
+                  {d.groups.filter((g) => g.note).map((g) => (
+                    <div key={g.key ?? "\u0000unknown"}>
+                      {g.key ?? UNKNOWN_STORE}: {g.note}</div>))}
+                </td></tr>)}
             </tbody>
           </table>
         </div>
@@ -99,17 +121,29 @@ export default function Items() {
             <thead>
               <tr><th style={{ width: "1%", whiteSpace: "nowrap" }}>Date</th>
                   <th className="num" style={{ width: "1%" }}>$</th>
-                  <th className="num hide-m" style={{ width: "1%" }}>Qty</th>
                   <th>Item</th>
                   <th className="hide-m">Store</th></tr>
             </thead>
             <tbody>
               {d.rows.map((r) => (
-                <tr key={`${r.receipt_id}-${r.line}`}>
+                <tr key={`${r.receipt_id}-${r.line}`}
+                    style={r.counts === false ? { opacity: .55 } : undefined}>
                   <td className="mut" style={{ whiteSpace: "nowrap" }}>{mmdd(r.date)}</td>
-                  <td className="num" style={{ whiteSpace: "nowrap" }}>{money(r.amount)}</td>
-                  <td className="num hide-m">{r.qty ?? ""}</td>
+                  {/* the line's total, in cents (the phone's figure); the
+                      quantity rides with the item at every width */}
+                  <td className="num" style={{ whiteSpace: "nowrap" }}>{money(r.amount, true)}</td>
                   <td>{r.description}
+                    {r.qty != null && r.qty !== 1 &&
+                      <span className="mut"> ×{r.qty}</span>}
+                    {/* listed, never added up, or possibly counted twice:
+                        the server's words (specs/receipts.md) */}
+                    {r.note && (
+                      <span className={r.suspected ? undefined : "mut"}
+                            style={{ fontSize: 12,
+                                     color: r.suspected ? "var(--amber)"
+                                                        : undefined }}>
+                        {" "}· {r.note}
+                      </span>)}
                     {/* tap to tag — the tag drives the Business itemized
                         report */}
                     {mayEdit && <button className="pill m linklike"

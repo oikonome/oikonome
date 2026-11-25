@@ -71,17 +71,17 @@ from dataclasses import dataclass
 
 MIGRATIONS = pathlib.Path(__file__).resolve().parent.parent / "db" / "migrations"
 
-#: the archive member naming the schema the archive was written under
+# The archive member naming the schema the archive was written under.
 MANIFEST = "manifest.json"
-#: the manifest's own shape; any other is read as no manifest
+# The manifest's own format number; any other is read as no manifest.
 MANIFEST_FORMAT = 1
 # a manifest is a few hundred bytes; anything larger is not one
 _MANIFEST_MAX = 64 * 1024
 
 HOWS = ("after", "inline", "structural", "gap")
 
-#: `gap` entries the test accepts, each with why no restore can apply it.
-#: Empty: every migration that changes restored data is applied.
+# The `gap` entries the test accepts, each with why no restore can apply
+# it. Empty: every migration that changes restored data is applied.
 ACCEPTED_GAPS: dict[str, str] = {}
 
 
@@ -104,12 +104,12 @@ def manifest(schema: str | None, version: str, tables: list[str]) -> str:
                       indent=2) + "\n"
 
 
-#: Columns a migration added to a table an archive carries, as
-#: (migration, archive member, column): an archive whose member's header
-#: shows the column was written by an install that had run at least that
-#: migration. What an archive without a manifest is read as (archive_floor).
-#: Only a column the export writes whenever the table has a row counts, and
-#: only one no earlier migration or schema had on that table.
+# Columns a migration added to a table an archive carries, as
+# (migration, archive member, column): an archive whose member's header
+# shows the column was written by an install that had run at least that
+# migration. What an archive without a manifest is read as (archive_floor).
+# Only a column the export writes whenever the table has a row counts, and
+# only one no earlier migration or schema had on that table.
 FLOOR_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("064_category_plaid_confidence.sql", "transactions.csv",
      "category_plaid"),
@@ -120,6 +120,10 @@ FLOOR_COLUMNS: tuple[tuple[str, str, str], ...] = (
     ("092_merchant_outlet.sql", "transactions.csv", "merchant_outlet"),
     ("097_merchants.sql", "transactions.csv", "merchant_id"),
     ("098_txn_enrichment.sql", "transactions.csv", "payment_processor"),
+    ("221_a_w2_says_whose_it_is.sql", "income_annual.csv",
+     "primary_wages_from_w2"),
+    ("226_a_w2_figure_remembers_what_it_wrote.sql", "income_annual.csv",
+     "primary_wages_w2"),
 )
 
 # a header line is a few hundred bytes; the read stops well past that
@@ -217,7 +221,8 @@ UPGRADES: tuple[Upgrade, ...] = (
             "corrected rows landed, for an archive older than it "
             "(archive_schema)"),
     Upgrade("040_bills_rename.sql", "inline",
-            "the bills pass reads recurring.csv when there is no bills.csv"),
+            "the bills pass reads recurring.csv when there is no bills.csv, "
+            "and the offers lander recurring_proposals.csv"),
     Upgrade("044_llm_rule_canonical_rekey.sql", "after",
             "rekey_model_rules_on_the_merchant, for an archive older than it "
             "(archive_schema)"),
@@ -269,7 +274,8 @@ UPGRADES: tuple[Upgrade, ...] = (
             "unless a person or a rule decided its category"),
     Upgrade("098_txn_enrichment.sql", "inline",
             "upgrade_archived_txn: base.enrichment_from_raw fills the empty "
-            "columns, and category_source is derived as 098 derived it"),
+            "columns, and, for an archive older than it (archive_schema), "
+            "category_source is derived as 098 derived it"),
     Upgrade("100_account_links_account_fk.sql", "structural",
             "a link naming an account that is not here is refused as "
             "orphaned"),
@@ -398,11 +404,98 @@ UPGRADES: tuple[Upgrade, ...] = (
             "inline", "scrub_account_raw / scrub_liability_raw / "
             "scrub_transaction_raw and the holdings pass drop "
             "plaid.PLAID_RAW_IDENTIFIERS from every archived raw"),
+    Upgrade("215_card_numbers_joined_by_any_whitespace_are_cut.sql",
+            "inline", "card_number.cut in the passes reads any whitespace "
+            "(a tab, a no-break space) between a number's groups as a "
+            "space: the same passes that apply 203, 204 and 206 (file "
+            "rows, merchant names, bills and what names them, offers, the "
+            "log), and 208's step after"),
+    Upgrade("216_bill_dates_that_do_not_read_as_dates_are_dropped.sql",
+            "inline", "clean_bill_raw drops a raw dueOn, lastDueOn, "
+            "recurrence endOn or dueOn that does not read as a date, and "
+            "the bills pass refills raw dueOn from due_on"),
+    Upgrade("220_ofx_rows_dated_by_the_printed_day_say_so.sql", "after",
+            "ofximport.mark_printed_day_rows over the rows this restore "
+            "landed, after its import batches and transactions landed, for "
+            "an archive at or after 210 (the first build that dated OFX "
+            "lines by their printed day) and older than this one, from the "
+            "earliest moment any build could have dated them so (a fixed "
+            "instant, never the destination's own migration time); an older "
+            "archive's rows are noted as dated by the UTC day; an archive's "
+            "own note is kept by scrub_transaction_raw"),
+    Upgrade("221_a_w2_says_whose_it_is.sql", "inline",
+            "the income pass, for an archive older than this (its documents "
+            "carry no person): a W-2 lands as the primary earner's when its "
+            "year holds no primary W-2 yet and 'unassigned' otherwise "
+            "(taxdocs.unsaid_owner); on every archive a person outside the "
+            "three known words lands 'unassigned'. The two wage flags are "
+            "not read"),
+    Upgrade("223_flow_labels_differing_only_in_case_are_one.sql", "inline",
+            "the transactions pass, on every archive: a row of money in "
+            "(amount < 0) whose category_primary is an ASCII-letters "
+            "spelling of INCOME in another case lands as INCOME, before "
+            "its category_source is derived; an outflow and "
+            "category_override land as written"),
+    Upgrade("224_the_mail_relay_user_is_encrypted.sql", "inline",
+            "the budget_snapshots pass lands every archived month's config "
+            "through scrub_config, which drops smtp_user as a credential "
+            "(restore._secret_key), on every archive; a snapshot read back "
+            "is cleaned of it again by budget._clean_snapshot_config"),
+    Upgrade("226_a_w2_figure_remembers_what_it_wrote.sql", "inline",
+            "the income pass lands each wage figure's *_w2 value as "
+            "archived; for an archive older than this (archive_schema) a "
+            "primary figure on a row whose source is exactly 'w2' is seeded "
+            "as the W-2s', as the migration seeds it. After the documents "
+            "land, each year a W-2 landed in is summed once (taxdocs.resum) "
+            "under the W-2 year locks, which the pass takes before its "
+            "first write"),
+    Upgrade("227_w2s_an_older_build_filed_under_the_primary_earner.sql",
+            "inline",
+            "the income pass, for an archive older than 226: in a year whose "
+            "row the restore landed, its W-2s land as archived and the year "
+            "is reconciled with its figure (taxdocs.reconcile_unmarked, the "
+            "migration's rule); in a year the household already had, they "
+            "land by taxdocs.unsaid_owner"),
+    Upgrade("228_a_hand_entered_asset_remembers_when_it_was_acquired.sql",
+            "inline", "clean_manual_assets, on every archive's settings: a "
+            "hand-entered asset without a readable acquired_on lands with "
+            "its as_of as one, the migration's rule"),
+    Upgrade("229_a_coinbase_row_carries_the_ledgers_sign.sql", "inline",
+            "the transactions pass, on every archive (upgrade_archived_txn): "
+            "a coinbase: row whose record carries a plain-decimal "
+            "native_amount lands with that amount negated, and a "
+            "TRANSFER_IN/TRANSFER_OUT label follows the sign; "
+            "category_override lands as written"),
+    Upgrade("230_a_retired_row_remembers_when_it_left_the_ledger.sql",
+            "inline",
+            "the transactions pass, on every archive (landers._txn_values): "
+            "a retired row lands with its archived removed_at when that "
+            "reads as a time, else the migration's rule (the feed's own "
+            "withdrawal stamp, else retired_at, else the restore's own "
+            "time); a live row lands with none"),
+    Upgrade("231_a_stored_tax_document_remembers_what_it_wrote.sql",
+            "after",
+            "landers._resolve_income: an archive that carries no "
+            "income_uploads member gets the migration's backfill over what "
+            "it landed (taxdocs.backfill_household — the yearly figures "
+            "when the household holds no upload yet, and an upload of its "
+            "own for every form without one); an archive that carries them "
+            "lands them and works out each year they wrote again"),
+    Upgrade("234_a_bill_keeps_one_identity_through_a_rename.sql", "inline",
+            "the bills pass, on every archive (landers._bill): a bill lands "
+            "with its archived uid when that reads as one and no other bill "
+            "of the household holds it, else with one the column's default "
+            "draws, as the migration draws one for every stored bill"),
+    Upgrade("235_a_pool_set_up_mid_year_counts_from_its_month.sql", "inline",
+            "the bills pass, on every archive (landers._bill): a bill lands "
+            "with its archived created_on when that reads as a day, else "
+            "with none — not known, as the migration leaves every stored "
+            "bill — never with the day of the restore"),
 )
 
 
-#: Migrations that change no stored row a restore loads. The test checks
-#: each: no INSERT, UPDATE or DELETE on a restored table.
+# Migrations that change no stored row a restore loads. The test checks
+# each: no INSERT, UPDATE or DELETE on a restored table.
 SCHEMA_ONLY: dict[str, str] = {
     **{name: "tables, columns, indexes, functions, policies or grants only"
        for name in (
@@ -519,6 +612,28 @@ SCHEMA_ONLY: dict[str, str] = {
            "211_a_folder_import_job_names_the_worker_that_holds_it.sql",
            "212_sync_log_reads_one_connection_from_an_index.sql",
            "213_a_link_session_remembers_the_window_it_asked_for.sql",
+           "217_an_undone_email_change_is_remembered.sql",
+           "218_a_ledger_write_moves_the_households_ledger_version.sql",
+           "219_the_audit_trim_reads_an_index.sql",
+           "225_one_w2_row_is_not_enforced.sql",
+           # receipts' slip columns; a receipt from an older archive
+           # lands undecided and the restore decides it once committed
+           # (restore.after_commit, receipt_identity.decide_backlog)
+           "232_a_receipt_remembers_which_slip_it_is.sql",
+           # a column whose default is every older archive's truth: no
+           # name an older build stored was typed through the rename
+           "233_a_payer_named_by_a_person_is_kept_as_typed.sql",
+           # a table no archive carries (plaid_users is never exported)
+           # and a link-session column on an admin-only table
+           "236_a_household_links_several_banks_in_one_go.sql",
+           # derived, not in archives: the forecast's learned facts
+           "237_the_forecast_keeps_what_it_learned_per_day.sql",
+           # a new table; an older archive has no nights to land
+           "238_the_forecast_keeps_what_it_said_each_night.sql",
+           # a column whose default is every older archive's truth: no
+           # business an older build stored said whose it was, and the
+           # lander lands an archive without the column as 'unknown'
+           "239_a_business_says_whose_it_is.sql",
        )},
     "060_spam_defense.sql":
         "writes only blocklist_meta (the instance's spam blocklist), which no archive restores",

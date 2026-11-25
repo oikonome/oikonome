@@ -21,7 +21,7 @@ from psycopg.types.json import Jsonb
 from oikonome.db import tenancy
 from oikonome.engine import alerts, bills
 from oikonome.notify import mailact
-from oikonome.web import api
+from oikonome.web import api, fields
 
 from .util import TEST_DB, make_db, write_config
 
@@ -175,9 +175,9 @@ class TwoApprovalsOneChargeTests(unittest.TestCase):
         with self.a.transaction():
             bills.hold_bill_claims(self.a)
             t = threading.Thread(target=lambda: out.update(
-                r=api.bills_save_api(user=user, body={
+                r=api.bills_save_api(user=user, body=fields.Fields({
                     "payee": "Lanternfish Gym", "amount": 31.0,
-                    "cadence": "MONTHLY:1"})))
+                    "cadence": "MONTHLY:1"}))))
             t.start()
             t.join(1.0)
             waited = t.is_alive()

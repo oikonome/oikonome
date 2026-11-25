@@ -6,7 +6,7 @@
 // see the list read-only.
 //
 // One section per provenance — "Your
-// rules" expanded, Model-learned / Learned / Built-in collapsed to a count. Groups
+// rules" expanded, From an AI pass / Your trained model / Built-in collapsed to a count. Groups
 // load LAZILY with server-side search + pagination (~50/page; a real
 // ledger has thousands of rules and nothing may render them all at once).
 // Editing or disabling a model/seed rule PROMOTES it to source='user' and
@@ -19,13 +19,17 @@ import { api, errText, toast, type RuleRow, type RulesPage, catLabel } from "../
 import { invalidateRollups, patchList, removeFromList } from "../api/cache";
 import { canEdit } from "../role";
 import DemoLock from "../components/DemoLock";
-import { spendPickerGroups } from "../moneymath";
+import { spendPickerGroups, UNKNOWN_FIGURE } from "../moneymath";
+import PageSkeleton from "../components/PageSkeleton";
+import { FailedLine } from "../components/Loaded";
+import Disclosure from "../components/Disclosure";
+import Note from "../components/Note";
 
 const SOURCE_LABEL: Record<string, string> = {
   user: "your correction",
-  llm: "classified by model",
+  llm: "classified by an AI pass",
   seed: "matched seed rule",
-  model: "learned from your corrections",
+  model: "your trained model, from your corrections",
 };
 type Source = "user" | "llm" | "seed" | "model";
 type Cats = Awaited<ReturnType<typeof api.categories>>;
@@ -47,20 +51,24 @@ export default function Rules({ embedded = false }:
   // "Your rules" is the always-loaded group; its response also carries the
   // q-filtered per-source counts the collapsed headers need — no rows load
   // for a group until it's expanded.
+  // A new search keeps the page, search box and all (focus included), with
+  // the previous answer dimmed until the new one lands.
   const userQ = useQuery({ queryKey: ["rules", "user", q, 1],
-                           queryFn: () => api.rules("user", q, 1) });
+                           queryFn: () => api.rules("user", q, 1),
+                           placeholderData: (prev) => prev });
   const counts = userQ.data?.counts;
   // all FOUR provenances count — the trained classifier ("model") is a
   // source like any other, and leaving it out would both undercount the
   // header and let a model-only ledger render as "no rules yet".
   const total = counts
-    ? counts.user + counts.llm + counts.seed + (counts.model ?? 0) : 0;
+    ? counts.user + counts.llm + counts.seed + counts.model : 0;
   const empty = !q && !!counts && total === 0;
 
   if (userQ.isPending)
-    return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
-  if (userQ.isLoadingError)
-    return <div className="note bad">Couldn't load: {String(userQ.error)}</div>;
+    return <PageSkeleton />;
+  // a failed read keeps the hero and its search box; the count is unknown
+  // and the failed line stands where the groups would
+  const failed = userQ.data === undefined;
 
   return (
     <>
@@ -72,15 +80,19 @@ export default function Rules({ embedded = false }:
         <div style={{ display: "flex", gap: ".9rem", alignItems: "baseline",
                       flexWrap: "wrap" }}>
           <span style={{ fontSize: "1.35rem", fontWeight: 700 }}>
-            {total.toLocaleString()} rule{total === 1 ? "" : "s"}</span>
+            {failed ? `${UNKNOWN_FIGURE} rules`
+              : `${total.toLocaleString()} rule${total === 1 ? "" : "s"}`}</span>
+          {/* the server's words for where each rule came from: "model"
+              alone named two different things (an AI pass and the
+              household's own trained classifier) */}
           <span className="sub">sorting your transactions
-            {counts && <> · {counts.user} yours · {counts.llm} model
-              {(counts.model ?? 0) > 0 && <> · {counts.model} learned</>}
-              · {counts.seed} built-in</>}</span>
+            {userQ.data && <> · {userQ.data.counts_text}</>}</span>
           {!empty && (
-            <input value={filter} onChange={(e) => setFilter(e.target.value)}
+            <input aria-label="Search merchants or categories"
+                   value={filter} onChange={(e) => setFilter(e.target.value)}
                    placeholder="search merchants or categories"
-                   style={{ marginLeft: "auto", minWidth: "15rem" }} />)}
+                   style={{ marginLeft: "auto", flex: "1 1 17rem",
+                            maxWidth: "22rem", minWidth: 0 }} />)}
         </div>
         <div className="sub" style={{ marginTop: ".2rem" }}>Rules are learned,
           never hand-written. Correcting or disabling one makes it yours.</div>
@@ -91,8 +103,10 @@ export default function Rules({ embedded = false }:
         )}
       </div>
 
-      {empty ? (
-        <div className={embedded ? undefined : "card"}>
+      {failed ? (
+        <FailedLine q={userQ} what={q ? `rules matching “${q}”` : "rules"} />
+      ) : empty ? (
+        <div className={embedded ? undefined : "card stickyhead"}>
           <p className="mut" style={{ margin: 0 }}>
             No rules yet — they appear as Oikonome learns your merchants:
             built-in rules match on your first import, the model classifies
@@ -101,36 +115,36 @@ export default function Rules({ embedded = false }:
             own (“Just this one” changes only that row).
           </p>
         </div>
-      ) : (<>
-        <div className={embedded ? undefined : "card"}>
+      ) : (<div style={userQ.isPlaceholderData ? { opacity: 0.55 } : undefined}>
+        <div className={embedded ? undefined : "card stickyhead"}>
           <RuleGroup source="user" title="Your rules" mayEdit={mayEdit} demo={demo} q={q}
                      note="corrections you made"
                      count={counts?.user ?? 0} defaultOpen />
         </div>
-        <div className={embedded ? undefined : "card"}>
+        <div className={embedded ? undefined : "card stickyhead"}>
           {(counts?.llm ?? 0) > 0 && (
-            <RuleGroup source="llm" title="Model-learned" mayEdit={mayEdit} demo={demo} q={q}
-                       note="inferred by the local model; correcting one makes it yours"
+            <RuleGroup source="llm" title="From an AI pass" mayEdit={mayEdit} demo={demo} q={q}
+                       note="classified by an AI endpoint; correcting one makes it yours"
                        count={counts?.llm ?? 0} />)}
           {(counts?.model ?? 0) > 0 && (
-            <RuleGroup source="model" title="Learned" mayEdit={mayEdit} demo={demo} q={q}
-                       note="the classifier trained on your own corrections; correcting one makes it yours"
+            <RuleGroup source="model" title="Your trained model" mayEdit={mayEdit} demo={demo} q={q}
+                       note="the classifier trained on your household's own corrections; correcting one makes it yours"
                        count={counts?.model ?? 0} />)}
           {(counts?.seed ?? 0) > 0 && (
             <RuleGroup source="seed" title="Built-in" mayEdit={mayEdit} demo={demo} q={q}
                        note="shipped starting points"
                        count={counts?.seed ?? 0} />)}
         </div>
-      </>)}
+      </div>)}
 
       {/* the page's rarest action, below its content */}
       {mayEdit && (
-        <details className={embedded ? undefined : "card"}>
-          <summary style={{ cursor: "pointer", color: "var(--mut)",
-                            fontSize: 13.5 }}>
-            Rename a custom category…</summary>
+        <Disclosure card={!embedded}
+          style={embedded ? { marginTop: "1rem" } : undefined}
+          summary={<span className="mut" style={{ fontSize: 13.5 }}>
+            Rename a custom category…</span>}>
           <DemoLock on={demo}><RenameCategoryCard /></DemoLock>
-        </details>
+        </Disclosure>
       )}
     </>
   );
@@ -191,17 +205,21 @@ function RenameCategoryCard() {
       </p>
       <div style={{ display: "flex", gap: ".5rem", flexWrap: "wrap",
                     alignItems: "center" }}>
-        <select value={from} onChange={(e) => setFrom(e.target.value)}
+        <select aria-label="Category to rename"
+                value={from} onChange={(e) => setFrom(e.target.value)}
                 style={{ minWidth: "12rem" }}>
           <option value="">
-            {options.length ? "your custom name…" : "no custom categories yet"}
+            {/* "none yet" only from a list that answered */}
+            {options.length ? "your custom name…"
+              : cats.data === undefined ? "Loading…"
+              : "no custom categories yet"}
           </option>
           {options.map((c) => (
             <option key={c} value={c}>{catLabel(c)}</option>
           ))}
         </select>
         <span className="mut">→</span>
-        <input value={to} placeholder="new name"
+        <input aria-label="New name" value={to} placeholder="new name"
                onChange={(e) => setTo(e.target.value)}
                style={{ minWidth: "12rem" }} />
         <button className="pri"
@@ -211,9 +229,9 @@ function RenameCategoryCard() {
           {rename.isPending ? "renaming…" : "Rename"}
         </button>
       </div>
-      {msg && <div className="note good" style={{ marginTop: ".5rem" }}>{msg}</div>}
-      {err && <div className="note bad" style={{ marginTop: ".5rem" }}
-                   onClick={() => setErr(null)}>{err}</div>}
+      {msg && <Note tone="good" style={{ marginTop: ".5rem" }}>{msg}</Note>}
+      {err && <Note tone="bad" style={{ marginTop: ".5rem" }}
+                   onDismiss={() => setErr(null)}>{err}</Note>}
     </div>
   );
 }
@@ -229,9 +247,11 @@ function RuleGroup({ source, title, mayEdit, demo, q, count, note,
   const [page, setPage] = useState(1);
   useEffect(() => setPage(1), [q]);     // a new search restarts at page 1
   const key = ["rules", source, q, page];
+  // a new search or page keeps the rows on screen until it answers
   const rq = useQuery({ queryKey: key,
                         queryFn: () => api.rules(source, q, page),
-                        enabled: open });
+                        enabled: open,
+                        placeholderData: (prev) => prev });
   // one taxonomy fetch for the group, not one observer per row
   const cats = useQuery({ queryKey: ["categories"], queryFn: api.categories });
   // A write touches one rule: this page's cached rows are patched first, so
@@ -306,27 +326,26 @@ function RuleGroup({ source, title, mayEdit, demo, q, count, note,
   const d: RulesPage | undefined = rq.data;
   const pages = d ? Math.max(1, Math.ceil(d.total / d.per_page)) : 1;
   return (
-    <div>
-      {/* the group carries its own explanation — the promotion rule only
-          matters where it applies, not in a shared paragraph up top */}
-      <button className="grouphead" onClick={() => setOpen(!open)}
-              aria-expanded={open}>
-        <b>{title}</b>
-        <span className="sub">{count} — {note}</span>
-        <span className="sub" style={{ marginLeft: "auto" }}>
-          {open ? "▾" : "▸"}</span>
-      </button>
+    // the group carries its own explanation — the promotion rule only
+    // matters where it applies, not in a shared paragraph up top
+    <Disclosure open={open} onToggle={setOpen}
+      summary={<><b>{title}</b>
+        <span className="sub">{count.toLocaleString()} — {note}</span></>}>
       {open && rq.isPending && <p className="mut">loading…</p>}
-      {open && rq.isError &&
-        <div className="note bad">Couldn't load: {String(rq.error)}</div>}
+      {open && rq.data === undefined && rq.isError &&
+        <FailedLine q={rq} what="these rules" />}
+      {/* the category picker in each row reads this list: an unread one
+          is not "no categories" */}
+      {open && d && mayEdit && cats.data === undefined && cats.isError && (
+        <FailedLine q={cats} what="the categories" />)}
       {open && d && (<>
-        <table style={{ width: "100%" }}>
+        <table className="rules-table" style={{ width: "100%" }}>
           <thead>
             <tr>
               <th>Merchant</th>
               <th>Category</th>
               <th className="num hide-m">Matches</th>
-              {mayEdit && <th style={{ width: "1%" }}></th>}
+              {mayEdit && <th style={{ width: "1%" }}><span className="sr-only">Actions</span></th>}
             </tr>
           </thead>
           <tbody>
@@ -341,7 +360,8 @@ function RuleGroup({ source, title, mayEdit, demo, q, count, note,
             ))}
             {d.rules.length === 0 && (
               <tr><td colSpan={mayEdit ? 4 : 3} className="mut">
-                {q ? "No matches in this group." : "No rules here yet."}
+                {q ? "No matches in this group."
+                  : "No rules here yet. Change a transaction's category and choose to remember it, and the rule appears here."}
               </td></tr>
             )}
           </tbody>
@@ -351,14 +371,14 @@ function RuleGroup({ source, title, mayEdit, demo, q, count, note,
           {pages > 1 && (<>
             {" · "}
             <button disabled={page <= 1}
-                    onClick={() => setPage(page - 1)}>‹ prev</button>
+                    onClick={() => setPage(page - 1)}>‹ Prev</button>
             {" "}page {d.page} of {pages}{" "}
             <button disabled={page >= pages}
-                    onClick={() => setPage(page + 1)}>next ›</button>
+                    onClick={() => setPage(page + 1)}>Next ›</button>
           </>)}
         </div>
       </>)}
-    </div>
+    </Disclosure>
   );
 }
 
@@ -386,13 +406,17 @@ function RuleLine({ r, mayEdit, demo, cats, onEdit, onToggle, onDelete, busy }: 
   return (
     <>
       <tr style={{ opacity: r.disabled ? 0.55 : 1 }}>
-        <td><b>{r.merchant}</b>
+        {/* .c-merch: a bank's run-together descriptor may break anywhere
+            on a wide table (unbroken, one long token sets its width past
+            the card); stacked at phone width it breaks only between words
+            unless one word is wider than the line (index.css) */}
+        <td className="c-merch"><b>{r.merchant}</b>
           {r.disabled && <span className="pill m"
             style={{ marginLeft: ".4rem" }}
             title="kept, but not applied to new transactions">off</span>}</td>
-        <td>
+        <td className="c-cat">
           {mayEdit ? (
-            <select className="cat-chip" value=""
+            <select className="cat-chip" value="" style={{ maxWidth: "100%" }}
                     aria-label={`category for ${r.merchant} — change`}
                     disabled={saving || demo}
                     onChange={(e) => e.target.value && set(e.target.value)}>
@@ -411,11 +435,11 @@ function RuleLine({ r, mayEdit, demo, cats, onEdit, onToggle, onDelete, busy }: 
           ) : (
             <span className="sub">{catLabel(r.category_primary)}</span>
           )}
-          {err && <div className="note bad" onClick={() => setErr(null)}>{err}</div>}
+          {err && <Note tone="bad" onDismiss={() => setErr(null)}>{err}</Note>}
         </td>
         <td className="num mut hide-m">{r.disabled ? "—" : r.count}</td>
         {mayEdit && (
-          <td>
+          <td className="c-act">
             <button className="row-menu" aria-expanded={menu}
                     aria-label={`actions for ${r.merchant}`}
                     onClick={() => setMenu(!menu)}>⋯</button>
@@ -429,10 +453,10 @@ function RuleLine({ r, mayEdit, demo, cats, onEdit, onToggle, onDelete, busy }: 
               title={r.disabled
                 ? "apply this rule again"
                 : "keep the rule but stop applying it to new transactions"}>
-              {r.disabled ? "turn back on" : "turn off"}</button>
+              {r.disabled ? "Turn back on" : "Turn off"}</button>
             <button disabled={busy || demo} onClick={onDelete}
               title="the merchant can be classified again from scratch">
-              delete this rule</button>
+              Delete this rule</button>
             <span className="sub" style={{ alignSelf: "center" }}>
               {SOURCE_LABEL[r.source] ?? r.source}</span>
           </div>

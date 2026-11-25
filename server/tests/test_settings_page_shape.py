@@ -37,7 +37,7 @@ class SettingsNavSummaryTests(unittest.TestCase):
         self.assertIn(".setnav-s.warn", _src("index.css"))
 
     def test_the_problems_it_can_state(self):
-        self.assertIn("needs attention", self.src)   # a dead connection
+        self.assertIn("attention`", self.src)        # a dead connection
         self.assertIn("2FA off", self.src)
         self.assertIn("not arriving — paused", self.src)
 
@@ -82,7 +82,7 @@ class SettingsRowShapeTests(unittest.TestCase):
     def test_smtp_collapses(self):
         """An override most installs never touch, sitting as a full card of
         six fields above the recipients it serves."""
-        self.assertIn("<details className=\"card\" style={{ marginTop: \"1rem\" }}\n"
+        self.assertIn("<details className=\"card disclosure\" style={{ marginTop: \"1rem\" }}\n"
                       "             open={!!data.smtp_host}>", self.src)
         self.assertIn("using the operator's OIKONOME_SMTP_* settings", self.src)
 

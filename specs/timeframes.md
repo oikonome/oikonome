@@ -1,8 +1,7 @@
 # Home page with timeframe lenses (spec)
 
-Decisions:
 1. IDENTITY: the omicron logo + "Oikonome" (top-left) is the home button;
-   the "Today" nav tab is DROPPED (nav starts at Transactions). The home
+   there is no "Today" nav tab (nav starts at Transactions). The home
    page's own header carries the lens picker: [Today | Week | Month |
    Year] + ‹ › stepper (+ month/year dropdown on those lenses). Page
    title reflects the lens ("Today", "Week of 07/07/26", "July 2026",
@@ -21,7 +20,7 @@ Decisions:
    transactions, income vs spend.
 5. YEAR lens: 12-cell month grid — each cell that month's final verdict +
    margin (current month shows projection, future months blank); annual
-   totals (income, spend, saved, rate); category totals vs prior year;
+   totals (income, spend, left over, rate); category totals vs prior year;
    steppable across years. Closed months are judged against their frozen
    budget snapshot; a closed month with no snapshot shows net income −
    spending instead of a verdict (see budget-snapshots.md).
@@ -29,10 +28,10 @@ Decisions:
    month_status/history — the daily email and the canonical monthly math
    change zero. Week/year math composes from existing engine outputs
    (daily allowances, month_status per month); no new judgment rules.
-7. Link to email scheduling: the week/month report-card views
-   become the future weekly/monthly email bodies — build the render
-   functions email-reusable (single-source, like todayview).
+7. Link to email scheduling: the week/month report-card render
+   functions are email-reusable (single-source, like todayview), so the
+   same views can serve as weekly/monthly email bodies.
 
-Constraints: engine month_status untouched; new views compute via
-existing functions per month/day; suite stays green; SPA-only nav change
-plus new /api endpoints for week/month/year summaries as needed.
+Constraints: every lens reads the one engine month_status; the views
+compute via existing functions per month/day, served by /api endpoints
+for the week, month and year summaries.

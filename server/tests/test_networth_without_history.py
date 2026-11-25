@@ -24,7 +24,11 @@ class NetWorthWithoutHistoryTests(unittest.TestCase):
         with mock.patch.object(reporting, "_reconstruct_trend",
                                side_effect=AssertionError("walked")), \
              mock.patch.object(reporting, "_cumulative_savings",
-                               side_effect=AssertionError("walked")):
+                               side_effect=AssertionError("walked")), \
+             mock.patch.object(reporting, "_coinbase_pl",
+                               side_effect=AssertionError("P/L panel")), \
+             mock.patch.object(reporting, "_retirement_combined",
+                               side_effect=AssertionError("P/L panel")):
             nw = reporting.compute_networth(self.conn, trend=False)
         for k in ("current_total", "full_total", "by_institution",
                   "by_asset_class", "property_net"):
@@ -33,6 +37,10 @@ class NetWorthWithoutHistoryTests(unittest.TestCase):
         self.assertEqual(nw["snapshot_trend"], [])
         self.assertEqual(nw["savings_trend"], [])
         self.assertEqual(nw["trend_estimated_until"], 0)
+        # the P/L panels belong to the page, not to today's figures: the
+        # Coinbase one reads every crypto row's whole raw payload
+        self.assertEqual(nw["coinbase_pl"], [])
+        self.assertEqual(nw["retirement_combined"], {})
 
     def test_the_full_report_still_walks(self):
         with mock.patch.object(reporting, "_reconstruct_trend",

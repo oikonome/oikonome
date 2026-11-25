@@ -21,11 +21,13 @@ disabled after it, and nothing acts on it in between.
 """
 
 import datetime as dt
+import os
 import unittest
 
+from oikonome.db import tenancy
 from oikonome.engine import bills, budget
 
-from .util import TODAY, add_bill, add_txn, make_db, write_config
+from .util import TEST_DB, TODAY, add_bill, add_txn, make_db, write_config
 
 
 class ARenameCarriesTheDisabledMark(unittest.TestCase):
@@ -139,17 +141,28 @@ class TheNightlyPassSkipsADisabledBillMidRename(unittest.TestCase):
     def test_a_rename_landing_mid_pass_does_not_un_disable_it(self):
         # the rename commits AFTER the pass has read its rows and BEFORE it
         # decides what to do with each one — the gap between read and act
+        # The rename comes from another session, as a person's rename does:
+        # the pass holds its own transaction open, and a bill write inside
+        # it without the bill-claim lock is refused.
         original = bills._advance_due_dates
+        tid = self.conn.execute(
+            "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"]
+        other = tenancy.tenant_connect(tid, os.environ.get(
+            "OIKONOME_TEST_DSN",
+            f"postgresql://oikonome_app:apppass@127.0.0.1:5433/{TEST_DB}"))
+        other.execute("SET statement_timeout = '10s'")
 
         def rename_mid_pass(conn, today, stats):
             original(conn, today, stats)
-            bills.rename_bill(conn, "Zenith Fibre", "Zenith Net")
+            self.assertEqual(
+                bills.rename_bill(other, "Zenith Fibre", "Zenith Net"), 1)
 
         bills._advance_due_dates = rename_mid_pass
         try:
             bills.run(self.conn, TODAY)
         finally:
             bills._advance_due_dates = original
+            other.close()
 
         # the rename took, and the bill is still paused: same amount, and
         # no proposal of any kind was raised against it

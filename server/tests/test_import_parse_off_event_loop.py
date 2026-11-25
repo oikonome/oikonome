@@ -115,10 +115,10 @@ class ImportParseOffEventLoopTests(unittest.TestCase):
         self.assertTrue(SEEN)
 
     def test_taxdoc_analyze_parses_in_a_worker_thread(self):
-        def fake_analyze(conn, filename, data, mime):
+        def fake_parse(ctx, filename, data, mime):
             _assert_off_loop()
-            return {"rows": [], "token": "t"}
-        with mock.patch("oikonome.engine.taxdocs.analyze", fake_analyze):
+            return "w2", [{"year": 2024}]
+        with mock.patch("oikonome.engine.taxdocs.parse", fake_parse):
             r = self.client.post(
                 "/api/import/taxdoc/analyze",
                 files={"file": ("w2.pdf", b"%PDF-1.4", "application/pdf")})

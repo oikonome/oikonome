@@ -166,10 +166,12 @@ class CapitalizedPreOpeningCostTests(unittest.TestCase):
         p2023 = books._pnl_core(self.conn, ent, 2023)
         retained = p2023["net_operating"] + p2024["net_operating"]
         ye = self._year_end(ent, 2024, dt.date(2026, 7, 15))
-        # contributions through 2024 (the 2023 cost) plus the retained
-        # earnings the 2023 and 2024 P&Ls report — the refund adds nothing
-        self.assertEqual(ye["capital_account"], round(3000.0 + retained, 2))
-        self.assertEqual(ye["capital_account"], 3000.0)
+        # contributions through 2024 (the 2023 cost, less the refund that
+        # came back to the owner's own card) plus the retained earnings the
+        # 2023 and 2024 P&Ls report — the refund adds no income
+        self.assertEqual(ye["capital_account"],
+                         round(3000.0 - 1000.0 + retained, 2))
+        self.assertEqual(ye["capital_account"], 2000.0)
 
 
 if __name__ == "__main__":

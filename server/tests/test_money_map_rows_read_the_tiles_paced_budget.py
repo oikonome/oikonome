@@ -134,7 +134,7 @@ class TodayPayloadCarriesPacedBudgetsTests(unittest.TestCase):
                     primary="FOOD_AND_DRINK")
         finally:
             conn.close()
-        with mock.patch("oikonome.web.api._today", return_value=TODAY), \
+        with mock.patch("oikonome.web.api_today._today", return_value=TODAY), \
                 mock.patch("oikonome.localtime.now_local",
                            return_value=dt.datetime.combine(TODAY,
                                                             dt.time(12))):

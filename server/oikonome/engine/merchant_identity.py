@@ -229,6 +229,40 @@ def _survivor(conn, mid):
     return cur
 
 
+def _survivors(conn, mids) -> dict:
+    """{id: _survivor(conn, id)} for every id at once.
+
+    Every chain advances one hop per read, so the reads follow the longest
+    chain, not the number of ids. Each id keeps its own `seen` set: where a
+    walk stops inside a cycle depends on where it started, and the answer
+    must be the single walk's."""
+    out: dict = {}
+    walks: dict = {}
+    for m in set(mids):
+        if m is None:
+            out[None] = None
+        else:
+            walks[m] = (m, {m})
+    while walks:
+        rows = conn.execute(
+            "SELECT id, merged_into FROM merchants WHERE id = ANY(%s)",
+            (list({cur for cur, _seen in walks.values()}),)).fetchall()
+        nxt_of = {r["id"]: r["merged_into"] for r in rows}
+        going: dict = {}
+        for start, (cur, seen) in walks.items():
+            if cur not in nxt_of:
+                out[start] = None
+                continue
+            nxt = nxt_of[cur]
+            if nxt is None or nxt in seen or len(seen) >= _MERGE_HOPS:
+                out[start] = cur
+                continue
+            seen.add(nxt)
+            going[start] = (nxt, seen)
+        walks = going
+    return out
+
+
 def _create(conn, name: str, source: str, *, entity=None, kind="merchant",
             logo=None, website=None):
     # the one door a merchant is minted through: only a person's own name
@@ -629,6 +663,76 @@ def _merchant_by_bank_descriptor(conn, bank_name: str, asking=(),
                 and _descriptor_names(bank_name, next(iter(seen["named"]))))):
         return None
     return mid
+
+
+def _line_word(cleaned: str) -> str | None:
+    """The word a cleaned line is looked up by: its longest word that could
+    tell a payee apart (four letters or more, not a word for a kind of
+    business or a bank mechanic). None when it has none — a line made of
+    generic words names nobody, and is never matched by its clean."""
+    words = [w for w in _words(cleaned)
+             if len(w) >= 4 and w.isalpha()
+             and w not in merchant_dedup._GENERIC_ALONE
+             and w not in merchant_dedup._STOP]
+    return max(words, key=len) if words else None
+
+
+def _cleaned_line_evidence(conn, asks, cities, deciding=()) -> dict:
+    """`_descriptor_evidence` for lines that are one line once CLEANED.
+
+    `asks` is (bank line, ids of the group asking) pairs, each an unnamed
+    group no exact line answered for. A statement export and a live feed
+    write one payment as two strings — a lead-in on one, the amount inside
+    the other — that `merchant_dedup.canonical_merchant` cleans to one. For
+    each asked line: `named`, the aggregator names of the live rows whose
+    own line cleans to the same string, and `mids`, the merchants those
+    rows were given. Only rows the aggregator NAMED are evidence, never
+    another unnamed row, and never a row this pass is itself deciding by
+    its line (`deciding`, every adopter's ids): an adopter must not see an
+    adopter, or the answer depends on which was settled first — and a
+    re-resolve revisits rows that still carry the merchant they are being
+    moved off, which would otherwise vouch for staying put.
+
+    One grouped read however many lines ask: the ledger's named lines that
+    contain one of the asked lines' distinctive words, cleaned here and
+    compared whole. Returned keyed by the asked line, in the shape
+    `_merchant_by_bank_descriptor` takes, so the same tests decide — one
+    aggregator name, one surviving merchant, and a line that names it."""
+    out: dict = {}
+    want: dict[str, list[str]] = {}          # cleaned -> asked lines
+    words: set[str] = set()
+    for bank, _ids in asks:
+        if not (bank or "").strip():
+            continue
+        cleaned = merchant_dedup.canonical_merchant(bank, cities) or ""
+        word = _line_word(cleaned)
+        if word is None:
+            continue
+        out[bank] = {"named": set(), "mids": set()}
+        want.setdefault(cleaned.lower(), []).append(bank)
+        words.add(word)
+    if not words:
+        return out
+    seen: dict[str, str] = {}
+    for r in conn.execute(
+            f"""SELECT t.name AS bank, lower(t.merchant_name) AS n,
+                       t.merchant_id AS mid
+                  FROM transactions t
+                 WHERE {_LIVE_OR_SETTLED}
+                   AND t.merchant_name IS NOT NULL
+                   AND t.merchant_id IS NOT NULL
+                   AND lower(t.name) LIKE ANY(%s)
+                   AND NOT (t.id = ANY(%s))
+                 GROUP BY 1, 2, 3""",
+            ([f"%{w}%" for w in sorted(words)], list(deciding))).fetchall():
+        line = r["bank"]
+        if line not in seen:
+            seen[line] = (merchant_dedup.canonical_merchant(line, cities)
+                          or "").lower()
+        for bank in want.get(seen[line], ()):
+            out[bank]["named"].add(r["n"])
+            out[bank]["mids"].add(r["mid"])
+    return out
 
 
 # The country codes a card network ends a hold's location tail with.
@@ -1081,6 +1185,125 @@ def _descriptor_overrules_enrichment(conn, bank_name: str, enriched: str,
     return mid
 
 
+def _line_holder(conn, bank_name: str, name: str, asking=(), *,
+                 ignore=(), evidence: dict | None = None,
+                 agreement: dict | None = None):
+    """The merchant a bank line already belongs to, for rows the feed has
+    just attached a first-seen entity to. None is every doubt.
+
+    The line must spell the entity's name, must already have agreed with
+    the feed about a payee (a row under exactly this line whose feed name
+    the line names: the test `_descriptor_overrules_enrichment` rests on,
+    so a bank's constant never qualifies), and every OTHER row under it
+    must resolve to one surviving merchant: an ordinary one with no entity
+    of its own. `asking` are the rows being decided and `ignore` merchants
+    that may not vote (the twin a repair is judging); neither is evidence
+    for itself. specs/merchant-identity.md, "A line that has its merchant
+    keeps it".
+
+    `evidence` and `agreement` are `_descriptor_evidence` and
+    `_agreement_evidence` read for a whole pass; without them this line is
+    read on its own."""
+    bank, name = (bank_name or "").strip(), (name or "").strip()
+    if not bank or not name or bank == name:
+        return None
+    if not _descriptor_names(bank, name):
+        return None
+    if evidence is None:
+        evidence = _descriptor_evidence(conn, [(bank_name, list(asking))])
+    if agreement is None:
+        agreement = _agreement_evidence(conn, [(bank_name, name)])
+    ignore = set(ignore)
+    mine = agreement["lower"].get(name)
+    if mine is None:
+        mine = conn.execute("SELECT lower(%s) AS l", (name,)).fetchone()["l"]
+    voters = [mid for mid, n, _c in agreement["rows"].get(bank_name) or ()
+              if n != mine and _descriptor_names(bank, n)]
+    seen = evidence.get(bank_name) or {"mids": set()}
+    survivor = _survivors(conn, [*voters, *seen["mids"]])
+    agreed = {survivor[mid] for mid in voters}
+    agreed -= ignore | {None}
+    holders = {survivor[mid] for mid in seen["mids"]}
+    holders -= ignore | {None}
+    if len(holders) != 1 or not agreed or not agreed <= holders:
+        return None
+    mid = next(iter(holders))
+    got = conn.execute(
+        "SELECT kind, plaid_entity_id FROM merchants WHERE id=%s",
+        (mid,)).fetchone()
+    if (got is None or (got["kind"] or "merchant") != "merchant"
+            or got["plaid_entity_id"] is not None):
+        return None
+    return mid
+
+
+def _first_entity_answers(conn, groups) -> dict:
+    """{entity id: (merchant, feed identity)} for the groups of a pass
+    whose entity no merchant carries yet and whose one bank line already
+    has its merchant (`_line_holder`).
+
+    Read for every such group before the pass writes anything, so the
+    evidence is the ledger as the pass found it: a row the same pass has
+    yet to resolve carries no merchant and vouches for nothing. An entity
+    two groups disagree about — or one of whose groups the line does not
+    answer for — is left to mint as before: one id cannot be two
+    merchants."""
+    asks = []
+    for g in groups:
+        ident, alias = g["ident"], g["alias"]
+        if (not ident or g["outlet"] or (alias and alias[1] == "manual")
+                or (ident.get("kind") or "merchant") != "merchant"):
+            continue
+        asks.append((g, ident))
+    if not asks:
+        return {}
+    known = {r["plaid_entity_id"] for r in conn.execute(
+        "SELECT plaid_entity_id FROM merchants"
+        " WHERE plaid_entity_id = ANY(%s)",
+        ([i["entity_id"] for _g, i in asks],)).fetchall()}
+    asks = [(g, i) for g, i in asks if i["entity_id"] not in known]
+    if not asks:
+        return {}
+    one_line = [(g, i) for g, i in asks
+                if g["lines"] == 1 and (g["bank"] or "").strip()
+                and g["bank"] != g["raw_key"]]
+    evidence = _descriptor_evidence(
+        conn, [(g["bank"], [r["id"] for r in g["group"]])
+               for g, _i in one_line])
+    agreement = _agreement_evidence(
+        conn, [(g["bank"], i.get("name") or g["raw_key"])
+               for g, i in one_line])
+    answered = {id(g): _line_holder(
+                    conn, g["bank"], i.get("name") or g["raw_key"],
+                    [r["id"] for r in g["group"]],
+                    evidence=evidence, agreement=agreement)
+                for g, i in one_line}
+    votes: dict = {}
+    for g, i in asks:
+        votes.setdefault(i["entity_id"], []).append((answered.get(id(g)), i))
+    out = {}
+    for eid, got in votes.items():
+        mids = {m for m, _i in got}
+        if len(mids) == 1 and None not in mids:
+            out[eid] = (next(iter(mids)), got[0][1])
+    return out
+
+
+def _adopt_entity(conn, mid, ident: dict) -> bool:
+    """Give an existing merchant the feed's entity: the id, and the logo
+    and site where it has none. Its name and who named it stay."""
+    return conn.execute(
+        """UPDATE merchants SET plaid_entity_id = %s,
+                  logo_url = COALESCE(logo_url, %s),
+                  website = COALESCE(website, %s), updated_at = now()
+            WHERE id = %s AND plaid_entity_id IS NULL
+              AND merged_into IS NULL
+              AND NOT EXISTS (SELECT 1 FROM merchants x
+                               WHERE x.plaid_entity_id = %s)""",
+        (ident["entity_id"], ident.get("logo_url"), ident.get("website"),
+         mid, ident["entity_id"])).rowcount == 1
+
+
 def _line_merchant(conn, bank_name: str):
     """The merchant the bank line's own key already answers to, or None.
 
@@ -1413,6 +1636,15 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
 
         _mark_minters(prepared)
 
+        # An entity the household has never seen would mint a merchant.
+        # Where its rows' one bank line already has its merchant, that
+        # merchant takes the entity instead, before any group is settled:
+        # every group carrying the id then finds it by id, whatever order
+        # the keys are walked in.
+        for mid, ident in _first_entity_answers(conn, prepared).values():
+            if _adopt_entity(conn, mid, ident):
+                stats["line_kept"] = stats.get("line_kept", 0) + 1
+
         def _ask(g):
             named = g["bank"] != g["raw_key"]
             return {"bank": g["bank"] if g["lines"] == 1 else None,
@@ -1695,6 +1927,37 @@ def resolve(conn, *, txn_ids: list[str] | None = None,
                 evidence=evidence)):
             if n in unsure:
                 answers[n] = a
+        # Still unanswered: no row shares the exact line and no hold
+        # vouches for it. The line may yet be one the ledger knows under
+        # another spelling — a statement export's row of a payment the feed
+        # also carries, the lead-in on one and the amount inside the other —
+        # and then the rows the aggregator named under that CLEANED line
+        # say whose it is (`_cleaned_line_evidence`; the same tests as the
+        # exact line). Asked last, so an exact line always answers first,
+        # and never for a spelling family a person has named: their name
+        # for it is the answer `_settle` gives.
+        def _person_named(g):
+            fam = manual_family.get(
+                merchant_dedup.canonical_merchant(g["raw_key"], cities) or "")
+            return bool(fam) and len({c for c, _ in fam}) == 1
+
+        open_ = [n for n, (g, a) in enumerate(zip(adopters, answers))
+                 if a is None and not _person_named(g)]
+        if open_:
+            by_clean = _cleaned_line_evidence(
+                conn, [(adopters[n]["bank"],
+                        [r["id"] for r in adopters[n]["group"]])
+                       for n in open_], cities,
+                deciding=[r["id"] for g in adopters for r in g["group"]])
+            for n in open_:
+                g = adopters[n]
+                if g["bank"] in by_clean:
+                    answers[n] = _merchant_by_bank_descriptor(
+                        conn, g["bank"], [r["id"] for r in g["group"]],
+                        evidence=by_clean)
+                    if answers[n] is not None:
+                        stats["cleaned_line"] = (stats.get("cleaned_line", 0)
+                                                 + len(g["group"]))
         for g, answer in zip(adopters, answers):
             _settle(g, answer)
     if txn_ids is None:

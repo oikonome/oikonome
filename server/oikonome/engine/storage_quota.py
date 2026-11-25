@@ -71,6 +71,21 @@ def _mb(n: int) -> str:
     return f"{n / (1024 * 1024):,.0f} MB"
 
 
+def hold_lock(conn) -> None:
+    """Take the household's file-bytes lock for the rest of the enclosing
+    transaction. Every writer that stores bytes (a receipt, a parked
+    upload, a restore) serializes on this one key, and a writer that also
+    needs the pairing or identity lock takes this one FIRST: storage, then
+    pairing, then identity, then rows. A receipt snap reserves its bytes
+    and only then finds its charge under the pairing lock, so a writer
+    holding pairing that asked for storage afterwards would close a cycle
+    with that snap. Re-entrant: a transaction that holds it gets it again
+    at once."""
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtext("
+        "'oikonome:storage:' || current_setting('app.tenant_id')))")
+
+
 def reserve(conn, incoming: int) -> None:
     """Refuse (StorageQuotaExceeded) when `incoming` more bytes would take
     the household past its quota. Run it in the transaction that writes
@@ -79,9 +94,7 @@ def reserve(conn, incoming: int) -> None:
     quota = quota_bytes()
     if quota is None or incoming <= 0:
         return
-    conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtext("
-        "'oikonome:storage:' || current_setting('app.tenant_id')))")
+    hold_lock(conn)
     held = bytes_held(conn)
     if held + incoming > quota:
         raise StorageQuotaExceeded(

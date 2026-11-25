@@ -152,7 +152,7 @@ class SectionTests(_Household):
                          [self.txn])
         opts = self.acts["uncategorized"][0]["options"]
         self.assertEqual(len(opts), mailact.MAX_OPTIONS)
-        self.assertIn(("FOOD_AND_DRINK", "FOOD AND DRINK"), opts)
+        self.assertIn(("FOOD_AND_DRINK", "Food and Drink"), opts)
         self.assertNotIn("?", [k for k, _ in opts])
         self.assertTrue(any(a["kind"] == "proposals" for a in self.acts["alerts"]))
 
@@ -162,7 +162,7 @@ class SectionTests(_Household):
         self.assertIn(self._alert()["message"], html)
         self.assertIn("mute ✕", html)
         self.assertIn("Confirm bill", html)
-        self.assertIn("FOOD AND DRINK", html)
+        self.assertIn("Food and Drink", html)
         yes = mailact.url(BASE, self.tid, self.owner, "bill", self.pid, "approve")
         self.assertIn(yes, html)
         self.assertIn(yes, plain)
@@ -283,7 +283,7 @@ class RouteTests(_Routes):
     def test_post_files_the_charge_this_row_only(self):
         tok = self._tok(self.owner, "cat", self.txn, "FOOD_AND_DRINK")
         r = self.client.get("/act", params={"token": tok})
-        self.assertIn("FOOD AND DRINK", r.text)
+        self.assertIn("Food and Drink", r.text)
         self.assertIsNone(self.conn.execute(
             "SELECT category_override FROM transactions WHERE id=%s",
             (self.txn,)).fetchone()["category_override"],
@@ -514,11 +514,11 @@ class FileUnderStaleTests(_Routes):
         data.set_category(self.conn, self.txn, "TRAVEL", scope="one")
         r = self.client.get("/act", params={"token": tok})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertIn("now filed under TRAVEL", r.text)
+        self.assertIn("now filed under Travel", r.text)
         self.assertNotIn('action="/act"', r.text)
         r = self.client.post("/act", data={"token": tok})
         self.assertEqual(r.status_code, 200, r.text)
-        self.assertIn("now filed under TRAVEL", r.text)
+        self.assertIn("now filed under Travel", r.text)
         self.assertEqual(self._cat(), "TRAVEL",
                          "a mailed guess overwrote a later decision")
 

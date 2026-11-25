@@ -444,10 +444,12 @@ class ProposalsAlertSettlesTests(DetectBase):
     still asking them to review it."""
 
     def _offer(self, pid, payee):
+        # a current offer, dated off the real calendar: the queue the alert
+        # counts is the listed one, and an offer a cycle behind has lapsed
         rd._insert_proposal(
             self.conn, pid=pid, kind="add", payee=payee, amount=40.0,
             bill_type="fixed", frequency="monthly", interval=1,
-            next_due=TODAY + dt.timedelta(days=7), evidence={})
+            next_due=dt.date.today() + dt.timedelta(days=7), evidence={})
 
     def _alert_active(self):
         return self.conn.execute(

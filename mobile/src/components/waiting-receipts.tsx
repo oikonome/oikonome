@@ -12,14 +12,14 @@ import * as DocumentPicker from "expo-document-picker";
 import { Image as ExpoImage } from "expo-image";
 import * as ImagePicker from "expo-image-picker";
 import { useRouter } from "expo-router";
-import { Alert, Pressable, StyleSheet, Text, TextInput, View }
+import { Alert, Platform, Pressable, StyleSheet, Text, TextInput, View }
   from "react-native";
 
 import { errText, type WaitingReceipt, type WaitingReceipts as Waiting }
   from "../lib/api";
 import { patchList, removeFromList } from "../lib/cache";
 import { ymd } from "../lib/dates";
-import { receiptDetailsDraft } from "../lib/pure";
+import { pickedImagePart, receiptDetailsDraft } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, mmddyy, money } from "../lib/theme";
 import { useDemo, useViewer } from "../lib/viewer";
@@ -28,7 +28,8 @@ import { WAITING_KEY, moreWaiting, receiptDateBounds, useMatchReceipt,
          useUnmatchReceipt, useWaitingReceipts, parseStalled,
          forgetParseStart } from "../lib/waiting";
 import DatePicker, { DateField } from "./date-picker";
-import { Card, H } from "./ui";
+import SlipNote from "./slip-note";
+import { Card, H, Note } from "./ui";
 
 /** Camera, photo library or a PDF → the file the snap door takes. */
 export async function pickReceipt(source: "camera" | "library" | "pdf")
@@ -46,13 +47,14 @@ export async function pickReceipt(source: "camera" | "library" | "pdf")
   }
   const fn = source === "camera" ? ImagePicker.launchCameraAsync
                                  : ImagePicker.launchImageLibraryAsync;
-  const res = await fn({ mediaTypes: ["images"], quality: 0.8 });
+  // Compatible: iOS hands a library HEIC over as a JPEG, a type the
+  // server takes; the photo's own type is sent with it either way, since
+  // the server stores the declared type as the file's
+  const res = await fn({ mediaTypes: ["images"], quality: 0.8,
+    preferredAssetRepresentationMode:
+      ImagePicker.UIImagePickerPreferredAssetRepresentationMode.Compatible });
   if (res.canceled || !res.assets[0]) return null;
-  // the picker knows the real type and name; a library PNG or HEIC sent
-  // as "receipt.jpg" is refused by the door as a mislabelled file
-  const a = res.assets[0];
-  return { uri: a.uri, name: a.fileName ?? undefined,
-           type: a.mimeType ?? undefined };
+  return pickedImagePart(res.assets[0], Platform.OS);
 }
 
 /** Camera, photo library or PDF — the same three the Receipts card offers,
@@ -74,7 +76,7 @@ export function SnapReceiptButton({ label = "📷 Receipt" }: { label?: string }
   const snap = useSnapReceipt();
   const router = useRouter();
   return (
-    <Pressable style={[s.btn, snap.isPending && { opacity: 0.5 }]}
+    <Pressable accessibilityRole="button" style={[s.btn, snap.isPending && { opacity: 0.5 }]}
                disabled={snap.isPending}
                accessibilityLabel="snap a receipt before its transaction arrives"
                onPress={async () => {
@@ -109,7 +111,7 @@ export function WaitingBadge() {
   const n = q.data?.count ?? 0;
   if (!n) return null;
   return (
-    <Pressable style={s.pill} onPress={() => router.push("/items")}>
+    <Pressable accessibilityRole="button" style={s.pill} onPress={() => router.push("/items")}>
       <Text style={{ color: C.text, fontSize: 12 }}>
         {n} receipt{n === 1 ? "" : "s"} waiting ›</Text>
     </Pressable>
@@ -156,7 +158,7 @@ function DetailsForm({ r, onDone }: { r: WaitingReceipt; onDone?: () => void }) 
   // (the web form's bounds); the picker offers exactly that
   const bounds = receiptDateBounds(r.created_at);
   const submit = () => {
-    const d = receiptDetailsDraft(total, date, store);
+    const d = receiptDetailsDraft(total, date, store, r.merchant);
     if (!d.ok) { setErr(d.error); return; }
     if (bounds && (d.body.date < bounds.min || d.body.date > bounds.max)) {
       setErr(d.body.date > bounds.max
@@ -182,16 +184,19 @@ function DetailsForm({ r, onDone }: { r: WaitingReceipt; onDone?: () => void }) 
         </View>
       </View>
       <TextInput style={s.input} placeholder="store (optional)"
-                 placeholderTextColor={C.mut} maxLength={80}
+                 placeholderTextColor={C.mut}
+                 maxLength={Math.max(80, (r.merchant ?? "").length)}
                  accessibilityLabel="store"
                  value={store} onChangeText={setStore} />
       <View style={{ flexDirection: "row", gap: 8 }}>
-        <Pressable style={[s.btn, s.btnSmall, save.isPending && { opacity: 0.5 }]}
+        <Pressable accessibilityRole="button"
+                   style={[s.btn, s.btnSmall, save.isPending && { opacity: 0.5 }]}
                    disabled={save.isPending} onPress={submit}>
           <Text style={s.btnText}>{save.isPending ? "Saving…" : "Save"}</Text>
         </Pressable>
         {onDone && (
-          <Pressable style={[s.btn, s.btnSmall, s.btnQuiet]} onPress={onDone}>
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnSmall, s.btnQuiet]} onPress={onDone}>
             <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
           </Pressable>)}
       </View>
@@ -273,23 +278,25 @@ export default function WaitingReceiptsCard() {
       {!viewer && !demo && (
         <View style={{ flexDirection: "row", gap: 8, marginTop: 8,
                        flexWrap: "wrap" }}>
-          <Pressable style={[s.btn, snap.isPending && { opacity: 0.5 }]}
+          <Pressable accessibilityRole="button" style={[s.btn, snap.isPending && { opacity: 0.5 }]}
                      disabled={snap.isPending} onPress={() => take("camera")}>
             <Text style={s.btnText}>
               {snap.isPending ? "Uploading…" : "📷 Receipt"}</Text>
           </Pressable>
-          <Pressable style={[s.btn, s.btnQuiet]} disabled={snap.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet]} disabled={snap.isPending}
                      onPress={() => take("library")}>
             <Text style={[s.btnText, { color: C.mut }]}>Choose photo</Text>
           </Pressable>
-          <Pressable style={[s.btn, s.btnQuiet]} disabled={snap.isPending}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet]} disabled={snap.isPending}
                      onPress={() => take("pdf")}>
             <Text style={[s.btnText, { color: C.mut }]}>PDF</Text>
           </Pressable>
         </View>
       )}
-      {err ? <Text style={{ color: C.bad, fontSize: 12, marginTop: 6 }}>
-        {errText(err)}</Text> : null}
+      {err ? <Note bad style={{ color: C.bad, fontSize: 12, marginTop: 6 }}>
+        {errText(err)}</Note> : null}
       {q.isPending && <Text style={s.mut}>Loading…</Text>}
       {d && d.waiting.length === 0 && (
         <Text style={[s.mut, { marginTop: 6 }]}>
@@ -326,6 +333,11 @@ export default function WaitingReceiptsCard() {
               <Text style={s.mut}>
                 Was matched by hand — that charge was removed. Pick its
                 charge again.</Text>)}
+            {/* which slip it is: a copy counted elsewhere says so, and a
+                look-alike asks once (specs/receipts.md) */}
+            <SlipNote id={r.id} counts={r.counts ?? true}
+              twins={r.slip_twins ?? []}
+              suspected={r.suspected ?? []} mayAnswer={!viewer} />
             {r.candidates.map((c) => (
               <View key={c.txn_id} style={s.cand}>
                 <View style={{ flex: 1 }}>
@@ -338,7 +350,7 @@ export default function WaitingReceiptsCard() {
                       .join(" · ")}</Text>
                 </View>
                 {!viewer && (
-                  <Pressable style={[s.btn, s.btnSmall,
+                  <Pressable accessibilityRole="button" style={[s.btn, s.btnSmall,
                                      match.isPending && { opacity: 0.5 }]}
                              disabled={match.isPending}
                              onPress={() => match.mutate(
@@ -417,12 +429,12 @@ const s = StyleSheet.create({
   thumbPdf: { alignItems: "center", justifyContent: "center" },
   pill: { backgroundColor: C.hover, borderRadius: 999,
           paddingHorizontal: 10, paddingVertical: 3 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8 },
   btnSmall: { paddingHorizontal: 10, paddingVertical: 5 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 14,
            paddingHorizontal: 10, paddingVertical: 8 },
 });

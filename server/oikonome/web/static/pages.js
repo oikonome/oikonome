@@ -415,6 +415,13 @@
         loginErr.textContent = m || "";
         loginErr.style.display = m ? "" : "none";
       }
+      // the fields read the error as their description (aria-describedby
+      // in the template) and are marked invalid while it shows
+      [emailEl, pwEl, totpEl].forEach(function (el) {
+        if (!el) return;
+        if (m) el.setAttribute("aria-invalid", "true");
+        else el.removeAttribute("aria-invalid");
+      });
       if (pkErr) {
         if (m && mode2fa === "passkey_only") {
           pkErr.textContent = m; pkErr.style.display = "";

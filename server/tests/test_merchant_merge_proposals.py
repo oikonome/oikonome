@@ -191,7 +191,7 @@ class TheVetoesMakeTheKnownMistakesImpossible(unittest.TestCase):
         b = _cand("Ashbury Toyworks Market", rows=20)
         b.update(first=d(2022, 8, 2), last=d(2024, 1, 5))
         why = mm.supports(a, b)
-        self.assertTrue(any("stops 06/22" in w and "starts 08/22" in w for w in why), why)
+        self.assertTrue(any("stops in Jun 2022" in w and "starts in Aug 2022" in w for w in why), why)
         # spellings that interleave say nothing either way
         b.update(first=d(2021, 6, 1))
         self.assertFalse(any("stops" in w for w in mm.supports(a, b)))
@@ -272,6 +272,42 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
             "SELECT count(*) AS n FROM transactions t JOIN merchants m ON m.id=t.merchant_id "
             "WHERE m.name='Ashbury Toyworks Market' AND t.removed=0").fetchone()["n"], 5)
 
+    def test_an_object_inside_a_signals_list_is_dropped(self):
+        """The clients render each signal, support and sample as text: an
+        object inside a restored list reads as absent, never as a crash."""
+        from oikonome.engine import merchant_merge as mm
+        ev = mm._evidence({"signals": ["same card", {"why": "name"}],
+                           "supports": [[1], "a receipt"],
+                           "from": {"rows": 3, "samples": ["X", {"a": 1}]},
+                           "into": "x", "rename_to": ["Brand"]})
+        self.assertEqual(ev["signals"], ["same card"])
+        self.assertEqual(ev["supports"], ["a receipt"])
+        self.assertEqual(ev["from"]["samples"], ["X"])
+
+    def test_evidence_of_another_shape_reads_as_no_evidence(self):
+        """A restored or hand-edited offer whose sides are not maps, whose
+        lists are not lists, or whose brand is not text still lists, and
+        still approves: the Merchants screen never fails on stored data."""
+        from oikonome.engine.compat import jsonb
+        mm.run(self.conn)
+        self.conn.execute(
+            "UPDATE merchant_merge_proposals SET evidence=%s",
+            (jsonb({"from": [1], "into": "x", "signals": "s",
+                    "supports": {"a": 1}, "rename_to": ["Brand"]}),))
+        offers = mm.pending(self.conn)
+        self.assertEqual(len(offers), 2)
+        for o in offers:
+            self.assertEqual((o["from_rows"], o["from_samples"],
+                              o["into_samples"], o["signals"]),
+                             (None, [], [], []))
+            # the reasons are worked out from the live sides, never read
+            # from the stored list
+            self.assertTrue(all(isinstance(x, str) for x in o["supports"]))
+            self.assertEqual(o["into"], "Ashbury Toyworks Market")
+        o = next(o for o in offers if o["from"] == "Ashbury Toyw")
+        self.assertEqual(mm.decide(self.conn, o["id"], "approve").get("into"),
+                         "Ashbury Toyworks Market")
+
     def test_a_rejected_pair_is_never_offered_again(self):
         mm.run(self.conn)
         o = next(o for o in mm.pending(self.conn) if o["from"] == "Ashbury Toywo")
@@ -339,12 +375,13 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
         self.assertIsNone(mm.notice(self.conn))
         self.assertEqual(alerts.build({"merge_offers": None}), [])
         mm.run(self.conn)
+        self._past_the_hold()
         first = mm.notice(self.conn)
         self.assertEqual((first["pending"], first["batch"]), (2, 2))
         line = alerts.build({"merge_offers": first})[0]
         self.assertEqual((line["kind"], line["severity"], line["link"]),
                          ("merges", "info", "/merchants"))
-        self.assertIn("2 merchant pairs", line["message"])
+        self.assertIn("2 new merchant pairs", line["message"])
         o = mm.pending(self.conn)[0]
         mm.decide(self.conn, o["id"], "reject")
         after = mm.notice(self.conn)
@@ -355,6 +392,31 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
         mm.decide(self.conn, mm.pending(self.conn)[0]["id"], "approve")
         self.assertIsNone(mm.notice(self.conn))
 
+    def _past_the_hold(self):
+        """Age every offer past the days a first batch waits before the
+        strip names it."""
+        self.conn.execute(
+            "UPDATE merchant_merge_proposals SET created_at = "
+            "created_at - make_interval(days => %s)",
+            (mm.NOTICE_HOLD_DAYS + 1,))
+
+    def test_a_first_batch_waits_before_the_strip_names_it(self):
+        """Offers found on a household's first night stay off the alert
+        strip for a few days — they are on the Merchants page, but a
+        household that has just set up is not greeted by a chore. Once the
+        first offers have aged, a new batch is announced the day it is
+        found."""
+        mm.run(self.conn)
+        self.assertEqual(len(mm.pending(self.conn)), 2)
+        self.assertIsNone(mm.notice(self.conn))
+        self._past_the_hold()
+        self.assertEqual(mm.notice(self.conn)["pending"], 2)
+        # a later offer beside the aged ones is news at once
+        self.conn.execute(
+            "UPDATE merchant_merge_proposals SET created_at = now() "
+            "WHERE id = (SELECT MAX(id) FROM merchant_merge_proposals)")
+        self.assertEqual(mm.notice(self.conn)["batch"], 1)
+
     def test_working_the_queue_retires_the_logged_alert_at_once(self):
         """The alert row in the log is a snapshot the Today build writes.
         Emptying the queue from the alert's own link — approving or
@@ -363,6 +425,7 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
         are waiting."""
         from oikonome.engine import alerts
         mm.run(self.conn)
+        self._past_the_hold()
         alerts.log(self.conn, alerts.build({"merge_offers": mm.notice(self.conn)}), TODAY)
         row = lambda: [r for r in alerts.history(self.conn) if r["kind"] == "merges"][0]
         self.assertEqual(row()["active"], 1)
@@ -463,6 +526,7 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
         empty — re-worded, and so undismissed, every night."""
         from oikonome.engine import merchant_dedup, merchant_identity
         mm.run(self.conn)
+        self._past_the_hold()
         self.assertEqual(mm.notice(self.conn)["pending"], 2)
         merchant_dedup.rename(self.conn, "Ashbury Toyw", "Ashbury Toyworks Market")
         merchant_identity.prune_empty(self.conn)
@@ -483,6 +547,7 @@ class OffersAreDecidedByThePerson(unittest.TestCase):
             "WHERE from_merchant_id=%s", (self.ids["Ashbury Toyw"],)
         ).fetchone()["status"], "stale")
         self.assertEqual(mm.run(self.conn)["stale"], 0)
+        self._past_the_hold()
         # the one real offer left is still on the strip
         self.assertEqual(mm.notice(self.conn)["pending"], 1)
 

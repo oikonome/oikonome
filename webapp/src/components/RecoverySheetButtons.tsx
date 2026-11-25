@@ -24,7 +24,7 @@ export function RecoverySheetButtons({ codes, onDone, onErr,
 }) {
   return (
     <div style={{ display: "flex", gap: ".5rem", marginTop: ".4rem" }}>
-      <button onClick={async () => {
+      <button className="pri" onClick={async () => {
         if (!(await copyText(codes.join("\n")))) {
           onErr("Couldn't copy — select the codes and copy them by hand, "
                 + `then press ${doneLabel}.`);

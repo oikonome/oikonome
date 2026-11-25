@@ -4,7 +4,7 @@ One PDF, printed on demand from what the instance already holds, that a
 household's survivor can read cold: every account and where it is held,
 the balances that day, the recurring bills and what pays them, the
 income, the businesses, and a note in the owner's own words about where
-the rest is. Decisions:
+the rest is. The rules:
 
 1. **A map, never a key.** No credential of any kind is in the packet —
    no password, no bank token, no full EIN (the last four only, with a
@@ -52,10 +52,28 @@ the rest is. Decisions:
   `GET /export/continuity`; `_continuity_pdf(user)` builds the packet
   for both doors (roster from the control plane, everything else on the
   tenant connection).
-- `web/api.py`: `GET /api/continuity` (fields + `mail_configured`,
-  `members_only`, `members`, `note_max` — every role reads; it is
-  household truth like the pages), `PUT /api/continuity` (owner; a save
-  of one field leaves the other; empty clears), `POST /api/continuity/email`.
+- `web/api_continuity.py`: `GET /api/continuity` (fields + `mail_configured`,
+  `members_only`, `members`, `note_max`, `note_set`, `note_readable`),
+  `PUT /api/continuity` (owner; a save of one field leaves the other;
+  empty clears), `POST /api/continuity/email`.
+- **The note is the owner's to read**, like the PDF it heads: it says
+  where the will and the passwords are. `continuity_get` decides it with
+  `api_common._is_owner` (the predicate `_owner_only` refuses on) and the
+  shared-login rule (`demoguard.people_hidden`): any other caller — a
+  member, a viewer, a script token, the shared demonstration login — gets
+  `note: ""`, `note_set` (whether one is written) and `note_readable:
+  false`. No step-up is asked to read it; ownership is the whole rule.
+  Clients show "Only the household owner can read this note" in place of
+  the fields and hide Save when `note_readable` is `false`; a reply
+  without the field (an older server) is treated as readable. An older
+  phone build that predates the field shows a non-owner an empty note —
+  acceptable, because it has nothing to leak and its Save is refused
+  (`PUT` is owner-only). The note's other readers: the settings read
+  never carries it (not in `_SETTINGS_FIELDS`; an unclassified key is
+  owner-only in `settings_exposure.view_for` anyway); the ZIP export, the
+  dump, the PDF and the emailed copy are all owner-only doors; the
+  activity log records which keys changed, never the text; a restore is
+  an owner act.
 - Clients: `ContinuityCard` on Settings → Data (web) and under the
   "Your data" card in More → Settings (mobile; PDF to the share sheet via
   the existing authenticated `download`). On hosted the recipient is a

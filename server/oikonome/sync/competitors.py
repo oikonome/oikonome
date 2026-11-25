@@ -25,7 +25,7 @@ from typing import Callable
 
 from ..engine.compat import as_date
 from . import flowmap
-from .base import (FileImportIds, Transaction, check_split_accounts,
+from .base import (FileRowCount, FileImportIds, Transaction, check_split_accounts,
                    drop_before_history, ensure_split_account, split_former,
                    tally_split, upsert_transactions)
 from .csvimport import (bounded_dict_reader, check_width, date_order,
@@ -142,7 +142,7 @@ def _generic(conn, account_id: str, text: str, *, prefix: str,
     by_vendor: dict[str, list[tuple]] = {}
     for p in parsed:
         by_vendor.setdefault((p[4].get("account") or "?").strip(), []).append(p)
-    total = {"imported": 0, "rows": 0, "skipped_duplicates": 0,
+    total = {"imported": 0, "matched": 0, "rows": 0, "skipped_duplicates": 0,
              "split_accounts": {}}
     check_split_accounts(by_vendor)
     run_ids: dict = {}          # one FileImportIds per target across the run
@@ -159,7 +159,7 @@ def _generic(conn, account_id: str, text: str, *, prefix: str,
                            former=split_former(prefix, vendor_name, target),
                            ids=run_ids.setdefault(
                                target, FileImportIds(prefix, target)))
-        for k in ("imported", "rows", "skipped_duplicates"):
+        for k in ("imported", "matched", "rows", "skipped_duplicates"):
             total[k] += out[k]
         tally_split(total["split_accounts"], vendor_name,
                out["imported"])
@@ -201,8 +201,10 @@ def _import_into(conn, account_id: str, parsed: list[tuple], *, prefix: str,
     if batch_id:
         from . import batches
         batches.tag(conn, txns, batch_id)
-    added = upsert_transactions(conn, txns)
-    return {"imported": added, "rows": len(txns),
+    count = FileRowCount(conn, txns)
+    upsert_transactions(conn, txns)
+    added, matched = count.after()
+    return {"imported": added, "matched": matched, "rows": len(txns),
             "skipped_duplicates": skipped_dupes,
             "skipped_older": skipped_older}
 

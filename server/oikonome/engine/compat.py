@@ -21,6 +21,7 @@ Conventions every engine module follows:
 
 import datetime as dt
 import json
+import re
 
 from psycopg.types.json import Jsonb
 
@@ -53,6 +54,16 @@ def as_date(v) -> dt.date | None:
     return d
 
 
+def asset_day(v) -> dt.date | None:
+    """A hand-entered asset's as_of / acquired_on: a day, or a month alone
+    ("2026-07", the shape an older build stored and the net-worth report
+    reads as that month), taken as the month's first day. Raises
+    ValueError on anything else, as `as_date` does."""
+    if isinstance(v, str) and re.fullmatch(r"\d{4}-\d{2}", v.strip()):
+        v = v.strip() + "-01"
+    return as_date(v)
+
+
 def req_date(v) -> dt.date:
     """A required date input, parsed strictly. Raises ValueError if missing or
     malformed (so a bad request becomes a 400, not a DB 500)."""
@@ -81,7 +92,18 @@ def strip_nul(v):
     Dropping the NUL would turn "limit\\x00" into "limit" and replace the real
     key's value, after every check that compares keys exactly (a policy
     denylist, a guarded destination, a network check on a URL) had already
-    waved the stranger through. No honest document needs one in a key."""
+    waved the stranger through. No honest document needs one in a key.
+
+    A value nested past what the walk can reach is refused the same way:
+    Python's JSON reader takes thousands of levels, and the RecursionError
+    the walk would raise names nothing the caller sent."""
+    try:
+        return _strip_nul(v)
+    except RecursionError:
+        raise ValueError("the document is nested too deeply") from None
+
+
+def _strip_nul(v):
     if isinstance(v, str):
         return v.replace("\x00", "") if "\x00" in v else v
     if isinstance(v, dict):
@@ -91,10 +113,10 @@ def strip_nul(v):
                 raise ValueError(
                     "a key holds a NUL character (U+0000), which no genuine "
                     "document carries")
-            out[k] = strip_nul(x)
+            out[k] = _strip_nul(x)
         return out
     if isinstance(v, (list, tuple)):
-        return [strip_nul(x) for x in v]
+        return [_strip_nul(x) for x in v]
     return v
 
 

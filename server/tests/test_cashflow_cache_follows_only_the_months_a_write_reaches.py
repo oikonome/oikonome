@@ -5,13 +5,14 @@ of history — and whatever it serves must be, to the cent, what a cold walk
 computes."""
 
 import datetime as dt
+import os
 import unittest
 from unittest import mock
 
 from oikonome.engine import budget, links, reporting
 from oikonome.db import tenancy
 
-from .util import add_bill, add_txn, make_db, write_config
+from .util import TEST_DB, add_bill, add_txn, make_db, write_config
 
 TODAY = dt.date(2026, 9, 15)
 FIRST = dt.date(2023, 1, 1)
@@ -107,27 +108,74 @@ class CacheFollowsOnlyTheMonthsAWriteReaches(unittest.TestCase):
         self.assertIn(jan, walked)
         self.assertEqual(served, self.cold())
 
-    def test_a_write_during_the_walk_files_nothing(self):
-        """A charge re-categorised while the walk runs (and put back after)
-        brings the stamps back to the values read before the walk: what the
-        walk computed with it in must not be filed under them."""
+    def peer(self):
+        """Another request's connection to the same household: the writes
+        a walk races are committed by someone else, never by the walk."""
+        tid = self.conn.execute(
+            "SELECT current_setting('app.tenant_id') AS t").fetchone()["t"]
+        other = tenancy.tenant_connect(tid, os.environ.get(
+            "OIKONOME_TEST_DSN",
+            f"postgresql://oikonome_app:apppass@127.0.0.1:5433/{TEST_DB}"))
+        self.addCleanup(other.close)
+        return other
+
+    def _split(self, peer, month):
+        """A third of the month's rent re-filed as groceries: its fixed
+        total really moves."""
+        rid = self.rent[month]
+        peer.execute(
+            "INSERT INTO transaction_splits (txn_id, line, category, amount)"
+            " VALUES (%s, 1, 'RENT_AND_UTILITIES', 1000), "
+            "(%s, 2, 'FOOD_AND_DRINK', 500)", (rid, rid))
+
+    def _undo(self, peer, month):
+        peer.execute("DELETE FROM transaction_splits WHERE txn_id = %s",
+                     (self.rent[month],))
+
+    def test_a_write_and_its_undo_during_the_walk_leave_no_wrong_month(self):
+        """An old rent is split while the walk runs and the split removed
+        before it ends. Count and row versions are then exactly what
+        they were before the walk, so no probe can see that it happened:
+        whatever the walk files must still be what a cold walk computes."""
         real = budget.month_status
         old = dt.date(2024, 3, 1)
-        done = []
+        peer = self.peer()
+        calls = []
 
-        def writing(conn, day, **kw):
-            if not done:
-                done.append(1)
-                conn.execute(
-                    "INSERT INTO manual_categories (transaction_id, category) "
-                    "VALUES (%s, 'FOOD_AND_DRINK')", (self.rent[old],))
-            return real(conn, day, **kw)
+        def racing(conn, day, **kw):
+            calls.append(day)
+            if len(calls) == 1:
+                self._split(peer, old)
+            out = real(conn, day, **kw)
+            if day.replace(day=1) == dt.date(2025, 6, 1):
+                self._undo(peer, old)
+            return out
 
-        with mock.patch.object(budget, "month_status", writing):
+        with mock.patch.object(budget, "month_status", racing):
             reporting.flow_breakdown(self.conn, TODAY, "all")
-        self.assertEqual(
-            [k for k in reporting._FIXED_MONTH_CACHE], [],
-            "the walk filed months under stamps read before its own write")
+        self.refresh()
+        served, _ = self.walk()
+        self.assertEqual(served, self.cold())
+
+    def test_a_write_between_the_stamps_and_the_walk_is_not_filed_under_them(self):
+        """A write committed just after the month stamps are read, and
+        undone after the request, must not leave the request's figures
+        filed under the stamps from before it."""
+        real = reporting._fixed_month_stamps
+        old = dt.date(2024, 3, 1)
+        peer = self.peer()
+
+        def then_write(conn):
+            stamps = real(conn)
+            self._split(peer, old)
+            return stamps
+
+        with mock.patch.object(reporting, "_fixed_month_stamps", then_write):
+            reporting.flow_breakdown(self.conn, TODAY, "all")
+        self._undo(peer, old)
+        self.refresh()
+        served, _ = self.walk()
+        self.assertEqual(served, self.cold())
 
     def test_a_write_to_an_old_month_walks_only_the_months_it_reaches(self):
         before, _ = self.walk()

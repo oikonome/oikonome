@@ -1,47 +1,36 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { Link } from "react-router";
-import { api, mmdd, type AlertRow } from "../api/client";
+import { alertAction, api, mmdd, withLiveLinks, type AlertRow,
+         type TodayFull } from "../api/client";
 import { patchList } from "../api/cache";
-import { localDayOf } from "../moneymath";
+import { FailedLine } from "../components/Loaded";
+import { EMPTY_LINES, localDayOf } from "../moneymath";
 import { canEdit } from "../role";
+import EmptyState from "../components/EmptyState";
+import SegmentedControl from "../components/SegmentedControl";
+import Note from "../components/Note";
 
 const SEV_PILL: Record<string, string> = { good: "g", warn: "a", bad: "r", info: "m" };
 const sevIcon = (s: string) => (s === "good" ? "✓" : s === "info" ? "•" : "⚠");
 const sevNote = (s: string) => (s === "bad" ? "bad" : s === "good" ? "good" : s === "info" ? "info" : "");
 // history filters — a six-month log needs them, and "dismissed" stops being
-// a state you have to scan the whole table for
-const FILTERS = ["all", "connection", "bills", "cash", "dismissed"] as const;
+// a state you have to scan the whole table for. Which chip lists a line is
+// the server's (`group`), as is where it is acted on (`link`) and what the
+// history calls its kind (`kind_label`).
+const FILTERS = ["all", "connection", "bills", "merchants", "cash",
+                 "dismissed"] as const;
 type Filter = typeof FILTERS[number];
-// which alert kinds each chip covers; anything unmapped falls under "all"
-// Where each kind is fixed. The LIVE alert carries its own `link` (Today's
-// strip uses it), but /alerts/history stores only the identity columns —
-// link is deliberately not one of them, so retargeting cannot resurrect a
-// dismissed alert. This map is the fallback for history rows.
-const KIND_ROUTE: Record<string, string> = {
-  "stale-pull": "/accounts", "connection-removed": "/accounts",
-  setup: "/bills", proposals: "/bills", drift: "/bills", merges: "/merchants",
-  reimb: "/reimburse", funding: "/networth", transfer: "/transactions",
-  anomaly: "/transactions", bonus: "/transactions",
-  "llm-backend": "/doctor", "collector-token-revoked": "/settings/connections",
-};
-// "fix this" is the right verb for something BROKEN — a dead connection, a
-// funding gap. It is the wrong verb for a queue: a detected bill waiting on
-// a yes/no is not a fault, and calling it one makes routine review sound
-// like breakage.
-const KIND_CTA: Record<string, string> = {
-  proposals: "review", drift: "review", merges: "review", anomaly: "review",
-  bonus: "review", reimb: "review", transfer: "review",
-};
-const FILTER_KINDS: Record<string, string[]> = {
-  connection: ["stale-pull", "connection-removed", "setup"],
-  bills: ["proposals", "drift"],
-  cash: ["funding", "transfer", "bonus", "anomaly", "reimb"],
-};
 
 export default function Alerts() {
   const qc = useQueryClient();
-  const q = useQuery({ queryKey: ["alertsHistory"], queryFn: api.alertsHistory });
+  // Read fresh on every visit, and never shown from before it: Today writes
+  // a newly raised alert to the log at the end of its own (slower) request,
+  // so a log the bell fetched beside Today can predate the alert Today's
+  // "needs you" row just sent the person here to act on.
+  // One retry, not three: a failed refresh shows the copy it has, marked.
+  const q = useQuery({ queryKey: ["alertsHistory"], queryFn: api.alertsHistory,
+                       refetchOnMount: "always", retry: 1 });
   // dismiss/restore are tenant-wide writes — viewers read only
   const me = useQuery({ queryKey: ["me"], queryFn: api.me });
   const mayEdit = canEdit(me);
@@ -52,7 +41,8 @@ export default function Alerts() {
 
   type Hist = { alerts: AlertRow[] };
   const act = useMutation({
-    mutationFn: (v: { row: AlertRow; restore: boolean }) =>
+    // dismiss and restore answer different counts; only success matters
+    mutationFn: (v: { row: AlertRow; restore: boolean }): Promise<unknown> =>
       v.restore
         ? api.alertRestore(v.row.kind, v.row.message)
         : api.alertDismiss(v.row.kind, v.row.message),
@@ -72,44 +62,59 @@ export default function Alerts() {
     onError: (_e, _v, ctx) => {
       if (ctx?.prev) qc.setQueryData(["alertsHistory"], ctx.prev);
     },
-    // Today's strip reads the live alerts, which a dismissal does change
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["today"] }),
+    // Today's strip reads the live alerts, which a dismissal does change;
+    // the log is read again too, so a row Today rewrote meanwhile (a new
+    // count or amount) is not hidden behind the patched one
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["today"] });
+      qc.invalidateQueries({ queryKey: ["alertsHistory"] });
+    },
   });
   // only the row being written is busy — one click must not grey every
   // other row's button while it lands
   const busy = (r: AlertRow) => act.isPending &&
     act.variables?.row.kind === r.kind && act.variables.row.message === r.message;
 
-  if (q.isPending)
+  if (q.isPending || (q.isFetching && !q.isFetchedAfterMount
+                       && !q.isRefetchError))
     return <div className="centered"><span className="mut">loading…</span></div>;
   if (q.isLoadingError)
-    return <div className="card">Couldn't load alerts: {String(q.error)}</div>;
+    // the page keeps its title when its read fails, as every page does
+    return <><h1>Alerts</h1>
+      <div className="card"><FailedLine q={q} what="alerts" /></div></>;
 
-  const rows = [...q.data.alerts].sort((a, b) =>
-    a.last_seen < b.last_seen ? 1 : a.last_seen > b.last_seen ? -1 : 0);
+  // the live alerts Today already fetched carry each one's own target
+  const live = qc.getQueryData<TodayFull>(["today", "now"])?.alerts;
+  // one line per subject, live lines first, in the server's order
+  const rows = withLiveLinks(q.data.alerts, live);
   const active = rows.filter((r) => r.active && !r.dismissed);
 
   const shown = rows.filter((r) =>
     filter === "all" ? true
       : filter === "dismissed" ? (r.active && r.dismissed)
-      : (FILTER_KINDS[filter] ?? []).includes(r.kind));
+      : r.group === filter);
   const dismissed = rows.filter((r) => r.active && r.dismissed);
   const resolved = rows.filter((r) => !r.active);
 
   return (
     <>
       <h1>Alerts</h1>
+      {q.isRefetchError && (
+        <Note style={{ margin: "0 0 1rem" }}>
+          Couldn't refresh — showing alerts as of the last check.
+        </Note>
+      )}
       {/* a two-factor recovery pending on this account — the notice
           can still be undone, and only Settings > Security cancels it */}
       {me.data?.factor_reset_pending && (
-        <div className="note bad" style={{ margin: "0 0 1rem" }}>
+        <Note tone="bad" style={{ margin: "0 0 1rem" }}>
           <span style={{ flex: 1 }}>
             Someone asked for a recovery that removes this account's
             two-factor methods. It lands {mmdd(localDayOf(me.data.factor_reset_pending))}.
             {" "}Not you?{" "}
             <Link to="/settings/security">Cancel it in Security</Link>
           </span>
-        </div>
+        </Note>
       )}
       {/* HERO: the page's state, which a bare "Active alerts" heading
           does not say. */}
@@ -134,8 +139,8 @@ export default function Alerts() {
                  className={`alertrow ${sevNote(a.severity)}`}>
               <span className="ico">{sevIcon(a.severity)}</span>
               <div style={{ flex: 1, minWidth: 0 }}>
-                <div>{a.message}</div>
-                <div className="meta">{a.kind.replace(/-/g, " ")}
+                <div>{a.text}</div>
+                <div className="meta">{a.kind_label ?? a.kind}
                   {a.first_seen && ` · first seen ${mmdd(a.first_seen)}`}</div>
               </div>
               <div style={{ display: "flex", gap: ".4rem", flexShrink: 0 }}>
@@ -143,15 +148,16 @@ export default function Alerts() {
                     thing a person actually wants is to FIX it, and without
                     a link that means reading the message and guessing the
                     page. */}
-                {(a.link || KIND_ROUTE[a.kind]) && (
-                  <Link className="btn" to={a.link || KIND_ROUTE[a.kind]}
+                {a.link && (
+                  <Link className="btn" to={a.link}
                         style={{ textDecoration: "none", fontSize: 12.5,
                                  borderColor: "var(--blue)",
                                  color: "var(--blue)" }}>
-                    {KIND_CTA[a.kind] || "fix this"} ›</Link>
+                    {/* the one verb set (Fix / Review) every surface uses */}
+                    {alertAction(a.kind)} ›</Link>
                 )}
                 {mayEdit && (
-                  <button className="dismiss" title="dismiss"
+                  <button className="dismiss" title="dismiss" aria-label="Dismiss"
                           disabled={busy(a)}
                           onClick={() => act.mutate({ row: a, restore: false })}>
                     ✕</button>
@@ -166,71 +172,66 @@ export default function Alerts() {
         <div style={{ display: "flex", gap: ".8rem", alignItems: "baseline",
                       flexWrap: "wrap" }}>
           <h2 style={{ margin: 0 }}>History</h2>
+          {rows.length > 0 && (
           <button className="btn" style={{ fontSize: 12.5 }}
                   onClick={() => setShowHistory((v) => !v)}>
             {showHistory ? "hide history"
               : `show history (${rows.length} ${rows.length === 1 ? "alert" : "alerts"})`}
           </button>
+          )}
           {/* a six-month log is unreadable without these, and "dismissed"
               stops being a state you have to scan for */}
-          {showHistory && (
-          <span style={{ marginLeft: "auto", display: "flex", gap: ".35rem",
-                         flexWrap: "wrap" }}>
-            {FILTERS.map((f) => (
-              <button key={f} className={"chip" + (filter === f ? " on" : "")}
-                      onClick={() => setFilter(f)}>{f}</button>
-            ))}
-          </span>
+          {showHistory && rows.length > 0 && (
+          <SegmentedControl label="Show" size="sm" value={filter}
+            onChange={setFilter} style={{ marginLeft: "auto" }}
+            options={FILTERS.map((f) => ({
+              value: f, label: f[0].toUpperCase() + f.slice(1) }))} />
           )}
         </div>
-        {!showHistory ? null : rows.length === 0 ? (
-          <p className="sub" style={{ marginBottom: 0 }}>No alerts logged yet —
-            they appear here as the daily checks find things worth telling
-            you about.</p>
-        ) : (
-          <table style={{ marginTop: ".5rem" }}>
-            <thead>
-              <tr>
-                <th style={{ width: "1%", whiteSpace: "nowrap" }}>When</th>
-                <th style={{ width: "1%" }}>Kind</th>
-                <th>Alert</th>
-                <th style={{ width: "1%" }}></th>
-              </tr>
-            </thead>
-            <tbody>
+        {rows.length === 0 ? (
+          <EmptyState title="No alerts yet"
+            text="The daily checks post here when they find something worth telling you: a bill that jumped, a connection that needs you, cash running tight." />
+        ) : !showHistory ? null
+          // a filter that matches nothing says so, not a header over no rows
+          : shown.length === 0 ? <p className="sub">{EMPTY_LINES.filtered}</p> : (
+          // one stacked line per subject — the words get the full width,
+          // so a phone-width page reads each alert in a few lines rather
+          // than a ten-line column beside three narrow ones
+          <div style={{ marginTop: ".5rem" }}>
               {shown.map((r) => (
-                <tr key={`${r.kind}|${r.message}`}
-                    style={r.dismissed ? { opacity: .6 } : undefined}>
-                  {/* ONE "when" column. Split into first-seen and
-                      last-seen, the first is hide-m — so a phone loses the
-                      AGE of a problem, which is most of its severity. */}
-                  <td className="mut" style={{ whiteSpace: "nowrap" }}>
-                    {mmdd(r.first_seen)}
-                    <span className="sub"> → {r.active ? "today"
-                      : mmdd(r.last_seen)}</span>
-                  </td>
-                  <td style={{ whiteSpace: "nowrap" }}>
+                <div key={`${r.kind}|${r.message}`} className="hist-line"
+                     style={r.dismissed ? { opacity: .6 } : undefined}>
+                  {/* the server's words for the line; `message` stays
+                      the key dismiss and restore send back */}
+                  <div>{r.text}</div>
+                  <div className="meta">
+                    {/* the subject's whole span: the first day it was
+                        ever seen to the last — its age is most of its
+                        severity */}
+                    {mmdd(r.first_seen)} → {r.active ? "today" : mmdd(r.last_seen)}
+                    {" · "}
+                    {/* every line keeps its subject's chip, resolved or
+                        not; the state rides beside it */}
                     <span className={"pill " + (r.active
-                      ? (SEV_PILL[r.severity] ?? "m") : "g")}>
-                      {r.active ? r.kind.replace(/-/g, " ") : "resolved"}</span>
-                  </td>
-                  <td>{r.message}</td>
-                  <td style={{ whiteSpace: "nowrap" }}>
+                      ? (SEV_PILL[r.severity] ?? "m") : "m")}>
+                      {r.kind_label ?? r.kind}</span>
+                    {!r.active && <>{" "}<span className="pill g">resolved</span></>}
+                    {/* where the subject is acted on (the server's link) */}
+                    {r.link && <>{" · "}<Link to={r.link}>open</Link></>}
                     {r.active && r.dismissed ? (
                       <>
-                        <span className="pill m">dismissed</span>{" "}
+                        {" "}<span className="pill m">dismissed</span>{" "}
                         {mayEdit && (
                         <button disabled={busy(r)}
                                 onClick={() => act.mutate({ row: r, restore: true })}>
                           restore</button>
                         )}
                       </>
-                    ) : r.active ? <span className="pill a">active</span> : null}
-                  </td>
-                </tr>
+                    ) : r.active ? <>{" "}<span className="pill a">active</span></> : null}
+                  </div>
+                </div>
               ))}
-            </tbody>
-          </table>
+          </div>
         )}
       </div>
     </>

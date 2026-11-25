@@ -67,9 +67,12 @@ class MerchantHistoryWindowTests(unittest.TestCase):
         self.assertEqual(h["lifetime"]["count"], 5)
         ids, _ = self._ids(window="1m")
         self.assertEqual(ids, {on_last_day, mid_last})
-        # the named windows still read as before, and an unknown one as all
+        # a longer window is complete months too, ending with last month:
+        # this month's charges are "This month"'s
         ids, _ = self._ids(window="1y")
-        self.assertEqual(ids, {self.recent, on_last_day, mid_last, first_of_this})
+        self.assertEqual(ids, {on_last_day, mid_last})
+        ids, _ = self._ids(window="no such window")
+        self.assertIn(self.old, ids)
         ids, _ = self._ids(window="all")
         self.assertIn(self.old, ids)
 

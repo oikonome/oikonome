@@ -23,6 +23,7 @@ from oikonome.engine import budget, forecast
 from oikonome.notify import render
 from oikonome.web import lenses, report, todayview
 
+from .util import freeze_month
 from .util import add_ledger_history, add_txn, make_db, write_config
 
 TODAY = dt.date(2026, 7, 22)            # day 22 of a 31-day July
@@ -322,13 +323,15 @@ class HeroAgreesWithTheTilesTests(unittest.TestCase):
                 st["variable_budget_paced"],
                 3100.0 * (31 - (TODAY.day - 9) + 1) / 31, 2)
             _s, plain, html = report.build(st)
-            hero = (f"${st['month_remaining_paced']:,.0f} of "
+            # the month figure names the month (todayview.hero_face)
+            hero = (f"${st['month_remaining_paced']:,.0f} of the month's "
                     f"${st['variable_budget_paced']:,.0f} left · "
-                    f"{days_left} days")
+                    f"{days_left} days left")
             self.assertIn(hero, plain)
             flat = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html))
-            self.assertIn(f"${st['month_remaining_paced']:,.0f} of "
-                          f"${st['variable_budget_paced']:,.0f} left", flat)
+            self.assertIn(f"${st['month_remaining_paced']:,.0f} of the "
+                          f"month&#39;s ${st['variable_budget_paced']:,.0f} "
+                          "left", flat)
         finally:
             conn.close()
 
@@ -435,6 +438,7 @@ class ClosedFirstMonthTests(unittest.TestCase):
                     self.assertEqual(closed["verdict"], want)
                     self.assertAlmostEqual(closed["variable_expected"],
                                            3100.0 * 21 / 30, 2)
+                    freeze_month(conn, 2026, 9)
                     lens = lenses.month_summary(conn, 2026, 9,
                                                 dt.date(2026, 10, 16))
                     self.assertEqual(lens["verdict"], want)

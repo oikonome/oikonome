@@ -121,6 +121,49 @@ class YearEndPackageTests(unittest.TestCase):
                 if len(row) >= 2}
         self.assertEqual(rows["Capital account balance"], "3450.00")
 
+    def test_a_package_with_no_year_is_the_households_year_throughout(self):
+        """Asked for no year, every file covers the household's current
+        year: a trip log listing every year's trips above one year's total
+        does not add up, and neither does an all-years ledger beside one
+        year's 1099 list."""
+        from oikonome.engine import selfemploy
+        from oikonome.web.api_common import _today
+        conn = tenancy.tenant_connect(self.tid)
+        try:
+            yr = _today(conn).year
+            ids = [selfemploy.add_trip(conn, self.eid,
+                                       date=f"{yr - 1}-05-01", miles=300),
+                   selfemploy.add_trip(conn, self.eid,
+                                       date=f"{yr}-01-02", miles=120)]
+        finally:
+            conn.close()
+        try:
+            r = self.client.get(
+                f"/api/business/entities/{self.eid}/package.zip",
+                headers={"Sec-Fetch-Site": "same-origin"})
+            self.assertEqual(r.status_code, 200, r.text)
+            z = zipfile.ZipFile(io.BytesIO(r.content))
+            self.assertIn(f"Period:   {yr}\n", z.read("README.txt").decode())
+            rows = list(csv.reader(io.StringIO(
+                z.read("mileage.csv").decode())))
+            trips = [row for row in rows[1:] if row and row[0][:2] in
+                     ("19", "20")]
+            self.assertEqual([row[1] for row in trips], ["120.0"])
+            total = {row[0]: row[1] for row in rows if len(row) >= 2}
+            self.assertEqual(total["Total miles"], "120.0")
+            ledger = list(csv.reader(io.StringIO(
+                z.read("ledger.csv").decode())))[1:]
+            self.assertTrue(all(row[0].startswith(str(yr))
+                                for row in ledger), ledger)
+        finally:
+            conn = tenancy.tenant_connect(self.tid)
+            try:
+                for t in ids:
+                    selfemploy.delete_trip(conn, t["id"] if isinstance(
+                        t, dict) else t, self.eid)
+            finally:
+                conn.close()
+
 
 if __name__ == "__main__":
     unittest.main()

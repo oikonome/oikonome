@@ -39,12 +39,12 @@ class PaychecksStillDueTests(unittest.TestCase):
         self.assertIsNone(d.get("income_due_total"))
         self.assertIsNone(d.get("income_due_dates"))
         subj, plain, html = report.build(d)
-        self.assertIn("after cards & bills", plain)
+        self.assertIn("checking at month end", plain)
         self.assertIn("no paycheck set up", plain)
         self.assertNotIn("paychecks still due", plain)
-        self.assertIn("after cards &amp; bills", html)
+        self.assertIn("checking at month end</span>", html)
         self.assertIn("no paycheck set up", html)
-        self.assertNotIn("after cards, bills &amp; paychecks", html)
+        self.assertNotIn("paychecks still due", html)
 
     def test_with_a_paycheck_still_due_the_figure_counts_it(self):
         # a biweekly paycheck whose next occurrence is still inside this
@@ -62,51 +62,88 @@ class PaychecksStillDueTests(unittest.TestCase):
         self.assertAlmostEqual(d["income_due_total"],
                                2400.0 * len(d["income_due_dates"]), places=2)
         subj, plain, html = report.build(d)
-        rw = d["runway"]
-        after = (rw["checking"] - rw["card_debt"] - d["bills_remaining_month"]
-                 + d["income_due_total"])
+        from oikonome.web import todayview
+        # the month-end balance counts the paychecks: it is the walk's,
+        # which lands them on their days (month_end_left)
+        after = todayview.build_context(d)["month_end"]["balance"]
         self.assertIn("paychecks still due", plain)
-        self.assertIn("after cards, bills & paychecks", plain)
-        self.assertIn(report._money(after), plain)
+        self.assertIn("checking at month end " + report._money(after), plain)
         self.assertNotIn("no paycheck set up", plain)
         self.assertIn("paychecks still due", html)
-        self.assertIn("after cards, bills &amp; paychecks", html)
+        self.assertIn("checking at month end</span>", html)
         self.assertIn(report._money(after), html)
         self.assertNotIn("no paycheck set up", html)
 
-    def test_a_pending_paycheck_the_balance_cannot_see_still_counts(self):
-        # Payday: the check is pending, the bank reports no available
-        # balance, so checking starts from the current balance that does
-        # not hold it. The month's income halves read the pending deposit
-        # as received; the cash walk re-dates the occurrence to tomorrow.
-        # The tile follows the walk, or it would show +$0 beside a cash
-        # figure that never saw the money.
+    def _pending_payday(self, available):
+        # Payday: the check shows as a PENDING deposit today
         payday = TODAY
-        if payday + dt.timedelta(days=1) > MONTH_END:
-            self.skipTest("no tomorrow left in this month")
         add_bill(self.conn, "ACME HOLDINGS PAYROLL", 2400.0, income=True,
                  frequency="WEEKLY", interval=2, next_due=payday)
-        self.conn.execute("UPDATE accounts SET balance_available = NULL "
-                          "WHERE id = 'chk'")
+        if not available:
+            self.conn.execute("UPDATE accounts SET balance_available = NULL "
+                              "WHERE id = 'chk'")
         add_txn(self.conn, payday, -2400.0, "ACME HOLDINGS PAYROLL",
                 primary="INCOME", account="chk", pending=1)
-        d = self._gather()
-        self.assertEqual(d["income_due_dates"][0],
-                         (payday + dt.timedelta(days=1)).isoformat())
+        return payday, self._gather()
+
+    def test_a_pending_paycheck_the_balance_cannot_see_still_counts(self):
+        # The bank reports no available balance, so checking starts from
+        # the current balance, which a pending credit is not in yet. The
+        # check is still due — in the tile, on Budget and in the email —
+        # or the month-end figure drops it from both sides.
+        payday, d = self._pending_payday(available=False)
+        self.assertIn(payday.isoformat(), d["income_due_dates"])
         self.assertAlmostEqual(d["income_due_total"],
                                2400.0 * len(d["income_due_dates"]), places=2)
+        self.assertEqual(d["income_due_total"], d["income_expected"])
+        rw = d["runway"]
+        self.assertAlmostEqual(
+            d["after_cards_bills_paychecks"],
+            rw["checking"] - rw["card_debt"] - d["bills_remaining_month"]
+            + 2400.0 * len(d["income_due_dates"]), places=2)
+
+    def test_a_pending_paycheck_inside_the_available_balance_has_landed(self):
+        # An available balance already holds the pending credit: counting
+        # it as still due would add the same check twice
+        payday, d = self._pending_payday(available=True)
+        self.assertNotIn(payday.isoformat(), d["income_due_dates"])
+        self.assertAlmostEqual(d["income_due_total"],
+                               2400.0 * len(d["income_due_dates"]), places=2)
+        self.assertEqual(d["income_due_total"], d["income_expected"])
+
+    def test_without_a_landed_check_or_one_due_the_figures_still_agree(self):
+        # A series whose next check is next month and that has never paid:
+        # Budget falls back to the budgeted income (no halves), and the
+        # tile's still-due is the same function's $0, never another walk
+        add_bill(self.conn, "STATE PENSION", 2000.0, income=True,
+                 frequency="MONTHLY", interval=1,
+                 next_due=MONTH_END + dt.timedelta(days=1))
+        d = self._gather()
+        self.assertIsNone(d["income_expected"])
+        self.assertEqual(d["income_due_total"], 0.0)
+        self.assertEqual(d["income_due_dates"], [])
+        self.assertIsNone(d["income_due_note"])
+
+    def test_paychecks_still_due_is_the_month_plans_figure(self):
+        payday = TODAY + dt.timedelta(days=1)
+        add_bill(self.conn, "ACME HOLDINGS PAYROLL", 2400.0, income=True,
+                 frequency="WEEKLY", interval=2, next_due=payday)
+        # the latest deposit sizes each check still due, in both readers
+        add_txn(self.conn, payday - dt.timedelta(days=14), -2500.0,
+                "ACME HOLDINGS PAYROLL", primary="INCOME", account="chk")
+        d = self._gather()
+        self.assertIsNotNone(d["income_expected"])
+        self.assertEqual(d["income_due_total"], d["income_expected"])
 
     def test_a_payday_on_the_months_last_day_still_counts(self):
         # Semi-monthly payroll pays on the last day; the check has not
-        # posted by the morning email. The walk re-dates an unposted check
-        # due today to tomorrow, and on the last day tomorrow is next
-        # month — the tile reserves to the same horizon the bills do, so
-        # the month-end payday is not read as +$0.
+        # posted by the morning email. A check due today has not failed to
+        # come until the day is over, so the month-end payday is still due,
+        # not +$0.
         add_bill(self.conn, "ACME HOLDINGS PAYROLL", 2400.0, income=True,
                  frequency="MONTHLY", interval=1, next_due=MONTH_END)
         d = report.gather(self.conn, MONTH_END)
-        self.assertEqual(d["income_due_dates"],
-                         [(MONTH_END + dt.timedelta(days=1)).isoformat()])
+        self.assertEqual(d["income_due_dates"], [MONTH_END.isoformat()])
         self.assertAlmostEqual(d["income_due_total"], 2400.0, places=2)
 
     def test_next_months_first_day_paycheck_is_not_this_months(self):

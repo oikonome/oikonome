@@ -153,6 +153,27 @@ class WaitingReceiptDoorTests(unittest.TestCase):
                             "image/png")})
         self.assertEqual(big.status_code, 413)
 
+    def test_refusals_raised_in_the_worker_reach_the_client(self):
+        """Both doors store in the threadpool: a quota refusal (413) and
+        a bad upload (400) raised there come back to the client with
+        their status and message, not as a 500."""
+        from unittest import mock
+
+        from oikonome.engine import receipts, storage_quota
+        doors = {"snap": "/api/receipts",
+                 "attach": f"/api/transactions/{self.txn}/receipt"}
+        for name, url in doors.items():
+            with self.subTest(door=name, refusal="quota"), mock.patch.object(
+                    receipts, "add", side_effect=storage_quota
+                    .StorageQuotaExceeded("household storage is full")):
+                r = self.owner.post(url, files={"file": PNG})
+                self.assertEqual(r.status_code, 413, r.text)
+                self.assertIn("household storage is full", r.text)
+            with self.subTest(door=name, refusal="bad upload"):
+                r = self.owner.post(
+                    url, files={"file": ("x.html", b"<p>", "text/html")})
+                self.assertEqual(r.status_code, 400, r.text)
+
 
 class WhoMaySnapTests(unittest.TestCase):
     """A member attaches and snaps; a viewer does neither."""

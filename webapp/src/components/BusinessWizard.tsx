@@ -16,6 +16,7 @@
 // does, and is skippable — a wizard invites fast clicking and this is the
 // step where fast clicking does damage.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { FailedLine } from "./Loaded";
 import { useRef, useState } from "react";
 import { api, errText, kindIs, type BusinessSummary } from "../api/client";
 import { patchQuery, SETTINGS_SAVES, saveSettings } from "../api/cache";
@@ -26,6 +27,7 @@ import DemoLock from "./DemoLock";
 import { bankAwaitsConfirm, CONFIRM_TO_CONNECT, VerifyEmailCard }
   from "./VerifyEmailCard";
 import { sharedLock } from "../sharedlogin";
+import Note from "./Note";
 
 const STRUCTURES = [
   ["sole_prop", "Sole proprietorship"],
@@ -293,7 +295,7 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
       </div>
       <h2 style={{ marginTop: 0 }}>{step.title}</h2>
       {step.blurb && <p className="mut">{step.blurb}</p>}
-      {err && <div className="note bad">{err}</div>}
+      {err && <Note tone="bad">{err}</Note>}
 
       {step.key === "what" && (
         <div className="field-grid">
@@ -340,9 +342,12 @@ export default function BusinessWizard({ resume, onDone, onCancel }: {
             change this any time on the Accounts page.
           </div>
           {accounts.isPending && <p className="mut">loading accounts…</p>}
+          {/* a failed read is not an empty picker */}
+          {accounts.data === undefined && accounts.isError && (
+            <FailedLine q={accounts} what="your accounts" />)}
           <div style={{ display: "flex", gap: ".5rem", alignItems: "center",
                         flexWrap: "wrap", marginBottom: ".5rem" }}>
-            <input value={acctQ} placeholder="search accounts"
+            <input aria-label="Search accounts" value={acctQ} placeholder="search accounts"
                    onChange={(e) => setAcctQ(e.target.value)}
                    style={{ flex: "1 1 12rem" }} />
             <button onClick={() => { accounts.refetch(); }}>Refresh</button>

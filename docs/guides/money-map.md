@@ -33,27 +33,52 @@ Each row is `label · actual / budget · delta`:
   budget divider** — the budget boundary stays visible exactly when it
   matters, and everything past the line is overspend. (The daily email
   shows the striped segment as a solid darker red.)
-- The right-side delta says it in words: `over by $X`; `$X ahead of
-  pace` (past the pace tick, still inside budget); `$X left`; on Bills,
-  `$X still due`, prefixed `$X awaiting ·` when a due bill hasn't
-  posted; and an amber `no budget set — set one` on a category with
-  spending but no budget — the state is never color-alone.
+- The right-side delta says it in words. On Today a spending row reads
+  against today's pace: `$X over pace`, `$X under pace` or `on pace`
+  (the Today guide says the same). On the Month and Year views it reads
+  `over by $X`; `$X over pace so far` (past the pace tick, still inside
+  budget); `$X left`. On Bills,
+  `$X still due` — this month's bills not yet paid and any bill late
+  from an earlier month; a month that is over says how it came out
+  (`$X not paid`, `$Y under plan`, `over plan by $Y`), and a running
+  month says `over plan by $Y` once it is; its caption names
+  what posted (with its awaiting part, and for the running month the
+  plan), and **How this
+  adds up** under it opens a small table of the parts, each with its
+  sign, that add up to the plan. An amber `no budget set — set one`
+  marks a category with spending but no budget — the state is never
+  color-alone.
 
 ## The rows
 
-- **Bills** — the whole month's schedule, segmented paid / awaiting /
+- **Bills** — the month's due-dated bills, segmented paid / awaiting /
   still-due. The runway story reads from the unpaid segments.
+- **Envelopes** — directly under Bills when the plan has a pool: what
+  the pools paid out this month (left) of what they held (right, what
+  was paid out plus what is left). The bar never runs past its right
+  figure, so it is never red; the caption says what the pools are
+  still expected to pay out this month. It says "over" only as "$X past
+  the pool, counted in spending" — a charge past a pool, which is
+  counted once, in Food or Everything else. **Each pool**, under the
+  row, lists the pools one by one, each as what its period charged of
+  its amount, and what the plan sets aside for them each month.
 - **Variable spending** — the total the verdict judges, with the budget
   categories (Food, Everything else, and your custom categories)
   indented beneath it. The header row only appears when more than one
-  category is judged; a single category stands on its own.
+  category is judged; a single category stands on its own. A bucket
+  whose whole budget went to its custom categories, with nothing spent
+  outside them, gets no row of its own (it would read $0 / $0).
 - **Savings / Investment** — on Today and on the Month and Year lenses,
   when a savings plan or posted transfers exist. A plan with no
   destination account has nothing to measure and folds into the footer
   instead of drawing an empty bar.
 - Excess cash is never a bar: it folds into the footer line "Also this
-  month: $X excess stays in checking", beside any plan-only savings
-  row.
+  month: $X planned excess (the plan's, with bills evened out)", beside
+  any plan-only savings row — with "none this month" once the month's
+  spending has gone past its budget by at least the excess (the Budget
+  page's summary line says the same, muted rather than green). It is the plan line's figure — income less
+  the budgets, the bills evened out to a month and savings — so it does
+  not move with this month's spending or this month's bill schedule.
 - **Every label opens its rows** (Today, the month lens, the year
   lens): a category name opens the transactions the number counts for
   that month — or, on the year lens's map, for the year: one listing of
@@ -68,10 +93,11 @@ Each row is `label · actual / budget · delta`:
 
 Checking-now and card-debt-now are **point-in-time facts**, not plan
 rows — they live as plain numbers at the top of Today's Cash timeline
-card (**checking now**, **card debt**, **paychecks still due**, **after
-cards, bills & paychecks** — **after cards & bills** while no income
-series is set up), the last shown red when checking plus the paychecks
-still due don't cover the cards and the bills still due. The one-line
+card (**checking now**, **card debt**, **paychecks still due**, and
+**left at month end** — the balance the month ends on after this month's
+bills, paychecks, card payments and spending at your usual pace; with no
+paycheck set up the note under it says so and counts none), the last
+shown red when the month is forecast to end below $0. The one-line
 plan flow at the bottom of the verdict card
 carries no cash numbers. Cash *warnings* have exactly one home: the
 verdict card.

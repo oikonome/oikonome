@@ -19,6 +19,10 @@ the maintenance reboot alone is pinned to UTC):
                                    gate's sweeps, the never-confirmed
                                    freeze and the purge — each step under
                                    its own budget (NIGHTLY_STEP_BUDGET)
+  * forecast_all    every 10 min — each household's cash forecast once per
+                                   household-local day after its 04:00:
+                                   what it learned (forecast_learned) and
+                                   what it said (forecast_nights)
   * email_all       hourly :05   — each household's cadences at ITS local
                                    send hour (emails_due)
   * staging_sweep   hourly :47   — every household's expired staged uploads
@@ -169,7 +173,7 @@ def _recipients_raw(conn, tenant_id: str,
 
 
 def _recipient_lists(conn, tenant_id: str, kind: str | None = None, *,
-                     honour_mute: bool = True
+                     honour_mute: bool = True, admin=None
                      ) -> tuple[list[str], list[str]]:
     """Tenant alert/email recipients: the account OWNER always, plus anyone
     configured in `email_recipients`. With nothing configured, every
@@ -211,7 +215,13 @@ def _recipient_lists(conn, tenant_id: str, kind: str | None = None, *,
 
     `honour_mute=False` leaves the mute list out: who is on the household's
     mail at all, the question the owner's roster asks beside each person's
-    own mute switch. Every other rule above still applies."""
+    own mute switch. Every other rule above still applies.
+
+    `admin` is an admin connection the caller already holds, used for the
+    member and invitation reads instead of opening one here (a settings
+    read building one person's row from several such reads pays one
+    connect); the caller closes it. Without one, this opens and closes its
+    own."""
     from ..engine import budget
     cfg = budget.load_config(conn)
     recips = cfg.get("email_recipients")
@@ -227,7 +237,9 @@ def _recipient_lists(conn, tenant_id: str, kind: str | None = None, *,
         audible = [e for e in emails if e.lower() not in muted]
         return audible, email_prefs.keep(cfg, audible, kind)
 
-    admin = tenancy.admin_connect()
+    own_admin = admin is None
+    if own_admin:
+        admin = tenancy.admin_connect()
     try:
         if recips:
             # one policy, one place — the settings doors and this sweep must
@@ -274,9 +286,13 @@ def _recipient_lists(conn, tenant_id: str, kind: str | None = None, *,
             # who needs to know is the owner, not the log.
             recips = []
             if pairs:
-                st = recipient_invites.states(
-                    tenant_id, [b for b, _ in pairs]
-                    + [raw for _, raw in pairs if raw])
+                wanted = ([b for b, _ in pairs]
+                          + [raw for _, raw in pairs if raw])
+                # on the caller's connection when it handed one in; the
+                # scheduled sweep keeps its own invitation read
+                st = (recipient_invites.states(tenant_id, wanted)
+                      if own_admin else
+                      recipient_invites.states_on(admin, tenant_id, wanted))
                 seen = set()
                 for b, raw in pairs:
                     if b.lower() in seen:
@@ -341,7 +357,8 @@ def _recipient_lists(conn, tenant_id: str, kind: str | None = None, *,
                                  (tenant_id,)).fetchall()
         return _unmuted([r["email"] for r in rows])
     finally:
-        admin.close()
+        if own_admin:
+            admin.close()
 
 
 def _recipients_and_raw(conn, tenant_id: str, kind: str | None = None,
@@ -1302,9 +1319,9 @@ def sync_tenant(tenant_id: str, since_days: int = 30, progress=None) -> dict:
         # A session-level TRY lock, not a waiting one: a second sync arriving
         # while one is in flight should return immediately saying so, not
         # queue up behind a job that may take minutes. Released in `finally`.
-        locked = conn.execute(
-            "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-            (f"oikonome:sync:{tenant_id}",)).fetchone()["ok"]
+        locked = tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (f"oikonome:sync:{tenant_id}",))["ok"]
         if not locked:
             # Skipping is right — queueing behind a run that can take
             # minutes holds a worker slot — but skipping SILENTLY left this
@@ -1360,6 +1377,24 @@ def sync_tenant(tenant_id: str, since_days: int = 30, progress=None) -> dict:
         if locked:
             if tenancy.release_lock(conn, f"oikonome:sync:{tenant_id}"):
                 conn = None                      # type: ignore[assignment]
+            # a sync turned away after this run's last nudge claim (during
+            # its second pass, or between the claim and the release) left a
+            # nudge nobody would read until the tenant's next hourly slot:
+            # answer it now the lock is free, as every other holder does
+            try:
+                if conn is not None:
+                    # the unlock succeeded: answer on the connection in
+                    # hand, never borrow a second one while holding the
+                    # first (the pool is sized one per running job)
+                    answer_sync_nudge(conn, tenant_id)
+                else:
+                    c2 = tenancy.tenant_connect(tenant_id)
+                    try:
+                        answer_sync_nudge(c2, tenant_id)
+                    finally:
+                        c2.close()
+            except Exception as e:                           # noqa: BLE001
+                log.warning("post-release nudge check failed for %s: %s", tenant_id, e)
         if conn is not None:
             conn.close()
 
@@ -1380,9 +1415,9 @@ def nightly_tenant(tenant_id: str) -> dict:
         # Skipping is right rather than waiting: the run already in flight
         # is doing this exact idempotent sweep, so a second entrant queueing
         # behind it would only repeat the work it just watched finish.
-        locked = conn.execute(
-            "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-            (f"oikonome:nightly:{tenant_id}",)).fetchone()["ok"]
+        locked = tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (f"oikonome:nightly:{tenant_id}",))["ok"]
         if not locked:
             log.info("nightly already running for tenant %s — skipping",
                      tenant_id)
@@ -1412,6 +1447,26 @@ def nightly_tenant(tenant_id: str) -> dict:
             _wh.prune(conn)
         except Exception as e:                   # noqa: BLE001
             log.warning("webhook prune failed tenant=%s: %s", tenant_id, e)
+        # stored tax documents: what an outside writer left is adopted, and
+        # one removed more than 30 days ago can no longer be put back: it
+        # goes, with the figures it held
+        try:
+            from ..engine import taxdocs as _taxdocs
+            # first, any figure or form a writer outside the stored list
+            # left (the release before this one, after a rollback) is kept
+            # as its own upload, so no later resolve sets it back
+            _taxdocs.adopt_household(conn)
+        except Exception as e:                   # noqa: BLE001
+            log.warning("tax document adoption failed tenant=%s: %s",
+                        tenant_id, e)
+        # its own step: a household the adoption cannot read still has
+        # its removed documents purged on time
+        try:
+            from ..engine import taxdocs as _taxdocs
+            _taxdocs.purge_removed(conn)
+        except Exception as e:                   # noqa: BLE001
+            log.warning("tax document purge failed tenant=%s: %s",
+                        tenant_id, e)
         # A household that turned automatic bill detection off (it enters
         # its bills by hand) gets no new-bill or new-income offers from the
         # nightly — neither from the ledger finder nor from Plaid's streams.
@@ -1449,6 +1504,17 @@ def nightly_tenant(tenant_id: str) -> dict:
                      "proposed_change": 0, "proposed_income": 0,
                      "drift_applied": 0, "superseded": 0, "due_advanced": 0,
                      "groups": 0, "error": "recurring detection failed"}
+        # each bill's start in the schedule: filled for a bill an older
+        # build or an older archive left without one, and moved earlier
+        # when history arrived after the bill was saved (never later).
+        # One ledger read for every bill
+        try:
+            with conn.transaction():
+                filled = bills.fill_scheduled_since(conn)
+            if filled:
+                stats["bill_starts_filled"] = filled
+        except Exception as e:                   # noqa: BLE001
+            log.warning("bill start fill failed tenant=%s: %s", tenant_id, e)
         # Plaid's own recurring streams as a cross-check on detection —
         # proposals only, never auto-applied; off with plaid_recurring=false.
         # It is a separately billed aggregator product, like liabilities
@@ -1510,6 +1576,16 @@ def nightly_tenant(tenant_id: str) -> dict:
                 stats["reanchor_ambiguous"] = ra["ambiguous"]
         except Exception as e:                       # noqa: BLE001
             log.warning("re-anchor sweep failed tenant=%s: %s", tenant_id, e)
+        # stored links held to what counts: a full pair left on a deposit
+        # the feed withdrew, a charge repaid past its cost by a deposit the
+        # feed reported again — closed months included (web.data.repair_pairs)
+        try:
+            from ..web import data as _pairs
+            rp = _pairs.repair_pairs(conn)
+            if rp["stamps_released"] or rp["rows_rechecked"]:
+                stats["pairs_repaired"] = rp
+        except Exception as e:                       # noqa: BLE001
+            log.warning("pair repair failed tenant=%s: %s", tenant_id, e)
         # a primary-checking pin left on an account a relink renumbered or
         # a disconnect removed is re-pinned where the forecast already
         # anchors, so the Today checklist does not reopen a settled choice
@@ -1602,6 +1678,12 @@ def nightly_tenant(tenant_id: str) -> dict:
         # pass either of them skipped
         try:
             from ..engine import receipt_match as _rmatch
+            # first, a receipt attached from a charge that left the ledger
+            # for good goes back to waiting: only here, once a night and
+            # after the re-anchor above, never from a sync
+            freed = _rmatch.release_unplaced(conn)
+            if freed:
+                stats["receipts_released"] = freed
             _rmatch.match_waiting(conn)
         except Exception as e:                   # noqa: BLE001
             log.warning("waiting-receipt match sweep failed: %s",
@@ -1670,6 +1752,21 @@ def nightly_tenant(tenant_id: str) -> dict:
                     # minutes.
                     with _budget.config_txn(conn) as live:
                         live["savings_goal_state"] = new_state
+                elif not delivered:
+                    # the milestones and the off-pace falls wait for the
+                    # retry, but a goal's plan and a verdict that mailed
+                    # nothing are not news to deliver: left unstored, a
+                    # relay that is down for a week would start every new
+                    # plan from next week's balance, and a stale verdict
+                    # would swallow the next real fall
+                    kept = _savings.undelivered_state(
+                        cfg.get("savings_goal_state") or {}, new_state)
+                    if kept != (cfg.get("savings_goal_state") or {}):
+                        with _budget.config_txn(conn) as live:
+                            live["savings_goal_state"] = (
+                                _savings.undelivered_state(
+                                    live.get("savings_goal_state") or {},
+                                    new_state))
         except Exception as e:                   # noqa: BLE001
             log.warning("savings milestone sweep failed: %s", e)
         # the heartbeat is what Doctor reads as "nightly detection works":
@@ -1695,6 +1792,120 @@ def nightly_tenant(tenant_id: str) -> dict:
             conn.close()
 
 
+# the household-local hour from which the day's forecast is kept: early
+# morning, after the night's pulls and before most of the day's spending
+FORECAST_LOCAL_HOUR = 4                # = forecast_score.RECORD_LOCAL_HOUR
+
+
+# when the instance's nightly sweep (nightly_all) starts, on the instance's
+# clock, and how long before it a household's early morning waits for it
+NIGHTLY_HOUR, NIGHTLY_MINUTE = 4, 17
+DETECTION_WAIT = dt.timedelta(hours=1)
+# and how long after the start it waits at most. A household whose
+# detection fails every night waits this long every night, so it is kept
+# short: a sweep still running past it (its budget is three hours) records
+# the households it has not reached on the schedule they had, which moves
+# a night's forecast far less than keeping it hours into the morning does
+DETECTION_GIVE_UP = dt.timedelta(minutes=90)
+
+
+def _nightly_holds(conn, tenant_id: str) -> bool:
+    """Whether a nightly (the sweep's or a console re-run) holds this
+    household's nightly lock now. Read from pg_locks, never by trying the
+    lock: a try that wins for an instant makes a nightly arriving in that
+    instant skip the household's whole night."""
+    return bool(conn.execute(
+        "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'"
+        " AND granted AND objsubid = 1"
+        " AND database = (SELECT oid FROM pg_database"
+        "                  WHERE datname = current_database())"
+        " AND ((classid::bigint << 32) | objid::bigint)"
+        "     = hashtext(%s)::bigint) AS held",
+        (f"oikonome:nightly:{tenant_id}",)).fetchone()["held"])
+
+
+def _detection_pending(conn) -> bool:
+    """Whether tonight's bill detection is still to come for a household
+    whose record is due now: the instant falls between DETECTION_WAIT
+    before the instance's nightly start and DETECTION_GIVE_UP after it,
+    and the household's own detection heartbeat is older than that
+    start. A household on the instance's clock reaches 04:00 seventeen
+    minutes before the nightly; recording then would grade the night
+    against the previous night's schedule. Read from the household's row,
+    never from a counter of this process: a detect sweep that outlived
+    its run, or a nightly still queued, is waited for too. Far from the
+    nightly, last night's detection is the night's; past the give-up a
+    household whose detection failed keeps its night on the schedule it
+    has."""
+    from .. import localtime
+    now = localtime.now_local(None)          # the instance's clock
+    start = now.replace(hour=NIGHTLY_HOUR, minute=NIGHTLY_MINUTE,
+                        second=0, microsecond=0)
+    # (the wait is shorter than the nightly's hour, so the window never
+    # crosses midnight: tonight's start is on today's date)
+    if not start - DETECTION_WAIT <= now < start + DETECTION_GIVE_UP:
+        return False
+    hb = conn.execute("SELECT ran_at FROM job_runs WHERE job = "
+                      "'nightly-detect'").fetchone()
+    return hb is None or hb["ran_at"] < start
+
+
+def forecast_tenant(tenant_id: str) -> dict:
+    """The cash forecast's nightly step for one household: tonight's
+    build, so what the forecast learned from history is stored for the
+    household's day (forecast_learned) before anyone opens Today, and
+    every worker serves the same forecast from one row; then tonight's
+    record of what it said (forecast_nights, forecast_score.record). Kept
+    after the night's bill detection, so it learns tonight's schedule
+    (_detection_pending). Its own lock: it yields to a nightly holding the
+    household (a later tick keeps the night), and a nightly arriving
+    mid-build runs as ever — the nightly is never the one that skips."""
+    from ..engine import budget as _budget, forecast as _forecast
+    from .. import localtime
+    conn = tenancy.tenant_connect(tenant_id)
+    locked = False
+    try:
+        locked = tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (f"oikonome:forecast:{tenant_id}",))["ok"]
+        if not locked:
+            log.info("forecast step already running for tenant %s — "
+                     "skipping", tenant_id)
+            return {"_status": "already-running"}
+        if _nightly_holds(conn, tenant_id):
+            return {"_status": "nightly-running"}
+        if not _household_active(conn, tenant_id):
+            return {"_status": "inactive"}
+        from ..engine import forecast_score as _score
+        now = localtime.now_local(_budget.load_config(conn))
+        day = now.date()
+        # once per household-local day, once its clock has passed
+        # FORECAST_LOCAL_HOUR (the sweep ticks hourly: the same local hour
+        # every night, give or take the tick)
+        if now.hour < FORECAST_LOCAL_HOUR:
+            return {"_status": "not-yet", "day": day.isoformat()}
+        # visited today already (the day's marker, written below for every
+        # household the step reaches — one with no checking account, which
+        # keeps no night, too)
+        if conn.execute("SELECT 1 FROM job_runs WHERE job = 'forecast' "
+                        "AND note = %s", (day.isoformat(),)).fetchone():
+            return {"_status": "done", "day": day.isoformat()}
+        if _detection_pending(conn):
+            return {"_status": "detection-pending", "day": day.isoformat()}
+        _forecast.build(conn, today=day)
+        # and what it said tonight, kept so the day it points at can grade
+        # it (specs/forecast-grading.md)
+        recorded = _score.record(conn, day)
+        alerts.heartbeat(conn, "forecast", day.isoformat())
+        return {"day": day.isoformat(), "recorded": recorded}
+    finally:
+        if locked:
+            if tenancy.release_lock(conn, f"oikonome:forecast:{tenant_id}"):
+                conn = None                      # type: ignore[assignment]
+        if conn is not None:
+            conn.close()
+
+
 def script_alert_tenant(tenant_id: str) -> dict:
     """Opt-in stale-collector email. Edge-triggered: one email
     when a watched source crosses 2× its expected interval, guarded by
@@ -1714,9 +1925,9 @@ def script_alert_tenant(tenant_id: str) -> dict:
         # dedupes the FLAG, not a mail that already left. A second entrant
         # skips rather than waits: waiting only to send the duplicate this
         # guard exists to prevent would miss the point.
-        locked = conn.execute(
-            "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-            (f"oikonome:script-alert:{tenant_id}",)).fetchone()["ok"]
+        locked = tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (f"oikonome:script-alert:{tenant_id}",))["ok"]
         if not locked:
             log.info("stale-collector alert already running for tenant %s "
                      "— skipping", tenant_id)
@@ -2594,7 +2805,8 @@ async def _nightly_all_body():
     # each connection's newest success and every error after it)
     from . import retention as _retention
     retained = await _nightly_step("retention", _retention.sweep)
-    return {"detect": detect, "snapshot": snapshot, "script_alerts": stale,
+    return {"detect": detect, "snapshot": snapshot,
+            "script_alerts": stale,
             "plaid_reap": reap, "frozen": frozen, "purged": purged,
             "unverified": stale_signups, "retention": retained}
 
@@ -2988,9 +3200,9 @@ def _email_if_due(tenant_id: str) -> None:
     now = dt.datetime.now(dt.timezone.utc)
     conn = tenancy.tenant_connect(tenant_id)
     try:
-        locked = conn.execute(
-            "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-            (f"oikonome:email:{tenant_id}",)).fetchone()["ok"]
+        locked = tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (f"oikonome:email:{tenant_id}",))["ok"]
         if not locked:
             log.info("email sweep already running for tenant %s — skipping",
                      tenant_id)
@@ -3150,6 +3362,86 @@ def _email_threads_running() -> int:
         return _EMAIL_THREADS
 
 
+# a forecast tick stops starting households past this many seconds (the
+# rest are due on the next tick, or kept by a Today open); its job's own
+# timeout is FORECAST_TICK_TIMEOUT. A first build of a day is a full learn,
+# seconds on a long ledger, and every household of one zone passes 04:00 on
+# the same tick: the ticks are ten minutes apart, so a zone spreads over
+# several of them
+FORECAST_TICK_BUDGET_S = 240.0
+FORECAST_TICK_TIMEOUT = 600
+
+
+def _due_forecast_tenants(admin, among: list | None = None) -> list[str]:
+    """The households whose forecast is due, from ONE query: active, their
+    own clock past FORECAST_LOCAL_HOUR, and no marker for their local
+    today (job_runs 'forecast', its note the local day). Each household's
+    day is read in Python by localtime.tenant_tz, the resolver
+    forecast_tenant keeps the day by, so the check and the step agree: the
+    instance's zone can be a process abbreviation Postgres reads as
+    another zone, or not at all. Oldest marker first, so a tick that stops
+    early leaves the same households for the next."""
+    from .. import localtime
+    rows = admin.execute(
+        """SELECT t.id, s.config->>'timezone' AS zone, j.note
+             FROM tenants t
+             LEFT JOIN tenant_settings s ON s.tenant_id = t.id
+             LEFT JOIN job_runs j ON j.tenant_id = t.id AND j.job = 'forecast'
+            WHERE COALESCE(t.status, 'active') = 'active'
+              AND (%(among)s::uuid[] IS NULL OR t.id = ANY(%(among)s))
+            ORDER BY j.ran_at NULLS FIRST, t.id""",
+        {"among": among}).fetchall()
+    out, zones = [], {}
+    for r in rows:
+        z = r["zone"]
+        if z not in zones:
+            zones[z] = localtime.now_local({"timezone": z})
+        now = zones[z]
+        if (now.hour >= FORECAST_LOCAL_HOUR
+                and r["note"] != now.date().isoformat()):
+            out.append(str(r["id"]))
+    return out
+
+
+def forecast_sweep(budget_s: float | None = None,
+                   among: list | None = None) -> dict:
+    """One forecast tick: the due households (_due_forecast_tenants), each
+    through forecast_tenant, until FORECAST_TICK_BUDGET_S has passed — the
+    rest are left for the next tick. {"done": n, "left": n}."""
+    import time
+    budget_s = FORECAST_TICK_BUDGET_S if budget_s is None else budget_s
+    admin = tenancy.admin_connect()
+    try:
+        due = _due_forecast_tenants(admin, among)
+    finally:
+        admin.close()
+    t0 = time.monotonic()
+    done = 0
+    for k, tid in enumerate(due):
+        if time.monotonic() - t0 > budget_s:
+            log.info("forecast tick: %d households left for the next tick",
+                     len(due) - k)
+            return {"done": done, "left": len(due) - k}
+        try:
+            forecast_tenant(tid)
+        except Exception as e:                   # noqa: BLE001
+            log.error("forecast failed for tenant %s: %s", tid, e)
+        done += 1
+    return {"done": done, "left": 0}
+
+
+async def forecast_all(ctx):
+    """Every ten minutes: each household's cash forecast for its own local
+    day, kept once that day's clock passes FORECAST_LOCAL_HOUR
+    (forecast_tenant): what it learned, stored for the day, and what it
+    said, recorded. Only the due households are visited (one query finds
+    them), under a time budget (forecast_sweep). In the household's zone,
+    not the instance's, so the record is the same moment of every
+    household's day and no day is doubled or skipped across a
+    daylight-saving change."""
+    return await asyncio.to_thread(forecast_sweep)
+
+
 async def email_all(ctx):
     """Hourly sweep — each tenant sends at ITS configured hour, once/day."""
     return await asyncio.to_thread(_counted_email_sweep)
@@ -3200,9 +3492,9 @@ def _sync_item_body(tenant_id: str, item_id: str,
         # waiting: the run already in flight covers this item, and a webhook
         # job must not sit holding a worker slot behind a sync that can take
         # minutes.
-        locked = conn.execute(
-            "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-            (f"oikonome:sync:{tenant_id}",)).fetchone()["ok"]
+        locked = tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (f"oikonome:sync:{tenant_id}",))["ok"]
         if not locked:
             # "will cover it" is only true if the run in flight has not
             # already passed this item's cursor — Plaid's webhook fires
@@ -3575,12 +3867,34 @@ SYNC_TIMEOUT = 30 * 60
 PLAID_LINK_TIMEOUT = 30 * 60
 
 
-async def plaid_link_finish(ctx, tenant_id: str, link_token: str):
+# A webhook-named finish that found the household busy is queued again
+# this much later, this many times: its tokens may be ones /link/token/get
+# does not show, and dropping them would leave a bank unexchanged.
+LINK_FINISH_RETRY_S = 20
+LINK_FINISH_RETRIES = 6
+
+
+async def plaid_link_finish(ctx, tenant_id: str, link_token: str,
+                            tokens: list | None = None, attempt: int = 0):
     """LINK webhook → finish a Hosted Link add session nobody may be
-    polling (web/plaid_webhook.py enqueues; jobs/plaid_links.py)."""
+    polling (web/plaid_webhook.py enqueues; jobs/plaid_links.py).
+    `tokens`: the public tokens the webhook named — single-use, and only
+    exchangeable with this instance's secret; they ride the job (whose
+    result, arguments included, is not kept: keep_result=0), never a
+    stored row. A finish that found the household's lock held is queued
+    again with the same tokens, LINK_FINISH_RETRIES times."""
     from . import plaid_links
-    return await asyncio.to_thread(plaid_links.finish_session, tenant_id,
-                                   link_token)
+    word = await asyncio.to_thread(plaid_links.finish_session, tenant_id,
+                                   link_token, None, tokens)
+    if word == "busy" and tokens and attempt < LINK_FINISH_RETRIES:
+        try:
+            await ctx["redis"].enqueue_job(
+                "plaid_link_finish", tenant_id, link_token, tokens,
+                attempt + 1, _defer_by=LINK_FINISH_RETRY_S)
+        except Exception as e:                             # noqa: BLE001
+            log.warning("plaid link finish not queued again: %s",
+                        type(e).__name__)
+    return word
 
 
 async def plaid_link_sweep(ctx):
@@ -4065,7 +4379,7 @@ async def _startup(ctx):
     # nobody can act on. Wait for the grants
     # rather than racing them; skip quietly if they never come, the next
     # boot repeats the sweeps anyway. Nothing else runs in this hook, so
-    # the early return skips exactly the two sweeps.
+    # the early return skips exactly the sweeps.
     for _ in range(STARTUP_GRANT_TRIES):
         if await asyncio.to_thread(_startup_grants_ready):
             break
@@ -4088,6 +4402,39 @@ async def _startup(ctx):
             log.info("re-encrypted %d plaintext tenant secret(s) at rest", n)
     except Exception:                                       # noqa: BLE001
         log.warning("startup secret re-encryption sweep failed", exc_info=True)
+    try:
+        n = await asyncio.to_thread(decide_receipt_backlogs)
+        if n:
+            log.info("decided %d receipt(s) left undecided by an upgrade", n)
+    except Exception:                                       # noqa: BLE001
+        log.warning("startup receipt backlog sweep failed", exc_info=True)
+
+
+def decide_receipt_backlogs() -> int:
+    """Decide every household's undecided receipts (which are one slip)
+    once, at boot. A migration leaves stored receipts undecided, and
+    until a sync or the nightly decides them one photo stored twice
+    counts twice — so the boot after a deploy settles them, outside every
+    request, on each household's own connection (the migrate step has
+    only the superuser DSN, as for the secret sweep above). Bounded per
+    household (receipt_identity.BACKLOG_PASSES); a household with nothing
+    undecided costs one probe; one household's failure does not stop the
+    rest. Returns how many were decided."""
+    from ..engine import receipt_identity
+    n = 0
+    for tid in _tenant_ids():
+        conn = None
+        try:
+            conn = tenancy.tenant_connect(tid)
+            if receipt_identity.has_pending(conn):
+                n += receipt_identity.decide_backlog(conn)
+        except Exception:                                   # noqa: BLE001
+            log.warning("receipt backlog failed for tenant %s", tid,
+                        exc_info=True)
+        finally:
+            if conn is not None:
+                conn.close()
+    return n
 
 
 class WorkerSettings:
@@ -4108,14 +4455,18 @@ class WorkerSettings:
                  # a whole fleet in one job: the time the cron takes to
                  # cover it, one default job timeout per slot
                  arq_func(sync_all_now, timeout=SYNC_BUCKETS * 300),
-                 email_all, demo_reset_all,
+                 email_all, arq_func(forecast_all,
+                                     timeout=FORECAST_TICK_TIMEOUT),
+                 demo_reset_all,
                  arq_func(sync_one, timeout=SYNC_TIMEOUT),
                  arq_func(sync_item, timeout=SYNC_TIMEOUT,
                           max_tries=SYNC_ITEM_ARQ_MAX_TRIES),
                  broadcast_sweep, nightly_reboot,
                  blocklist_refresh, webhooks_all,
                  staging_sweep,
-                 arq_func(plaid_link_finish, timeout=PLAID_LINK_TIMEOUT),
+                 # its arguments can hold public tokens: no result kept
+                 arq_func(plaid_link_finish, timeout=PLAID_LINK_TIMEOUT,
+                          keep_result=0),
                  arq_func(plaid_link_sweep, timeout=PLAID_LINK_TIMEOUT),
                  arq_func(bulk_import_job.bulk_import_run,
                           timeout=bulk_import_job.ARQ_TIMEOUT)] + ext.job_functions()
@@ -4131,9 +4482,14 @@ class WorkerSettings:
         # lock and whoever loses skips the tenant; colliding by
         # construction every single night would mean the Plaid reaper
         # almost never ran for that slot's tenants.
-        cron(nightly_all, hour=4, minute=17, timeout=NIGHTLY_TIMEOUT),
+        cron(nightly_all, hour=NIGHTLY_HOUR, minute=NIGHTLY_MINUTE,
+             timeout=NIGHTLY_TIMEOUT),
         cron(blocklist_refresh, hour=3, minute=30),     # daily spam-list refresh
         cron(email_all, minute=5),                      # hourly; per-tenant hour
+        # every ten minutes, off the sync grid: each household's forecast
+        # at its own local early morning (forecast_sweep)
+        cron(forecast_all, minute=set(range(3, 60, 10)),
+             timeout=FORECAST_TICK_TIMEOUT),
         cron(demo_reset_all, minute=0),                 # hourly pristine
         cron(staging_sweep, minute=47),                 # abandoned uploads
         cron(bulk_import_job.bulk_import_sweep,         # queued folder imports,

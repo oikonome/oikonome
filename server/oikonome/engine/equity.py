@@ -68,9 +68,10 @@ def _row(r: dict) -> dict:
             "txn_id": r["txn_id"], "form": r["form"], "note": r["note"]}
 
 
-def record_movement(conn, entity_id: str, *, kind: str, amount, date,
-                    member_id=None, txn_id=None, form=None,
-                    note=None) -> dict:
+def check_movement(*, kind: str, amount, member_id=None) -> tuple:
+    """(kind, amount, member_id) as the table takes them, or ValueError:
+    the one judgement both doors that write a movement apply, the
+    Business page's and a restore's archived row."""
     if kind not in KINDS:
         raise ValueError(f"kind must be one of {KINDS}")
     try:
@@ -95,6 +96,14 @@ def record_movement(conn, entity_id: str, *, kind: str, amount, date,
         from .entities import _valid_uuid
         if not _valid_uuid(member_id):
             raise ValueError("no such member")
+    return kind, amt, member_id
+
+
+def record_movement(conn, entity_id: str, *, kind: str, amount, date,
+                    member_id=None, txn_id=None, form=None,
+                    note=None) -> dict:
+    kind, amt, member_id = check_movement(kind=kind, amount=amount,
+                                          member_id=member_id)
     from .compat import req_date
     date = req_date(date)
     # One movement per (transaction, kind) — a partial unique index. A
@@ -160,10 +169,21 @@ def capital_summary(conn, entity_id: str, *, lifetime=None,
              WHERE m.entity_id = %s AND {COUNTS_IN_CAPITAL}
              GROUP BY m.kind""", (entity_id,)).fetchall()
     by = {r["kind"]: float(r["s"]) for r in rows}
-    contrib = by.get("contribution", 0.0)
     draws = by.get("draw", 0.0) + by.get("distribution", 0.0)
     from . import books
     net_income = 0.0
+    paid = 0.0
+    try:
+        if lifetime is None:
+            lifetime = books.entity_transactions(conn, entity_id, None)
+        # a business cost paid on a personal card is money the owner put
+        # in (specs/business-books.md → The capital account): counted as a
+        # contribution on every read, never written
+        paid = books.personally_paid(lifetime)
+    except Exception:                                     # noqa: BLE001
+        log.warning("capital summary: costs paid personally unavailable",
+                    exc_info=True)
+    contrib = by.get("contribution", 0.0) + paid
     try:
         # cumulative, all years: net income is what accrues to the owner,
         # and it takes the start-up allowance deducted so far as well as
@@ -178,8 +198,10 @@ def capital_summary(conn, entity_id: str, *, lifetime=None,
     except Exception:                                     # noqa: BLE001
         log.warning("capital summary: net income unavailable", exc_info=True)
     balance = round(contrib + net_income - draws, 2)
-    household_capital, pct = _household_capital(conn, entity_id, net_income)
+    household_capital, pct = _household_capital(conn, entity_id,
+                                                net_income + paid)
     return {"contributions": round(contrib, 2),
+            "paid_personally": round(paid, 2),
             "draws": round(by.get("draw", 0.0), 2),
             "distributions": round(by.get("distribution", 0.0), 2),
             "reimbursements": round(by.get("reimbursement", 0.0), 2),
@@ -191,6 +213,9 @@ def capital_summary(conn, entity_id: str, *, lifetime=None,
 
 
 def _household_capital(conn, entity_id: str, net_income: float):
+    # `net_income` here is everything the movements do not name a member
+    # for: the net income and the costs paid personally (whose card paid
+    # one is not recorded, so it splits by ownership like the income)
     """The household member's own capital account, and their ownership %.
 
     Each member of a multi-member business has their own capital account:
@@ -319,6 +344,61 @@ def _front_expense(conn, entity_id: str, txn_id: str, *, kind: str,
                                txn_id=txn_id, note=note)
 
 
+def record_owner_transfer(conn, entity_id: str, txn_id: str) -> dict:
+    """Record an owner transfer on the business's books as what it is:
+    money in as a contribution, money out as a draw, at the row's own
+    amount and date (specs/business-books.md → What a row is). Refuses a
+    row that is not an owner transfer of this business (books.row_roles);
+    a second call returns the movement already recorded."""
+    from . import books, entities
+    # the roles read the business's whole history: computed before the
+    # pairing lock, so the sync's settlement is not held up behind them,
+    # and recomputed under it only when the locked row no longer matches
+    # what was read
+    snapshot = {t["id"]: t
+                for t in books.entity_transactions(conn, entity_id, None)}
+    with conn.transaction():
+        live = entities.live_txn_id(conn, txn_id)
+        if live is None:
+            raise ValueError("no such transaction")
+        entities.require_active(conn, entity_id)
+        row = snapshot.get(live)
+        now = conn.execute(
+            """SELECT t.amount, t.date, t.account_id,
+                      (SELECT m.kind FROM equity_movement m
+                        WHERE m.txn_id = t.id AND m.entity_id = %s
+                        ORDER BY m.created_at, m.id LIMIT 1) AS recorded
+                 FROM transactions t WHERE t.id = %s""",
+            (entity_id, live)).fetchone()
+        if (row is None or now is None
+                or float(now["amount"] or 0) != row["amount"]
+                or (now["date"].isoformat() if now["date"] else None)
+                != row["date"]
+                or now["account_id"] != row["account_id"]):
+            row = next((t for t in books.entity_transactions(
+                conn, entity_id, None) if t["id"] == live), None)
+        elif now["recorded"] != row.get("owner_recorded"):
+            # what is already recorded is read under the lock
+            row = {**row, "owner_recorded": now["recorded"]}
+        if row is None:
+            raise ValueError("no such transaction")
+        if row["role"] not in ("owner_in", "owner_out"):
+            raise ValueError("only money the owner moved into or out of the "
+                             "business can be recorded this way")
+        kind = "contribution" if row["role"] == "owner_in" else "draw"
+        if row.get("owner_recorded") not in (None, kind):
+            raise FrontedExpenseConflict(
+                f"that transfer is already recorded as a "
+                f"{row['owner_recorded']}: delete that movement first")
+        return record_movement(conn, entity_id, kind=kind,
+                               amount=abs(row["amount"]), date=row["date"],
+                               txn_id=live,
+                               note=("owner transfer into the business"
+                                     if kind == "contribution"
+                                     else "owner transfer out of the "
+                                          "business"))
+
+
 def contribute_expense(conn, entity_id: str, txn_id: str, *,
                        member_id=None, date=None, note=None) -> dict:
     """A personally-paid business cost the member donates as capital: assign the
@@ -363,10 +443,10 @@ def release_withdrawn_fronted(conn, txn_ids: list[str], *,
     params: list = [ids, list(FRONTED_KINDS)]
     if older_than_days is not None:
         from .budget import (FEED_REMOVED_OLDER_SQL,
-                             log_unreadable_removed_stamps)
+                             log_unstamped_removed_rows)
         age = FEED_REMOVED_OLDER_SQL
         params.append(int(older_than_days))
-        log_unreadable_removed_stamps(conn, ids, "release_withdrawn_fronted")
+        log_unstamped_removed_rows(conn, ids, "release_withdrawn_fronted")
     removed = 0
     with conn.transaction():
         rows = conn.execute(

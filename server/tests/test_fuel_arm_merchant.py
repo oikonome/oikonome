@@ -114,8 +114,10 @@ class FuelArmCostDoesNotGrowWithDistinctMerchants(unittest.TestCase):
         import string
         import time
         rng = random.Random(7)
+        # as long as a brand can be while "<brand> GAS #12" still fits the
+        # descriptor cap the reader clips its text to
         brands = ["".join(rng.choice(string.ascii_uppercase)
-                          for _ in range(600)) for _ in range(600)]
+                          for _ in range(590)) for _ in range(600)]
         started = time.perf_counter()
         for b in brands:
             self.assertEqual(fuel_arm(b.title(), f"{b} GAS #12"),

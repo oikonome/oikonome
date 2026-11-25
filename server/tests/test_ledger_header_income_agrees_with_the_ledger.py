@@ -15,7 +15,8 @@ import unittest
 from unittest import mock
 
 from oikonome.engine import budget, reporting
-from oikonome.web import api
+from oikonome.web import api  # noqa: F401 (loads every API module in route order)
+from oikonome.web import api_ledger as api  # noqa: F811 (the module the ledger doors read)
 
 from .util import add_bill, add_txn, make_db, write_config
 

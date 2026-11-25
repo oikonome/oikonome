@@ -283,7 +283,9 @@ class TheTableTravelsWithTheHousehold(_Household):
         with zipfile.ZipFile(io.BytesIO(data)) as z:
             member = z.read("account_sources.csv").decode("utf-8")
         self.assertNotIn("Invented", member)
-        self.assertNotIn("4000", member)
+        # digests are hex, so "4000" can turn up inside one by chance; only
+        # a run of digits that stands on its own would be a card number
+        self.assertIsNone(re.search(r"(?<![0-9a-f])4000(?![0-9a-f])", member))
         n = self._sources(self.conn)
         dest = make_db()
         self.addCleanup(dest.close)

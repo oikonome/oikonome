@@ -45,10 +45,12 @@ the map sits alongside them, so it's reversible.
 ## Learned categories vs your corrections
 
 The aggregator categorizes every transaction and is trusted by default.
-On top sit merchant-level **category rules** in three tiers — the same
-three groups the Rules page shows: **built-in** seed rules (always on,
-no LLM needed), **model-learned** rules (optional, needs an LLM — see
-the FAQ), and **your rules** (created by your corrections). Two
+On top sit merchant-level **category rules** from four sources — the
+groups the Rules page shows: **Built-in** seed rules (always on, no LLM
+needed), rules **From an AI pass** (optional, needs an LLM — see the
+FAQ), **Your trained model** (a classifier trained on your own
+corrections), and **Your rules** (created by your corrections); a group
+with no rules is not shown. Two
 invariants hold everywhere: built-in and model rules only ever sharpen
 vague buckets and never override a specific aggregator category, while
 your rules apply merchant-wide, past and future, over anything; and no
@@ -67,8 +69,8 @@ The merchants guide has the detail, and the page to undo it on.
 
 The same goes for a loan payment on an imported statement line that
 carries no category of its own: a line that says it is a student-loan or
-loan payment ("… STD LN PMT", "AUTO LOAN PMT") is filed under **loan
-payments**, even when the importer cleaned the name down to the bare
+loan payment ("… STD LN PMT", "AUTO LOAN PMT") is filed under **Loan
+Payments**, even when the importer cleaned the name down to the bare
 servicer, so it is not read as a utility or a service. It still counts
 as money out. A servicer's other charges are left alone, and your own
 overrides outrank this too.
@@ -142,8 +144,9 @@ account's default.
 
 ## Gotchas
 
-- Canonical merchant cleanup runs nightly; a brand-new descriptor may
-  display raw until the next nightly pass groups it.
+- Canonical merchant cleanup runs as each sync lands — a new row gets
+  its merchant (name, logo) during the sync itself, and the nightly pass
+  is only the backstop.
 - A reaped connection stops syncing but keeps every transaction it
   ever brought in — history never disappears with the connection.
 - Recategorizing a transaction asks whether it covers **just this one**

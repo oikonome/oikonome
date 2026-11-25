@@ -113,10 +113,19 @@ def request(conn, user_id, ip: str = "",
     transaction, so the second request blocks until the first is committed
     and visible and then supersedes it in the ordinary way. The partial
     unique index on the live rows is the same rule stated where no future
-    caller can route around it — belt to this braces."""
+    caller can route around it — belt to this braces.
+
+    Refused (`posture.refuse_during_revert_hold`) while an undone address
+    change is recent. The check runs under the account's factor lock,
+    which the undo holds to its commit, so a request racing an undo either
+    lands first and is cancelled by the undo's rotation, or waits and then
+    reads the stamp — never neither."""
+    from . import posture
     token = secrets.token_urlsafe(32)
     lands = dt.datetime.now(dt.timezone.utc) + cooling_off
     with conn.transaction():
+        posture.lock_user_factors(conn, user_id)
+        posture.refuse_during_revert_hold(conn, user_id)
         conn.execute("SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
                      (_CLOCK_LOCK_SPACE, str(user_id)))
         conn.execute(

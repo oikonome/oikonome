@@ -7,8 +7,8 @@ import { Alert, KeyboardAvoidingView, Modal, Pressable, ScrollView,
          StyleSheet, Text, TextInput, View } from "react-native";
 import PullRefresh from "../components/pull-refresh";
 
-import StaleBanner from "../components/stale-banner";
-import { Card, HelpLink } from "../components/ui";
+import { FailedLine, StaleLine } from "../components/loaded";
+import { Card, HelpLink, Skeleton, Note } from "../components/ui";
 import { errText, RuleRow, RulesPage } from "../lib/api";
 import { patchList, removeFromList } from "../lib/cache";
 import { useSession } from "../lib/session";
@@ -16,10 +16,13 @@ import { useDemo, useViewer } from "../lib/viewer";
 import { C } from "../lib/theme";
 import { catLabel, filterCategories, lastPage, rulesEmptyLine,
          spendPickerGroups } from "../lib/pure";
+import { fieldA11y } from "../components/field";
+import { useSheetAnimation } from "../lib/a11y";
 
 const SOURCES = ["user", "llm", "model", "seed"] as const;
 
 export default function Rules() {
+  const sheetAnim = useSheetAnimation();
   const { client } = useSession();
   const qc = useQueryClient();
   const viewer = useViewer();
@@ -144,7 +147,7 @@ export default function Rules() {
       <View style={s.tabs}>
         {SOURCES.filter((x) => x === source || x === "user"
             || (d?.counts[x] ?? 1) > 0).map((x) => (
-          <Pressable key={x} style={[s.tab, source === x && s.tabOn]}
+          <Pressable accessibilityRole="button" key={x} style={[s.tab, source === x && s.tabOn]}
                      onPress={() => { setSource(x);
                                       // each tab starts at its first
                                       // page: a page past a smaller
@@ -153,8 +156,8 @@ export default function Rules() {
             <Text style={{ color: source === x ? C.text : C.mut,
                            fontWeight: "600", fontSize: 13 }}>
               {x === "user" ? "Your rules"
-                : x === "llm" ? "Model-learned"
-                : x === "model" ? "Learned" : "Built-in"}
+                : x === "llm" ? "From an AI pass"
+                : x === "model" ? "Your trained model" : "Built-in"}
               {d ? ` · ${d.counts[x] ?? 0}` : ""}
             </Text>
           </Pressable>
@@ -164,9 +167,9 @@ export default function Rules() {
       <Text style={[s.mut, { marginHorizontal: 12 }]}>
         {source === "user" ? "corrections you made"
           : source === "llm"
-            ? "inferred by the local model; correcting one makes it yours"
+            ? "classified by an AI endpoint; correcting one makes it yours"
           : source === "model"
-            ? "the classifier trained on your own corrections; "
+            ? "the classifier trained on your household's own corrections; "
               + "correcting one makes it yours"
             : "shipped starting points"}
       </Text>
@@ -176,16 +179,14 @@ export default function Rules() {
           Not available on the demo instance — synthetic data only.
         </Text>
       )}
-      <TextInput style={s.search}
+      <TextInput {...fieldA11y("Search merchants or categories")} style={s.search}
                  placeholder="search merchants or categories"
                  placeholderTextColor={C.mut} autoCapitalize="none"
                  value={qText} onChangeText={setQText} />
-      <StaleBanner query={query} />
-      {query.isPending && <Text style={s.center}>Loading…</Text>}
+      <StaleLine query={query} />
+      {query.isPending && <Skeleton />}
       {query.isError && !d && (
-        <Text style={[s.center, { color: C.bad }]}>
-          Couldn't reach the server — pull down to retry.
-        </Text>
+        <FailedLine q={query} what={q ? `rules matching “${q}”` : "rules"} />
       )}
       {d && (
         <Card style={query.isPlaceholderData ? { opacity: 0.6 } : undefined}>
@@ -227,8 +228,10 @@ export default function Rules() {
                         merchant: r.merchant, disabled: !r.disabled })}>
                   {r.disabled ? "Enable" : "Disable"}
                 </Text>
-                <Text style={[{ color: C.bad, fontSize: 12, padding: 6 },
+                <Text style={[{ color: C.bad, fontSize: 14, paddingHorizontal: 14,
+                                paddingVertical: 12 },
                               demo && { opacity: 0.4 }]}
+                      accessibilityRole="button" accessibilityLabel={`Delete the rule for ${r.merchant}`}
                       onPress={() => !busy && !demo && del(r.merchant)}>
                   ✕
                 </Text>
@@ -272,24 +275,22 @@ export default function Rules() {
         <Text style={[s.mut, { paddingBottom: 8 }]}>
           {/* all four provenances — the trained classifier counts too */}
           {(d.counts.user + d.counts.llm + d.counts.seed
-            + (d.counts.model ?? 0)).toLocaleString()}
-          {" rules sorting your transactions · "}{d.counts.user} yours ·{" "}
-          {d.counts.llm} model ·{" "}
-          {(d.counts.model ?? 0) > 0 ? `${d.counts.model} learned · ` : ""}
-          {d.counts.seed} built-in.{"\n"}
+            + d.counts.model).toLocaleString()}
+          {" rules sorting your transactions · "}{d.counts_text}.{"\n"}
           Rules are learned, never hand-written. Correcting or disabling
           one makes it yours.
         </Text>
       )}
       {!viewer && <RenameCategoryCard demo={demo} />}
 
-      <Modal visible={!!changing} animationType="slide" transparent
+      <Modal visible={!!changing} animationType={sheetAnim} transparent
              onRequestClose={() => setChanging(null)}>
         {/* edge-to-edge Android does not resize for the keyboard */}
         <KeyboardAvoidingView style={s.sheetWrap} behavior="padding">
           <View style={s.sheet}>
             <Text style={s.sheetTitle}>Category for {changing}</Text>
-            <TextInput style={s.search2} placeholder="filter…"
+            <TextInput {...fieldA11y(`Filter categories for ${changing}`)}
+                       style={s.search2} placeholder="filter…"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        value={catFilter} onChangeText={setCatFilter} />
             <ScrollView style={{ maxHeight: 400 }}
@@ -297,11 +298,7 @@ export default function Rules() {
               {/* a picker with nothing in it must say why */}
               {cats.isPending && <Text style={s.mut}>Loading…</Text>}
               {cats.isError && !cats.data && (
-                <Text style={[s.mut, { color: C.bad }]}
-                      onPress={() => cats.refetch()}>
-                  Couldn't load categories — tap to retry.
-                </Text>
-              )}
+                <FailedLine q={cats} what="the categories" />)}
               {/* the web's groups, in its order — the taxonomy is part
                   of the answer, not decoration. No "Transfers & income":
                   a rule re-files every charge from the merchant, and the
@@ -314,7 +311,7 @@ export default function Rules() {
                 const spend = flt(groups.spend);
                 const custom = flt(groups.custom);
                 const row = (c: string) => (
-                  <Pressable key={c} style={s.catRow}
+                  <Pressable accessibilityRole="button" key={c} style={s.catRow}
                              disabled={setRule.isPending}
                              onPress={() => setRule.mutate(
                                { merchant: changing!, category: c })}>
@@ -343,7 +340,7 @@ export default function Rules() {
                 );
               })()}
             </ScrollView>
-            <Pressable style={[s.closeBtn]}
+            <Pressable accessibilityRole="button" style={[s.closeBtn]}
                        onPress={() => setChanging(null)}>
               <Text style={{ color: C.mut, fontWeight: "600" }}>Close</Text>
             </Pressable>
@@ -410,7 +407,14 @@ function RenameCategoryCard({ demo }: { demo: boolean }) {
         override, merchant rule, and budget carve-out that used the old
         name.
       </Text>
-      {customs.length === 0 ? (
+      {/* "none yet" only from a list that answered */}
+      {cats.data === undefined && cats.isError ? (
+        <FailedLine q={cats} what="the categories" />
+      ) : cats.data === undefined ? (
+        <Text style={{ color: C.mut, fontSize: 12, marginTop: 6 }}>
+          Loading…
+        </Text>
+      ) : customs.length === 0 ? (
         <Text style={{ color: C.mut, fontSize: 12, marginTop: 6 }}>
           no custom categories yet
         </Text>
@@ -418,7 +422,7 @@ function RenameCategoryCard({ demo }: { demo: boolean }) {
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6,
                        marginTop: 6 }}>
           {customs.map((c) => (
-            <Pressable key={c}
+            <Pressable accessibilityRole="button" key={c}
                        style={[s.chip, oldName === c && s.chipOn]}
                        onPress={() => setOldName(c)}>
               <Text style={{ color: oldName === c ? C.text : C.mut,
@@ -430,13 +434,13 @@ function RenameCategoryCard({ demo }: { demo: boolean }) {
         </View>
       )}
       <View style={{ flexDirection: "row", gap: 6, marginTop: 6 }}>
-        <TextInput style={[s.search, { flex: 1, marginHorizontal: 0,
+        <TextInput {...fieldA11y("New name")} style={[s.search, { flex: 1, marginHorizontal: 0,
                                        marginTop: 0 }]}
                    placeholder="new name" placeholderTextColor={C.mut}
                    autoCapitalize="none"
                    editable={!demo}
                    value={newName} onChangeText={setNewName} />
-        <Pressable style={{ backgroundColor: C.accent, borderRadius: 8,
+        <Pressable accessibilityRole="button" style={{ backgroundColor: C.btn, borderRadius: 8,
                             paddingHorizontal: 12,
                             justifyContent: "center",
                             opacity: !oldName.trim() || !newName.trim()
@@ -449,9 +453,9 @@ function RenameCategoryCard({ demo }: { demo: boolean }) {
         </Pressable>
       </View>
       {msg ? (
-        <Text style={{ color: msg.startsWith("Renamed")
+        <Note bad={!(msg.startsWith("Renamed"))} style={{ color: msg.startsWith("Renamed")
                          ? C.good : C.bad, fontSize: 12, marginTop: 4 }}
-              onPress={() => setMsg(null)}>{msg}</Text>
+              onPress={() => setMsg(null)}>{msg}</Note>
       ) : null}
       </View>
     </Card>
@@ -470,7 +474,7 @@ const s = StyleSheet.create({
   chip: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
           borderRadius: 14, paddingHorizontal: 10, paddingVertical: 4 },
   chipOn: { borderColor: C.accent, backgroundColor: C.hover },
-  search: { backgroundColor: C.card, borderColor: C.border, borderWidth: 1,
+  search: { backgroundColor: C.card, borderColor: C.field, borderWidth: 1,
             borderRadius: 10, color: C.text, fontSize: 14,
             marginHorizontal: 12, marginTop: 10,
             paddingHorizontal: 12, paddingVertical: 8 },
@@ -483,7 +487,7 @@ const s = StyleSheet.create({
   sheet: { backgroundColor: C.card, borderTopLeftRadius: 16,
            borderTopRightRadius: 16, padding: 16, gap: 10 },
   sheetTitle: { color: C.text, fontSize: 16, fontWeight: "700" },
-  search2: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  search2: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
              borderRadius: 8, color: C.text, fontSize: 14,
              paddingHorizontal: 10, paddingVertical: 7 },
   catRow: { paddingVertical: 9, borderTopColor: C.border,

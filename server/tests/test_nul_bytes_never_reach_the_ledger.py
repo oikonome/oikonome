@@ -192,7 +192,7 @@ class NulKeysInARestoredConfigTests(unittest.TestCase):
         return dict(self.conn.execute(
             "SELECT config FROM tenant_settings").fetchone()["config"])
 
-    def test_a_nul_spelled_policy_key_is_refused_and_changes_nothing(self):
+    def test_a_nul_spelled_policy_key_is_left_out_and_changes_nothing(self):
         before = self._cfg()
         for key, val in (("plaid_enrich_used", {}),
                          ("notify_phone", {"number": "+15550199",
@@ -204,8 +204,11 @@ class NulKeysInARestoredConfigTests(unittest.TestCase):
             cell = json.dumps({key + NUL: val, "food_monthly": 321})
             self.assertIn("\\u0000", cell)
             with self.subTest(key=key):
-                with self.assertRaises(ValueError):
-                    restore.restore_zip(self.conn, _settings_zip(cell))
+                # the document is left out whole, never folded onto the
+                # real key, and the summary says which file and column
+                got = restore.restore_zip(self.conn, _settings_zip(cell))
+                self.assertTrue(any("tenant_settings.csv" in n
+                                    for n in got.get("_notes") or []))
                 cfg = self._cfg()
                 self.assertEqual(cfg, before)
                 self.assertFalse(any(NUL in k for k in cfg))

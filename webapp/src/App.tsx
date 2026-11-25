@@ -1,4 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { helpHref } from "./helptopic";
 import { lazy, memo, Suspense, useCallback, useEffect, useMemo, useRef,
   useState, type ReactElement } from "react";
 import { Link, Navigate, NavLink, Route, Routes, useLocation,
@@ -22,7 +23,9 @@ function applyTheme(t: Theme) {
     ?.setAttribute("content", light ? "#f2f5f7" : "#0f141a");
 }
 import ErrorBoundary from "./components/ErrorBoundary";
+import { useDialog } from "./components/useDialog";
 import TwoFactorGate from "./components/TwoFactorGate";
+import { verifyNagDue } from "./components/VerifyEmailCard";
 import { LogosProvider } from "./components/MerchantAvatar";
 import { ext } from "./ext";
 import Home from "./pages/Home";
@@ -34,6 +37,7 @@ import { hasLeftWizard } from "./wizardexit";
 import { checklistOpen } from "./checklist";
 import { isOwner, isViewer } from "./role";
 import { PAGE, warmEveryRoute } from "./pageChunks";
+import { reducedMotion } from "./motion";
 
 // Logged-out users are redirected to the server-rendered /login; there is
 // no second in-SPA login screen.
@@ -191,40 +195,14 @@ function Toaster() {
                padding: ".6rem 1rem", boxShadow: "0 4px 16px rgba(0,0,0,.3)",
                cursor: "pointer", maxWidth: "90vw" }}>
       {msg.text}
+      {/* the keyboard's way to the click above: out of sight until focused */}
+      <button type="button" className="note-x"
+              aria-label={msg.to ? "Open" : "Dismiss"}
+              onClick={(e) => { e.stopPropagation();
+                                if (msg.to) nav(msg.to); setMsg(null); }}>
+        {msg.to ? "›" : "✕"}</button>
     </div>
   );
-}
-
-// the verify-email banner waits out a grace window so a brand-new
-// signup isn't nagged on day one. True once the account is ≥3 days old (or
-// if we somehow have no timestamp — fail toward showing the nag).
-const VERIFY_GRACE_MS = 3 * 24 * 60 * 60 * 1000;
-function verifyBannerDue(createdAt: string | null): boolean {
-  if (!createdAt) return true;
-  const t = Date.parse(createdAt);
-  if (Number.isNaN(t)) return true;
-  return Date.now() - t >= VERIFY_GRACE_MS;
-}
-
-// which help guide the header ? opens per route (longest prefix
-// wins). Routes without a guide land on the plain catalog.
-const HELP_TOPIC_BY_ROUTE: [string, string][] = [
-  ["/transactions", "transactions"], ["/bills", "bills"],
-  ["/budget", "budget"], ["/rules", "rules"], ["/merchants", "merchants"],
-  ["/assistant", "assistant"], ["/cashflow", "cash-flow"],
-  ["/retirement", "retirement"], ["/debt", "debt"],
-  ["/networth", "net-worth"], ["/alerts", "alerts"],
-  ["/accounts", "accounts"], ["/items", "receipts"],
-  ["/reimburse", "reimbursements"], ["/import", "import-history"],
-  ["/business", "business"],
-  ["/settings", "security"], ["/doctor", "troubleshooting"],
-  ["/", "today"],   // last: matches everything (the home lenses)
-];
-
-function helpHref(pathname: string): string {
-  const hit = HELP_TOPIC_BY_ROUTE.find(([p]) =>
-    p === "/" ? pathname === "/" : pathname.startsWith(p));
-  return hit ? `/help?topic=${hit[1]}` : "/help";
 }
 
 // ---- rail icons -------------------------------------------------
@@ -333,9 +311,11 @@ export default function App() {
   // it is a workspace preference, not a per-visit one — someone still
   // learning nine glyphs should not have to re-pin every session.
   const [railPinned, setRailPinned] = useState(
-    () => readStore("local", "oiko-rail-pinned") === "1");
+    // open (labels showing) unless this browser closed it: an icon-only
+    // rail asks a newcomer to guess what each mark means
+    () => readStore("local", "oiko-rail") !== "closed");
   useEffect(() => {
-    writeStore("local", "oiko-rail-pinned", railPinned ? "1" : "0");
+    writeStore("local", "oiko-rail", railPinned ? "open" : "closed");
   }, [railPinned]);
   // On a phone, hover is the rail's entire reveal mechanism and a touch
   // screen has no hover, so below the breakpoint the SAME <nav> becomes a
@@ -355,26 +335,35 @@ export default function App() {
   // choosing the route you are already on does not change loc.pathname and
   // would otherwise leave the drawer sitting open over the answer.
   useEffect(() => { setDrawerOpen(false); }, [loc.pathname]);
+  // The drawer only exists at phone width. A window that grows past it
+  // (a tablet turned to landscape) shows the ordinary rail, so an open
+  // drawer would leave the page inert and scroll-locked behind nothing
+  // anyone can see to close: closing it when the width passes is the fix.
+  useEffect(() => {
+    if (!drawerOpen || typeof window.matchMedia !== "function") return;
+    const phone = window.matchMedia("(max-width:760px)");
+    if (!phone.matches) { setDrawerOpen(false); return; }
+    const onChange = (e: MediaQueryListEvent) => {
+      if (!e.matches) setDrawerOpen(false);
+    };
+    phone.addEventListener("change", onChange);
+    return () => phone.removeEventListener("change", onChange);
+  }, [drawerOpen]);
+  // Open, the drawer is a modal dialog: focus moves to its close control,
+  // Tab stays inside, the page behind is inert, Escape closes it, and
+  // focus goes back to the ☰.
+  const navRef = useRef<HTMLElement | null>(null);
+  useDialog(navRef, { open: drawerOpen, modal: true, initialFocus: closeRef,
+                      returnFocus: burgerRef,
+                      onClose: () => setDrawerOpen(false) });
   useEffect(() => {
     if (!drawerOpen) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape") return;
-      setDrawerOpen(false);
-      burgerRef.current?.focus();
-    };
-    document.addEventListener("keydown", onKey);
     // Without the lock the page behind scrolls under the finger, and on iOS
     // that also drags the drawer itself: position:fixed is relative to the
     // visual viewport, which moves during an overscroll bounce.
     const prev = document.body.style.overflow;
     document.body.style.overflow = "hidden";
-    // Focus a control INSIDE the panel, or the next Tab continues from the
-    // ☰ behind the scrim and walks the top bar the drawer is covering.
-    closeRef.current?.focus();
-    return () => {
-      document.removeEventListener("keydown", onKey);
-      document.body.style.overflow = prev;
-    };
+    return () => { document.body.style.overflow = prev; };
   }, [drawerOpen]);
   // Clicking a destination should hand the rail back to the page, but the
   // pointer is still sitting on the link that was just clicked, so :hover
@@ -660,6 +649,12 @@ export default function App() {
       <ScrollToTop />
       <div className={"shell" + (railPinned ? " rail-pinned" : "")
                       + (drawerOpen ? " drawer-open" : "")}>
+      {/* the first Tab stop: past the header and the nav to the page
+          (moves focus without touching the URL, whose hash some pages read) */}
+      <a href="#main" className="skip-link"
+         onClick={(e) => { e.preventDefault();
+                           document.getElementById("main")?.focus(); }}>
+        Skip to content</a>
       <header className="top" ref={headerRef}><div className="bar"
         onClick={(e) => {
           // On the BAR, not on <nav>. The brand is the Home link and it sits
@@ -735,14 +730,10 @@ export default function App() {
             {/* Feedback is icon-only, left of Help — keeps the top bar
                 quiet while still one click away. */}
             {feedbackOn && (
-              <NavLink to="/feedback"
+              <NavLink to="/feedback" className="hdr-ic hdr-round hdr-fold"
                 title="Feedback & bug reports"
                 aria-label="Feedback & bug reports"
-                style={{ alignSelf: "center", width: 28, height: 28,
-                         lineHeight: "28px", textAlign: "center",
-                         borderRadius: "50%", border: "1px solid var(--line)",
-                         fontSize: 14, textDecoration: "none",
-                         color: "var(--blue)" }}>
+                style={{ fontSize: 14 }}>
                 {/* Inline SVG, not the 💬 emoji: the emoji renders as a
                     filled colour glyph no CSS can restyle, so it sat white
                     and solid in a bar of currentColor outlines. Same lesson
@@ -750,9 +741,7 @@ export default function App() {
                 <svg aria-hidden="true" width="14" height="14"
                      viewBox="0 0 24 24" fill="none" stroke="currentColor"
                      strokeWidth="2" strokeLinecap="round"
-                     strokeLinejoin="round"
-                     style={{ display: "block", margin: "0 auto",
-                              position: "relative", top: 6 }}>
+                     strokeLinejoin="round" style={{ display: "block" }}>
                   <path d="M21 11.5a8.5 8.5 0 0 1-8.5 8.5 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 8.5-8.5h.5a8.5 8.5 0 0 1 8 8v.5z" />
                 </svg>
               </NavLink>
@@ -769,22 +758,32 @@ export default function App() {
                 Matches the ? circle's geometry deliberately — two icons of
                 different sizes in one cluster read as an accident. */}
             <AlertsBell />
-            <NavLink to={helpHref(loc.pathname)}
+            <NavLink to={helpHref(loc.pathname, loc.search)} className="hdr-ic hdr-round hdr-fold"
               title="Help — guides, search, FAQ"
               aria-label="Help — guides, search, FAQ"
-              style={{ alignSelf: "center", width: 28, height: 28,
-                       lineHeight: "28px", textAlign: "center",
-                       borderRadius: "50%", border: "1px solid var(--line)",
-                       fontSize: 13, textDecoration: "none",
-                       color: "var(--blue)" }}>?</NavLink>
+              // the glyph sat a pixel low in the old 28px line box; the
+              // padding keeps it where it was
+              style={{ fontSize: 13, paddingTop: 2 }}>?</NavLink>
             <details className="usermenu">
               {/* long addresses truncated unreadably — show the
                   local part in the chrome; the full address lives on
                   hover and as the menu's first line */}
-              <summary title={me.data.email}>
-                {me.data.email.split("@")[0]}</summary>
+              <summary className="hdr-ic" title={me.data.email}>
+                {me.data.email.split("@")[0].slice(0, 1)}
+                <span className="um-rest">
+                  {me.data.email.split("@")[0].slice(1)}</span></summary>
               <div className="usermenu-panel">
                 <span className="usermenu-email">{me.data.email}</span>
+                {/* at phone width the header's Feedback and Help icons
+                    fold in here, so the bar fits 320 px without scrolling
+                    sideways (index.css .hdr-fold / .um-fold) */}
+                {feedbackOn && (
+                  <NavLink to="/feedback" className="um-fold"
+                    onClick={(e) => (e.target as HTMLElement).closest("details")
+                      ?.removeAttribute("open")}>Feedback &amp; bug reports</NavLink>)}
+                <NavLink to={helpHref(loc.pathname, loc.search)} className="um-fold"
+                  onClick={(e) => (e.target as HTMLElement).closest("details")
+                    ?.removeAttribute("open")}>Help</NavLink>
                 <NavLink to="/settings"
                   onClick={(e) => (e.target as HTMLElement).closest("details")
                     ?.removeAttribute("open")}>Settings</NavLink>
@@ -809,7 +808,7 @@ export default function App() {
             CSS, so a destination can never exist in one and not the
             other. Groups run in order: manage / reports / wealth /
             system. */}
-        <nav id="mainnav">
+        <nav id="mainnav" ref={navRef}>
           {/* Drawer-only head. The open panel covers the top bar, so the
               brand and the ☰ that opened it are both behind the scrim and
               unreachable — the close control and the Home link have to be
@@ -908,7 +907,7 @@ export default function App() {
           aria-hidden: the drawer already carries the close control, and a
           screen reader announcing an unlabelled div is noise. */}
       {drawerOpen && (
-        <div className="navscrim" aria-hidden="true"
+        <div className="navscrim" aria-hidden="true" data-dialog-keep=""
              onClick={() => { setDrawerOpen(false);
                               burgerRef.current?.focus(); }} />
       )}
@@ -928,7 +927,7 @@ export default function App() {
           <span style={{ flex: 1 }}>
             {me.data.broadcast.severity === "warn" ? "⚠" : "•"}{" "}
             {me.data.broadcast.message}</span>
-          <button className="dismiss" title="dismiss"
+          <button className="dismiss" title="dismiss" aria-label="Dismiss"
                   onClick={(e) => {
                     writeStore("session", "bc-" + me.data!.broadcast!.message, "1");
                     (e.currentTarget.parentElement as HTMLElement).style.display = "none";
@@ -972,7 +971,7 @@ export default function App() {
           contradiction. */}
       {me.data?.hosted && me.data.verified === false
         && !me.data.email_delivery
-        && verifyBannerDue(me.data.created_at) && (
+        && verifyNagDue(me.data.created_at, me.data.verify_deadline) && (
         <div className="note topnote">
           <span style={{ flex: 1 }}>
             Verify your email — we sent a link to <b>{me.data.email}</b>.
@@ -992,14 +991,14 @@ export default function App() {
         </div>
       )}
       <RouteTitle demo={!!me.data.demo} />
-      <main>
+      <main id="main" tabIndex={-1}>
         <ErrorBoundary resetKey={loc.pathname}>
           <AppRoutes me={me.data} homeWeb={settingsQ.data?.home_web}
                      homeKnown={settingsQ.isSuccess || settingsQ.isError}
                      homeOk={settingsQ.isSuccess} />
         </ErrorBoundary>
         <footer className="mut" style={{ textAlign: "center", fontSize: 12,
-                 padding: "1.2rem 0 .8rem", opacity: .7 }}>
+                 padding: "1.2rem 0 .8rem" }}>
           {/* the version opens the release notes on GitHub — the releases
               index, which always exists, not a tag page */}
           <a href={RELEASES} target="_blank"
@@ -1071,15 +1070,12 @@ function SyncChip({ viewer }: { viewer: boolean }) {
   // The clock is the server's phrase ("synced 12m ago"); the chip owns
   // the verb, so only the age is kept.
   const age = (conns.data?.last_sync ?? "").replace(/^synced\s+/, "");
-  // amber = a connection that needs the person's hand (re-auth, gone);
-  // a bank that is merely down or slow is green like any other
-  // "not right now" — red/amber for that is what made them stop meaning
-  // anything. Same rule as the dot on Accounts.
-  const attention = rows.some((c) => {
-    const k = c.status_kind
-      ?? (c.status && c.status !== "ok" ? "attention" : "ok");
-    return k !== "ok" && k !== "retrying";
-  });
+  // amber = a connection that needs the person's hand (re-auth, gone and
+  // not linked again); a bank that is merely down or slow is green like
+  // any other "not right now" — red/amber for that is what made them stop
+  // meaning anything. The server decides which (needs_attention), and the
+  // Settings row and the phone print the same count.
+  const attention = (conns.data?.attention ?? 0) > 0;
   // Status, not a control: a small dot says "healthy" at a glance, the
   // words carry the clock; no
   // border, no background, no hover — nothing that reads as a button,
@@ -1163,16 +1159,15 @@ function AlertsBell() {
   const alertColor = live.some((a) => a.severity === "bad") ? "var(--red)"
     : live.some((a) => a.severity === "warn") ? "var(--amber)"
     : "var(--blue)";
-  const alertLabel = alertN === 0 ? "Alerts — nothing needs attention"
+  // "nothing needs attention" is a claim, made only from a read that
+  // answered: unread (loading or failed), the bell is just "Alerts"
+  const alertLabel = alertsQ.data === undefined ? "Alerts"
+    : alertN === 0 ? "Alerts — nothing needs attention"
     : `Alerts — ${alertN} need${alertN === 1 ? "s" : ""} attention`;
   return (
-    <NavLink to="/alerts"
+    <NavLink to="/alerts" className="hdr-ic hdr-round"
       title={alertLabel} aria-label={alertLabel}
-      style={{ alignSelf: "center", position: "relative",
-               width: 28, height: 28, lineHeight: "28px",
-               textAlign: "center", borderRadius: "50%",
-               border: "1px solid var(--line)", fontSize: 14,
-               textDecoration: "none", color: "var(--blue)" }}>
+      style={{ fontSize: 14 }}>
       {/* Inline SVG, not the 🔔 emoji: the emoji renders gold on
           every platform and no CSS can recolour it, so it read as a
           warning badge sitting permanently next to a neutral ?.
@@ -1182,9 +1177,7 @@ function AlertsBell() {
       <svg aria-hidden="true" width="14" height="14"
            viewBox="0 0 24 24" fill="none" stroke="currentColor"
            strokeWidth="2" strokeLinecap="round"
-           strokeLinejoin="round"
-           style={{ display: "block", margin: "0 auto",
-                    position: "relative", top: 6 }}>
+           strokeLinejoin="round" style={{ display: "block" }}>
         <path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9" />
         <path d="M13.73 21a2 2 0 0 1-3.46 0" />
       </svg>
@@ -1647,7 +1640,7 @@ function RebootCountdown({ deadline, message }: {
                   flexDirection: "column", gap: "1rem", textAlign: "center",
                   padding: "2rem" }}>
       <svg width="64" height="64" viewBox="0 0 100 100"
-           style={{ animation: "spin 2.2s linear infinite" }}>
+           style={{ animation: reducedMotion() ? "none" : "spin 2.2s linear infinite" }}>
         <path d="M39.7 78.2 A30 30 0 1 1 60.3 78.2" fill="none"
               stroke="var(--blue)" strokeWidth="11" strokeLinecap="round" />
       </svg>

@@ -86,7 +86,7 @@ class PlanPruneSoftRetiresTests(unittest.TestCase):
 
     def _rows(self):
         return {r["raw"]["fund"]: r for r in self.conn.execute(
-            "SELECT removed, raw FROM transactions "
+            "SELECT removed, removed_at, raw FROM transactions "
             "WHERE account_id='plan-403b'").fetchall()}
 
     def test_stale_row_soft_removed_not_gone(self):
@@ -95,12 +95,16 @@ class PlanPruneSoftRetiresTests(unittest.TestCase):
         self.assertEqual(rows["Fund A"]["removed"], 0)
         self.assertIn("Fund B", rows, "stale row was hard-deleted")
         self.assertEqual(rows["Fund B"]["removed"], 1)
+        # and remembers when it left, which the reconcile waits count from
+        self.assertIsNotNone(rows["Fund B"]["removed_at"])
+        self.assertIsNone(rows["Fund A"]["removed_at"])
 
     def test_reappearing_id_comes_back_live(self):
         plan_csv.import_csv(self.conn, "403B", self.csv_only_a)
         plan_csv.import_csv(self.conn, "403B", self.csv_both)  # B returns
         rows = self._rows()
         self.assertEqual(rows["Fund B"]["removed"], 0)
+        self.assertIsNone(rows["Fund B"]["removed_at"])
         self.assertEqual(len(self.conn.execute(
             "SELECT 1 FROM transactions WHERE account_id='plan-403b'"
         ).fetchall()), 2)                       # upserted, not duplicated
@@ -162,6 +166,11 @@ class CoinbaseFullPullRetiresVanishedTests(unittest.TestCase):
             "SELECT removed FROM transactions WHERE id=%s",
             (f"coinbase:{tid}",)).fetchone()["removed"]
 
+    def _removed_at(self, tid):
+        return self.conn.execute(
+            "SELECT removed_at FROM transactions WHERE id=%s",
+            (f"coinbase:{tid}",)).fetchone()["removed_at"]
+
     def test_vanished_txn_soft_retired_on_full_pull(self):
         self._sync()
         self.txns = [_txn("tx-1")]                  # tx-2 restated away
@@ -169,6 +178,8 @@ class CoinbaseFullPullRetiresVanishedTests(unittest.TestCase):
         self.assertEqual(res["stale_removed"], 1)
         self.assertEqual(self._removed("tx-1"), 0)
         self.assertEqual(self._removed("tx-2"), 1)  # retired, not deleted
+        self.assertIsNotNone(self._removed_at("tx-2"))
+        self.assertIsNone(self._removed_at("tx-1"))
 
     def test_returning_txn_flips_back_live(self):
         self._sync()
@@ -178,6 +189,7 @@ class CoinbaseFullPullRetiresVanishedTests(unittest.TestCase):
         res = self._sync()
         self.assertEqual(res["stale_removed"], 0)
         self.assertEqual(self._removed("tx-2"), 0)
+        self.assertIsNone(self._removed_at("tx-2"))
 
     def test_failed_pull_retires_nothing(self):
         self._sync()

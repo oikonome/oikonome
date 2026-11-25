@@ -327,6 +327,93 @@ class YearLensSavedYtdTests(unittest.TestCase):
                 account="chk", primary="TRANSFER_OUT")
         self.assertEqual(self._year(2026)["saved_ytd"], 1000.0)
 
+    def test_saved_ytd_is_the_sum_of_the_month_cells(self):
+        """A destination feed that carries the transfer only some months:
+        each Month lens reads the plan met (destination rows one month,
+        the checking leg the next), so the year is the sum of those month
+        figures, never the destination's net alone."""
+        write_config(self.conn, savings_goals=[
+            {"name": "Savings", "target": 10_000.0, "monthly_plan": 500.0,
+             "account_id": "sav", "tokens": [], "start_balance": 0}])
+        self.conn.execute("DELETE FROM transactions WHERE account_id='sav'")
+        add_txn(self.conn, dt.date(2026, 1, 10), -500.0, "TO SAVINGS",
+                account="sav", primary="TRANSFER_IN")
+        add_txn(self.conn, dt.date(2026, 2, 10), 500.0, "TO SAVINGS",
+                account="chk", primary="TRANSFER_OUT")
+        add_txn(self.conn, dt.date(2026, 3, 10), -500.0, "TO SAVINGS",
+                account="sav", primary="TRANSFER_IN")
+        from oikonome.web import lenses
+        months = [lenses.month_summary(self.conn, 2026, m,
+                                       today=TODAY)["saved_month"]
+                  for m in range(1, TODAY.month + 1)]
+        self.assertEqual(months[:3], [500.0, 500.0, 500.0])
+        self.assertEqual(self._year(2026)["saved_ytd"], sum(months))
+
+    def _only_this_years_savings(self):
+        write_config(self.conn, savings_goals=[
+            {"name": "Savings", "target": 10_000.0, "monthly_plan": 500.0,
+             "account_id": "sav", "tokens": [], "start_balance": 0}])
+        self.conn.execute("DELETE FROM transactions WHERE account_id='sav'")
+
+    def _cell_and_year(self, m):
+        from oikonome.web import lenses
+        cell = lenses.month_summary(self.conn, 2026, m,
+                                    today=TODAY)["saved_month"]
+        return cell, self._year(2026)["saved_ytd"]
+
+    def test_a_partial_pull_back_counts_the_destinations_net(self):
+        """$500 in and $200 back out of savings in one month, the checking
+        leg matching the plan: the savings grew by $300, not $500 — in the
+        month's cell and in the year."""
+        self._only_this_years_savings()
+        add_txn(self.conn, dt.date(2026, 3, 5), 500.0, "TO SAVINGS",
+                account="chk", primary="TRANSFER_OUT")
+        add_txn(self.conn, dt.date(2026, 3, 5), -500.0, "TO SAVINGS",
+                account="sav", primary="TRANSFER_IN")
+        add_txn(self.conn, dt.date(2026, 3, 20), 200.0, "FROM SAVINGS",
+                account="sav", primary="TRANSFER_OUT")
+        self.assertEqual(self._cell_and_year(3), (300.0, 300.0))
+
+    def test_a_month_whose_rows_net_to_zero_saved_nothing(self):
+        self._only_this_years_savings()
+        add_txn(self.conn, dt.date(2026, 3, 5), 500.0, "TO SAVINGS",
+                account="chk", primary="TRANSFER_OUT")
+        add_txn(self.conn, dt.date(2026, 3, 5), -500.0, "TO SAVINGS",
+                account="sav", primary="TRANSFER_IN")
+        add_txn(self.conn, dt.date(2026, 3, 25), 500.0, "FROM SAVINGS",
+                account="sav", primary="TRANSFER_OUT")
+        self.assertEqual(self._cell_and_year(3), (0.0, 0.0))
+
+    def test_a_silent_destination_reads_the_checking_leg(self):
+        self._only_this_years_savings()
+        add_txn(self.conn, dt.date(2026, 3, 5), 500.0, "TO SAVINGS",
+                account="chk", primary="TRANSFER_OUT")
+        self.assertEqual(self._cell_and_year(3), (500.0, 500.0))
+
+    def test_a_net_withdrawal_month_lowers_the_cell_and_the_year(self):
+        self._only_this_years_savings()
+        add_txn(self.conn, dt.date(2026, 2, 5), -500.0, "TO SAVINGS",
+                account="sav", primary="TRANSFER_IN")
+        add_txn(self.conn, dt.date(2026, 4, 20), 300.0, "FROM SAVINGS",
+                account="sav", primary="TRANSFER_OUT")
+        cell, year = self._cell_and_year(4)
+        self.assertEqual(cell, -300.0)
+        self.assertEqual(year, 200.0)
+
+    def test_an_unrelated_transfer_on_a_tokened_goals_account_is_silence(self):
+        """A tokened goal pinned to an account other money also moves
+        through: a transfer its tokens do not match is not the goal's row,
+        so the month still reads the goal's checking leg."""
+        write_config(self.conn, savings_goals=[
+            {"name": "Savings", "target": 10_000.0, "monthly_plan": 500.0,
+             "account_id": "sav", "tokens": ["rainy"], "start_balance": 0}])
+        self.conn.execute("DELETE FROM transactions WHERE account_id='sav'")
+        add_txn(self.conn, dt.date(2026, 3, 5), 500.0, "RAINY FUND",
+                account="chk", primary="TRANSFER_OUT")
+        add_txn(self.conn, dt.date(2026, 3, 9), -1000.0, "FROM BROKERAGE",
+                account="sav", primary="TRANSFER_IN")
+        self.assertEqual(self._cell_and_year(3), (500.0, 500.0))
+
     def test_saved_ytd_covers_only_the_months_the_map_budgets(self):
         """The row's plan is the monthly plan times the budgeted months,
         so the actual must be measured over those same months. A month

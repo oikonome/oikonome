@@ -135,7 +135,9 @@ class PossessiveConvergenceTests(unittest.TestCase):
         merchant_dedup.apply(self.conn)
         rule = merchant_dedup.detail(self.conn, NOW)["rule"]
         self.assertEqual(rule, {"category_primary": "GENERAL_MERCHANDISE",
-                                "source": "user"})
+                                "source": "user",
+                                "label": "new charges go to General "
+                                         "Merchandise (your rule)"})
 
 
 if __name__ == "__main__":

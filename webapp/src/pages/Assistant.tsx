@@ -18,11 +18,16 @@
 // it could not keep) live in this tab alone.
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
-import { Link, useSearchParams } from "react-router";
+import { useSearchParams } from "react-router";
 import { api, assistant, errText, type AssistantCursor, type AssistantTurn } from "../api/client";
+import { FailedLine } from "../components/Loaded";
+import EmptyState from "../components/EmptyState";
+import { EMPTY_LINES } from "../moneymath";
 import AssistantBlocks, { type AnswerBlock, RichText } from "../components/AssistantBlocks";
 import { plainText } from "../richtext";
 import { canEdit, isViewer } from "../role";
+import PageSkeleton from "../components/PageSkeleton";
+import Note from "../components/Note";
 
 /** a question in flight (or one that failed); `thread` is the
  *  conversation it continues, null for a new one; `note` says why it
@@ -45,8 +50,10 @@ interface FollowUp { id: string; question: string; last_at: string }
  *  the log read that will show it has not landed yet. `note` says why the
  *  answer is not the follow-up it was asked as (RESTARTED_NOTE,
  *  REMOVED_NOTE); once the log carries the id it moves to TurnNotes */
-interface LocalTurn extends Omit<AssistantTurn, "id"> {
-  key: string; id: string | null; local: true; note?: string;
+// a turn the server did not keep has no id and may have no conversation
+interface LocalTurn extends Omit<AssistantTurn, "id" | "thread_id"> {
+  key: string; id: string | null; thread_id: string | null; local: true;
+  note?: string;
 }
 /** `saved: false` or `removed: true` (with a null `thread_id`) is the
  *  server saying the answer was not kept as a conversation — it could
@@ -538,17 +545,15 @@ export default function Assistant() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [openKey, openTurnCount, pendingCount]);
 
-  if (status.isPending) return <p className="mut" style={{ marginTop: "2rem" }}>loading…</p>;
+  if (status.isPending) return <PageSkeleton />;
   if (!statusFailed && !status.data?.available) {
     return (
       <>
         <h1>Assistant</h1>
-        <div className="note">
-          The assistant needs a language model backend and none is
-          configured. It appears as soon as one is: the bundled model on a
-          standard self-hosted install, or an endpoint you point it
-          at. <Link to="/settings/categorize">Set one up in Settings ›</Link>
-        </div>
+        {/* the model endpoint lives under Settings → AI, not with the
+            categorization rules */}
+        <EmptyState title={EMPTY_LINES.assistantOff} to="/settings/ai"
+                    action={EMPTY_LINES.assistantAction} />
       </>
     );
   }
@@ -571,7 +576,7 @@ export default function Assistant() {
         {t.note && <div className="sub" style={{ fontSize: 12, marginBottom: ".3rem" }}>{t.note}</div>}
         {t.err
           ? <>
-              <div className="note bad">{t.err}</div>
+              <Note tone="bad">{t.err}</Note>
               <div style={{ marginTop: ".5rem", display: "flex", gap: ".5rem" }}>
                 <button style={{ fontSize: 12 }} onClick={() => submit(t.q, t.thread)}>try again</button>
                 <button style={{ fontSize: 12 }}
@@ -601,7 +606,7 @@ export default function Assistant() {
   const composer = (placeholder: string) => (
     <div className="chat-compose">
       <div className="box">
-        <textarea ref={boxRef} rows={1} value={q} placeholder={placeholder}
+        <textarea aria-label={placeholder} ref={boxRef} rows={1} value={q} placeholder={placeholder}
                   onChange={(e) => { setQ(e.target.value);
                                      e.target.style.height = "auto";
                                      e.target.style.height = `${Math.min(e.target.scrollHeight, 160)}px`; }}
@@ -610,10 +615,7 @@ export default function Assistant() {
           {ask.isPending ? "thinking…" : "Send"}</button>
       </div>
       {status.isError && (
-        <div className="note bad" style={{ marginTop: ".4rem" }}>
-          Couldn&apos;t check the assistant: {errText(status.error)}{" "}
-          <button style={{ fontSize: 12 }} onClick={() => void status.refetch()}>try again</button>
-        </div>
+        <FailedLine q={status} what="the assistant's status" />
       )}
       <div className="hint"><span>Enter to send · Shift+Enter for a new line</span><span>{whereLine}</span></div>
     </div>
@@ -623,7 +625,7 @@ export default function Assistant() {
   return (
     <>
       <h1>Assistant</h1>
-      {err && <div className="note bad" style={{ marginBottom: ".6rem" }}>{err}</div>}
+      {err && <Note tone="bad" style={{ marginBottom: ".6rem" }}>{err}</Note>}
       <div className={`chat chat-${mode}`}>
         <aside className="chat-rail">
           <div className="head">
@@ -635,7 +637,12 @@ export default function Assistant() {
               <div key={th.key} className={`row${th.key === openKey ? " on" : ""}`}
                    role="button" tabIndex={0}
                    onClick={() => show(th.key)}
-                   onKeyDown={(e) => e.key === "Enter" && show(th.key)}>
+                   onKeyDown={(e) => {
+                     // a button answers Enter and Space alike
+                     if (e.key !== "Enter" && e.key !== " ") return;
+                     e.preventDefault();
+                     show(th.key);
+                   }}>
                 <div className="q">{th.partial ? "… " : ""}{title(th)}</div>
                 <div className="m">{when(th.last_at)} · {th.turns.length}{" "}
                   {th.turns.length === 1 ? "question" : "questions"}
@@ -644,11 +651,7 @@ export default function Assistant() {
             ))}
             {history.isPending && <p className="mut" style={{ padding: ".6rem .75rem" }}>loading history…</p>}
             {history.isError && !noLog && (
-              <div className="note bad" style={{ margin: ".5rem" }}>
-                Couldn&apos;t load the history: {errText(history.error)}{" "}
-                <button style={{ fontSize: 12 }} onClick={() => void history.refetch()}>
-                  try again</button>
-              </div>
+              <FailedLine q={history} what="the history" />
             )}
             {!history.isPending && (!history.isError || noLog) && threads.length === 0 && (
               <p className="mut" style={{ padding: ".6rem .75rem", fontSize: 13 }}>

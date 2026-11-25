@@ -43,7 +43,7 @@ class CashShortfallPairingTests(unittest.TestCase):
         self.conn.close()
 
     def _scenario(self):
-        s = self.d["forecast"]["pace_stmt"]
+        s = self.d["forecast"]["pace_usual"]
         # fixture sanity: early small dip, deep later trough
         self.assertEqual(s["negative_date"], self.dip_date)
         self.assertEqual(s["first_neg_amount"], -50.0)
@@ -60,20 +60,34 @@ class CashShortfallPairingTests(unittest.TestCase):
         self.assertEqual(cash["by"], self.dip_date)
         self.assertEqual(cash["short"], 50.0)
 
-    def test_slow_to_uses_the_amount_of_the_date_shown(self):
-        s = self._scenario()
+    def test_a_dip_from_bills_gives_no_spending_advice(self):
+        # zero burn and still short: no daily rate clears a dip that comes
+        # from what is scheduled (forecast.slow_to_rate) — the notice says
+        # so instead of advising $0/day
+        self._scenario()
         cash = todayview.build_context(self.d)["cash"]
-        # $50 short in 5 days at zero burn: no daily rate to slow below
-        # −$650/day — the honest suggestion from the shown pair is $0/day
-        # of headroom against the dip, i.e. rate + first_neg/days
-        expected = max(0.0, (s["rate"] or 0) + s["first_neg_amount"] / 5)
-        self.assertAlmostEqual(cash["slow_to"], expected, places=2)
+        self.assertIsNone(cash["slow_to"])
+        self.assertTrue(cash["scheduled"])
+
+    def test_the_sent_notice_carries_the_same_pair(self):
+        # the clients draw this notice; they never judge the thresholds
+        self._scenario()
+        note = todayview.build_context(self.d)["cash_notice"]
+        self.assertEqual(note["state"], "critical")
+        self.assertEqual(note["kind"], "date")
+        self.assertEqual(note["until"], self.dip_date)
+        self.assertEqual(note["amount"], 50.0)
+        self.assertIsNone(note["slow_to_per_day"])
+        self.assertTrue(note["scheduled"])
+        self.assertIn("bills and card payments due before 07/20/26 exceed "
+                      "what is coming in", note["text"])
+        self.assertNotIn("$0/day", note["text"])
 
     def test_plain_text_quotes_the_same_pair(self):
         self._scenario()
         plain = report.build(self.d)[1]
         line = next(l for l in plain.splitlines() if "!! CASH:" in l)
-        self.assertIn("short $50 by", line)
+        self.assertIn("Short $50 by", line)
         self.assertNotIn("$5,", line)
         self.assertNotIn("$4,", line)
         self.assertNotIn("$3,", line)
@@ -81,3 +95,16 @@ class CashShortfallPairingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlowToIsDecidedAgainstTheWalk(unittest.TestCase):
+    def test_the_largest_whole_dollar_rate_that_stays_above_zero(self):
+        from oikonome.engine import forecast
+        self.assertEqual(forecast.slow_to_rate(lambda r: 500 - 30 * r, 100),
+                         {"rate": 16.0, "scheduled": False})
+        # even $0 a day dips: no advice
+        self.assertEqual(forecast.slow_to_rate(lambda r: -10 - r, 100),
+                         {"rate": None, "scheduled": True})
+        # under $1 a day is no advice either, never "$0/day"
+        self.assertEqual(forecast.slow_to_rate(lambda r: 0.5 - r, 100),
+                         {"rate": None, "scheduled": True})

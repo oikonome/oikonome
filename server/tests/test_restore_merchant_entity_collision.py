@@ -31,6 +31,19 @@ def _zip(files: dict) -> bytes:
     return buf.getvalue()
 
 
+def _merchant(mid, name, entity=""):
+    return {"id": mid, "plaid_entity_id": entity, "name": name,
+            "name_source": "plaid", "kind": "merchant", "logo_url": "",
+            "website": "", "phone": "", "mcc": "", "parent_id": "",
+            "merged_into": "", "created_at": ""}
+
+
+def _txn(tid, merchant_id):
+    return {"id": tid, "account_id": "chk", "date": "2026-04-01",
+            "amount": "12", "name": "INVENTED CO", "removed": "0",
+            "merchant_id": merchant_id}
+
+
 LIVE = "11111111-1111-4111-8111-111111111111"
 RESTORED = "22222222-2222-4222-8222-222222222222"
 
@@ -59,17 +72,42 @@ class MerchantEntityCollisionTests(unittest.TestCase):
              "name": "Restored Co", "name_source": "plaid",
              "kind": "merchant", "logo_url": "", "website": "",
              "phone": "", "mcc": "", "parent_id": "", "merged_into": "",
-             "created_at": ""}]})
+             "created_at": ""}],
+            # a charge names the merchant, so the restore's merchant pass
+            # keeps it
+            "transactions.csv": [_txn("t-live", LIVE)]})
         # no exception is the headline; the report shows one row landed
-        # and the duplicate was skipped (the restore's own post-pass may
-        # prune merchants no transaction references, so the report — not
-        # a later SELECT — is the evidence)
+        # and the duplicate was skipped
         report = restore.restore_zip(self.conn, data)
         self.assertEqual(report.get("merchants"), 1, report)
         # folded onto the live merchant: counted as merged, never as a row
         # the destination already held under the archive's id
         self.assertEqual(report.get("merged"), 1, report)
         self.assertNotIn("already_present", report)
+
+class AMerchantTheRestorePrunesIsNotCountedWritten(unittest.TestCase):
+    """The restore's merchant pass removes an archived merchant nothing
+    here names. The summary is read after that pass, so such a merchant is
+    reported as left for the household to derive again (rebuilt), never
+    as a row written."""
+
+    def setUp(self):
+        self.conn = make_db()
+        write_config(self.conn)
+
+    def tearDown(self):
+        self.conn.close()
+
+    def test_only_a_merchant_something_names_is_written(self):
+        report = restore.restore_zip(self.conn, _zip({
+            "merchants.csv": [_merchant(LIVE, "Named Co"),
+                              _merchant(RESTORED, "Unnamed Co")],
+            "transactions.csv": [_txn("t-named", LIVE)]}))
+        self.assertEqual(report.get("merchants"), 1, report)
+        self.assertEqual(report.get("rebuilt"), 1, report)
+        self.assertEqual([r["id"] for r in self.conn.execute(
+            "SELECT id::text AS id FROM merchants")], [LIVE])
+
 
 if __name__ == "__main__":
     unittest.main()

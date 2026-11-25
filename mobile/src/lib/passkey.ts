@@ -55,7 +55,12 @@ export function passkeyMaybeAvailable(serverUrl: string): boolean {
  *  and from a quiet null (the person closed the sheet themselves). The
  *  message carries the platform's own error name and text, because "didn't
  *  work" hides every one of a dozen distinct causes. */
-export class PasskeySheetError extends Error {}
+/** The platform refused before any key was used. `why` is the app's own
+ *  plain words for it, never the platform's error text. */
+export class PasskeySheetError extends Error {
+  readonly why: string;
+  constructor(why: string) { super(why); this.why = why; }
+}
 
 /** The person closing the sheet is the one silence that is honest:
  *  they know what they just did. Everything else gets a message. */
@@ -99,9 +104,9 @@ export async function signInWithPasskey(
       publicKey as Parameters<typeof passkeys.get>[0]);
   } catch (e) {
     if (isUserCancel(e)) return null;
-    const err = e as Error;
-    throw new PasskeySheetError(
-      `${err?.name || "error"}: ${err?.message || String(e)}`);
+    // the platform's own text ("NotAllowedError: …") means nothing to a
+    // person; what they can act on is that no key on this phone answered
+    throw new PasskeySheetError("no passkey on this phone answered");
   }
   if (!credential) return null;
   return passkeyLoginAndMintDevice(serverUrl, challengeId, credential,

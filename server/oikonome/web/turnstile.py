@@ -133,7 +133,8 @@ def required_for_login(ip: str, email: str = "") -> bool:
     return security.challenge_warranted(ip, email)
 
 
-def verify_login(token: str, ip: str = "", email: str = "") -> bool:
+def verify_login(token: str, ip: str = "", email: str = "",
+                 unlock_proof: str = "") -> bool:
     """The sign-in doors' check: verify only when the attempt looks risky.
 
     A clean IP signing into a clean account is let through without a token —
@@ -145,14 +146,15 @@ def verify_login(token: str, ip: str = "", email: str = "") -> bool:
     proved control of its mailbox holds a one-shot exemption, which is what
     lets a user the Cloudflare script cannot reach (JS off, blocked,
     proxied) answer the check at all. It is tried LAST so that a user who
-    can produce a token never spends one.
+    can produce a token never spends one. Only a request carrying that
+    unlock's proof (`unlock_proof`) can spend it — see login_unlock.
     """
     _SPENT_UNLOCKS.set(())
     if not required_for_login(ip, email):
         return True
     if verify(token, ip):
         return True
-    return _spend_unlock(email)
+    return _spend_unlock(email, unlock_proof, ip)
 
 
 def spent_unlocks() -> tuple:
@@ -187,24 +189,31 @@ def refund_unlock(email: str) -> None:
         pass
 
 
-def spend_unlock(email: str) -> bool:
+def spend_unlock(email: str, unlock_proof: str = "", ip: str = "") -> bool:
     """Public spend-only door for /forgot — a held emailed exemption answers
     the human check there too, WITHOUT the per-account risk bucket entering
-    the gate (that door must stay un-armable against a stranger's address)."""
-    return _spend_unlock(email)
+    the gate (that door must stay un-armable against a stranger's address).
+    The same rule as sign-in: only the unlock's proof spends it."""
+    return _spend_unlock(email, unlock_proof, ip)
 
 
-def _spend_unlock(email: str) -> bool:
-    """True if this account held a live emailed exemption, which is now
-    spent. Never raises: a database wobble here must fail CLOSED (the
-    challenge simply stands), not hand out a free pass."""
-    if not email:
+def _spend_unlock(email: str, unlock_proof: str = "", ip: str = "") -> bool:
+    """True if this account held a live emailed exemption whose proof this
+    request carries, which is now spent. Never raises: a database wobble
+    here must fail CLOSED (the challenge simply stands), not hand out a
+    free pass.
+
+    A request carrying no proof spends nothing — not even from the address
+    that confirmed the link, which everyone behind the same public address
+    shares. An app without the code field is updated, or the person signs
+    in on the web in the browser that opened the link. `ip` is accepted for the callers' signature only."""
+    if not email or not unlock_proof:
         return False
     try:
         from ..auth import login_unlock
         from ..db import tenancy
         with tenancy.control_connect() as conn:
-            ids = login_unlock.consume(conn, email)
+            ids = login_unlock.consume(conn, email, unlock_proof)
     except Exception:
         return False
     if ids:

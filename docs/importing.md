@@ -54,7 +54,7 @@ the older files from Accounts → Import.
 | YNAB | register export | Outflow/Inflow handled; a register holding several YNAB accounts asks where each one goes (see below) |
 | PDF statement | bank, card or brokerage statement with a text layer (not a scan) | pick the statement kind on the Import page; the cycle is dated from the statement's period line, or from separate **Opening Date** / **Closing Date** lines; the sign of an unsigned line comes from the statement itself: on a bank or brokerage statement that prints a running balance, the one reading of in/out that makes the balances add up exactly (a statement whose balances could add up two ways says nothing); then the column it is printed under, when the statement has a withdrawals/debits and a deposits/credits column (a figure under Deposits is money in whatever the words say); then the section heading it sits under (*Withdrawals*, *Checks paid*, *Deposits and additions*, …). A printed minus, parentheses or CR/DR marker always wins. Only a line none of these covers is read by its words (deposit, withdrawal, dividend, …), where an unsigned line with no such word reads as money out — cash back taken with a purchase is money out, a cash-back *reward* is money in, and a retirement account's own distribution (IRA, RMD, Roth …) is money out while a fund's dividend or capital-gain distribution is money in; the import's warnings say how many lines were read by their words, so you can check them |
 | Monarch / Copilot / Simplifi | each app's CSV export | auto-detected |
-| Oikonome export ZIP | Settings → Data & maintenance on another instance | runs in the background with progress on the page (a big archive takes minutes; leaving the page doesn't stop it) — full restore: transactions, bills, your answers to recurring-bill and merchant-merge offers (something you declined is not offered again), the import history (so a file import that came along can still be undone under Recent imports), overrides, settings, and business-entity data (entities, equity, mileage, 1099 vendors, compliance, classifications). **Note:** a business entity's full EIN is never included in the export for security — after restoring, re-enter it (only the last 4 digits carry over). The daily email's recipient answers travel, with one narrowing: a **decline** always carries over, so somebody who said no stays off the list; an **acceptance** carries over only for an address that already has its own login on the destination household (in hosted mode, one whose email is confirmed). Everyone else — and anybody who had not answered yet — lands as *not invited* with an **Invite** button, because the invite *link* itself never travels. The restore summary tells you how many people have to accept a fresh invite before their mail resumes; Settings → Email & Push is where you send it. |
+| Oikonome export ZIP | Settings → Data & maintenance on another instance | runs in the background with progress on the page (a big archive takes minutes; leaving the page doesn't stop it) — full restore: transactions, bills, your answers to recurring-bill and merchant-merge offers (something you declined is not offered again), the import history (so a file import that came along can still be undone under Recent imports), overrides, settings, and business-entity data (entities, equity, mileage, 1099 vendors, compliance, classifications). **Note:** a business entity's full EIN is never included in the export for security — after restoring, re-enter it (only the last 4 digits carry over). A business whose type is not one the Business page offers (an older spelling, or a blank) comes back as a **sole proprietorship**, and the restore summary names it so you can set the real type on the Business page. The daily email's recipient answers travel, with one narrowing: a **decline** always carries over, so somebody who said no stays off the list; an **acceptance** carries over only for an address that already has its own login on the destination household (in hosted mode, one whose email is confirmed). Everyone else — and anybody who had not answered yet — lands as *not invited* with an **Invite** button, because the invite *link* itself never travels. The restore summary tells you how many people have to accept a fresh invite before their mail resumes; Settings → Email & Push is where you send it. |
 
 **Income labels.** When a CSV, Mint or other-app import files a deposit under an income label of its own — "Income",
 "Paycheck", "Salary", "Payroll", "Direct Deposit", "Income:Interest" and
@@ -140,9 +140,36 @@ carry), *out of range* (an amount larger than any real sum), *malformed*
 (a required cell blank, an unreadable id or image, a split that does not
 add up to its charge), *over cap* (a receipt image over the upload size),
 or *merged* (the same merchant this household already has under its own
-id; everything that pointed at it now points at that one). Split parts a
+id; everything that pointed at it now points at that one). A row with a
+cell the restore could not read at all is skipped on its own (counted as
+*malformed*, along with anything that hangs on it) and the rest of the
+archive still lands. The page then shows a separate warning above the
+result, *Some rows could not be read and were left out*, with one line
+per table — *"3 rows of bills could not be read and were skipped (row 4,
+row 9, row 15)"* — naming each row by its line in the file (or by its id
+when that is a random one), never by what it holds. Accounts booked to a
+business that could not be read come back as personal, and the summary
+says how many. When most rows of a table fail that way the archive is
+refused instead (*"the backup's bills could not be read"*) and nothing is
+written; so is a number that is not finite (`NaN`, `Infinity`), or
+anything that shows the file is not a genuine export.
+Split parts a
 store receipt made are not copied: the store match rebuilds them from the
-restored receipts.
+restored receipts. A receipt you marked as not belonging to a charge
+keeps that refusal against the charge's restored row, so the matcher
+does not pair them again.
+
+**A hand-edited archive is read tolerantly.** A stored date that does
+not read as one — February 30 on a bill's due, last-due or end day, on
+an offer's last-seen day or next due — is dropped (a bill keeps its due
+date from its own column when that one reads), and offer evidence of an
+unexpected shape is treated as no evidence; the restore completes and
+says in its note how many due dates it had to drop, and the Bills and
+Merchants pages load afterwards. A figure or a day is read only as the
+export writes it: an amount spelled `1_000` or in non-ASCII digits, a day
+written `20260302`, or a time no clock shows (`25:00`) is unreadable, so
+the row is left out as malformed where the value is required and the
+value is left empty where it is optional.
 
 **Amount signs:** most bank CSVs use negative-for-spending — that's the
 default. If your import shows spending as income, undo it and re-import
@@ -182,6 +209,13 @@ and a statement printing only January lines cannot prove which year's row
 is its own, so it adds the right row and leaves the old one for you to undo
 under Recent imports.
 
+An OFX/QFX line is dated by the day the bank printed on it. An earlier
+version dated a line whose time carries a zone by that time's UTC day,
+which can be a day off. Importing such a file again moves each of those
+rows onto its printed day, notes and all, instead of adding a second
+copy: a row is moved only when it carries the line's own bank id, sits
+exactly on that line's UTC day, and has the same amount and name.
+
 **Multi-account files split automatically.** A whole-household export
 (Mint / Monarch / Copilot / Simplifi with several account names, or an
 OFX file carrying several statements) never merges into one account:
@@ -216,6 +250,9 @@ history and its receipt images) at **500 MB** — a restore is streamed to
 disk rather than held in memory, which is why it may be that much larger
 (an instance behind a CDN or proxy may cap request bodies lower — see
 [the reverse-proxy guide](reverse-proxy.md#upload-size-and-time-limits)).
+Its step-up is judged from when the upload started arriving (up to
+thirty minutes of credit), so an upload that takes minutes to send does
+not run out the ten-minute window.
 Drop the export ZIP **on its own** to use that limit: mixed in with other
 files it is read with the folder.
 Some formats carry a tighter limit of their own, because of how much
@@ -228,10 +265,18 @@ Receipts travel inside the export as the photos themselves, so they are
 most of a big archive: the receipts file inside it has no size cap of its
 own, but the whole ZIP must stay under the 500 MB upload, which is
 roughly 500 MB of receipt photos less the rest of the history. The rest
-of the archive is held to **128 MB** per file and **512 MB** unpacked.
+of the archive is held to **128 MB** per file and **512 MB** unpacked,
+and a ZIP listing more than **5,000** files is refused before it is
+opened (an export holds a few hundred).
 An export that is over any of these still downloads complete — it is
 your copy — but carries a `RESTORE-NOTE.txt` saying what a restore would
 refuse.
+A restored setting is held to the shape this version saves it in: one
+that does not fit (a hand-edited archive, or a value an older version
+wrote) is left out rather than restored, and the restore summary says
+so — "some settings were not in the shape this version keeps them in:"
+followed by the settings left out. Those settings start from their
+defaults; set them again in Settings.
 A folder analyze takes up to **200 files** and **60 MB** in all at a time
 (a bigger folder is refused with *"import the folder in smaller
 batches"* — split it and analyze each part). The doors that take a

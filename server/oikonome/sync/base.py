@@ -86,13 +86,16 @@ def released_count(conn) -> int:
     holds (sync.plaid.REPEAT_LEDGER_REASON): the household reached for no
     new institution, and the repeats are bounded by their own limit. And so
     is an Item released to link the same bank again for a wider history
-    window (RELINK_LEDGER_REASON), for the same reason."""
+    window (RELINK_LEDGER_REASON), for the same reason. And so is a bank
+    handed back because a several-bank session went past the cap
+    (OVERSHOOT_LEDGER_REASON), bounded per day by its own allowance."""
     row = conn.execute(
         """SELECT COUNT(*) AS n FROM plaid_item_ledger l
            WHERE l.tenant = current_setting('app.tenant_id', true)
              AND l.credential_source = 'platform'
              AND l.removed_reason IS DISTINCT FROM 'repeat'
              AND l.removed_reason IS DISTINCT FROM 'relink'
+             AND l.removed_reason IS DISTINCT FROM 'overshoot'
              AND COALESCE(l.removed_at, l.created_at)
                  >= now() - make_interval(days => %s)
              AND NOT EXISTS (
@@ -252,7 +255,8 @@ def disconnect_item(conn, item_id: str, *,
         token = get_access_token(conn, item_id)
         if token:
             try:
-                plaid_mod.Client.for_tenant(conn).remove_item(token)
+                # a release never waits on an OIKONOME_PLAID_ENV typo
+                plaid_mod._release_client(conn).remove_item(token)
                 plaid_released = True
             except plaid_mod.PlaidError as e:
                 # ITEM_NOT_FOUND means the Item is already gone at Plaid —
@@ -847,14 +851,22 @@ def credit_account_ids(conn) -> set[str]:
 # itself is mixed-case — trailing ALL-CAPS city words ("Taylor Sample NEW
 # YORK"). Bare descriptors ("VENMO PAYMENT", "VENMO CASHOUT") name nobody
 # and yield None. Migration 081 applied the same transform to stored rows.
-_VENMO_ADDRESS_TAIL = re.compile(r"\s+\d.*$")
-_VENMO_GEO_TAIL = re.compile(r",?\s+[A-Z]{2},?\s+US\s*$")
+#
+# Every parser below clips its own input to a descriptor's length before a
+# pattern runs (the callers clip too, but the guard belongs to the parser),
+# and a pattern that opens on a whitespace or separator run starts only at
+# the run's first character: started from every position inside a run, each
+# attempt rescans the rest of it, which is quadratic in the run's length. A
+# match can only begin at a run's start anyway — any later start inside the
+# same run sees the same remainder — so the lookbehind changes no answer.
+_VENMO_ADDRESS_TAIL = re.compile(r"(?<!\s)\s+\d.*$")
+_VENMO_GEO_TAIL = re.compile(r"(?:,|(?<!\s))\s+[A-Z]{2},?\s+US\s*$")
 
 
 def venmo_counterparty(orig_desc: str | None) -> str | None:
     if not orig_desc:
         return None
-    s = orig_desc.strip()
+    s = orig_desc[:MAX_DESCRIPTOR].strip()
     if not s.upper().startswith("VENMO"):
         return None
     rest = s[len("VENMO"):].strip()
@@ -890,13 +902,14 @@ _ZELLE_REST = re.compile(r"zelle payment from (?P<rest>.+)$", re.IGNORECASE)
 _ZELLE_PAREN_SPLIT = re.compile(
     r"^(?P<frm>.+?\([^)]*\))\s+to\s+(?P<to>.+)$", re.IGNORECASE)
 _ZELLE_DESCRIPTOR = re.compile(r"zelle payment from", re.IGNORECASE)
-_ZELLE_PAREN_TAIL = re.compile(r"\s*\(.*$")
-_ZELLE_RECEIVER_TAG = re.compile(r"\s+RECEIVER\s*$", re.IGNORECASE)
+_ZELLE_PAREN_TAIL = re.compile(r"(?<!\s)\s*\(.*$")
+_ZELLE_RECEIVER_TAG = re.compile(r"(?<!\s)\s+RECEIVER\s*$", re.IGNORECASE)
 
 
 def zelle_counterparty(desc: str | None, money_in: bool) -> str | None:
     if not desc:
         return None
+    desc = desc[:MAX_DESCRIPTOR]
     m = _ZELLE_REST.search(desc)
     if not m:
         return None
@@ -969,13 +982,19 @@ _ALNUM_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz"
 _FUEL_BRAND_RE = re.compile(rf"\b{_FUEL_WORD}\b", re.IGNORECASE)
 _FUEL_AFTER_RE = re.compile(
     r"[^A-Za-z0-9]+" + _FUEL_WORD + r"(?:[^A-Za-z0-9]|$)", re.IGNORECASE)
+# the same test as a search: it may open only where a separator run does
+# (the start, or after an alphanumeric), never again inside the run
+_FUEL_ANYWHERE_RE = re.compile(
+    r"(?:^|(?<=[A-Za-z0-9]))[^A-Za-z0-9]+" + _FUEL_WORD
+    + r"(?:[^A-Za-z0-9]|$)", re.IGNORECASE)
 
 
 def _brand_then_fuel(letters: str, text: str):
     """The fuel-word match following `letters` (lowercased alphanumerics)
     spelled in `text` with any non-alphanumerics between them and a
     separator or the start before them; None when no such place exists."""
-    if not _FUEL_AFTER_RE.search(text):
+    text = text[:MAX_DESCRIPTOR]
+    if not _FUEL_ANYWHERE_RE.search(text):
         return None
     where = [i for i, ch in enumerate(text) if ch in _ALNUM_CHARS]
     read = "".join(text[i] for i in where).lower()
@@ -2437,6 +2456,33 @@ def _mark_token_pushed(txns: list[Transaction]) -> list[Transaction]:
     return out
 
 
+class FileRowCount:
+    """What a file import added, against what it found already stored.
+
+    The upsert writes every line, new or not, so the number it returns is
+    not what the import added: a file imported twice would say it added
+    every line twice. Taken around the write (`before`, write, `after`):
+    added is the rows the ledger shows now that it did not before, matched
+    the lines that were rows already. A row that was set aside and comes
+    back into the ledger counts as added (a person sees it appear); one
+    the upsert keeps set aside (retired by a decision) counts as matched.
+    Two lookups by key."""
+
+    def __init__(self, conn, txns: list[Transaction]):
+        self.conn = conn
+        self.ids = list({t.id for t in txns})
+        self.before = {r["id"]: r["removed"] for r in conn.execute(
+            "SELECT id, removed FROM transactions WHERE id = ANY(%s)",
+            (self.ids,)).fetchall()} if self.ids else {}
+
+    def after(self) -> tuple[int, int]:
+        live = {r["id"] for r in self.conn.execute(
+            "SELECT id FROM transactions WHERE id = ANY(%s) AND removed = 0",
+            (self.ids,)).fetchall()} if self.ids else set()
+        added = {i for i in live if self.before.get(i, 1) != 0}
+        return len(added), len(self.before.keys() - added)
+
+
 def upsert_transactions(conn, txns: list[Transaction]) -> int:
     # every aggregator (plaid per page, mx and simplefin whole-pull) and
     # every importer funnels through here — the one place a generous
@@ -2460,6 +2506,11 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
                 if t.account_id and "," in t.account_id else t
                 for t in txns]
     txns = _mark_token_pushed(txns)
+    # rows off the ledger that carry a link, read before the write that may
+    # bring them back: a deposit the feed reports again takes only the
+    # room its charge has left (web.data.settle_pairs)
+    from ..web.data import returning_paired
+    was_off = returning_paired(conn, [t.id for t in txns])
     hidden = hidden_account_ids(conn)
     cards = credit_account_ids(conn)
     links = [(t.id, t.raw.get("pending_transaction_id")) for t in txns
@@ -2467,17 +2518,24 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
              and isinstance(t.raw.get("pending_transaction_id"), str)
              and t.raw.get("pending_transaction_id")
              and not is_file_import_id(t.id)]
-    if links:
+    if links or was_off:
         # A settling page lands as ONE commit: its posted rows and the
         # retirement of the holds they replace. Written row by row on this
         # autocommit connection, each posted row would be visible on its own
         # while its pending twin was still live, and a Today load, a widget
         # poll or the hourly email read in that window would count the charge
-        # twice. Lock order is the one every pairing writer keeps: the pairing
-        # lock first, then the accounts the rows point at (the foreign-key
-        # check would otherwise take them mid-page, after transaction rows,
-        # the reverse of the classify doors), then the rows themselves.
-        from ..web.data import _REIMB_LOCK
+        # twice. A row the feed reports again lands in the same commit as the
+        # trim of its links to the room left: committed on its own first, a
+        # pair repair taking the lock in between would find its charge
+        # repaid twice and cut the newest link, the one that repaid it while
+        # it was gone, which is the reverse of the rule. A failure here rolls
+        # the page back and raises, so the page is fetched again: the nightly
+        # repair cannot tell which link came back. Lock order is the one
+        # every pairing writer keeps: the pairing lock first, then the
+        # accounts the rows point at (the foreign-key check would otherwise
+        # take them mid-page, after transaction rows, the reverse of the
+        # classify doors), then the rows themselves.
+        from ..web.data import _REIMB_LOCK, _settle_pairs_locked
         with conn.transaction():
             conn.execute(_REIMB_LOCK)
             conn.execute(
@@ -2486,7 +2544,13 @@ def upsert_transactions(conn, txns: list[Transaction]) -> int:
                 (sorted({t.account_id for t in txns
                          if t.account_id and t.account_id not in hidden}),))
             n = _write_rows(conn, txns, hidden, cards)
-            _settle_pendings(conn, links)
+            if links:
+                _settle_pendings(conn, links)
+            back = [r["id"] for r in conn.execute(
+                "SELECT id FROM transactions WHERE id = ANY(%s)"
+                " AND removed = 0", (was_off,)).fetchall()] if was_off else []
+            if back:
+                _settle_pairs_locked(conn, back, returning=True)
     else:
         n = _write_rows(conn, txns, hidden, cards)
 
@@ -4604,8 +4668,8 @@ def categorize_lock(conn, tenant_id):
     False means skip — every step is pending-gated, so the holder or the
     next sweep picks up whatever this pass would have done."""
     key = f"oikonome:sync-categorize:{tenant_id}"
-    got = conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-                       (key,)).fetchone()["ok"]
+    got = tenancy.take_lock(
+        conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok", (key,))["ok"]
     try:
         yield got
     finally:
@@ -4623,8 +4687,8 @@ def tenant_sync_lock(conn, tenant_id):
     work, and a first sync racing a background restore interleaves with
     its uncommitted insert-only transaction."""
     key = f"oikonome:sync:{tenant_id}"
-    got = conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-                       (key,)).fetchone()["ok"]
+    got = tenancy.take_lock(
+        conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok", (key,))["ok"]
     try:
         yield got
     finally:
@@ -4735,7 +4799,18 @@ def mark_removed(conn, txn_ids: list[str]) -> int:
         # the charge when it lives on under another id (a re-link numbers
         # the same purchases afresh); best-effort, the nightly sweep is the
         # backstop
-        _reanchor_after_removal(conn, [t for t in txn_ids if t not in missed])
+        landed = [t for t in txn_ids if t not in missed]
+        _reanchor_after_removal(conn, landed)
+        # a withdrawn deposit repays nothing from now: a full pair still on
+        # it becomes the partial link that records what it repaid, so the
+        # charge is spend again while the link waits for a twin (best
+        # effort; the nightly repair is the backstop)
+        if landed:
+            try:
+                from ..web.data import settle_pairs
+                settle_pairs(conn, landed)
+            except Exception:                          # noqa: BLE001
+                log.warning("settling withdrawn pairs failed", exc_info=True)
     return len(txn_ids) - len(missed)
 
 
@@ -4793,10 +4868,12 @@ def _reanchor_after_removal(conn, ids: list[str]) -> None:
             # re-numbered twin can arrive on a later page of this same sync,
             # on the next sync, or through a re-link days later, and the
             # pair has to still be there for the nightly sweep to carry it.
-            # The readers already treat a pair on a removed row as absent;
-            # only a full pair's transfer stamp waits, and the nightly sweep
-            # releases it once the twin has had the reconcile window to
-            # show up (reanchor_stranded's release_after_days).
+            # The readers already treat a pair on a removed row as absent,
+            # and mark_removed turns a full pair into the partial link that
+            # records what it repaid (web.data.settle_pairs), so nothing
+            # waits but the link itself; the nightly sweep releases it once
+            # the twin has had the reconcile window to show up
+            # (reanchor_stranded's release_after_days).
             reanchor.reanchor_stranded(conn, ids)
     except Exception:                                  # noqa: BLE001
         log.warning("re-anchor after removal failed", exc_info=True)

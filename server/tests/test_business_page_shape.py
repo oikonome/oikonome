@@ -3,8 +3,9 @@
 An account linked through two aggregators leaves two rows sharing one link
 group, and both can carry entity_id, so summing every matching row counts one
 real balance twice. The "Cash in the business" tile must apply the same
-shadow-exclusion rule as TaxSetAside in the same file; otherwise one checking
-account linked via two aggregators reads as double its balance.
+shadow-exclusion rule as the tax set-aside; otherwise one checking account
+linked via two aggregators reads as double its balance. Both are decided on
+the server (books.entity_cash, selfemploy.tax_set_aside).
 """
 
 import pathlib
@@ -42,28 +43,23 @@ class BusinessShapeTests(unittest.TestCase):
                              r"next_payment\s*\?\?\s*\S*quarterly", rel)
 
     def test_cash_tile_excludes_shadow_linked_rows(self):
-        # The Overview cash sum must carry the same shadow filter TaxSetAside
-        # uses: only the primary row of a link group contributes its balance.
-        # The rule lives in one place (bizmath.countsInTotals, shared with
-        # the phone) and the tile's account list goes through it.
-        rule = re.search(r"export const countsInTotals =.*?\n\n", _src("bizmath.ts"), re.S)
-        self.assertIsNotNone(rule, "countsInTotals not found in bizmath.ts")
-        self.assertIn("!a.link || a.link.primary", rule.group(0))
-        counted = re.search(r"const counted = \(accts.*?;", self.src, re.S)
-        self.assertIsNotNone(counted, "Overview cash account list not found")
-        self.assertIn("countsInTotals", counted.group(0))
+        # The Overview's cash and its "N accounts" are the server's
+        # (books.entity_cash on the P&L reply), which leaves a linked
+        # backup and a hidden account out; the page sums no balance.
+        import inspect
 
-    def test_account_count_excludes_shadow_linked_rows(self):
-        # The tile's "N account(s)" sub-label counts real accounts, not rows —
-        # a doubly-linked account is still one account.
-        label = re.search(r"[^\n]*account\(s\)", self.src)
-        self.assertIsNotNone(label, "account(s) sub-label not found")
-        self.assertIn("counted.length", label.group(0))
+        from oikonome.engine import books
+        self.assertIn("links.shadow_ids", inspect.getsource(books.entity_cash))
+        self.assertIn("pnl.data?.cash", self.src)
+        label = re.search(r"[^\n]*sub=\{cash \? `[^\n]*account", self.src)
+        self.assertIsNotNone(label, "accounts sub-label not found")
+        self.assertIn("cash.accounts", label.group(0))
 
-    def test_tax_set_aside_keeps_its_shadow_filter(self):
-        # The rule the Overview tile matches must itself stay.
-        mine = re.search(r"const mine =.*?countsInTotals\);", self.src, re.S)
-        self.assertIsNotNone(mine, "TaxSetAside account list must go through countsInTotals")
+    def test_tax_set_aside_reads_the_servers_figures(self):
+        block = self.src[self.src.index("function TaxSetAside"):]
+        block = block[:block.index("\nfunction ")]
+        self.assertIn("tax.data.set_aside", block)
+        self.assertNotIn("balance_current", block)
 
     def test_form_dates_default_to_the_local_day(self):
         """toISOString() is the UTC day: west of Greenwich an evening trip

@@ -38,6 +38,9 @@ class StorageQuotaTests(unittest.TestCase):
                      FROM information_schema.columns c
                     WHERE c.table_schema = 'public'
                       AND c.data_type = 'bytea'
+                      -- a column the database derives (an image's hash)
+                      -- holds no upload of its own
+                      AND c.is_generated = 'NEVER'
                       AND EXISTS (
                           SELECT 1 FROM information_schema.columns t
                            WHERE t.table_schema = 'public'

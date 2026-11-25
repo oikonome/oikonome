@@ -110,7 +110,8 @@ export default function More() {
       <View style={s.group}>
         {PAGES.filter(([, href]) => !hidden.has(href))
           .map(([label, href, sub, icon]) => (
-          <Pressable key={href} onPress={() => router.push(href as never)}
+          <Pressable accessibilityRole="button"
+                     key={href} onPress={() => router.push(href as never)}
                      style={({ pressed }) => [s.item,
                        pressed && { backgroundColor: C.hover }]}>
             <Ionicons name={icon} size={20} color={C.accent}

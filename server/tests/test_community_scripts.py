@@ -95,14 +95,18 @@ class TestCoinbaseExample(unittest.TestCase):
         txns = {t["id"]: t for t in payload["transactions"]}
         self.assertEqual(len(txns), 4)  # zero-balance wallet history included
         buy = txns["coinbase:22222222-aaaa-4bbb-8ccc-000000000001"]
-        self.assertEqual(buy["amount"], -20000.00)  # native_amount verbatim
-        self.assertEqual(buy["category_primary"], "TRANSFER_IN")
+        # native_amount in the ledger's sign: value leaving the wallet is
+        # money out
+        self.assertEqual(buy["amount"], 20000.00)
+        self.assertEqual(buy["category_primary"], "TRANSFER_OUT")
         self.assertEqual(buy["category_detailed"], "COINBASE_BUY")
         self.assertEqual(buy["date"], "2026-01-15")
         self.assertEqual(buy["pending"], 0)
         self.assertEqual(buy["raw"]["type"], "buy")  # raw travels for P/L
         dep = txns["coinbase:22222222-aaaa-4bbb-8ccc-000000000002"]
-        self.assertEqual(dep["category_primary"], "TRANSFER_OUT")
+        # a deposit arriving in the wallet is money in
+        self.assertEqual(dep["amount"], -20250.00)
+        self.assertEqual(dep["category_primary"], "TRANSFER_IN")
         send = txns["coinbase:22222222-aaaa-4bbb-8ccc-000000000004"]
         self.assertEqual(send["pending"], 1)
         for t in txns.values():  # every id prefix-owned => stale sweep safe

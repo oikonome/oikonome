@@ -26,7 +26,7 @@ what the envelope was supposed to prevent. The only cap that stops the leak
 reserves 4.5× the real cost and permanently suppresses plan surplus. The unused
 pool in the eight quiet months evaporates.
 
-## Decisions
+## Choices made
 
 1. **Period = calendar year, resets Jan 1.** Simple to state and to read
    ("$60 left this year"). Consumption is derived from the ledger, so an
@@ -94,3 +94,20 @@ and now spread the annual cost evenly, which is the point.
   scattered charges/yr is a different (and much noisier) inference job.
 - Other period lengths (quarterly, etc.). `envelope_months` is an int, so the
   door is open, but only 1 and 12 are offered.
+
+## The envelope bar is one fraction
+
+Every envelope bar — the Bills page on the web and on the phone, the Today
+envelope card — is drawn from `budget.envelope_frac(period_used, pool)`:
+what the pool's period has drawn over the pool, held to 0..1; a pool of
+zero or less reads full. The Bills reply carries it as each envelope
+row's `period_frac` (null on a bill that is not an envelope), the Today
+card as `frac`.
+
+- Both clients set the bar's width to `period_frac` and do no division of
+  their own, so one envelope cannot draw two bars.
+- **Older client**: keeps its own division (unchanged figures).
+- **Older server**: no `period_frac`, no bar — the row still prints its
+  amount and what is left.
+- **Stale tab**: the fraction arrives in the same row as `period_used`
+  and `period_left`, so the bar never mixes two fetches.

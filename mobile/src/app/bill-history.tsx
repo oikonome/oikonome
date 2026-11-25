@@ -10,10 +10,10 @@ import { useEffect, useMemo, useState } from "react";
 import { Alert, Pressable, ScrollView, StyleSheet, Text, TextInput,
          View } from "react-native";
 
-import StaleBanner from "../components/stale-banner";
+import { EmptyState, FailedLine, StaleLine } from "../components/loaded";
 import Sheet from "../components/sheet";
 import TxnRow from "../components/txn-row";
-import { Card, H, KV, Pill } from "../components/ui";
+import { Card, H, KV, Pill, Note } from "../components/ui";
 import { errText, setBillPrefill, setHandedOffTxn, type Bill, type BillsData, type BillsHistoryData,
          type Proposal } from "../lib/api";
 import { patchDismissedHint, patchList, patchQueries, patchQuery,
@@ -27,7 +27,10 @@ import MerchantAvatar from "../components/merchant-avatar";
 import { ADD_CADENCES, CATEGORY_MAX, CUSTOM_UNITS, cadenceChoices, cadenceWords, catLabel,
          dominantCategory,
          customCadence, customMax, filterCategories, missedBillPill,
-         proposalSuperseded, RANGE_LABEL, TREND_RANGES, type TrendRange } from "../lib/pure";
+         proposalSuperseded, rangeCaption, TREND_RANGES, type TrendRange, EMPTY_LINES }
+  from "../lib/pure";
+import { RangePicker } from "../components/segmented-control";
+import { fieldA11y } from "../components/field";
 
 // the web page's health pill wording
 const HEALTH_LABEL: Record<string, { text: string;
@@ -47,7 +50,8 @@ const healthPill = (h: string) =>
 
 
 export default function BillHistory() {
-  const { payee } = useLocalSearchParams<{ payee: string }>();
+  const { payee, window: linked } =
+    useLocalSearchParams<{ payee: string; window?: string }>();
   const { client } = useSession();
   const router = useRouter();
   const viewer = useViewer();
@@ -58,14 +62,25 @@ export default function BillHistory() {
   const qc = useQueryClient();
   // ledger rows render in pages (a category-pool envelope is hundreds)
   const [shownTxns, setShownTxns] = useState(60);
-  // the ledger's window; the lifetime card is lifetime either way
-  const [span, setSpan] = useState<TrendRange>("all");
+  // the ledger's window; the lifetime card is lifetime either way. A link
+  // may name the window it was read in (?window=, as on the web); anything
+  // else opens on the whole history.
+  const [span, setSpan] = useState<TrendRange>(
+    TREND_RANGES.includes(linked as TrendRange) ? linked as TrendRange : "all");
   const histKey = ["payee-history", payee, span];
   const q = useQuery({
     queryKey: histKey,
     queryFn: () => client!.billsHistory(String(payee), span),
     enabled: !!client && !!payee,
+    // a new range keeps the screen (the list dimmed) until it answers
+    placeholderData: (prev) => prev,
   });
+  // The last answer: a range that fails keeps the screen, its range picker
+  // included, with the failed line where the list sits (the web's rule).
+  // The lifetime card is lifetime either way, so it stands.
+  const [lastGood, setLastGood] = useState<typeof q.data>();
+  if (q.data && !q.isPlaceholderData && q.data !== lastGood)
+    setLastGood(q.data);
   const refetch = () => {
     qc.invalidateQueries({ queryKey: ["payee-history", payee] });
     qc.invalidateQueries({ queryKey: ["bills"], refetchType: "none" });
@@ -135,7 +150,9 @@ export default function BillHistory() {
       }
     },
   });
-  const d = q.data;
+  const d = q.data ?? lastGood;
+  // the transaction list answers the range on view, or says it failed
+  const rangeFailed = q.data === undefined && q.isError;
   const bill = d?.bill;
   const fit = d?.fit;
   const cadLabel = (v: string) =>
@@ -147,14 +164,13 @@ export default function BillHistory() {
 
   return (
     <ScrollView style={s.wrap} contentContainerStyle={{ paddingBottom: 24 }}>
-      <StaleBanner query={q} />
-      {q.isPending && <Text style={s.center}>Loading…</Text>}
+      <StaleLine query={q} />
+      {/* reached with no bill named: nothing to load, so no spinner */}
+      {!payee && <EmptyState title="Pick a bill on Bills & Income."
+                             to="/bills" action="Bills & Income" />}
+      {!!payee && q.isPending && <Text style={s.center}>Loading…</Text>}
       {q.isError && !d && (
-        <Text style={[s.center, { color: C.bad }]}
-              onPress={() => q.refetch()}>
-          Couldn't load this history — tap to retry.
-        </Text>
-      )}
+        <FailedLine q={q} what="this bill's history" />)}
       {d && (
         <>
           <Card>
@@ -166,6 +182,12 @@ export default function BillHistory() {
               {bill && <Pill text={bill.bill_type} />}
               {bill?.income && <Pill text="income" tone="good" />}
             </View>
+            {/* the server's words for what this screen lists (web same);
+                an older server sends none */}
+            {d.scope_line ? (
+              <Text style={[s.mut, { fontSize: 12, marginTop: 2 }]}>
+                {d.scope_line}</Text>
+            ) : null}
             {d.health?.health === "withdrawn"
               && missedBillPill(d.health.withdrawn_on).note ? (
               <Text style={{ color: C.warn, fontSize: 12, marginTop: 4 }}>
@@ -210,14 +232,16 @@ export default function BillHistory() {
             <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8,
                            marginTop: 8 }}>
               {bill && !viewer && (
-                <Pressable style={s.btn}
+                <Pressable accessibilityRole="button" style={s.btn}
                            onPress={() => router.push({ pathname: "/bill",
                              params: { payee: d.payee } } as never)}>
                   <Text style={s.btnText}>Edit bill</Text>
                 </Pressable>
               )}
-              {bill && !viewer && fit && (
-                <Pressable style={[s.btn, s.btnQuiet]}
+              {/* only where the ledger's values differ from the bill's
+                  (the server's fit_diverges), as on the web */}
+              {bill && !viewer && fit && !!d.health?.fit_diverges && (
+                <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                            onPress={() => {
                              setBillPrefill(d.payee, {
                                amount: fit.amount.toFixed(2),
@@ -232,7 +256,7 @@ export default function BillHistory() {
                 </Pressable>
               )}
               {bill && !viewer && fit && d.hint_dismissed ? (
-                <Pressable style={[s.btn, s.btnQuiet]}
+                <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                            disabled={hint.isPending}
                            onPress={() => hint.mutate("restore")}>
                   <Text style={[s.btnText, { color: C.mut }]}>
@@ -240,7 +264,7 @@ export default function BillHistory() {
                   </Text>
                 </Pressable>
               ) : bill && !viewer && fit && showDismiss ? (
-                <Pressable style={[s.btn, s.btnQuiet]}
+                <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                            disabled={hint.isPending}
                            onPress={() => hint.mutate("dismiss")}>
                   <Text style={[s.btnText, { color: C.mut }]}>
@@ -292,13 +316,13 @@ export default function BillHistory() {
                     </View>
                     <Text style={s.mut}>{p.summary}</Text>
                   </View>
-                  <Pressable style={[s.btn, busy && { opacity: 0.5 }]}
+                  <Pressable accessibilityRole="button" style={[s.btn, busy && { opacity: 0.5 }]}
                              disabled={busy}
                              onPress={() => proposal.mutate({
                                pid: p.id, action: "approve" })}>
                     <Text style={s.btnText}>Approve</Text>
                   </Pressable>
-                  <Pressable style={[s.btn, s.btnQuiet,
+                  <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet,
                                      busy && { opacity: 0.5 }]}
                              disabled={busy}
                              onPress={() => proposal.mutate({
@@ -347,24 +371,18 @@ export default function BillHistory() {
 
           <Card>
             <H>Transactions</H>
-            <View style={{ flexDirection: "row", gap: 6, marginBottom: 8,
-                           flexWrap: "wrap" }}>
-              {TREND_RANGES.map((r) => (
-                <Pressable key={r} onPress={() => setSpan(r)}
-                    style={{ paddingVertical: 3, paddingHorizontal: 9,
-                             borderRadius: 999, borderWidth: 1,
-                             borderColor: span === r ? C.accent : C.border,
-                             backgroundColor: span === r
-                               ? C.accent + "22" : "transparent" }}>
-                  <Text style={{ fontSize: 12,
-                                 color: span === r ? C.accent : C.mut }}>
-                    {RANGE_LABEL[r]}</Text>
-                </Pressable>
-              ))}
-            </View>
+            <RangePicker value={span} onChange={setSpan}
+                         style={{ marginBottom: 8 }} />
+            {rangeFailed && (
+              <FailedLine q={q} what={`this bill's transactions (${
+                rangeCaption(span)})`} />)}
+            {!rangeFailed && (<View style={q.isPlaceholderData
+                                          ? { opacity: 0.55 } : undefined}>
             {d.txns.length === 0 && (
               <Text style={s.mut}>
-                No ledger transactions match this payee.
+                {/* a narrow range's emptiness, not the bill's (the web's) */}
+                {span === "all" ? "No ledger transactions match this payee."
+                  : EMPTY_LINES.range}
               </Text>
             )}
             {/* the server returns EVERY match in the window and this
@@ -378,7 +396,7 @@ export default function BillHistory() {
                                       params: { id: x.id } }); }} />
             ))}
             {d.txns.length > shownTxns && (
-              <Pressable onPress={() =>
+              <Pressable accessibilityRole="button" onPress={() =>
                   setShownTxns((n) => n + 120)}>
                 <Text style={{ color: C.accent, fontSize: 13,
                                textAlign: "center", marginTop: 6 }}>
@@ -386,6 +404,7 @@ export default function BillHistory() {
                 </Text>
               </Pressable>
             )}
+            </View>)}
           </Card>
 
           {d.monthly.length > 0 && (
@@ -467,7 +486,8 @@ function MergeInto({ payee, inUse }: { payee: string; inUse?: boolean }) {
   });
   if (!isMerchant && !open) return null;
   if (!open) return (
-    <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start", marginTop: 10 }]}
+    <Pressable accessibilityRole="button"
+               style={[s.btn, s.btnQuiet, { alignSelf: "flex-start", marginTop: 10 }]}
                onPress={() => setOpen(true)}>
       <Text style={[s.btnText, { color: C.accent }]}>Merge into…</Text>
     </Pressable>
@@ -482,13 +502,15 @@ function MergeInto({ payee, inUse }: { payee: string; inUse?: boolean }) {
             the bill, if any, follows.
           </Text>
           <View style={{ flexDirection: "row", gap: 8 }}>
-            <Pressable style={[s.btn, merge.isPending && { opacity: 0.5 }]}
+            <Pressable accessibilityRole="button"
+                       style={[s.btn, merge.isPending && { opacity: 0.5 }]}
                        disabled={merge.isPending}
                        onPress={() => merge.mutate(target)}>
               <Text style={s.btnText}>
                 {merge.isPending ? "Merging…" : "Yes, merge"}</Text>
             </Pressable>
-            <Pressable style={[s.btn, s.btnQuiet]} disabled={merge.isPending}
+            <Pressable accessibilityRole="button"
+                       style={[s.btn, s.btnQuiet]} disabled={merge.isPending}
                        onPress={() => setTarget(null)}>
               <Text style={[s.btnText, { color: C.mut }]}>Back</Text>
             </Pressable>
@@ -496,30 +518,35 @@ function MergeInto({ payee, inUse }: { payee: string; inUse?: boolean }) {
         </>
       ) : (
         <>
-          <TextInput style={s.input} value={pick} onChangeText={setPick} autoFocus
+          <TextInput {...fieldA11y("Merge into which merchant?")}
+                     style={s.input} value={pick} onChangeText={setPick} autoFocus
                      placeholder="merge into which merchant?" placeholderTextColor={C.mut}
                      autoCapitalize="none" autoCorrect={false} />
           <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
             {options.map((o) => (
-              <Pressable key={o.display} style={s.chip}
+              <Pressable accessibilityRole="button" key={o.display} style={s.chip}
                          onPress={() => setTarget(o.display)}>
                 <Text style={{ color: C.accent, fontSize: 12 }}>
                   {o.display}<Text style={{ color: C.mut }}> · {o.rows}</Text></Text>
               </Pressable>
             ))}
-            {pickQ.length > 0 && !cands.isPending && options.length === 0 && (
+            {/* "no match" only from a search that answered */}
+            {pickQ.length > 0 && cands.isError && (
+              <FailedLine q={cands} what="the merchants" />)}
+            {pickQ.length > 0 && cands.isSuccess && options.length === 0 && (
               <Text style={s.mut}>No merchant matches that.</Text>
             )}
           </View>
-          <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "flex-start" }]}
+          <Pressable accessibilityRole="button"
+                     style={[s.btn, s.btnQuiet, { alignSelf: "flex-start" }]}
                      onPress={close}>
             <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
           </Pressable>
         </>
       )}
       {err ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setErr(null)}>{err}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setErr(null)}>{err}</Note>
       ) : null}
     </View>
   );
@@ -544,7 +571,7 @@ function RestoreArchived({ payee, onDone }: {
   return (
     <View style={{ marginTop: 10, gap: 8 }}>
       <Text style={s.mut}>This bill is archived.</Text>
-      <Pressable style={[s.btn, { alignSelf: "flex-start" },
+      <Pressable accessibilityRole="button" style={[s.btn, { alignSelf: "flex-start" },
                    restore.isPending && { opacity: 0.5 }]}
                  disabled={restore.isPending}
                  onPress={() => restore.mutate()}>
@@ -552,7 +579,7 @@ function RestoreArchived({ payee, onDone }: {
           {restore.isPending ? "Restoring…" : "Restore"}
         </Text>
       </Pressable>
-      {err ? <Text style={{ color: C.bad, fontSize: 12 }}>{err}</Text> : null}
+      {err ? <Note bad style={{ color: C.bad, fontSize: 12 }}>{err}</Note> : null}
     </View>
   );
 }
@@ -598,12 +625,12 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
       <Text style={{ color: C.text, fontSize: 14, fontWeight: "700" }}>
         {inflow ? "Add as recurring income" : "Add as recurring bill"}
       </Text>
-      <TextInput style={s.input} placeholder="amount"
+      <TextInput {...fieldA11y("Amount")} style={s.input} placeholder="amount"
                  placeholderTextColor={C.mut} value={amount}
                  onChangeText={setAmount} keyboardType="decimal-pad" />
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 6 }}>
         {options.map(([v, l]) => (
-          <Pressable key={v} style={[s.chip, cadence === v && s.chipOn]}
+          <Pressable accessibilityRole="button" key={v} style={[s.chip, cadence === v && s.chipOn]}
                      onPress={() => setCadence(v)}>
             <Text style={{ color: cadence === v ? C.text : C.mut,
                            fontSize: 12 }}>{l}</Text>
@@ -616,13 +643,14 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
           <Text style={s.mut}>every</Text>
           {/* the cap depends on the unit (about 20 years of it), so the
               field clamps as it is typed rather than at a fixed length */}
-          <TextInput style={[s.input, { minWidth: 60, flex: 0 }]}
+          <TextInput {...fieldA11y("Repeats every")} style={[s.input, { minWidth: 60, flex: 0 }]}
                      keyboardType="number-pad" value={customN} maxLength={4}
                      onChangeText={(t) => setCustomN(
                        Number(t) > customMax(customUnit)
                          ? String(customMax(customUnit)) : t)} />
           {CUSTOM_UNITS.map(([u, label]) => (
-            <Pressable key={u} style={[s.chip, customUnit === u && s.chipOn]}
+            <Pressable accessibilityRole="button"
+                       key={u} style={[s.chip, customUnit === u && s.chipOn]}
                        onPress={() => setCustomUnit(u)}>
               <Text style={{ color: customUnit === u ? C.text : C.mut,
                              fontSize: 12 }}>
@@ -632,19 +660,19 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
           ))}
         </View>
       )}
-      <TextInput style={s.input}
+      <TextInput {...fieldA11y("Next due (YYYY-MM-DD, optional)")} style={s.input}
                  placeholder="next due (YYYY-MM-DD, optional)"
                  placeholderTextColor={C.mut} value={nextDue}
                  onChangeText={setNextDue} autoCapitalize="none" />
       <View style={{ flexDirection: "row", gap: 8, flexWrap: "wrap" }}>
-        <Pressable style={[s.btn, (!amount || add.isPending)
+        <Pressable accessibilityRole="button" style={[s.btn, (!amount || add.isPending)
                      && { opacity: 0.5 }]}
                    disabled={!amount || add.isPending}
                    onPress={() => add.mutate()}>
           <Text style={s.btnText}>Add</Text>
         </Pressable>
         {fit ? (
-          <Pressable style={[s.btn, s.btnQuiet]}
+          <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]}
                      onPress={() => { setAmount(fit.amount.toFixed(2));
                                       setCadence(cadencePick(fit.cadence, fitDays));
                                       setNextDue(fit.next_due ?? "");
@@ -669,8 +697,8 @@ function AddAsBill({ payee, fit, inflow, onDone }: {
         </Text>
       )}
       {err ? (
-        <Text style={{ color: C.bad, fontSize: 12 }}
-              onPress={() => setErr(null)}>{err}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12 }}
+              onPress={() => setErr(null)}>{err}</Note>
       ) : null}
     </View>
   );
@@ -759,7 +787,7 @@ function MerchantCategory({ payee, current, onDone }: {
       </Text>
       {/* the resting label is the current category, like the ledger
           row's chip; tapping opens the picker */}
-      <Pressable style={[s.chip, { alignSelf: "flex-start", marginTop: 8,
+      <Pressable accessibilityRole="button" style={[s.chip, { alignSelf: "flex-start", marginTop: 8,
                                    flexDirection: "row", gap: 6 },
                          busy && { opacity: 0.5 }]}
                  disabled={busy}
@@ -819,10 +847,10 @@ function MerchantCategory({ payee, current, onDone }: {
             </Text>
           )}
           <View style={{ flexDirection: "row", gap: 8 }}>
-            <Pressable style={s.btn} disabled={busy} onPress={apply}>
+            <Pressable accessibilityRole="button" style={s.btn} disabled={busy} onPress={apply}>
               <Text style={s.btnText}>Yes, recategorize</Text>
             </Pressable>
-            <Pressable style={[s.btn, s.btnQuiet]} disabled={busy}
+            <Pressable accessibilityRole="button" style={[s.btn, s.btnQuiet]} disabled={busy}
                        onPress={() => setConfirm(null)}>
               <Text style={[s.btnText, { color: C.mut }]}>Cancel</Text>
             </Pressable>
@@ -841,34 +869,37 @@ function MerchantCategory({ payee, current, onDone }: {
         </Text>
       )}
       {err ? (
-        <Text style={{ color: C.bad, fontSize: 12, marginTop: 6 }}
-              onPress={() => setErr(null)}>{err}</Text>
+        <Note bad style={{ color: C.bad, fontSize: 12, marginTop: 6 }}
+              onPress={() => setErr(null)}>{err}</Note>
       ) : null}
 
       <Sheet visible={picking} onClose={() => setPicking(false)}
              title={`Category for ${payee}`}
              footer={
-               <Pressable style={[s.btn, s.btnQuiet, { alignSelf: "center",
+               <Pressable accessibilityRole="button"
+                          style={[s.btn, s.btnQuiet, { alignSelf: "center",
                                                        marginTop: 10 }]}
                           onPress={() => setPicking(false)}>
                  <Text style={[s.btnText, { color: C.mut }]}>Close</Text>
                </Pressable>}>
             {/* the filter doubles as a new custom name ("✎ Create …") */}
-            <TextInput style={s.input} placeholder="filter, or type a new category…"
+            <TextInput {...fieldA11y("Filter, or type a new category")}
+                       style={s.input} placeholder="filter, or type a new category…"
                        placeholderTextColor={C.mut} autoCapitalize="none"
                        maxLength={CATEGORY_MAX}
                        value={filter} onChangeText={setFilter} />
             <ScrollView style={{ maxHeight: 420 }}>
               {cats.isPending && <Text style={s.mut}>Loading…</Text>}
               {creatable && (
-                <Pressable style={s.catRow} onPress={() => preview(typed)}>
+                <Pressable accessibilityRole="button"
+                           style={s.catRow} onPress={() => preview(typed)}>
                   <Text style={{ color: C.accent, fontSize: 15 }}>
                     ✎ Create “{typed}”
                   </Text>
                 </Pressable>
               )}
               {catList.map((c) => (
-                <Pressable key={c} style={s.catRow}
+                <Pressable accessibilityRole="button" key={c} style={s.catRow}
                            onPress={() => preview(c)}>
                   <Text style={{ color: catLabel(c) === catLabel(current)
                                    ? C.accent : C.text, fontSize: 15 }}>
@@ -886,7 +917,7 @@ const s = StyleSheet.create({
   wrap: { flex: 1, backgroundColor: C.bg },
   center: { color: C.mut, textAlign: "center", padding: 20 },
   mut: { color: C.mut, fontSize: 12, lineHeight: 17 },
-  btn: { backgroundColor: C.accent, borderRadius: 8,
+  btn: { backgroundColor: C.btn, borderRadius: 8,
          paddingHorizontal: 14, paddingVertical: 8 },
   btnQuiet: { backgroundColor: C.hover },
   btnText: { color: C.text, fontSize: 13, fontWeight: "600" },
@@ -894,7 +925,7 @@ const s = StyleSheet.create({
              borderTopColor: C.border,
              borderTopWidth: StyleSheet.hairlineWidth,
              paddingVertical: 8 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 8, color: C.text, fontSize: 15,
            paddingHorizontal: 10, paddingVertical: 8 },
   chip: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,

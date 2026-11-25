@@ -283,8 +283,9 @@ def reap_tenant(tenant_id: str) -> dict:
     month. Blocking a worker thread behind a multi-minute sync costs more."""
     conn = tenancy.tenant_connect(tenant_id)
     try:
-        if not conn.execute("SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-                            (f"oikonome:sync:{tenant_id}",)).fetchone()["ok"]:
+        if not tenancy.take_lock(
+                conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+                (f"oikonome:sync:{tenant_id}",))["ok"]:
             log.info("sync in flight for tenant %s — deferring reap",
                      tenant_id)
             return {"skipped": "sync-in-flight"}

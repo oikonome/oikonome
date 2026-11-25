@@ -51,7 +51,8 @@ already see on the pages.
 ## Where your data goes
 
 The assistant runs on whichever AI backend the **Assistant** task is
-routed to (Settings → AI, the **AI (optional)** card). Several backends
+routed to (Settings → AI, under **What uses what**; on the phone, the
+**AI (optional)** section). Several backends
 can be configured at once — a local model doing the bulk categorization
 while a cloud model answers here, or any other split:
 
@@ -164,9 +165,10 @@ When a picture or a table makes an answer clearer — "chart my groceries
 by month", "compare 2024 and 2025 spending", "where does my money go" —
 the answer can carry one, drawn in place on the web and in the mobile
 app: a **bar** chart, a **line** chart, a **pie** (parts of a whole) or a
-small **table**. Under every chart, **show numbers** folds out the same
-figures as a table, so the picture is never the only way to read a
-number.
+small **table**. Every chart says in one sentence where it starts and
+ends (and its highest and lowest point), and under it **Show numbers**
+folds out the same figures as a table, so the picture is never the only
+way to read a number — as on every other chart in the app.
 
 The model never writes markup. It describes the chart as a small list of
 labels and values taken from the summaries it fetched; the server checks
@@ -220,3 +222,8 @@ as free software should.
   (better than queueing behind a slow answer); retry in a moment.
   Operators can raise `OIKONOME_ASSISTANT_CONCURRENCY` on a big machine.
 - Questions longer than 1,000 characters are truncated.
+- The backends and task routing in Settings → AI are each saved as a
+  whole list. An edit is merged onto what another device saved in the
+  meantime; only if the list moves again during that save does it stop
+  with *"Changed on another device. Reloaded the latest; make your change
+  again."*, and the card then shows the stored list.

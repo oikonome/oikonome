@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 from oikonome.db import tenancy
 from oikonome.web import setup
 
-from .util import _ensure_db, seed_accounts, write_config
+from .util import _ensure_db, outlive_no_threads, seed_accounts, write_config
 from .export_ticket import export_get
 
 
@@ -42,6 +42,11 @@ class LoginSetupAndDataTransferTests(unittest.TestCase):
             write_config(conn)
         finally:
             conn.close()
+
+    def setUp(self):
+        # the ZIP restore runs as a job on its own thread, holding the
+        # household's sync lock: it finishes before the next test begins
+        outlive_no_threads(self)
 
     def test_login_page_renders_and_signs_in(self):
         anon = TestClient(self.client.app)

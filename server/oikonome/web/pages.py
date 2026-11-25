@@ -5,11 +5,14 @@ over web/data + sync importers.
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import math
 import threading as _threading
 import os
 import time
 
+from starlette.concurrency import run_in_threadpool
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, \
     UploadFile
 from urllib.parse import quote
@@ -20,6 +23,8 @@ from ..db import tenancy
 from ..envnum import env_flag
 from . import demoguard, mailguard, permissions
 from .security import limit
+from .schemas import documented
+from .schemas import exports as shapes
 import datetime as _dt
 
 
@@ -84,6 +89,7 @@ def _connections(conn):
     # (archived, no reason) stay hidden.
     rows = conn.execute(
         """SELECT i.id, i.aggregator, i.institution_name, i.archived_reason,
+                  i.institution_id, i.archived_at,
                   CASE WHEN COALESCE(i.status,'') = 'archived' THEN 'reaped'
                        ELSE COALESCE(NULLIF(i.status, 'ok'),
                                      i.webhook_status, 'ok') END AS status,
@@ -143,7 +149,44 @@ def _connections(conn):
         d["history_months"] = (plaid.history_months_from_days(days)
                                if d.get("aggregator") == "plaid" else None)
         out.append(d)
+    _mark_attention(out)
     return out
+
+
+def _same_bank(a: dict, b: dict) -> bool:
+    """Two connections to one institution: the aggregator's institution id
+    when both carry one, the name otherwise (case and spacing aside)."""
+    if a.get("institution_id") and b.get("institution_id"):
+        return a["institution_id"] == b["institution_id"]
+    na = " ".join(str(a.get("institution_name") or "").lower().split())
+    nb = " ".join(str(b.get("institution_name") or "").lower().split())
+    return bool(na) and na == nb
+
+
+def _mark_attention(rows: list[dict]) -> None:
+    """Which connections need a person's hand — decided here, once, for
+    the header chip, the Settings row and the phone alike
+    (specs/settings-status-lines.md).
+
+    A connection the bank feed removed is work only until the household
+    links that bank again: once a live link to the same institution
+    exists, the old one is history. It stops counting and says what
+    happened to it, once, beside a forget button."""
+    live = [r for r in rows if r["status_kind"] != "gone"]
+    for r in rows:
+        gone = r["status_kind"] == "gone"
+        r["replaced"] = gone and any(_same_bank(r, o) for o in live)
+        r["needs_attention"] = (r["status_kind"] in ("reauth", "gone",
+                                                     "attention")
+                                and not r["replaced"])
+        r["removed_text"] = None
+        if r["replaced"]:
+            when = r.get("archived_at") or r.get("last_ok")
+            day = (f" on {when.strftime('%m/%d/%y')}"
+                   if isinstance(when, _dt.datetime) else "")
+            r["removed_text"] = f"removed by the bank feed{day} — replaced"
+        r.pop("institution_id", None)
+        r.pop("archived_at", None)
 
 
 @router.get("/accounts")
@@ -153,10 +196,19 @@ def accounts_page(user: dict = Depends(_user()), msg: str = ""):
     return RedirectResponse("/app/accounts" + (f"?msg={quote(msg)}" if msg else ""), status_code=303)
 
 
+def _account_type_or_400(typ: str) -> None:
+    """The JSON doors' vocabulary: the type drives the spend universe and
+    the net-worth grouping, so any other string drops the account out of
+    every aggregate, pinned there by type_user_set."""
+    if typ not in ("depository", "credit", "investment", "loan", "other"):
+        raise HTTPException(400, "unknown account type")
+
+
 @router.post("/accounts/classify")
 def classify(user: dict = Depends(_user()), account_id: str = Form(...),
              kind: str = Form(...), primary_checking: str = Form("")):
     typ, _, sub = kind.partition("/")
+    _account_type_or_400(typ)
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
         # the legacy form door, same rules as /api/accounts/classify: one
@@ -244,6 +296,7 @@ def add_account(user: dict = Depends(_user()), name: str = Form(...),
     name = name.strip()
     _merchant_name_or_400("name", name)
     typ, _, sub = kind.partition("/")
+    _account_type_or_400(typ)
     import math
     from .api import _MONEY_MAX, _typed_money
     try:
@@ -277,8 +330,9 @@ def _csv_cell(v):
     if isinstance(v, (dict, list)):
         import json as _j
         from .api import _csv_piece_safe
-        # a JSON cell is text a spreadsheet splits like any other
-        return _csv_piece_safe(_j.dumps(v))
+        # a JSON cell is text a spreadsheet splits like any other; a list
+        # of ids (a uuid[] column: receipts.not_same_slip) as strings
+        return _csv_piece_safe(_j.dumps(v, default=str))
     # Spreadsheet formula injection: a cell beginning = + - @ — with or
     # without an invisible character in front of it (tab, CR, LF, BOM,
     # space) — is prefixed with a quote so Excel/Calc treat it as text.
@@ -403,6 +457,7 @@ SHARED_EXPORT_DENIED = ("This is a shared demonstration login — the "
 
 
 @router.post("/api/export/token")
+@documented(response=shapes.ExportTicket, body=shapes.ExportTicketAsk)
 def export_token(user: dict = Depends(_user()), body: dict = Body(...)):
     """Re-prove identity and mint the one-shot ticket that GET /export or
     /export/dump will redeem. Same proof the connections bundle demands —
@@ -564,6 +619,9 @@ EXPORT_SKIP = {
     "tenant_keys",       # envelope key material — secret, never travels
     "txn_id_keys",       # the secret file-row ids are keyed under — never travels
     "import_staging",    # import scratch
+    # which transactions last wrote the dated ledger: cache bookkeeping,
+    # meaningless on another instance
+    "ledger_writes",
     # a folder import's frozen plan and the files it has not reached yet:
     # import scratch and job bookkeeping, never the household's data
     "bulk_import_jobs",
@@ -579,6 +637,10 @@ EXPORT_SKIP = {
     # a merchant-wide category write's held undo: a week of scratch that
     # only means anything to the instance that issued its reference
     "category_undo",
+    # what the cash forecast learned from history, per day: derived from
+    # the ledger the export carries, recomputed by the first build after
+    # a restore
+    "forecast_learned",
     # learned categorizer overlay — a binary model artifact, not user-
     # legible data; derived from merchant_categories (which exports fully)
     # and retrained nightly, so the export carries the source, not the cache
@@ -596,6 +658,10 @@ EXPORT_SKIP = {
     # tenant_export.ARCHIVE_TABLE_SKIP names the same two.
     "webhooks",
     "webhook_deliveries",
+    # the household's Plaid user: an id at Plaid tied to THIS instance's
+    # client keys, meaningless (and never valid) under another's; a
+    # restored household gets a new one the first time it links a bank
+    "plaid_users",
 }
 
 # PRESENTATION only — a human-friendly file order for the ZIP and its
@@ -714,6 +780,7 @@ EXPORT_LAST_JOB = "export-zip"
 
 
 @router.get("/api/export/last")
+@documented(response=shapes.ExportLast)
 def export_last(user: dict = Depends(_user())):
     """What the household's most recent full-data export found: when it
     was built and what a restore would refuse in it. A browser download is
@@ -859,6 +926,7 @@ def settings_save(user: dict = Depends(_user()),
             else:
                 cfg.pop("budgeted_income_monthly", None)
             cfg["dynamic_variable_budget"] = bool(dynamic_variable_budget)
+            budget.mark_saved_by_user(cfg)
     finally:
         conn.close()
     return RedirectResponse("/settings?msg=Saved.", status_code=303)
@@ -902,7 +970,9 @@ def settings_email(user: dict = Depends(_user()),
                 cfg["email_recipients"] = recips
             else:
                 cfg.pop("email_recipients", None)
-            cfg["email_send_hour_utc"] = max(0, min(23, email_send_hour_utc))
+            from ..notify.schedule import legacy_hour_counts
+            if legacy_hour_counts(cfg):
+                cfg["email_send_hour_utc"] = max(0, min(23, email_send_hour_utc))
         # and the same for the invite half: a policy that lives in one
         # door drifts out of the other one. Added addresses are invited,
         # never enrolled.
@@ -1087,6 +1157,70 @@ def plaid_completion_redirect() -> str | None:
     return raw if raw.lower().startswith("https://") else None
 
 
+def link_offer(user: dict, conn, *, relink: bool = False) -> dict:
+    """What the next new bank link would do, decided in ONE place so the
+    line under the buttons can never promise what the start will not do:
+    {"multi": several banks per sign-in, "refuse": the sentence a start
+    would be refused with, or None, "line": what the buttons say}.
+
+    Refused outright: read-only billing, the bank-link hold, the day's
+    handed-back ceiling, no room under the cap (counting add sessions
+    still open). Several banks: the switch on, not a relink, room for two
+    more, keys present, and not paused for this household and keys
+    (plaid_user.paused)."""
+    from ..sync import plaid_user
+    tid = str(user["tenant_id"])
+    out: dict = {"multi": False, "refuse": None, "line": None}
+    try:
+        client_id, _secret, base_url = plaid.credentials(conn)
+    except plaid.PlaidError:
+        return out
+    from .app import _billing_write_blocked
+    from ..notify import outbound_pause
+    cfg = budget.load_config(conn)
+    cap = sync_base.institution_cap(conn)
+    held = pending = 0
+    if cap is not None:
+        from ..jobs import plaid_links
+        held = max(0, sync_base.institutions_held(conn)
+                   - (1 if relink else 0))
+        # read through a short per-household cache: this runs on every
+        # account answer, and the record is on an unpooled owner
+        # connection (the start door reads it fresh before binding)
+        pending = _open_add_sessions(
+            tid, time.time(),
+            plaid_links.recent_open_cached(tid, _PLAID_ADD_LIVE))
+    left = None if cap is None else cap - held - pending
+    if _billing_write_blocked({"tenant_id": tid}):
+        out["refuse"] = "this account is read-only right now"
+    elif outbound_pause.links_held(cfg, "plaid"):
+        out["refuse"] = outbound_pause.hold_message(cfg, "plaid")
+    elif plaid.handed_back_today(conn, tid) >= plaid.HANDED_BACK_PER_DAY:
+        out["refuse"] = plaid.TOO_MANY_HANDED_BACK
+    elif left is not None and left <= 0:
+        try:
+            _refuse_add_over_cap(cap, held, pending)
+        except ValueError as e:
+            out["refuse"] = str(e)
+    if out["refuse"]:
+        out["line"] = out["refuse"]
+        return out
+    out["multi"] = (plaid_user.enabled() and not relink
+                    and (left is None or left >= 2)
+                    and not plaid_user.paused(
+                        conn, plaid_user.key(client_id, base_url)))
+    tail = ("several in one go: after the first, choose to add another "
+            "before you finish.")
+    if left is None:
+        out["line"] = ("You can connect several banks in one go: after the "
+                       "first, choose to add another before you finish."
+                       if out["multi"] else None)
+    else:
+        more = f"You can connect {left} more bank{'s' if left != 1 else ''}"
+        out["line"] = f"{more} — {tail}" if out["multi"] else f"{more}."
+    return out
+
+
 def _start_plaid_session(user: dict, item_id: str = "",
                          manage_accounts: bool = False,
                          relink_of: dict | None = None,
@@ -1110,6 +1244,13 @@ def _start_plaid_session(user: dict, item_id: str = "",
         access_token, inst, kind = None, None, "add"
         cap, held = None, 0
         recorded: set = set()
+        # several banks in one session: a plain add only (never a re-auth,
+        # never a relink, which is ONE bank by design), and only with room
+        # under the institution cap for at least two more — the exchange
+        # checks the cap for each bank all the same, and a bank it refuses
+        # is handed back, so offering the button at the last slot would
+        # only invite a bank the household cannot keep
+        multi = False
         if item_id:
             row = conn.execute(
                 "SELECT id, institution_name, status, webhook_status "
@@ -1159,6 +1300,12 @@ def _start_plaid_session(user: dict, item_id: str = "",
             # the binding check is the one under the guard below
             _refuse_add_over_cap(cap, held, _open_add_sessions(
                 str(user["tenant_id"]), time.time(), recorded))
+            # the day's ceiling on banks handed back, and several banks or
+            # one: decided where the line under the buttons is worded
+            offer = link_offer(user, conn, relink=bool(relink_of))
+            if offer["refuse"] == plaid.TOO_MANY_HANDED_BACK:
+                raise ValueError(plaid.TOO_MANY_HANDED_BACK)
+            multi = offer["multi"]
         # While a credential rotation's bank-link hold stands, the
         # household's own Plaid client may be one a hijacker saved: a new
         # link AND a re-auth would both hand it the bank login typed into
@@ -1167,6 +1314,8 @@ def _start_plaid_session(user: dict, item_id: str = "",
         from ..notify import outbound_pause
         outbound_pause.refuse_if_held(budget.load_config(conn), "plaid")
         client = plaid.Client.for_tenant(conn)
+        client_id = (getattr(client, "_auth", None) or {}).get("client_id")
+        client_id = client_id if isinstance(client_id, str) else None
         created = client.create_hosted_link(
             str(user["tenant_id"]), client_name="Oikonome",
             access_token=access_token,
@@ -1174,13 +1323,25 @@ def _start_plaid_session(user: dict, item_id: str = "",
             # the completion page is the web app's: a phone's in-app
             # browser would land on the web login there and never close
             completion_redirect=(plaid_completion_redirect()
-                                 if web_client else None), conn=conn)
+                                 if web_client else None), conn=conn,
+            multi_item=multi)
+        if relink_of and "have_months" in relink_of:
+            # the window the token itself asked for is the one the new Item
+            # is recorded with; a choice narrowed since the binding's check
+            # would make a relink no wider than the bank it frees
+            got = plaid.history_months_from_days(
+                created.get("days_requested"))
+            if got is not None and got <= relink_of["have_months"]:
+                raise ValueError("this bank already has the history window "
+                                 "you chose — widen the window first to "
+                                 "pull more")
     finally:
         conn.close()
     tid = str(user["tenant_id"])
     lt = created["link_token"]
     url = created["hosted_link_url"]
     dropped: list = []
+    from ..jobs import plaid_links
     with _PLAID_LINK_GUARD:
         now = time.time()
         if relink_of and any(
@@ -1215,7 +1376,15 @@ def _start_plaid_session(user: dict, item_id: str = "",
                                                    and manage_accounts),
                            "institution": inst, "at": now,
                            "url": url, "done": False,
-                           "relink_of": (relink_of or {}).get("item_id")}
+                           "relink_of": (relink_of or {}).get("item_id"),
+                           "multi_item": bool(created.get("multi_item")),
+                           "client_id": client_id,
+                           # until when Plaid can still report a bank for
+                           # it (plaid_links.accepts_results)
+                           "results_until": (
+                               now + plaid_links._window_s(
+                                   created.get("expiration"))
+                               if created.get("multi_item") else None)}
     if relink_of:
         # the binding on the old row itself, so a finisher that never saw
         # this process's memory (the webhook, the sweep after a restart)
@@ -1243,7 +1412,10 @@ def _start_plaid_session(user: dict, item_id: str = "",
         plaid_links.forget(k, tid)
     plaid_links.record(tid, lt, kind, item_id or None,
                        bool(item_id and manage_accounts), inst,
-                       days_requested=created.get("days_requested"))
+                       days_requested=created.get("days_requested"),
+                       multi_item=bool(created.get("multi_item")),
+                       expiration=created.get("expiration"),
+                       client_id=client_id)
     return {"link_token": lt, "hosted_link_url": url,
             "kind": kind, "institution": inst}
 
@@ -1339,7 +1511,8 @@ def _relink_binding(user: dict, item_id: str) -> dict:
                 raise HTTPException(409, "a relink of this bank is already "
                                          "in progress — finish it, or "
                                          "close that bank window first")
-        return {"item_id": item_id, "institution_id": it["institution_id"]}
+        return {"item_id": item_id, "institution_id": it["institution_id"],
+                "have_months": have}
     finally:
         conn.close()
 
@@ -1412,7 +1585,7 @@ def plaid_link_set_aside(link_token: str, user: dict = Depends(_user())):
 
 @router.get("/accounts/plaid/link/{link_token}/status")
 def plaid_link_status(link_token: str, user: dict = Depends(_user()),
-                      resume: int = 0):
+                      resume: int = 0, v: int = 0):
     """Polled by the link page. Completes the exchange and queues the
     first sync on the worker (add) or verifies the item and clears its error status (update) the moment
     Plaid reports the session finished.
@@ -1423,6 +1596,10 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user()),
     resumes on every visit would otherwise hold an abandoned session's
     place for as long as it stays open, and Connect on the same page
     would be refused.
+
+    ``v=2`` is a client that keeps its bank window open on a quiet answer
+    (plaid_links.QUIET_S); a session only older clients look at is
+    answered quiet later (OLD_CLIENT_QUIET_S), since they close it.
 
     This GET writes the exchange and the item, so the request gate's
     write-only credential check never sees it; the shared demonstration
@@ -1441,6 +1618,9 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user()),
         if found is not None:
             with _PLAID_LINK_GUARD:
                 sess = _PLAID_LINK.setdefault(link_token, found)
+    if sess is not None and v >= 2 and (sess.get("client_v") or 0) < 2:
+        sess["client_v"] = 2
+        plaid_links.note_client(link_token, user["tenant_id"], 2)
     if sess is not None and not resume:
         with _PLAID_LINK_GUARD:
             # the client is still waiting on this window: it keeps its
@@ -1454,13 +1634,17 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user()),
     # session started while the tenant was in good standing stays pollable for its whole TTL,
     # so a lapse mid-session would otherwise add a billed Plaid item to a
     # read-only account. Same rule as the POST that opened the session.
-    if sess["done"]:
+    if sess["done"] and not plaid_links.accepts_results(sess):
         # nothing left to write — the exchange already happened while
         # the tenant was in good standing, so a lapse since then must not
         # turn a finished link into an error
         return plaid_links.done_reply(sess)
     from .app import _billing_write_blocked
     if _billing_write_blocked({"tenant_id": user["tenant_id"]}):
+        if sess["done"]:
+            # a finished several-bank session: what it already answered
+            # stands; a late bank is the worker's to hand back
+            return plaid_links.done_reply(sess)
         raise HTTPException(402, "this account is read-only right now")
     from ..sync.base import tenant_sync_lock
     # Items this poll saved, whose first pull goes to the worker once the
@@ -1487,10 +1671,11 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user()),
         # the LINK webhook or the worker's sweep may have finished the
         # session, or exchanged one of its tokens, while nobody polled.
         plaid_links.refresh(sess, link_token)
-        if sess["done"]:
+        if sess["done"] and not plaid_links.accepts_results(sess):
             return plaid_links.done_reply(sess)
-        client = plaid.Client.for_tenant(conn)
         try:
+            # the keys the session's link token was made under
+            client = plaid_links.session_client(conn, sess, link_token)
             data = client.get_link_session(link_token)
         except plaid.PlaidError as e:
             # Plaid's typed code, message and request id — never the
@@ -1506,6 +1691,8 @@ def plaid_link_status(link_token: str, user: dict = Depends(_user()),
                                          defer_sync=first_syncs)
         if added is not None:
             return added
+        if sess["done"]:
+            return plaid_links.done_reply(sess)
         # ADD mode, session finished, nothing added: the user exited
         # Link without connecting a bank (the exit button stamps
         # finished_at too). Without this the poll falls through to
@@ -1649,9 +1836,9 @@ def _account_sync(user: dict, item_id: str) -> tuple[str, str]:
         # tabs' "↻ sync" racing the same item both read one tx_cursor and
         # the loser's cursor write silently discards the winner's pull.
         # Same lock, same "already running" answer as the other doors.
-        got = conn.execute(
-            "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
-            (f"oikonome:sync:{user['tenant_id']}",)).fetchone()["ok"]
+        got = tenancy.take_lock(
+            conn, "SELECT pg_try_advisory_lock(hashtext(%s)) AS ok",
+            (f"oikonome:sync:{user['tenant_id']}",))["ok"]
         if not got:
             # the holder answers this request with one more pass before it
             # lets go, instead of the tenant waiting for the hourly catch-up
@@ -1821,6 +2008,7 @@ _SYNC_STATUS = {"ok": 200, "busy": 409, "unknown": 404,
 
 @router.post("/api/accounts/sync",
              dependencies=[Depends(limit("account-sync", *SYNC_PER_IP))])
+@documented(response=shapes.AccountSynced, body=shapes.AccountSyncAsk)
 def account_sync_api(user: dict = Depends(_user()), body: dict = Body(...)):
     """Manual per-item sync, JSON: {"item_id"} → {"ok", "message"}.
     Throttled at 20 presses per 10 minutes per address and 30 per
@@ -1926,9 +2114,12 @@ def transactions_recategorize(user: dict = Depends(_user()),
                               back: str = Form("/transactions")):
     from . import data
     from ..engine import activity as _activity
+    from .api import _new_category_or_400
+    c = category.strip()
+    if c != "__clear__":
+        _new_category_or_400(c, user)     # the JSON door's bound
     conn = tenancy.tenant_connect(user["tenant_id"])
     try:
-        c = category.strip()
         was = conn.execute(
             "SELECT COALESCE(category_override, category_primary) AS cat "
             "FROM transactions WHERE id=%s", (txn_id,)).fetchone()
@@ -1961,6 +2152,13 @@ def _cadence_label(frequency: str | None, interval,
     return _cadence_words(frequency, interval, by_month_day)
 
 
+def _num(v) -> float | None:
+    """A finite number stored as one, else None (a bool is not a price)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    return float(v) if math.isfinite(v) else None
+
+
 def _proposal_summary(p) -> str:
     ev = as_dict(p["evidence"])
     bits = []
@@ -1969,18 +2167,39 @@ def _proposal_summary(p) -> str:
         n = ev.get("n") or 0
         bits.append(f"Plaid sees this recurring — {n} charge{'' if n == 1 else 's'}"
                     + (" (early)" if ev.get("status") == "EARLY_DETECTION" else ""))
-    if ev.get("charged_on") and ev.get("old") is not None and ev.get("new") is not None:
+    # stored evidence is read by type: a value of another shape (a restored
+    # or hand-edited row) reads as no evidence, never as a Bills screen 500
+    old, new = _num(ev.get("old")), _num(ev.get("new"))
+    try:
+        charged = as_date(ev.get("charged_on")) if ev.get("charged_on") else None
+    except (TypeError, ValueError, OverflowError):
+        charged = None
+    if charged and old is not None and new is not None:
         # a price change: the charge that arrived at the new amount
-        bits.append(f"charged ${float(ev['new']):,.2f} on "
-                    f"{as_date(ev['charged_on']).strftime('%m/%d/%y')}, "
-                    f"the bill says ${float(ev['old']):,.2f}")
-    if ev.get("hits"):
-        bits.append(f"{ev['hits']} charges on a {ev.get('cycle_days','?')}-day cycle")
-    if ev.get("monthly_totals"):
-        vals = list(ev["monthly_totals"].values())
-        bits.append(f"{len(vals)} monthly totals ${min(vals):,.0f}–${max(vals):,.0f}")
+        bits.append(f"charged ${new:,.2f} on {charged.strftime('%m/%d/%y')}, "
+                    f"the bill says ${old:,.2f}")
+    hits = ev.get("hits")
+    if isinstance(hits, int) and not isinstance(hits, bool) and hits > 0:
+        cyc = ev.get("cycle_days")
+        # a cycle the detector measured is said; an offer filed without
+        # one (a twice-a-month series, a Plaid stream) just counts charges
+        bits.append(f"{hits} charge{'' if hits == 1 else 's'}"
+                    + (f" about every {cyc} days"
+                       if isinstance(cyc, int) and not isinstance(cyc, bool)
+                       and cyc > 0 else ""))
+    mt = ev.get("monthly_totals")
+    vals = [v for v in (map(_num, mt.values()) if isinstance(mt, dict) else ())
+            if v is not None]
+    if vals:
+        bits.append(f"${min(vals):,.0f}–${max(vals):,.0f} a month over "
+                    f"{len(vals)} month{'' if len(vals) == 1 else 's'}")
     if ev.get("last_seen"):
-        bits.append(f"last seen {ev['last_seen']}")
+        # the app's date order; a value that is not a date is shown as stored
+        try:
+            seen = as_date(ev["last_seen"]).strftime("%m/%d/%y")
+        except Exception:                                # noqa: BLE001
+            seen = ev["last_seen"]
+        bits.append(f"last seen {seen}")
     if ev.get("income"):
         bits.append("looks like a paycheck")
     return " · ".join(bits) or "detected from your ledger"
@@ -2241,6 +2460,13 @@ def restore_result(counts: dict) -> dict:
     return {"imported": counts.get("transactions", 0),
             "rows": sum(inserted.values()),
             "warnings": list(notes) or None,
+            # the stored credentials the restore did not carry to an address
+            # the archive moved, by kind, so a client can say which to retype
+            "credentials_dropped": list(
+                getattr(counts, "credentials_dropped", None) or []),
+            # the rows no reader could read, per table, which a client
+            # shows apart from (and above) the result
+            "skipped": list(getattr(counts, "skipped", None) or []),
             "source": "Oikonome export restored: " + ", ".join(parts)}
 
 
@@ -2288,106 +2514,111 @@ def _dispatch_import_unlocked(conn, account_id: str, amount_sign: str,
             sync_base.assert_token_importable(conn, account_id)
         except PermissionError as e:
             raise HTTPException(403, str(e))
+    if name.endswith(".zip"):
+        # An export ZIP is restored by the background job, which every door
+        # that takes one starts (the Import page, /api/import, the folder
+        # import): a large archive outlives the edge timeout in front of a
+        # hosted instance, and the restore commits its own transaction
+        # before the steps that must follow the commit. Nothing reaches
+        # here with one that the checks above let through.
+        return {"error": "an export ZIP is restored from the Import page"}, None
     result: dict = {}
     bid = None
     try:
-        if not name.endswith(".zip") and not account_id:
-            raise ValueError("pick the account these transactions belong to")
-        if name.endswith(".zip"):
-            # Inline, on purpose: this is the no-JS door, which has nothing
-            # to poll a background job with. Both API doors (/api/import and
-            # the bulk runner, i.e. every path the apps use) start
-            # sync/restore_job instead, because a large archive outlives the
-            # edge timeout in front of a hosted instance.
-            from ..sync import restore
-            result = restore_result(restore.restore_zip(conn, data))
-        elif name.endswith((".ofx", ".qfx")):
-            bid = batches.create(conn, "ofx", account_id, filename)
-            result = ofximport.import_ofx(conn, account_id, data,
-                                          batch_id=bid)
-        elif name.endswith(".pdf"):
-            bid = batches.create(conn, "pdf", account_id, filename)
-            # statement → bank heuristic; investment keeps its own keywords
-            pdf_sign = (amount_sign if amount_sign in pdfimport.STATEMENT_KINDS
-                        else "bank")
-            result = pdfimport.import_pdf(
-                conn, account_id, data, amount_sign=pdf_sign, batch_id=bid)
-            conf = result.get("confidence")
-            label = {"card": "credit-card statement",
-                     "investment": "investment statement",
-                     "statement": "bank statement",
-                     "bank": "bank statement"}.get(pdf_sign, "PDF statement")
-            result["source"] = (f"PDF {label} parsed"
-                                + (f" (confidence {conf:.0%})"
-                                   if conf is not None else ""))
-        elif name.endswith(".qif"):
-            text = upload_text(data)
-            bid = batches.create(conn, "qif", account_id, filename)
-            result = qifimport.import_qif(conn, account_id, text,
-                                          batch_id=bid)
-        else:
-            if amount_sign in ("card", "statement"):
-                raise ValueError(
-                    "PDF statement conventions (card / bank statement) "
-                    "apply to PDFs — for a CSV pick bank or positive=out "
-                    "CSV, or investment for brokerage activity CSVs")
-            text = upload_text(data)
-            header = csvimport.read_header(text)
-            from ..sync import plan_csv as _plan
-            # Never auto-import a workplace-plan CSV here: the generic path
-            # cannot know which retirement plan the file belongs to, and
-            # guessing one window-deletes and overwrites a different plan's
-            # ledger and holdings. Refuse and point at the dedicated endpoint
-            # that takes an explicit plan.
-            if _plan.looks_like_plan_activity(header):
-                raise ValueError(
-                    "This looks like a workplace-plan activity CSV. Import "
-                    "it through POST /api/import/plan-activity with the "
-                    "explicit plan (e.g. 403B, 401A) — the generic importer "
-                    "can't tell which plan it belongs to.")
-            detected = [
-                (mintimport.looks_like_mint, "mint",
-                 mintimport.import_mint, "Mint export detected"),
-                (ynabimport.looks_like_ynab, "ynab",
-                 ynabimport.import_ynab, "YNAB register detected"),
-                (competitors.looks_like_monarch, "monarch",
-                 competitors.import_monarch, "Monarch export detected"),
-                (competitors.looks_like_copilot, "copilot",
-                 competitors.import_copilot, "Copilot export detected"),
-                (competitors.looks_like_simplifi, "simplifi",
-                 competitors.import_simplifi, "Simplifi export detected"),
-            ]
-            for looks, src, imp, label in detected:
-                if looks(header):
-                    if src == "ynab":
-                        need = _ynab_accounts_needed(
-                            conn, account_id, filename, text, ynab_choice)
-                        if need is not None:
-                            return {}, need
-                    bid = batches.create(conn, src, account_id, filename)
-                    result = imp(conn, account_id, text, batch_id=bid)
-                    result["source"] = label
-                    break
+        # a savepoint (the whole transaction on an autocommit handle):
+        # an importer that fails part-way takes back every row it
+        # wrote, rather than leave a partial batch counting in every
+        # total while the person is told the import failed
+        with conn.transaction():
+            if not account_id:
+                raise ValueError("pick the account these transactions belong to")
+            if name.endswith((".ofx", ".qfx")):
+                bid = batches.create(conn, "ofx", account_id, filename)
+                result = ofximport.import_ofx(conn, account_id, data,
+                                              batch_id=bid)
+            elif name.endswith(".pdf"):
+                bid = batches.create(conn, "pdf", account_id, filename)
+                # statement → bank heuristic; investment keeps its own keywords
+                pdf_sign = (amount_sign if amount_sign in pdfimport.STATEMENT_KINDS
+                            else "bank")
+                result = pdfimport.import_pdf(
+                    conn, account_id, data, amount_sign=pdf_sign, batch_id=bid)
+                conf = result.get("confidence")
+                label = {"card": "credit-card statement",
+                         "investment": "investment statement",
+                         "statement": "bank statement",
+                         "bank": "bank statement"}.get(pdf_sign, "PDF statement")
+                result["source"] = (f"PDF {label} parsed"
+                                    + (f" (confidence {conf:.0%})"
+                                       if conf is not None else ""))
+            elif name.endswith(".qif"):
+                text = upload_text(data)
+                bid = batches.create(conn, "qif", account_id, filename)
+                result = qifimport.import_qif(conn, account_id, text,
+                                              batch_id=bid)
             else:
-                mapping = _auto_map(header)
-                if mapping is None:
-                    token = _stash_csv(conn, account_id, amount_sign,
-                                       filename or "upload.csv",
-                                       text, header)
-                    # A mapping card of bare selects asks you to confirm a
-                    # column mapping blind — at the one moment the file's own
-                    # rows are the answer. Ship a few of them; the text is
-                    # already parsed and in hand.
-                    sample = csvimport.sample_rows(text, header)
-                    return {}, {"token": token, "header": header,
-                                "sample": sample,
-                                "filename": filename}
-                bid = batches.create(conn, "csv", account_id, filename)
-                result = csvimport.import_csv(
-                    conn, account_id, text, mapping,
-                    amount_sign=amount_sign, batch_id=bid)
-        if bid is not None and "imported" in result:
-            batches.finish(conn, bid, result["imported"])
+                if amount_sign in ("card", "statement"):
+                    raise ValueError(
+                        "PDF statement conventions (card / bank statement) "
+                        "apply to PDFs — for a CSV pick bank or positive=out "
+                        "CSV, or investment for brokerage activity CSVs")
+                text = upload_text(data)
+                header = csvimport.read_header(text)
+                from ..sync import plan_csv as _plan
+                # Never auto-import a workplace-plan CSV here: the generic path
+                # cannot know which retirement plan the file belongs to, and
+                # guessing one window-deletes and overwrites a different plan's
+                # ledger and holdings. Refuse and point at the dedicated endpoint
+                # that takes an explicit plan.
+                if _plan.looks_like_plan_activity(header):
+                    raise ValueError(
+                        "This looks like a workplace-plan activity CSV. Import "
+                        "it through POST /api/import/plan-activity with the "
+                        "explicit plan (e.g. 403B, 401A) — the generic importer "
+                        "can't tell which plan it belongs to.")
+                detected = [
+                    (mintimport.looks_like_mint, "mint",
+                     mintimport.import_mint, "Mint export detected"),
+                    (ynabimport.looks_like_ynab, "ynab",
+                     ynabimport.import_ynab, "YNAB register detected"),
+                    (competitors.looks_like_monarch, "monarch",
+                     competitors.import_monarch, "Monarch export detected"),
+                    (competitors.looks_like_copilot, "copilot",
+                     competitors.import_copilot, "Copilot export detected"),
+                    (competitors.looks_like_simplifi, "simplifi",
+                     competitors.import_simplifi, "Simplifi export detected"),
+                ]
+                for looks, src, imp, label in detected:
+                    if looks(header):
+                        if src == "ynab":
+                            need = _ynab_accounts_needed(
+                                conn, account_id, filename, text, ynab_choice)
+                            if need is not None:
+                                return {}, need
+                        bid = batches.create(conn, src, account_id, filename)
+                        result = imp(conn, account_id, text, batch_id=bid)
+                        result["source"] = label
+                        break
+                else:
+                    mapping = _auto_map(header)
+                    if mapping is None:
+                        token = _stash_csv(conn, account_id, amount_sign,
+                                           filename or "upload.csv",
+                                           text, header)
+                        # A mapping card of bare selects asks you to confirm a
+                        # column mapping blind — at the one moment the file's own
+                        # rows are the answer. Ship a few of them; the text is
+                        # already parsed and in hand.
+                        sample = csvimport.sample_rows(text, header)
+                        return {}, {"token": token, "header": header,
+                                    "sample": sample,
+                                    "filename": filename}
+                    bid = batches.create(conn, "csv", account_id, filename)
+                    result = csvimport.import_csv(
+                        conn, account_id, text, mapping,
+                        amount_sign=amount_sign, batch_id=bid)
+            if bid is not None and "imported" in result:
+                batches.finish(conn, bid, result["imported"])
     except _TokenRefused as e:
         # an authorization refusal, so a 403 — raised here, past the
         # catch-alls below, which would turn it into an import error
@@ -2447,22 +2678,72 @@ def _ynab_accounts_needed(conn, account_id: str, filename: str, text: str,
             "accounts": ynabimport.summary(conn, lines, account_id)}
 
 
+IMPORT_ERASED_MSG = "this household is being deleted; nothing was imported"
+IMPORT_SYNC_BUSY_MSG = ("a sync is running for this household — try the "
+                        "import again in a moment")
+
+
+def takes_ledger_locks_first(filename: str) -> bool:
+    """Whether an import door takes the ledger locks before its importer
+    runs. A PDF or OFX/QFX file takes them inside its importer, after its
+    slow sandboxed read: taken first, every edit in the household would
+    wait out the parse slot and the parse."""
+    return not (filename or "").lower().endswith((".pdf", ".ofx", ".qfx"))
+
+
+@contextlib.contextmanager
+def import_write(conn, tenant_id=None, *, ledger_locks: bool = True):
+    """The write frame every file-import door lands its rows in. Yields
+    False — nothing opened, nothing written — when another sync or import
+    holds the household's sync lock; True inside the import's one
+    transaction otherwise.
+
+    The sync lock first, OUTSIDE the transaction: every aggregator pull
+    takes it before it writes, so a file racing the hourly sync would land
+    a row the sync's dedup had not seen, and it is a session lock, so
+    released inside the transaction it would free a nudged sync to filter
+    its pull against a ledger without the file's rows. Then one
+    transaction, which asks `erasure.push_may_write` before its first
+    write: the request authenticated before an erasure may have flipped
+    the household's status and wiped its rows, and rows written after that
+    land under a tenant id nothing ever sweeps again (the domain tables
+    have no foreign key to tenants). Then the ledger locks, in the order
+    written beside erasure.WRITER_LOCKS. One transaction is also what
+    makes an import that fails part-way take back the rows it wrote.
+
+    A household being deleted answers 409 on both branches: the erasure
+    holds the sync lock too, so a door refused it must still say why."""
+    from .. import erasure
+    from ..sync.base import tenant_sync_lock
+    if tenant_id is None:
+        tenant_id = conn.execute(
+            "SELECT current_setting('app.tenant_id', true) AS t"
+        ).fetchone()["t"]
+    with tenant_sync_lock(conn, str(tenant_id)) as held:
+        if not held:
+            if erasure.being_deleted(tenant_id, conn):
+                raise HTTPException(409, IMPORT_ERASED_MSG)
+            yield False
+            return
+        with conn.transaction():
+            if not erasure.push_may_write(conn, tenant_id):
+                raise HTTPException(409, IMPORT_ERASED_MSG)
+            if ledger_locks:
+                from .bulk_import import hold_ledger_write_locks
+                hold_ledger_write_locks(conn)
+            yield True
+
+
 def dispatch_import(conn, account_id: str, amount_sign: str,
                     filename: str, data: bytes,
                     role: str = "") -> tuple[dict, dict | None]:
-    """`_dispatch_import_unlocked` under the per-tenant sync lock.
-
-    Every scheduled and ad-hoc aggregator pull takes this lock before it
-    writes to `transactions`, and a file import owes the same: one racing
-    the hourly sync would land a row the sync's dedup had not yet seen —
-    and count it twice. Held for the whole parse + upsert, like a sync."""
-    from ..sync.base import tenant_sync_lock
-    tid = conn.execute(
-        "SELECT current_setting('app.tenant_id', true) AS t").fetchone()["t"]
-    with tenant_sync_lock(conn, tid) as held:
+    """`_dispatch_import_unlocked` inside `import_write`: the sync lock
+    for the whole parse + upsert, like a sync, and the erasure check and
+    the ledger locks in one transaction."""
+    with import_write(conn, ledger_locks=takes_ledger_locks_first(
+            filename)) as held:
         if not held:
-            return ({"error": "a sync is running for this household — try "
-                              "the import again in a moment"}, None)
+            return {"error": IMPORT_SYNC_BUSY_MSG}, None
         return _dispatch_import_unlocked(conn, account_id, amount_sign,
                                          filename, data, role=role)
 
@@ -2509,16 +2790,12 @@ def _mapping_retry(conn, stash: dict, message: str,
 
 
 def run_mapped_import(conn, token: str, cols: dict) -> dict:
-    """`_run_mapped_import_unlocked` under the per-tenant sync lock — the
-    mapped path writes rows like any other import (see dispatch_import).
-    A held lock is refusal shape 1: nothing consumed, resubmit as-is."""
-    from ..sync.base import tenant_sync_lock
-    tid = conn.execute(
-        "SELECT current_setting('app.tenant_id', true) AS t").fetchone()["t"]
-    with tenant_sync_lock(conn, tid) as held:
+    """`_run_mapped_import_unlocked` inside `import_write` — the mapped
+    path writes rows like any other import (see dispatch_import). A held
+    lock is refusal shape 1: nothing consumed, resubmit as-is."""
+    with import_write(conn) as held:
         if not held:
-            return {"error": "a sync is running for this household — try "
-                             "the import again in a moment"}
+            return {"error": IMPORT_SYNC_BUSY_MSG}
         return _run_mapped_import_unlocked(conn, token, cols)
 
 
@@ -2586,10 +2863,7 @@ def _run_mapped_import_unlocked(conn, token: str, cols: dict) -> dict:
     sign = meta.get("amount_sign") \
         if meta.get("amount_sign") in ("bank", "plaid", "investment") \
         else "bank"
-    bid = None
-
     def run(aid):
-        nonlocal bid
         bid = batches.create(conn, "csv", aid, filename)
         result = csvimport.import_csv(conn, aid, text, mapping,
                                       amount_sign=sign, batch_id=bid)
@@ -2598,8 +2872,11 @@ def _run_mapped_import_unlocked(conn, token: str, cols: dict) -> dict:
     try:
         typed = str(meta.get("new_account_name") or "").strip()
         if meta.get("account_id") or not typed:
-            result = run(meta.get("account_id"))[0]
-            _remember_landed(conn, meta, meta.get("account_id"))
+            # a savepoint, so an importer failing part-way takes back
+            # every row it wrote; the ledger locks are import_write's
+            with conn.transaction():
+                result = run(meta.get("account_id"))[0]
+                _remember_landed(conn, meta, meta.get("account_id"))
             return result
         # parked under the new-account name the upload typed: the account
         # is decided now, from the mapped rows (bulk_import.import_named),
@@ -2622,36 +2899,29 @@ def _run_mapped_import_unlocked(conn, token: str, cols: dict) -> dict:
         # amount column of prose, more rows than the cap. import_csv parses
         # every row before it writes any, so none of these has changed the
         # ledger — the mapping is still correctable, and the stash is put
-        # back so it can be corrected. The batch row is claimed before the
-        # parse, so drop it: it owns no rows, and correcting a mapping
-        # twice must not leave a trail of empty imports in the batch list.
-        if bid is not None:
-            conn.execute("DELETE FROM import_batches WHERE id=%s "
-                         "AND row_count = 0", (bid,))
+        # back so it can be corrected. The batch row claimed before the
+        # parse went with the savepoint it was written in, so correcting a
+        # mapping twice leaves no trail of empty imports in the batch list.
         return _mapping_retry(conn, stash, str(e))
     except Exception as e:                     # noqa: BLE001 — UNEXPECTED
         import logging
         logging.getLogger("oikonome.import").exception("mapped import failed")
-        # An unexpected failure may have written part of the import, so
-        # this is NOT a correctable mapping — re-running it could double
-        # rows. The upload does not come back; the card closes and the
-        # person starts over, which is the only safe advice.
+        # An unexpected failure: the savepoint took back whatever part of
+        # the import it wrote, but the cause is unknown, so this is NOT a
+        # correctable mapping. The upload does not come back; the card
+        # closes and the person starts over, which is the only safe advice.
         return {"error": f"import failed ({type(e).__name__}) — upload the "
                          f"file again to retry",
                 "expired": True}
 
 
 def run_ynab_import(conn, token: str, accounts, remove_earlier) -> dict:
-    """`_run_ynab_import_unlocked` under the per-tenant sync lock, like
-    every import that writes rows (see dispatch_import). A held lock is
-    refusal shape 1: nothing consumed, resubmit as-is."""
-    from ..sync.base import tenant_sync_lock
-    tid = conn.execute(
-        "SELECT current_setting('app.tenant_id', true) AS t").fetchone()["t"]
-    with tenant_sync_lock(conn, tid) as held:
+    """`_run_ynab_import_unlocked` inside `import_write`, like every
+    import that writes rows (see dispatch_import). A held lock is refusal
+    shape 1: nothing consumed, resubmit as-is."""
+    with import_write(conn) as held:
         if not held:
-            return {"error": "a sync is running for this household — try "
-                             "the import again in a moment"}
+            return {"error": IMPORT_SYNC_BUSY_MSG}
         return _run_ynab_import_unlocked(conn, token, accounts,
                                          remove_earlier)
 
@@ -2754,45 +3024,47 @@ def _run_ynab_import_unlocked(conn, token: str, accounts,
         return {"error": "upload expired — please upload the file again",
                 "expired": True}
     from .bulk_import import _ensure_account, remember_choice
-    bid = None
     try:
-        dest: dict[str, str | None] = {}
-        for n, v in answers.items():
-            if v[0] == "new":
-                dest[n] = _ensure_account(conn, v[1], "bank")
-            elif v[0] == "id":
-                dest[n] = v[1]
-            else:
-                dest[n] = None
-        places = {d for d in dest.values() if d}
-        bid = batches.create(conn, "ynab",
-                             next(iter(places)) if len(places) == 1
-                             else None, filename)
-        result = ynabimport.import_ynab(
-            conn, pick, text, batch_id=bid, accounts=dest,
-            remove_earlier={n: (remove_earlier or {}).get(n) is True
-                            for n in names})
-        batches.finish(conn, bid, result["imported"])
-        # an account picked for a name two cards share is remembered once
-        # the register has landed, so the next file is not asked again:
-        # under the name the person typed, and under the YNAB account's
-        # own (the new-account name the card offers, which the next
-        # register spells). remember_choice records only a name that does
-        # lead to the pick, so the second is a no-op when it does not.
-        for n, v in answers.items():
-            if v[0] == "id":
-                for typed in {v[2], n} - {""}:
-                    remember_choice(conn, typed, v[1])
-        # and the account picked at the upload, when rows landed on it
-        if pick in places:
-            _remember_landed(conn, meta, pick)
-        result["source"] = "YNAB register detected"
-        return result
+        # a savepoint: an import failing part-way takes back the
+        # accounts it opened and every row it wrote
+        with conn.transaction():
+            dest: dict[str, str | None] = {}
+            for n, v in answers.items():
+                if v[0] == "new":
+                    dest[n] = _ensure_account(conn, v[1], "bank")
+                elif v[0] == "id":
+                    dest[n] = v[1]
+                else:
+                    dest[n] = None
+            places = {d for d in dest.values() if d}
+            bid = batches.create(conn, "ynab",
+                                 next(iter(places)) if len(places) == 1
+                                 else None, filename)
+            result = ynabimport.import_ynab(
+                conn, pick, text, batch_id=bid, accounts=dest,
+                remove_earlier={n: (remove_earlier or {}).get(n) is True
+                                for n in names})
+            batches.finish(conn, bid, result["imported"])
+            # an account picked for a name two cards share is remembered once
+            # the register has landed, so the next file is not asked again:
+            # under the name the person typed, and under the YNAB account's
+            # own (the new-account name the card offers, which the next
+            # register spells). remember_choice records only a name that does
+            # lead to the pick, so the second is a no-op when it does not.
+            for n, v in answers.items():
+                if v[0] == "id":
+                    for typed in {v[2], n} - {""}:
+                        remember_choice(conn, typed, v[1])
+            # and the account picked at the upload, when rows landed on it
+            if pick in places:
+                _remember_landed(conn, meta, pick)
+            result["source"] = "YNAB register detected"
+            return result
     except ValueError as e:                   # deliberate importer guidance
         # the importer parses and checks every line before it writes one,
-        # so a refusal here changed nothing: park the upload again and let
-        # the card answer against the new token
-        batches.discard(conn, bid)
+        # and the savepoint took back the accounts and batch opened before
+        # it, so a refusal here changed nothing: park the upload again and
+        # let the card answer against the new token
         return _mapping_retry(conn, stash, str(e), kind="ynab")
     except Exception as e:                     # noqa: BLE001 — UNEXPECTED
         import logging
@@ -2808,14 +3080,16 @@ def _run_ynab_import_unlocked(conn, token: str, accounts,
 # through — same budget, so switching flavors buys them nothing.
 @router.post("/import",
              dependencies=[Depends(limit("import_upload", 60, 3600))])
-async def import_submit(user: dict = Depends(_user()),
+async def import_submit(request: Request,
+                        user: dict = Depends(_user()),
                         account_id: str = Form(""),
                         amount_sign: str = Form("bank"),
                         file: UploadFile = File(...),
                         password: str = Form(""),
                         totp_code: str = Form(""),
                         recovery_code: str = Form("")):
-    demoguard.deny(user)
+    # the demo flag can be a tenant checkout and a config read
+    await run_in_threadpool(demoguard.deny, user)
     filename = file.filename or ""
     # cap uploads BEFORE buffering — one tenant must not be able to OOM a
     # shared node with a huge or decompression-bomb file. A ZIP is a
@@ -2833,10 +3107,15 @@ async def import_submit(user: dict = Depends(_user()),
         # the shared demonstration login's step-up proves nothing (its
         # password is handed out), so the endpoints an archive carries are
         # refused to it here as the Settings save refuses them
-        demoguard.deny_shared_grant(user)
+        await run_in_threadpool(demoguard.deny_shared_grant, user)
         from .app import _require_elevation
-        _require_elevation(user, password=password, totp_code=totp_code,
-                           recovery_code=recovery_code)
+        # off the event loop, as the API door does: the legacy password
+        # proof hashes and waits on the hasher gate
+        await run_in_threadpool(
+            lambda: _require_elevation(user, password=password,
+                                       totp_code=totp_code,
+                                       recovery_code=recovery_code,
+                                       as_of_arrival=request))
         data = await read_restore_capped(file)
         oversize_msg = RESTORE_OVERSIZE_MSG
     else:
@@ -2850,23 +3129,28 @@ async def import_submit(user: dict = Depends(_user()),
     if data is not None and is_restore:
         if not permissions.may_restore(user["role"]):
             raise HTTPException(403, permissions.RESTORE_DENIED)
-        from starlette.concurrency import run_in_threadpool
 
         from ..sync import restore_job
         started = await run_in_threadpool(restore_job.start,
                                           str(user["tenant_id"]), data)
+        if started.get("erased"):
+            # what every other file import answers a household being
+            # deleted (import_write)
+            raise HTTPException(409, IMPORT_ERASED_MSG)
         if not started.get("error"):
             started = {"source": "restore started — it keeps running in "
                                  "the background; reload this page to see "
                                  "it land ('restored' shows in the recent "
                                  "imports below when done)"}
-        conn = tenancy.tenant_connect(user["tenant_id"])
-        try:
-            return _tpl("import.html", title="Import", centered=False,
-                        accounts=_accounts(conn), result=started,
-                        recent=batches.recent(conn))
-        finally:
-            conn.close()
+        def _page_parts():
+            conn = tenancy.tenant_connect(user["tenant_id"])
+            try:
+                return _accounts(conn), batches.recent(conn)
+            finally:
+                conn.close()
+        accounts, recent = await run_in_threadpool(_page_parts)
+        return _tpl("import.html", title="Import", centered=False,
+                    accounts=accounts, result=started, recent=recent)
 
     # parse + upsert are CPU- and DB-bound: off the event loop, exactly
     # like /api/import — the container runs ONE uvicorn worker, so a
@@ -2894,7 +3178,6 @@ async def import_submit(user: dict = Depends(_user()),
         finally:
             conn.close()
 
-    from starlette.concurrency import run_in_threadpool
     return await run_in_threadpool(_run)
 
 

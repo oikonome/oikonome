@@ -9,6 +9,7 @@ table) is deliberately absent — hosted jobs go through arq, see jobs/.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 
 from ..engine import budget, links, merchant_dedup, merchant_sql, reporting
@@ -101,6 +102,7 @@ def _scope_sql(scope: str) -> str:
 # carry _MC_JOIN: payee resolves through the canonical map so a user
 # rename is visible on the ledger, not only on the Merchants page.
 from ..engine.splits import SPLITTABLE_SQL as _SPLITTABLE_SQL  # noqa: E402
+from ..engine.llm_categorize import ANSWER_NOTE_SQL as _CHECK_ANSWER_SQL  # noqa: E402
 
 # Whether the verdict counts a row as spending: budget.SPEND_ONLY_SQL and
 # PERSONAL_ONLY_SQL verbatim, minus the accounts its spend rows leave out.
@@ -233,7 +235,30 @@ _TXN_FIELDS = f"""t.id, t.date, t.amount, {_DISPLAY_MERCHANT} AS payee,
                   -- would the split door take this row: the spend test
                   -- the rollups use, so a client offers Split exactly
                   -- where the server will accept it
-                  (""" + _SPLITTABLE_SQL + """) AS splittable"""
+                  (""" + _SPLITTABLE_SQL + """) AS splittable,
+                  -- a written check still under Checks with no answer:
+                  -- no "paid to …" note, no payee read off its image (nor
+                  -- an image still being read), no person's category. An
+                  -- answer stays; a pass re-files the check from it
+                  -- (specs/ledger-figures.md).
+                  (t.category_source = 'check'
+                   AND t.category_override IS NULL
+                   AND NOT EXISTS (SELECT 1 FROM transaction_notes tn2
+                                    WHERE tn2.txn_id = t.id
+                                      AND tn2.note ~* '""" + _CHECK_ANSWER_SQL + """')
+                   AND NOT EXISTS (SELECT 1 FROM receipts rc2
+                                    WHERE rc2.txn_id = t.id
+                                      AND rc2.kind = 'check'
+                                      AND (rc2.status = 'uploaded'
+                                           OR NULLIF(rc2.parsed->>'payee', '')
+                                              IS NOT NULL))) AS needs_payee,
+                  -- whom a written check paid, as its read image says:
+                  -- the bank's line only ever says "CHECK PAID"
+                  (SELECT NULLIF(rc3.parsed->>'payee', '') FROM receipts rc3
+                    WHERE rc3.txn_id = t.id AND rc3.kind = 'check'
+                      AND rc3.status = 'parsed'
+                    ORDER BY rc3.parsed_at DESC NULLS LAST LIMIT 1)
+                    AS check_payee"""
 
 
 def _txn_fields(spend: str | None = None) -> str:
@@ -367,8 +392,12 @@ def live_edit_ids(conn, ids: list[str]) -> dict[str, str]:
     the hold outside the lock could commit between the two and land on a
     row every read hides; under it, the edit either commits first and is
     carried, or waits and is sent to the posted row."""
-    conn.execute(_REIMB_LOCK.replace(
-        "pg_advisory_xact_lock(", "pg_advisory_xact_lock_shared(", 1))
+    # a person's edit gives up after a few seconds behind a restore
+    # (reanchor.bounded_lock_wait) rather than pin a pooled connection
+    from ..sync.reanchor import bounded_lock_wait
+    with bounded_lock_wait(conn):
+        conn.execute(_REIMB_LOCK.replace(
+            "pg_advisory_xact_lock(", "pg_advisory_xact_lock_shared(", 1))
     # which posted row a hold became is engine.live_txn's one rule
     from ..engine import live_txn
     return live_txn.resolve(conn, ids)
@@ -391,13 +420,82 @@ def list_owners(conn) -> list[str]:
 UNCATEGORIZED = "?"          # the category filter's name for "has none"
 
 
+@dataclasses.dataclass(frozen=True)
+class Narrow:
+    """Filters the universal search takes on top of its own, each one more
+    AND. `account_ids` names several accounts the way `account_id` names
+    one (asking for an account explicitly reaches it even when hidden);
+    `owners` are effective owners (any of them), as the month browse
+    filters one; `merchants` are names a row is SHOWN under, matched
+    exactly, so a name a grouping returned finds exactly its rows;
+    `amount_min` / `amount_max` bound the size of the charge or deposit
+    (ABS(amount)); `direction` is "out" (amount > 0, Plaid's sign) or
+    "in"; and `spending_only` keeps the rows the verdict counts as
+    spending."""
+    account_ids: tuple[str, ...] | None = None
+    owners: tuple[str, ...] | None = None
+    merchants: tuple[str, ...] | None = None
+    amount_min: float | None = None
+    amount_max: float | None = None
+    direction: str | None = None
+    spending_only: bool = False
+
+
+def _narrow_sql(conn, narrow: Narrow) -> tuple[list[str], list]:
+    """The WHERE clauses and parameters a Narrow adds (accounts aside)."""
+    where: list[str] = []
+    args: list = []
+    if narrow.owners:
+        where.append("COALESCE(t.owner_override, (SELECT ao.owner FROM accounts ao"
+                     " WHERE ao.id = t.account_id)) = ANY(%s)")
+        args.append(list(narrow.owners))
+    if narrow.merchants:
+        join, shown = _merchant_join_for("tn", "tnmc", "tnmm")
+        where.append(f"""t.id IN (SELECT tn.id FROM transactions tn {join}
+                                  WHERE tn.removed = 0
+                                    AND {shown} = ANY(%s))""")
+        args.append(list(narrow.merchants))
+    if narrow.amount_min is not None:
+        where.append("ABS(t.amount) >= %s"); args.append(narrow.amount_min)
+    if narrow.amount_max is not None:
+        where.append("ABS(t.amount) <= %s"); args.append(narrow.amount_max)
+    if narrow.direction == "out":
+        where.append("t.amount > 0")
+    elif narrow.direction == "in":
+        where.append("t.amount < 0")
+    if narrow.spending_only:
+        where.append(_COUNTS_AS_SPEND); args.append(_spend_excluded(conn))
+    return where, args
+
+
+def shown_merchant_names(conn, fragment: str, limit: int = 500) -> list[str]:
+    """The distinct names rows are SHOWN under that contain `fragment`
+    (case-insensitive) — the candidates a caller holding a name in some
+    other spelling (cut, re-spaced) resolves it against."""
+    join, shown = _merchant_join_for("tn", "tnmc", "tnmm")
+    return [r["n"] for r in conn.execute(
+        f"""SELECT DISTINCT {shown} AS n FROM transactions tn {join}
+             WHERE tn.removed = 0 AND LOWER({shown}) LIKE %s ESCAPE '\\'
+             LIMIT %s""", (_like(fragment), limit))]
+
+
+def account_date_ranges(conn) -> dict[str, tuple[dt.date, dt.date]]:
+    """Each account's first and last live transaction date — where its
+    history in this ledger begins and ends."""
+    return {r["account_id"]: (r["first"], r["last"]) for r in conn.execute(
+        """SELECT account_id, MIN(date) AS first, MAX(date) AS last
+             FROM transactions WHERE removed = 0 GROUP BY account_id""")}
+
+
 def search_transactions(conn, search: str, *, account_id: str | None = None,
                         date_from: str | None = None, date_to: str | None = None,
                         category: str | None = None, reimb_only: bool = False,
                         page: int = 1, per_page: int = 100,
                         scope: str = "all", channel: str | None = None,
                         checks_only: bool = False,
-                        ids: list[str] | None = None, chunk: int = 0):
+                        ids: list[str] | None = None, chunk: int = 0,
+                        flows: bool = False, narrow: Narrow | None = None,
+                        offset: int | None = None, groups: int = 0):
     """Universal search: EVERY account, the FULL history, newest first,
     PAGINATED. Returns (rows, total_count, amount_sum, amazon_items) —
     amount_sum is the Plaid-signed sum over the WHOLE result set;
@@ -406,8 +504,9 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     Amazon item; spend is {count, sum} over the whole result set counting
     only what the verdict counts as spending, so the caller can state a
     per-transaction average. A sixth element lists the accounts the term
-    matched by name (either the user's rename or the bank's own name) —
-    those accounts' rows are part of the result.
+    matched by name (either the user's rename or the bank's own name),
+    each with `rows_listed`: their rows are the result only when no row's
+    own text matched the term (see below).
 
     `ids` restricts the result to exactly those transaction ids, in place
     of the account visibility rules (see below). It is how a caller that
@@ -419,7 +518,23 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     at most `chunk` rows, in the same order, fetched only as it is read.
     A download asks for every page at once; holding all of those wide
     rows together is what would size its memory, so it reads them a
-    slice at a time on the caller's still-open connection instead."""
+    slice at a time on the caller's still-open connection instead.
+
+    `flows` adds the result set's money in / out / net to the spend dict
+    ("flows"), by reporting.flows — Cash Flow's definitions over the
+    matched rows, so a date range reads as Cash Flow does for the same
+    days. None under the business scope: those figures are the
+    household's, and a business-only listing has none.
+
+    `narrow` adds the filters of `Narrow`; `offset` starts the page at
+    that row instead of at `page`; `groups` > 0 adds the result set's
+    money by month, spending by category and that many top merchants to
+    the spend dict ("groups", reporting.match_groups — None under the
+    business scope, like `flows`). With `groups` the in / out figures and
+    the groupings are filtered by the search's own predicate in SQL, not
+    by its id list, which on a whole-ledger result is the expensive part;
+    and the per-day figures, which only the page's dividers read, are
+    skipped."""
     search = (search or "").strip()
     account_hits: list[dict] = []
     # Business-entity rows are listed with their `entity` name unless the
@@ -444,6 +559,8 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     if ids is not None:
         where.append("t.id = ANY(%s)")
         args.append(list(ids))
+    elif narrow is not None and narrow.account_ids is not None:
+        where.append("t.account_id = ANY(%s)"); args.append(list(narrow.account_ids))
     elif account_id:
         where.append("t.account_id = %s"); args.append(account_id)
     else:
@@ -500,6 +617,11 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
         where.append("t.payment_channel = %s"); args.append(channel)
     if checks_only:
         where.append("t.check_number IS NOT NULL")
+    if narrow is not None:
+        n_where, n_args = _narrow_sql(conn, narrow)
+        where += n_where; args += n_args
+    # the search group must stay the LAST clause: the account-name hits
+    # below re-open it by position
     if search:
         like = _like(search)
         # One precomputed column for everything the row itself says (name,
@@ -520,6 +642,10 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
                    """t.id IN (SELECT rc2.txn_id FROM receipts rc2
                                JOIN receipt_items ri ON ri.receipt_id = rc2.id
                               WHERE LOWER(ri.description) LIKE %s)""",
+                   # a check finds by the payee its image was read as
+                   """t.id IN (SELECT rc4.txn_id FROM receipts rc4
+                              WHERE rc4.kind = 'check'
+                                AND LOWER(rc4.parsed->>'payee') LIKE %s)""",
                    """t.id IN (SELECT am.transaction_id FROM amazon_matches am
                                JOIN amazon_orders ao ON ao.dedup_key = am.dedup_key
                               WHERE EXISTS (SELECT 1
@@ -536,7 +662,7 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
                                             """ + _as_array('cr.items_json') + """) it
                                        WHERE LOWER(it->>'title') LIKE %s
                                           OR LOWER(it->>'description') LIKE %s))"""]
-        args += [like] * 8
+        args += [like] * 9
         # An account is findable by EITHER of its names — the user's rename
         # ("Everyday card") or the bank's own ("CREDIT CARD"). search_text is
         # a generated column and cannot reference the accounts table, so the
@@ -553,9 +679,6 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
                    AND (LOWER(COALESCE(a.display_name,'')) LIKE %s
                         OR LOWER(COALESCE(a.name,'')) LIKE %s)""",
             (like, like, like)).fetchall()]
-        if account_hits:
-            clauses.append("t.account_id = ANY(%s)")
-            args.append([r["id"] for r in account_hits])
         cleaned = search.replace(",", "").replace("$", "")
         try:
             float(cleaned)
@@ -569,6 +692,19 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
             pass
         where.append("(" + " OR ".join(clauses) + ")")
     where_sql = " AND ".join(where)
+    # the same predicate with the matching accounts' rows let in too: the
+    # search group is the last clause, and its account test the last
+    # parameter
+    acct_sql = (" AND ".join(where[:-1] + [
+        "(" + where[-1] + " OR t.account_id = ANY(%s))"])
+        if account_hits else "")
+    order = "ORDER BY t.date DESC, ABS(t.amount) DESC, t.id"
+    first_row = (max(0, (page - 1) * per_page) if offset is None
+                 else max(0, offset))
+    # with `groups` the figures read the predicate, so the id list is only
+    # the page: it is fetched no further than the page's last row
+    if groups > 0:
+        order += f" LIMIT {int(first_row + per_page)}"
     # spend_n / spend_sum ride along so the caller can state an AVERAGE. They
     # are computed over the WHOLE result set, like the count and sum beside
     # them — averaging the 100 rows of page one would answer a question nobody
@@ -587,12 +723,38 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     # (three full passes would cost three times the predicate). The page is a
     # slice of the ordered ids, so ORDER BY below only re-sorts 100 rows.
     ids = [r["id"] for r in conn.execute(
-        f"SELECT t.id FROM transactions t WHERE {where_sql} "
-        f"ORDER BY t.date DESC, ABS(t.amount) DESC, t.id", args).fetchall()]
+        f"SELECT t.id FROM transactions t WHERE {where_sql} {order}",
+        args).fetchall()]
+    # A term the rows' own text matches lists those rows only: "amazon"
+    # is the merchant, and every coffee on a card NAMED after it would
+    # turn the count and the average into the card's. The matching
+    # accounts still come back (rows_listed false) so the page can offer
+    # their rows as a link of their own. A term no row's text matches is
+    # about an account ("Groceries card", the bank's "CREDIT CARD"), and
+    # then the accounts' rows are the result (rows_listed true). The search
+    # group is the last clause appended, so its account test joins it as
+    # the final parameter.
+    if account_hits:
+        listed = not ids
+        if listed:
+            ids = [r["id"] for r in conn.execute(
+                f"SELECT t.id FROM transactions t WHERE {acct_sql} {order}",
+                (*args, [r["id"] for r in account_hits])).fetchall()]
+        for h in account_hits:
+            h["rows_listed"] = listed
     # The spend figures also drop the accounts the verdict drops (the
     # Accounts page's exclusions, shadows, hidden accounts): a search scoped
     # to an excluded card lists its rows, but they are not spending.
     excl = _spend_excluded(conn)
+    # with `groups` every figure below reads the search's predicate rather
+    # than its id list (see the docstring); the rows are the same ones
+    match = None
+    if groups > 0:
+        match = ((acct_sql, (*args, [h["id"] for h in account_hits]))
+                 if account_hits and account_hits[0]["rows_listed"]
+                 else (where_sql, tuple(args)))
+    rows_sql, rows_args = (("t.id = ANY(%s)", (ids,)) if match is None
+                           else (f"({match[0]})", match[1]))
     row = conn.execute(
         f"SELECT COUNT(*) AS n, "
         f"       COALESCE(SUM({amount_expr}) FILTER (WHERE TRUE {money_scope}), 0) AS s, "
@@ -600,8 +762,8 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
         f"       COUNT(*) FILTER (WHERE {_COUNTS_AS_SPEND}) AS spend_n, "
         f"       COALESCE(SUM({spend_expr}) FILTER "
         f"                (WHERE {_COUNTS_AS_SPEND}), 0) AS spend_sum "
-        f"FROM transactions t WHERE t.id = ANY(%s)",
-        (*amount_args, excl, *spend_args, excl, ids)).fetchone()
+        f"FROM transactions t WHERE {rows_sql}",
+        (*amount_args, excl, *spend_args, excl, *rows_args)).fetchone()
     total, amount_sum = row["n"], row["s"]
     spend_n = row["spend_n"]
     spend_sum = round(float(row["spend_sum"]), 2)
@@ -634,8 +796,7 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
             amazon_items = {"count": arow["n"],
                             "sum": round(float(arow["s"]), 2),
                             "unpriced": arow["unpriced"]}
-    offset = max(0, (page - 1) * per_page)
-    page_ids = ids[offset:offset + per_page]
+    page_ids = ids[first_row:first_row + per_page]
     # Each row's spend_amount is its share by the SAME expression spend_sum
     # just totalled, so under a category filter a split row's day subtotal
     # carries the matching part, not the whole charge.
@@ -655,9 +816,81 @@ def search_transactions(conn, search: str, *, account_id: str | None = None,
     else:
         rows = conn.execute(page_sql, (*lead, page_ids)).fetchall() \
             if page_ids else []
+    window = grouped = None
+    part_cat = (category if category and category != UNCATEGORIZED
+                else None)
+    if match is not None and scope != "business":
+        window = reporting.flows(conn, where=match, category=part_cat)
+        grouped = reporting.match_groups(conn, *match, category=category,
+                                         top=groups)
+    elif flows and scope != "business":
+        window = reporting.flows(conn, ids=ids, category=part_cat)
     return (rows, total, round(amount_sum, 2), amazon_items,
-            {"count": spend_n, "sum": spend_sum, "biz_count": biz_n},
+            {"count": spend_n, "sum": spend_sum, "biz_count": biz_n,
+             "flows": window, "groups": grouped,
+             "by_day": ({} if chunk > 0 or groups > 0
+                        else _whole_day_spend(conn, ids, page_ids,
+                                              spend_expr, spend_args, excl))},
             account_hits)
+
+
+def _whole_day_spend(conn, ids: list[str], page_ids: list[str],
+                     spend_expr: str, spend_args: list,
+                     excl: list[str]) -> dict[str, float]:
+    """What each day on this page spent across the WHOLE result set, by the
+    rule each row's spend_amount follows (the same expression and the same
+    counts-as-spend test): a day the page boundary cuts in two still reads
+    its whole total on its divider. Keyed by ISO date, for the page's days
+    only."""
+    if not page_ids:
+        return {}
+    rows = conn.execute(
+        f"SELECT t.date AS d, COALESCE(SUM({spend_expr}) FILTER "
+        f"           (WHERE {_COUNTS_AS_SPEND}), 0) AS s "
+        f"FROM transactions t WHERE t.id = ANY(%s) AND t.date IN "
+        f"     (SELECT p.date FROM transactions p WHERE p.id = ANY(%s)) "
+        f"GROUP BY t.date",
+        (*spend_args, excl, ids, page_ids)).fetchall()
+    return {str(r["d"])[:10]: round(float(r["s"]), 2) for r in rows}
+
+
+def day_spend(rows: list[dict]) -> dict[str, float]:
+    """Each listed day's spending: the rows' spend_amount summed per date —
+    the figure a Transactions day divider prints, whatever part of the day
+    the page has shown so far."""
+    out: dict[str, float] = {}
+    for r in rows:
+        d = str(r.get("date") or "")[:10]
+        out[d] = out.get(d, 0.0) + (r.get("spend_amount") or 0)
+    return {d: round(v, 2) for d, v in out.items()}
+
+
+def listed_spend(conn, rows: list[dict]) -> dict:
+    """What a filtered month's listed rows spent, and whose money it is.
+
+    Rows that are ALL a business's — by the household test the aggregates
+    use (budget.PERSONAL_ONLY_SQL: the row's entity, or an account in
+    app.entity_account_ids) — count the business's spending: the verdict's
+    spending rule (budget.SPEND_ONLY_SQL, net of a partial reimbursement,
+    the excluded accounts left out) with that household test turned round.
+    Anything else, a mixed set or none at all, counts the household's
+    spending, the rows' spend_amount (business rows count nothing). Under
+    the combined toggle every row is household money."""
+    household = {"amount": round(sum(r.get("spend_amount") or 0
+                                     for r in rows), 2),
+                 "scope": "household"}
+    ids = [r["id"] for r in rows]
+    if not ids:
+        return household
+    row = conn.execute(
+        f"SELECT COUNT(*) FILTER (WHERE TRUE {budget.PERSONAL_ONLY_SQL}) AS hh, "
+        f"       COALESCE(SUM({budget.NET_AMOUNT}) FILTER (WHERE TRUE "
+        f"           {budget.SPEND_ONLY_SQL} AND NOT (t.account_id = ANY(%s::text[]))), 0) AS biz "
+        f"FROM transactions t WHERE t.id = ANY(%s)",
+        (_spend_excluded(conn), ids)).fetchone()
+    if row["hh"]:
+        return household
+    return {"amount": round(float(row["biz"]), 2), "scope": "business"}
 
 
 # The longest category name any door writes. The rename door keeps it too,
@@ -735,6 +968,11 @@ def accounts_detail(conn, *, counts: bool = True):
                   -- a card's next due date + statement balance, straight
                   -- from the liabilities pull — shown beside the card row
                   l.raw ->> 'next_payment_due_date' AS card_due,
+                  -- what card_due_words reads to tell a paid card from a
+                  -- past-due one once that date has gone by
+                  l.raw ->> 'last_payment_date' AS card_paid_on,
+                  l.raw ->> 'last_statement_issue_date' AS card_statement_on,
+                  l.raw ->> 'is_overdue' AS card_overdue,
                   -- cast only what is a number: a restored ZIP can carry
                   -- "N/A" here, and a bare cast on it failed the whole
                   -- Accounts page (same guard as forecast.build)
@@ -746,6 +984,152 @@ def accounts_detail(conn, *, counts: bool = True):
            LEFT JOIN liabilities l ON l.account_id = a.id
                                       AND a.type = 'credit'
            ORDER BY i.institution_name""").fetchall()
+
+
+def _iso_day(v) -> dt.date | None:
+    try:
+        return dt.date.fromisoformat(str(v)[:10]) if v else None
+    except ValueError:
+        return None
+
+
+# how far before a due date a statement is taken to have been issued when
+# the bank sends no issue date (a card's grace period is three weeks or more)
+CARD_STATEMENT_LEAD_DAYS = 25
+
+
+def card_due_words(conn, rows: list[dict], today: dt.date) -> None:
+    """Each card row's `card_due_text`, the words beside its balance:
+    "due 11/25" while the due date is ahead; once it has passed, "paid
+    11/14" when a payment came in after the statement was issued (the
+    bank's last payment date, or a credit on the card in the ledger),
+    else "past due since 11/15" — never "due" a date already gone. No
+    words without a due date or with nothing owed (as before). The
+    helper fields are dropped from the rows.
+
+    A credit in the ledger counts only when it is shaped like a payment
+    (a card payment, or a payment or transfer in) and has posted: a
+    refund, cashback or a pending credit lowers the balance without
+    paying the statement. When the bank sends its last payment date,
+    that date alone decides."""
+    cards = [r for r in rows if r.get("card_due")]
+    credits: dict[str, dt.date] = {}
+    if cards:
+        credits = {x["account_id"]: x["d"] for x in conn.execute(
+            """SELECT t.account_id, MAX(t.date) AS d FROM transactions t
+                WHERE t.removed = 0 AND t.amount < 0
+                  AND t.account_id = ANY(%s)
+                  AND COALESCE(t.pending, 0) = 0
+                  AND (t.category_detailed = 'LOAN_PAYMENTS_CREDIT_CARD_PAYMENT'
+                       OR """ + _cats.EFFECTIVE_SQL + """
+                          IN ('LOAN_PAYMENTS', 'TRANSFER_IN'))
+                  AND t.date >= %s AND t.date <= %s
+                GROUP BY t.account_id""",
+            ([r["id"] for r in cards], today - dt.timedelta(days=90),
+             today)).fetchall()}
+    for r in rows:
+        due = _iso_day(r.get("card_due"))
+        paid_on = _iso_day(r.pop("card_paid_on", None))
+        issued = _iso_day(r.pop("card_statement_on", None))
+        overdue = r.pop("card_overdue", None)
+        r["card_due_text"] = None
+        if due is None or (r.get("balance_current") or 0) <= 0.5:
+            continue
+        if due >= today:
+            r["card_due_text"] = f"due {due:%m/%d}"
+            continue
+        since = issued or (due - dt.timedelta(days=CARD_STATEMENT_LEAD_DAYS))
+        seen = paid_on if paid_on is not None else credits.get(r["id"])
+        paid = seen if seen is not None and since <= seen <= today else None
+        if paid is not None and str(overdue).lower() != "true":
+            r["card_due_text"] = f"paid {paid:%m/%d}"
+        else:
+            r["card_due_text"] = f"past due since {due:%m/%d}"
+
+
+# a holdings snapshot older than this is not listed: the feed refreshes
+# holdings on its own clock, and positions months old read as today's
+HOLDINGS_FRESH_DAYS = 2
+# How far above its balance an account's positions may add up and still be
+# listed. Positions are priced when the feed last reported them and the
+# balance is today's, so on any day the market fell they sit a little above
+# it; that is the account, a day behind, and is shown with its date. Past
+# this the two are not describing the same holdings.
+HOLDINGS_BALANCE_TOLERANCE = 0.03
+
+
+def fresh_holdings(rows: list[dict], today: dt.date, *,
+                   limit: int = 60) -> dict:
+    """The Accounts page's Top holdings (specs/honest-figures.md): the
+    positions whose snapshot is at most HOLDINGS_FRESH_DAYS old, of accounts
+    whose listed positions do not add up to more than
+    HOLDINGS_BALANCE_TOLERANCE above the account's balance. Each listed
+    position says the day it was priced (`priced_text`) and its quantity as
+    printed (`qty_text`, null when the feed sent none). `as_of_text` dates
+    what is listed ("holdings as of 11/16/26", the oldest snapshot shown);
+    `hidden_text` names each account left out with its own reason."""
+    by_acct: dict[str, list] = {}
+    # account label -> why its positions are not listed
+    why: dict[str, str] = {}
+    last_priced: dict[str, dt.date | None] = {}
+    for r in rows:
+        # an account restored without a name still needs a label to list
+        r["acct"] = r.get("acct") or "an account"
+        day = r["as_of"].date() if hasattr(r.get("as_of"), "date") else None
+        if day is None or (today - day).days > HOLDINGS_FRESH_DAYS:
+            seen = last_priced.get(r["acct"])
+            if day is not None and (seen is None or day > seen):
+                seen = day
+            last_priced[r["acct"]] = seen
+            continue
+        r["_day"] = day
+        by_acct.setdefault(r["account_id"], []).append(r)
+    # why[acct] = (the reason, said once for every account it holds
+    # back, then the account's own detail)
+    stale = f"priced more than {HOLDINGS_FRESH_DAYS} days ago"
+    for acct, day in last_priced.items():
+        why[acct] = ((stale, f"last priced {day:%m/%d}") if day
+                     else ("the feed has not dated them", None))
+    keep = []
+    for acct_rows in by_acct.values():
+        bal = acct_rows[0]["bal"]
+        total = sum(float(r["value"] or 0) for r in acct_rows)
+        if bal is not None:
+            bal = float(bal)
+            over = total - bal
+            if over > max(HOLDINGS_BALANCE_TOLERANCE * bal,
+                          0.01 * len(acct_rows)):
+                why[acct_rows[0]["acct"]] = (
+                    "they add up to more than the account's balance",
+                    f"{round(100 * over / bal)}% over" if bal > 0 else None)
+                continue
+        keep.extend(acct_rows)
+    keep.sort(key=lambda r: -float(r["value"] or 0))
+    keep = keep[:limit]
+    oldest = min((r["_day"] for r in keep), default=None)
+    out = [{"acct": r["acct"], "symbol": r["symbol"], "fund": r["fund"],
+            "qty": r["qty"], "price": r["price"], "value": r["value"],
+            "as_of": r["_day"].isoformat(),
+            "priced_text": f"priced {r['_day']:%m/%d}",
+            "qty_text": (f"{float(r['qty']):,.3f}"
+                         if r["qty"] is not None else None)} for r in keep]
+    listed = {r["acct"] for r in keep}
+    # one reason said once, the accounts it holds back listed before it:
+    # five accounts over their balance read as five copies of a sentence
+    groups: dict[str, list[str]] = {}
+    for acct in sorted(why):
+        if acct in listed:
+            continue
+        reason, detail = why[acct]
+        groups.setdefault(reason, []).append(
+            f"{acct} ({detail})" if detail else acct)
+    hidden = [f"{', '.join(accts)} — {reason}"
+              for reason, accts in groups.items()]
+    return {"holdings": out,
+            "as_of_text": (f"holdings as of {oldest:%m/%d/%y}"
+                           if oldest else None),
+            "hidden_text": ("Holdings not shown: " + "; ".join(hidden)
+                            if hidden else None)}
 
 
 def items_health(conn):
@@ -860,7 +1244,8 @@ def retire_pending(conn, txn_id: str, today: dt.date | None = None) -> dict:
     # meanwhile is never retired as one: a person's retirement outlives
     # every later sync, and the posted charge would stay hidden for good.
     with conn.transaction():
-        conn.execute(_REIMB_LOCK)
+        from ..sync.reanchor import hold_pairing_lock_for_request
+        hold_pairing_lock_for_request(conn)
         done = conn.execute(
             "UPDATE transactions SET removed=1, retired_at=now() "
             "WHERE id=%s AND removed=0 AND pending=1", (txn_id,)).rowcount
@@ -1783,7 +2168,9 @@ def _display_names_of(conn, canon: str) -> list[str]:
 # every source merchant_categories.source can hold — the Rules page shows
 # them all, model-written rules included
 RULE_SOURCES = ("user", "llm", "seed", "model")
-RULES_PER_PAGE = 50
+# a page of the Rules table: every row carries a category picker, so a
+# page is kept to what reads at a glance; search finds the rest
+RULES_PER_PAGE = 25
 
 
 def list_rules(conn, source: str | None = None, q: str = "",
@@ -1855,7 +2242,25 @@ def list_rules(conn, source: str | None = None, q: str = "",
         LIMIT %s OFFSET %s""",
         params + [per_page, (page - 1) * per_page]).fetchall()
     return {"rules": [dict(r) for r in rows], "total": total,
-            "page": page, "per_page": per_page, "counts": counts}
+            "page": page, "per_page": per_page, "counts": counts,
+            "counts_text": rule_counts_text(counts, _llm.configured(conn))}
+
+
+def rule_counts_text(counts: dict, ai_set_up: bool) -> str:
+    """Where the rules came from, in the words every client prints
+    (specs/settings-status-lines.md). "Model" alone named two things —
+    the AI pass and the household's own trained classifier — so neither
+    is called that: "340 from an AI pass (none set up now) · 45 from
+    your household's trained model"."""
+    parts = [f"{counts.get('user', 0):,} yours"]
+    if counts.get("llm"):
+        parts.append(f"{counts['llm']:,} from an AI pass"
+                     + ("" if ai_set_up else " (none set up now)"))
+    if counts.get("model"):
+        parts.append(f"{counts['model']:,} from your household's "
+                     "trained model")
+    parts.append(f"{counts.get('seed', 0):,} built-in")
+    return " · ".join(parts)
 
 
 def set_rule_disabled(conn, merchant: str, disabled: bool) -> None:
@@ -2756,6 +3161,22 @@ def _charge_room(conn, expense: dict) -> tuple[float, float]:
     return round(float(expense["amount"]) - got, 2), got
 
 
+def _anchor_room(conn, row: dict) -> tuple[float, float]:
+    """(what a row still has to be matched for, what already came back to
+    it): a charge's unrepaid rest (_charge_room), a deposit's unclaimed
+    rest (_deposit_left). The awaiting list and the candidates door state
+    the same figure (`left_amount`, never below 0)."""
+    if row["amount"] > 0:
+        return _charge_room(conn, row)
+    return _deposit_left(conn, row), 0.0
+
+
+def reimb_left(conn, row: dict) -> float:
+    """What a row still has to be matched for, never below 0 — the
+    `left_amount` the matcher counts a selection against."""
+    return round(max(_anchor_room(conn, row)[0], 0.0), 2)
+
+
 def _deposit_left(conn, reimb: dict) -> float:
     """What of the deposit no link has claimed yet.
 
@@ -2843,7 +3264,8 @@ def link_reimbursements(conn, txn_id: str, other_ids: list[str],
     only when non-empty."""
     linked, errors, notes, n_partial = 0, [], [], 0
     with conn.transaction():
-        conn.execute(_REIMB_LOCK)
+        from ..sync.reanchor import hold_pairing_lock_for_request
+        hold_pairing_lock_for_request(conn)
         # a hold that settled since the list was read is linked as the
         # posted row it became, on either side; resolved under the lock
         # the settlement holds, so none retires in between
@@ -2871,6 +3293,84 @@ def link_reimbursements(conn, txn_id: str, other_ids: list[str],
     if notes:
         out["notes"] = notes
     return out
+
+
+class _Undo(Exception):
+    """Raised to roll a selection's trial link back."""
+
+
+def _cents(x: float) -> str:
+    return f"${x:,.2f}"
+
+
+def reimbursement_selection(conn, txn_id: str, other_ids: list[str],
+                            partial: bool = False) -> dict:
+    """The matcher's line beside Pair: what linking these rows to the
+    anchor would do, stated by the link rule itself. The link is made in
+    a transaction that is rolled back, so the figures are those Pair
+    would produce — the order the ids are sent, the dollar slack, a full
+    link the server makes partial — and nothing is linked by asking.
+
+    `selected` is what the ticked rows have left to give before the link,
+    `need` what the anchor still needs (its face value once nothing is
+    owed), and `line` the sentence both clients print as sent."""
+    out: dict = {}
+    try:
+        with conn.transaction():
+            from ..sync.reanchor import hold_pairing_lock_for_request
+            hold_pairing_lock_for_request(conn)
+            live = live_edit_ids(conn, [txn_id, *other_ids])
+            txn_id = live.get(txn_id, txn_id)
+            ids = [i for i in dict.fromkeys(live.get(i, i) for i in other_ids)
+                   if i != txn_id]
+            rows = _pair_rows(conn, [txn_id, *ids])
+            anchor = rows.get(txn_id)
+            if anchor is None:
+                raise _Undo
+            others = [rows[i] for i in ids if i in rows]
+            left0 = reimb_left(conn, anchor)
+            got0 = _anchor_room(conn, anchor)[1]
+            sel = round(sum(reimb_left(conn, r) for r in others), 2)
+            need = left0 if left0 > 0.005 else round(abs(float(anchor["amount"])), 2)
+            res = link_reimbursements(conn, txn_id, ids, partial=partial)
+            left1 = reimb_left(conn, anchor)
+            rest = round(sum(reimb_left(conn, r) for r in others), 2)
+            out = {"selected": sel, "need": need, "anchor_left": left1,
+                   "others_left": rest, "linked": res["linked"],
+                   "full": res["linked"] == 1 and not res.get("partial"),
+                   "got": got0}
+            raise _Undo
+    except _Undo:
+        pass
+    if not out:
+        return {}
+    sel, need = out["selected"], out["need"]
+    head = f"selected {_cents(sel)} of {_cents(need)}"
+    charge = float(anchor["amount"]) > 0
+    if charge and out["got"] > 0.005:
+        head += " still owed"
+    parts: list[str] = []
+    if charge:
+        owed, extra = out["anchor_left"], out["others_left"]
+        gap = round(need - sel, 2)
+        if (len(others) == 1 and out["full"] and owed < 0.005
+                and gap >= 0.005):
+            parts.append(f"{_cents(gap)} short, close enough: the whole "
+                         "charge counts as repaid")
+        else:
+            if extra >= 0.005:
+                parts.append(f"{_cents(extra)} over the charge; the rest "
+                             "stays income")
+            if owed >= 0.005:
+                parts.append(f"{_cents(owed)} stays as spend")
+    else:
+        income, spend = out["anchor_left"], out["others_left"]
+        if income >= 0.005:
+            parts.append(f"{_cents(income)} of this deposit stays income")
+        if spend >= 0.005:
+            parts.append(f"{_cents(spend)} of those charges stays as spend")
+    line = head + " — " + ("; ".join(parts) if parts else "exact ✓")
+    return {"selected": sel, "need": need, "line": line}
 
 
 def unlink_reimbursement(conn, expense_id: str, reimburse_id: str) -> bool:
@@ -2955,16 +3455,27 @@ def _full_to_partial(conn, expense_id: str, reimburse_id: str) -> None:
         _release_link_category(conn, expense_id, "TRANSFER_OUT")
 
 
-def _shrink_partials(conn, col: str, txn_id: str, over: float) -> None:
+def _shrink_partials(conn, col: str, txn_id: str, over: float) -> list:
     """Take `over` back out of the newest partial links on one side of
-    them (`col` is expense_id or reimburse_id). Lock held."""
+    them (`col` is expense_id or reimburse_id). Lock held. Returns each
+    link cut as (expense_id, reimburse_id, what it keeps), 0 for a link
+    removed.
+
+    Only a link whose other side is still on the ledger is cut: a link to
+    a row the feed withdrew claims nothing (budget.REIMB_RECEIVED,
+    _DEPOSIT_LEFT), so cutting it would leave `over` where it was."""
+    other = "reimburse_id" if col == "expense_id" else "expense_id"
+    cut_links = []
     for p in conn.execute(
-            f"SELECT expense_id, reimburse_id, amount FROM reimbursements "
-            f"WHERE {col} = %s AND partial = 1 "
-            f"ORDER BY created_at DESC, expense_id DESC, reimburse_id DESC",
+            f"SELECT r.expense_id, r.reimburse_id, r.amount "
+            f"FROM reimbursements r JOIN transactions o "
+            f"ON o.id = r.{other} AND o.removed = 0 "
+            f"WHERE r.{col} = %s AND r.partial = 1 "
+            f"ORDER BY r.created_at DESC, r.expense_id DESC, "
+            f"r.reimburse_id DESC",
             (txn_id,)).fetchall():
         if over <= 0.005:
-            return
+            break
         cut = min(over, float(p["amount"] or 0))
         left = round(float(p["amount"] or 0) - cut, 2)
         if left > 0.005:
@@ -2975,7 +3486,134 @@ def _shrink_partials(conn, col: str, txn_id: str, over: float) -> None:
             conn.execute("DELETE FROM reimbursements "
                          "WHERE expense_id = %s AND reimburse_id = %s",
                          (p["expense_id"], p["reimburse_id"]))
+        cut_links.append((p["expense_id"], p["reimburse_id"],
+                          left if left > 0.005 else 0.0))
         over = round(over - cut, 2)
+    return cut_links
+
+
+def trim_partial_links_to_charges(conn, charge_ids) -> list:
+    """trim_partial_links over these charges alone: no deposit's own limit
+    is weighed."""
+    return trim_partial_links(conn, charge_ids, ())
+
+
+def trim_restored_links(conn, restored) -> list:
+    """trim_partial_links over the charges and deposits the restored links
+    `restored` ((expense_id, reimburse_id) pairs) name, with every link the
+    household already held weighed before any restored one: a restored
+    link takes only the room the household's own links leave, so a link
+    the person made since the export is never cut or removed for an older
+    one the archive brings back."""
+    restored = set(restored)
+    return _trim_links(conn, {e for e, _r in restored},
+                       {r for _e, r in restored}, restored)
+
+
+def trim_partial_links(conn, charge_ids, deposit_ids) -> list:
+    """Cut the partial links on these charges and deposits back to the
+    limits the link door keeps: what came back against a charge never past
+    what it cost (_charge_room, budget.REIMB_RECEIVED: partial links plus
+    full pairs), what a deposit's links claim never past what it brought in
+    (_deposit_left: partial links plus the charges fully paired to it).
+    Returns each link cut as (expense_id, reimburse_id, what it keeps), 0
+    for a link removed. Lock held (a restore holds it for its whole
+    transaction).
+
+    Every partial link counted on a named charge or deposit is weighed in
+    one pass, oldest first (created_at, then the ids): it keeps what it
+    carries, or less where its charge's or its deposit's room has run out,
+    and a link left with nothing is removed. On one side alone that is the
+    excess cut newest first, as _shrink_partials cuts; across both, one
+    pass is what lets a second run over the same links change nothing (a
+    link removed for room an older link later gave back would otherwise
+    come back next time). A link counts on a charge only while its deposit
+    is on the ledger, and on a deposit only while its charge is, as the
+    limits read them; one that counts nowhere named is not touched. A full
+    pair is never touched. The part of a link a cut frees is spend again on
+    its charge and income again on its deposit (NET_AMOUNT, INCOME_NET). A
+    charge or deposit with no amount (an archive row restored at 0 for want
+    of one) is left alone: its links wait for the amount the person puts
+    back, as repair_pairs leaves them. See specs/restore-landers.md,
+    "Payback past a charge"."""
+    return _trim_links(conn, charge_ids, deposit_ids, frozenset())
+
+
+def _trim_links(conn, charge_ids, deposit_ids, restored) -> list:
+    """trim_partial_links, the links in `restored` weighed after every
+    other (oldest first within each set)."""
+    charges = sorted({i for i in charge_ids if i})
+    deposits = sorted({i for i in deposit_ids if i})
+    if not charges and not deposits:
+        return []
+    amounts = {r["id"]: abs(float(r["amount"])) for r in conn.execute(
+        "SELECT id, amount FROM transactions WHERE id = ANY(%s) "
+        "AND ABS(amount) > 0.005", (charges + deposits,)).fetchall()}
+    charges = [c for c in charges if c in amounts]
+    deposits = [d for d in deposits if d in amounts]
+    if not charges and not deposits:
+        return []
+    links = conn.execute(
+        """SELECT r.expense_id, r.reimburse_id, r.amount,
+                  (r.expense_id = ANY(%(c)s) AND d.removed = 0) AS on_charge,
+                  (r.reimburse_id = ANY(%(d)s) AND e.removed = 0)
+                      AS on_deposit
+             FROM reimbursements r
+             JOIN transactions e ON e.id = r.expense_id
+             JOIN transactions d ON d.id = r.reimburse_id
+            WHERE r.partial = 1
+              AND ((r.expense_id = ANY(%(c)s) AND d.removed = 0)
+                   OR (r.reimburse_id = ANY(%(d)s) AND e.removed = 0))
+            ORDER BY r.created_at, r.expense_id, r.reimburse_id""",
+        {"c": charges, "d": deposits}).fetchall()
+    if not links:
+        return []
+    # a link already held outranks a restored one (a stable sort keeps
+    # oldest first within each)
+    links.sort(key=lambda l: (l["expense_id"], l["reimburse_id"]) in restored)
+    # the room each side leaves the links weighed here: the limits read
+    # with those links set to nothing (the one definition of each limit),
+    # then given back their amounts below
+    keys = ([l["expense_id"] for l in links], [l["reimburse_id"] for l in links])
+    conn.execute(
+        "UPDATE reimbursements r SET amount = 0 FROM unnest(%s::text[], "
+        "%s::text[]) AS k(e, d) WHERE r.expense_id = k.e "
+        "AND r.reimburse_id = k.d", keys)
+    room = {}
+    for c in charges:
+        room[("c", c)] = _charge_room(conn, {"id": c, "amount": amounts[c]})[0]
+    for d in deposits:
+        room[("d", d)] = _deposit_left(conn, {"id": d, "amount": amounts[d]})
+    cut_links: list = []
+    for l in links:
+        have = round(float(l["amount"] or 0), 2)
+        sides = ([("c", l["expense_id"])] if l["on_charge"] else []) + (
+            [("d", l["reimburse_id"])] if l["on_deposit"] else [])
+        if have <= 0.005:
+            # a link recording nothing claims no room and is left as it was
+            conn.execute("UPDATE reimbursements SET amount = %s "
+                         "WHERE expense_id = %s AND reimburse_id = %s",
+                         (l["amount"], l["expense_id"], l["reimburse_id"]))
+            continue
+        keep = have
+        for side in sides:
+            if keep > room[side] + 0.005:
+                keep = max(round(room[side], 2), 0.0)
+        for side in sides:
+            room[side] = round(room[side] - keep, 2)
+        if keep > 0.005:
+            conn.execute("UPDATE reimbursements SET amount = %s "
+                         "WHERE expense_id = %s AND reimburse_id = %s",
+                         (keep if keep != have else l["amount"],
+                          l["expense_id"], l["reimburse_id"]))
+        else:
+            conn.execute("DELETE FROM reimbursements "
+                         "WHERE expense_id = %s AND reimburse_id = %s",
+                         (l["expense_id"], l["reimburse_id"]))
+        if keep != have:
+            cut_links.append((l["expense_id"], l["reimburse_id"],
+                              keep if keep > 0.005 else 0.0))
+    return cut_links
 
 
 def _recheck_pairs(conn, txn_ids: list[str]) -> None:
@@ -3075,6 +3713,163 @@ def detach_pairs(conn, txn_ids: list[str]) -> int:
     return n
 
 
+# A row the bank feed withdrew (sync.base.mark_removed stamps it). `t` is
+# the transactions alias.
+_FEED_WITHDRAWN = (f"(t.removed <> 0 AND t.raw IS NOT NULL"
+                   f" AND jsonb_typeof(t.raw) = 'object'"
+                   f" AND t.raw ? '{budget.FEED_REMOVED_KEY}')")
+
+
+def settle_pairs(conn, txn_ids: list[str], *,
+                 returning: bool = False) -> None:
+    """Make the stored links on these rows say what counts now
+    (specs/counted-figures.md, "A withdrawn deposit repays nothing"), under
+    the pairing lock. The one writer that holds links and the transfer
+    stamps to the readers' rule: a link repays only while both its rows
+    are on the ledger.
+
+    * A full pair on a deposit the feed withdrew becomes the partial link
+      that records what it repaid, and the charge lets go of the transfer
+      stamp the pair wrote: a partial link on a withdrawn row claims
+      nothing, so the charge is spend again at once, while the link stays
+      where a re-numbered twin or the same id reported again can pick it
+      up — and repays the same money again when one does, with the
+      charge's own category, which needs no stamp put back.
+    * `returning`: these rows have just come back to the ledger (the feed
+      reported them again, or a twin took their links). Their own links
+      take only the room the other side has left: what repaid the charge,
+      or drew on the deposit, while they were gone keeps its claim.
+    * Then every pair on the rows is brought back in line with both sides
+      (_recheck_pairs): no side repaid or claimed past its amount, the
+      newest link giving way."""
+    ids = [i for i in dict.fromkeys(txn_ids or []) if i]
+    if not ids:
+        return
+    with conn.transaction():
+        conn.execute(_REIMB_LOCK)
+        _settle_pairs_locked(conn, ids, returning=returning)
+
+
+def _settle_pairs_locked(conn, ids: list[str], *, returning: bool,
+                         only: set | None = None) -> None:
+    """settle_pairs with the lock held; `only` limits the returning links
+    to these (expense, deposit) pairs — the ones a carry just moved."""
+    for p in conn.execute(
+            f"""SELECT r.expense_id, r.reimburse_id FROM reimbursements r
+                  JOIN transactions t ON t.id = r.reimburse_id
+                  JOIN transactions e ON e.id = r.expense_id
+                       AND e.removed = 0
+                 WHERE r.partial = 0 AND {_FEED_WITHDRAWN}
+                   AND (r.expense_id = ANY(%s) OR r.reimburse_id = ANY(%s))
+                 ORDER BY r.created_at""", (ids, ids)).fetchall():
+        _full_to_partial(conn, p["expense_id"], p["reimburse_id"])
+    if returning:
+        _yield_returning(conn, ids, only)
+    _recheck_pairs(conn, ids)
+
+
+def _yield_returning(conn, ids: list[str], only: set | None = None) -> None:
+    """Cut the partial links of rows back on the ledger (or, given `only`,
+    those links) to the room their counterparts have left. Lock held."""
+    live = {r["id"]: r for r in conn.execute(
+        "SELECT id, amount FROM transactions WHERE id = ANY(%s) "
+        "AND removed = 0", (ids,)).fetchall()}
+    if not live:
+        return
+    back = sorted(live)
+    for p in conn.execute(
+            "SELECT r.expense_id, r.reimburse_id, r.amount, t.amount AS other"
+            "  FROM reimbursements r JOIN transactions t"
+            "    ON t.id = CASE WHEN r.reimburse_id = ANY(%s)"
+            "                   THEN r.expense_id ELSE r.reimburse_id END"
+            "   AND t.removed = 0"
+            " WHERE r.partial = 1"
+            "   AND (r.expense_id = ANY(%s) OR r.reimburse_id = ANY(%s))"
+            " ORDER BY r.created_at DESC, r.expense_id, r.reimburse_id",
+            (back, back, back)).fetchall():
+        e, dep = p["expense_id"], p["reimburse_id"]
+        if only is not None and (e, dep) not in only:
+            continue
+        if dep in live:
+            room, _ = _charge_room(conn, {"id": e, "amount": p["other"]})
+        else:
+            room = _deposit_left(conn, {"id": dep, "amount": p["other"]})
+        over = round(-room, 2)
+        if over <= 0.005:
+            continue
+        left = round(float(p["amount"] or 0) - over, 2)
+        if left > 0.005:
+            conn.execute("UPDATE reimbursements SET amount = %s "
+                         "WHERE expense_id = %s AND reimburse_id = %s",
+                         (left, e, dep))
+        else:
+            conn.execute("DELETE FROM reimbursements "
+                         "WHERE expense_id = %s AND reimburse_id = %s",
+                         (e, dep))
+
+
+def returning_paired(conn, txn_ids: list[str]) -> list[str]:
+    """The rows among `txn_ids` that are off the ledger and carry a link:
+    read before a write that may bring them back, for settle_pairs to be
+    given the ones that came back."""
+    ids = [i for i in dict.fromkeys(txn_ids or []) if i]
+    if not ids:
+        return []
+    return [r["id"] for r in conn.execute(
+        """SELECT t.id FROM transactions t
+            WHERE t.id = ANY(%s) AND t.removed <> 0
+              AND EXISTS (SELECT 1 FROM reimbursements r
+                           WHERE r.expense_id = t.id
+                              OR r.reimburse_id = t.id)""",
+        (ids,)).fetchall()]
+
+
+def repair_pairs(conn) -> dict:
+    """settle_pairs over every row of the household whose stored links
+    disagree with what counts: a full pair still on a deposit the feed
+    withdrew, and a live charge repaid, or a live deposit claimed, past its
+    amount (a deposit the feed reported again before settle_pairs ran on
+    it). Idempotent: a household in order is two reads. Run by the nightly
+    sweep and after a restore, so closed months written before the rule,
+    and an archive written then, end in the state a live ledger reaches.
+    Here nothing says which link came back last, so the newest gives way.
+    Returns {"stamps_released", "rows_rechecked"}: the full pairs turned
+    partial and the over-repaid rows put back in line."""
+    with conn.transaction():
+        conn.execute(_REIMB_LOCK)
+        full = [r["reimburse_id"] for r in conn.execute(
+            f"""SELECT DISTINCT r.reimburse_id FROM reimbursements r
+                  JOIN transactions t ON t.id = r.reimburse_id
+                  JOIN transactions e ON e.id = r.expense_id
+                       AND e.removed = 0
+                 WHERE r.partial = 0 AND {_FEED_WITHDRAWN}
+                 ORDER BY 1""").fetchall()]
+        n_full = 0
+        if full:
+            n_full = conn.execute(
+                "SELECT COUNT(*) AS n FROM reimbursements r "
+                "JOIN transactions e ON e.id = r.expense_id "
+                "AND e.removed = 0 WHERE r.partial = 0 "
+                "AND r.reimburse_id = ANY(%s)", (full,)).fetchone()["n"]
+            _settle_pairs_locked(conn, full, returning=False)
+        over = [r["id"] for r in conn.execute(
+            f"""SELECT t.id FROM transactions t
+                 WHERE t.removed = 0 AND t.amount > 0
+                   AND EXISTS (SELECT 1 FROM reimbursements x
+                                WHERE x.expense_id = t.id)
+                   AND {budget.REIMB_RECEIVED} > t.amount + 0.005
+                UNION
+                SELECT t.id FROM transactions t
+                 WHERE t.removed = 0 AND t.amount < 0
+                   AND EXISTS (SELECT 1 FROM reimbursements x
+                                WHERE x.reimburse_id = t.id)
+                   AND {_DEPOSIT_LEFT} < -0.005
+                 ORDER BY 1""").fetchall()]
+        if over:
+            _recheck_pairs(conn, over)
+    return {"stamps_released": int(n_full), "rows_rechecked": len(over)}
+
+
 # What a flag on a charge nothing is owed on answers.
 _ALREADY_REPAID_FLAG = ("that charge is already reimbursed — unlink its "
                         "match first to wait on it again")
@@ -3154,7 +3949,9 @@ def pending_reimbursements(conn) -> list:
 
 def recent_reimbursement_pairs(conn, limit: int = 50, offset: int = 0,
                                q: str = "") -> list:
-    """The tenant's linked pairs, newest first — the UNDO surface.
+    """The tenant's linked pairs, newest CHARGE first — the UNDO surface.
+    The list is read down its date column, which is the charge's date, so
+    it is sorted by that date (the day a pair was made is not shown).
 
     A wrong match stamps both sides TRANSFER_* and the charge leaves the
     pending list, so without this the mistake is invisible everywhere the
@@ -3191,10 +3988,60 @@ def recent_reimbursement_pairs(conn, limit: int = 50, offset: int = 0,
            {_MC_JOIN}
            {dep_join}
            {where}
-           ORDER BY r.created_at DESC, t.date DESC,
+           ORDER BY t.date DESC, r.created_at DESC,
                     r.expense_id, r.reimburse_id
            LIMIT %s OFFSET %s""",
         (*args, int(limit), max(0, int(offset)))).fetchall()
+
+
+def household_today(conn) -> dt.date:
+    """Today in the household's own zone — never the browser's clock or the
+    instance's (a hosted box runs on UTC)."""
+    from .. import localtime
+    return localtime.now_local(budget.load_config(conn)).date()
+
+
+def waited_label(date, today: dt.date) -> str:
+    """How long a charge has been out of pocket, in the words the
+    Reimbursements page prints: "today", "waiting 1 day", "waiting N
+    days" — counted in the household's days."""
+    n = max(0, (today - as_date(date)).days)
+    return ("today" if n == 0 else "waiting 1 day" if n == 1
+            else f"waiting {n} days")
+
+
+# A deposit dated up to this many days before its charge is ordinary
+# posting lag (a charge authorized on a Friday posts on the Monday, after
+# the refund it is matched to): the allowance the savings pace grants a
+# deposit that posts after a weekend (savings.PACE_POSTING_DAYS).
+_AHEAD_POSTING_DAYS = 3
+
+
+def pair_deposit_note(pair) -> str | None:
+    """What the Matched list says beside a pair whose deposit is dated
+    BEFORE the charge it repays: "9 days before the charge". Money can
+    come in ahead — a friend paying a share before the tickets are bought,
+    an advance — so such a pair is allowed (the candidate list offers
+    deposits on both sides of the charge), but a line reading "paid back
+    by X" on a day before anything was spent is either that or a wrong
+    pick, and the person can only tell if it says so. Within the posting
+    allowance (_AHEAD_POSTING_DAYS) it is an ordinary repayment: None."""
+    ahead = (as_date(pair["expense_date"])
+             - as_date(pair["deposit_date"])).days
+    if ahead <= _AHEAD_POSTING_DAYS:
+        return None
+    return f"{ahead} days before the charge"
+
+
+def pair_amount_label(pair) -> str:
+    """What a matched pair nets, in words both clients print: the charge
+    for a full match, "what came back of the charge" for a partial one —
+    the charge's size is half of what a partial row says."""
+    charge = abs(float(pair["expense_amount"] or 0))
+    if pair["partial"]:
+        got = abs(float(pair["received"] or 0))
+        return f"${got:,.2f} of ${charge:,.2f}"
+    return f"${charge:,.2f}"
 
 
 def reimbursement_pairs(conn, txn_id: str) -> list:
@@ -3302,12 +4149,9 @@ def reimbursement_candidates(conn, txn_id: str, q: str = "", limit: int = 40):
     # be refused), and one half-spent is an exact match only for what
     # remains of it — so the used-up are not listed, and the rest rank by
     # their remainder against what the anchor still needs.
-    if anchor["amount"] > 0:
-        left_sql = _DEPOSIT_LEFT
-        need, got = _charge_room(conn, anchor)
-    else:
-        left_sql = f"(t.amount - {budget.REIMB_RECEIVED})"
-        need, got = _deposit_left(conn, anchor), 0.0
+    left_sql = (_DEPOSIT_LEFT if anchor["amount"] > 0
+                else f"(t.amount - {budget.REIMB_RECEIVED})")
+    need, got = _anchor_room(conn, anchor)
     # The clients word each row and the selection by these same remainders
     # (what the anchor still needs, what already came back to it, what each
     # candidate has left) — by face value they would call a deposit that is
@@ -3405,3 +4249,66 @@ def business_expenses(conn, year: int | None = None,
     return {"rows": rows,
             "total": round(float(agg["total"]), 2),
             "count": int(agg["n"]), "years": years}
+
+
+def repair_pairs_preview(conn) -> dict:
+    """What repair_pairs would change in this household, without changing
+    it: the repair runs inside a transaction that is always rolled back.
+    Counts and sums only, for a person to read off a copy of a real
+    ledger before the nightly sweep touches it — no description, payee or
+    id leaves this function.
+
+    Returns {"links_settled": links added, removed or changed,
+    "pins_restored": category pins added, removed or changed, "months":
+    [{"month": "YYYY-MM", "in": change, "out": change}]} for each month a
+    touched row is dated in, the changes in dollars (Cash Flow's
+    month_flows; `in` is None for a month before the bank feed starts).
+
+    Refuses a connection already inside a transaction: the rollback has to
+    be the outermost one, or a caller's commit could keep the repair."""
+    import psycopg
+
+    from ..engine import reporting
+    if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise RuntimeError("the preview must start outside a transaction")
+
+    def links():
+        return {(r["expense_id"], r["reimburse_id"]):
+                (r["partial"], r["amount"]) for r in conn.execute(
+                    "SELECT expense_id, reimburse_id, partial, amount "
+                    "FROM reimbursements").fetchall()}
+
+    def pins():
+        return {r["transaction_id"]: (r["category"], r["bill_id"],
+                                      r["link_made"], r["link_prior"])
+                for r in conn.execute(
+                    "SELECT transaction_id, category, bill_id::text AS bill_id,"
+                    " link_made, link_prior FROM manual_categories").fetchall()}
+
+    def changed(a: dict, b: dict) -> set:
+        return {k for k in a.keys() | b.keys() if a.get(k) != b.get(k)}
+
+    def flows(months):
+        return {m: reporting.month_flows(conn, *m) for m in months}
+
+    l0, p0 = links(), pins()
+    with conn.transaction() as tx:
+        repair_pairs(conn)
+        dl, dp = changed(l0, links()), changed(p0, pins())
+        ids = sorted({i for k in dl for i in k} | dp)
+        months = sorted({(r["d"].year, r["d"].month) for r in conn.execute(
+            "SELECT date AS d FROM transactions WHERE id = ANY(%s)",
+            (ids,)).fetchall()}) if ids else []
+        after = flows(months)
+        raise psycopg.Rollback(tx)
+    before = flows(months)
+
+    def delta(a, b):
+        return None if a is None or b is None else round(b - a, 2)
+
+    return {"links_settled": len(dl), "pins_restored": len(dp),
+            "months": [{"month": f"{y:04d}-{m:02d}",
+                        "in": delta(before[(y, m)]["in"], after[(y, m)]["in"]),
+                        "out": delta(before[(y, m)]["out"],
+                                     after[(y, m)]["out"])}
+                       for y, m in months]}

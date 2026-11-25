@@ -17,6 +17,10 @@ from pathlib import Path
 import psycopg
 
 from ..envnum import env_int
+# when this install first dated OFX lines by their printed day: kept beside
+# the dating rule, since each OFX import reads it too
+from ..sync.feed_dates import (  # noqa: F401 (PRINTED_DAY_DATING_MIGRATIONS re-exported)
+    PRINTED_DAY_DATING_MIGRATIONS, printed_day_dating_began)
 from .tenancy import admin_connect
 
 HERE = Path(__file__).parent
@@ -296,6 +300,206 @@ def _follow_cut_payees(conn) -> None:
         bills.follow_cut_payees(conn))
 
 
+# Migration 206's file: its statements are what moves a bill, its pins,
+# offers and settings onto a cut name and what cuts the file rows, merchant
+# names, offers and log labels beside them (203's and 204's statements
+# again, then its own). Migration 215 runs them again, never a copy.
+_MOVES_206 = "206_card_numbers_in_bills_offers_and_the_activity_log_are_cut.sql"
+
+# What reads as whitespace in a number's separator and was not read by the
+# grammar 203, 204 and 206 froze (they read a space, dash, dot or slash):
+# a tab, a line break, a vertical tab, a form feed, a no-break space, also
+# as jsonb's text spells them inside a raw document ("\t", "\u000b").
+_ODD_WS = r"(?:[\t\n\v\f\r ]|\\[tnfr]|\\u000b)"
+_ANY_SEP = rf"(?:[ ./-]|{_ODD_WS})"
+_ODD_SEP = rf"{_ANY_SEP}{{0,2}}{_ODD_WS}{_ANY_SEP}{{0,2}}"
+_SEP_RUN = rf"{_ANY_SEP}{{1,3}}"
+
+
+def _odd_whitespace_selector() -> str:
+    """A pattern for `~` matching a card layout (sync/card_number.py) with
+    at least one of its separators holding whitespace other than a space:
+    the only numbers 206's frozen cut can have left, since it is held to
+    the module's cut in every other case
+    (tests/test_card_number_sql_matches_python.py). Wider than the cut;
+    what it selects is handed to the cut, which decides. A run of eight
+    digits is not selected: 206 read every one."""
+    g, o, a = r"\d{4}", _ODD_SEP, _SEP_RUN
+    return "|".join((
+        f"{g}{o}{g}{a}{g}{a}{g}", f"{g}{a}{g}{o}{g}{a}{g}",
+        f"{g}{a}{g}{a}{g}{o}{g}",
+        rf"{g}{o}\d{{6}}{a}\d{{5}}", rf"{g}{a}\d{{6}}{o}\d{{5}}"))
+
+
+def _function_206(sql: str, name: str) -> re.Match:
+    m = re.search(rf"CREATE OR REPLACE FUNCTION pg_temp\.{name}\(.*?\$\$;",
+                  sql, re.S)
+    if m is None:
+        raise RuntimeError(f"{_MOVES_206}: no pg_temp.{name} to replace")
+    return m
+
+
+# Every stored text 206's statements select their rows by: (table, text
+# expression). What follows a bill or a merchant onto its cut name (bill
+# ids, the settings that name a bill, rules, 1099 marks) is reached from
+# these, never selected on its own.
+_SELECTED_BY_206 = (
+    ("transactions", "name"), ("transactions", "merchant_name"),
+    ("transactions", "merchant_name_set_aside"),
+    ("transactions", "merchant_outlet"), ("transactions", "raw::text"),
+    ("import_batches", "filename"),
+    ("merchant_canonical", "raw_merchant"),
+    ("merchant_canonical", "canonical"),
+    ("merchant_renames", "raw_merchant"),
+    ("merchant_renames", "from_canonical"),
+    ("merchant_renames", "to_canonical"),
+    ("merchant_categories", "merchant"), ("vendor_1099", "merchant"),
+    ("merchants", "name"), ("bills", "payee"),
+    ("bill_proposals", "payee"),
+    ("bill_proposals", "evidence->>'bill_payee'"),
+    ("bill_proposals", "evidence->>'description'"),
+    ("activity_log", "label"), ("activity_log", "summary"),
+)
+
+
+def _holds_a_whitespace_joined_number(conn) -> bool:
+    """Does any text 206's statements select by hold a number the odd-
+    whitespace selector picks? One scan of one table per column, so its
+    cost does not depend on a plan: 206's own statements join merchants to
+    their rules, and on a database restored moments ago (no statistics
+    yet) the planner walks that join row by row, evaluating the cut's
+    patterns millions of times to write nothing."""
+    sel = _odd_whitespace_selector()
+    return any(
+        conn.execute(f"SELECT EXISTS (SELECT 1 FROM {table} "
+                     f"WHERE {expr} ~ %s) AS hit", (sel,)).fetchone()["hit"]
+        for table, expr in _SELECTED_BY_206)
+
+
+def cut_whitespace_joined_numbers(conn) -> int:
+    """Migration 215's cut: 206's statements run again, as written, with
+    the two definitions they cut and select by replaced — `cut_numbers`
+    by the module's cut (card_number.sql_cut_function, which reads any
+    whitespace as a space) and `may_hold_number` by a selector matching
+    only a number a tab, a line break or a no-break space joins. Every
+    statement of 206 already writes only rows its selector picks and its
+    cut changes, so on text holding no such number each one is one scan
+    that writes nothing, and the SQL cut is fed only the rows that hold
+    one. Then 208's step (bills.cut_detected_keys, which follows the
+    settings 210 moves, and activity.cut_stored_names), whose cut is the
+    module's own in Python. The statements run only when some stored
+    text holds such a number (_holds_a_whitespace_joined_number), and then
+    on fresh statistics. Returns the rows written."""
+    from ..engine import activity, bills
+    from ..sync import card_number
+    if not _holds_a_whitespace_joined_number(conn):
+        return bills.cut_detected_keys(conn) + activity.cut_stored_names(conn)
+    conn.execute("ANALYZE " + ", ".join(sorted(
+        {t for t, _ in _SELECTED_BY_206}
+        | {"tenant_settings", "manual_categories"})))
+    sql = (HERE / "migrations" / _MOVES_206).read_text()
+    cut_fn = _function_206(sql, "cut_numbers")
+    sql = sql[:cut_fn.start()] + card_number.sql_cut_function() + sql[cut_fn.end():]
+    sel_fn = _function_206(sql, "may_hold_number")
+    selector = ("CREATE OR REPLACE FUNCTION pg_temp.may_hold_number(v text)\n"
+                "RETURNS boolean LANGUAGE sql IMMUTABLE AS $$\n"
+                "    SELECT v ~ '"
+                + _odd_whitespace_selector().replace("'", "''") + "'\n$$;")
+    sql = sql[:sel_fn.start()] + selector + sql[sel_fn.end():]
+    written = 0
+    for stmt in _sql_statements(sql):
+        cur = conn.execute(stmt)
+        # a CREATE TABLE … AS reports the rows it selected, not rows written
+        if cur.rowcount > 0 and not _strip_comments(
+                stmt).lstrip().upper().startswith("CREATE"):
+            written += cur.rowcount
+    written += bills.cut_detected_keys(conn)
+    written += activity.cut_stored_names(conn)
+    return written
+
+
+def _strip_comments(stmt: str) -> str:
+    return "\n".join(line.split("--")[0] for line in stmt.splitlines())
+
+
+def _cut_whitespace_joined_numbers(conn) -> None:
+    """Migration 215's step (cut_whitespace_joined_numbers). See the
+    migration file for why."""
+    import logging
+    logging.getLogger("oikonome.db").info(
+        "215: cut %d stored value(s) whose number a tab or a no-break "
+        "space joins", cut_whitespace_joined_numbers(conn))
+
+
+# the raw keys of a bill that hold a date, top level and in recurrence
+_BILL_DATE_KEYS = ("dueOn", "lastDueOn")
+_RECURRENCE_DATE_KEYS = ("endOn", "dueOn")
+
+
+def _readable_bill_dates(raw: dict, due_on) -> dict:
+    """`raw` with every date key bills.stored_date cannot read dropped (a
+    null stays: it means no date yet) and dueOn taken from `due_on` where
+    it is then missing, as restore.clean_bill_raw and the bills pass
+    shape an archived bill. A copy; `raw` is not changed."""
+    from ..engine import bills
+
+    def bad(d: dict, key: str) -> bool:
+        return (key in d and d[key] is not None
+                and bills.stored_date(d[key]) is None)
+    out = {k: v for k, v in raw.items() if not (
+        k in _BILL_DATE_KEYS and bad(raw, k))}
+    rec = out.get("recurrence")
+    if isinstance(rec, dict) and any(bad(rec, k)
+                                     for k in _RECURRENCE_DATE_KEYS):
+        out["recurrence"] = {k: v for k, v in rec.items() if not (
+            k in _RECURRENCE_DATE_KEYS and bad(rec, k))}
+    due = bills.stored_date(due_on)
+    if due is not None and not out.get("dueOn"):
+        out["dueOn"] = due.isoformat()
+    return out
+
+
+def drop_unreadable_bill_dates(conn) -> int:
+    """Migration 216's work over every bill `conn` sees (see
+    _readable_bill_dates). The bills table is one row per series, so it
+    is read whole; a row is written only if its dates change, and only if
+    it still reads as it was read, so a save landing between the two is
+    never overwritten. Idempotent. Returns the bills written."""
+    from ..engine.compat import jsonb
+    written = 0
+    for r in conn.execute(
+            "SELECT tenant_id, id, raw, due_on FROM bills"
+            " WHERE jsonb_typeof(raw) = 'object'").fetchall():
+        new = _readable_bill_dates(r["raw"], r["due_on"])
+        if new == r["raw"]:
+            continue
+        written += conn.execute(
+            "UPDATE bills SET raw = %s::jsonb WHERE tenant_id = %s"
+            " AND id = %s AND raw = %s::jsonb",
+            (jsonb(new), r["tenant_id"], r["id"], jsonb(r["raw"]))).rowcount
+    return written
+
+
+def _drop_unreadable_bill_dates(conn) -> None:
+    """Migration 216's step (drop_unreadable_bill_dates). See the
+    migration file for why."""
+    import logging
+    logging.getLogger("oikonome.db").info(
+        "216: dropped the unreadable dates of %d bill(s)",
+        drop_unreadable_bill_dates(conn))
+
+
+def _mark_printed_day_ofx_rows(conn) -> None:
+    """Migration 220's step (ofximport.mark_printed_day_rows from the
+    moment printed-day dating began). See the migration file for why."""
+    import logging
+    from ..sync import ofximport
+    since = printed_day_dating_began(conn)
+    n = ofximport.mark_printed_day_rows(conn, since) if since else 0
+    logging.getLogger("oikonome.db").info(
+        "220: %d OFX row(s) noted as dated by the printed day", n)
+
+
 # A migration whose stored text is changed in Python, by file name: the
 # step runs in the same transaction as the file, right after it, so the
 # file is recorded only once the step has landed, and a step that fails
@@ -316,6 +520,12 @@ PYTHON_STEPS = {
         _cut_import_file_names,
     "210_payee_keyed_settings_follow_a_cut_bill_name.sql":
         _follow_cut_payees,
+    "215_card_numbers_joined_by_any_whitespace_are_cut.sql":
+        _cut_whitespace_joined_numbers,
+    "216_bill_dates_that_do_not_read_as_dates_are_dropped.sql":
+        _drop_unreadable_bill_dates,
+    "220_ofx_rows_dated_by_the_printed_day_say_so.sql":
+        _mark_printed_day_ofx_rows,
 }
 
 

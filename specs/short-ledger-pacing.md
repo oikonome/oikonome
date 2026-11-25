@@ -35,7 +35,8 @@ accounts left out):
 | Verdict expected-to-date | `budget × elapsed_days / days_in_month`, plus today's spend up to today's allowance |
 | Today's allowance (tiles, verdict credit) | (`budget × share` − spend before today) ÷ `days_left` |
 | Hero "$X of $Y left" | `variable_budget_paced` = budget × share; `month_remaining_paced` = that − month-to-date spend |
-| Pace (forecast, month lens projection) | spend through yesterday ÷ `elapsed_days`; projected over `paced_days`, judged against `budget × share` |
+| Pace (month lens projection) | spend through yesterday ÷ `elapsed_days`; projected over `paced_days`, judged against `budget × share` |
+| Pace (forecast) | the last 60 finished days' variable spending less its one-offs ÷ those days, cut at `first` (`forecast.forecast_pace`, specs/today-figures.md); under `MIN_RATE_DAYS` finished days of ledger the plan's daily. While the ledger began this month that is the month lens' pace less the one-offs |
 | Closed month (lens, report card) | expected = `budget × share`, so a first month judges what its last live day judged |
 | "running $X/day" | month-to-date spend ÷ days seen, today included |
 | Plan surplus accrual | the calendar's finished days (money accrues whatever the ledger saw) |
@@ -49,8 +50,10 @@ daily rates times the days left.
 ## The one floor
 
 `MIN_RATE_DAYS` decides only whether the read is **settled**. While it is
-not, the verdict never calls the household UNDER, the forecast burns at
-the plan rate, and the month lens projects the plan (unless even the
+not, the verdict never calls the household UNDER and the month lens
+projects the plan. The forecast reads its own window: under
+`MIN_RATE_DAYS` finished days of ledger it burns the plan rate, after
+that its trailing rate, whatever day of the month it is (unless even the
 plan's pace is OVER). The rate itself is never stretched or shrunk by it:
 a floor that divided a few days' spend by a week's worth would put the
 suggestion below the household's real rate, and no verdict can then agree

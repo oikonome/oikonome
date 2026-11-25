@@ -71,6 +71,27 @@ export function checklistSteps(data: Onboarding, hosted?: boolean):
   ];
 }
 
+/** Has the household saved a budget plan itself? The server's
+ *  budgets_saved_by_user: never true for the first-run seed the server
+ *  stores on its own once a month has closed, which budgets_set counts.
+ *  The setup wizard opens on the saved plan only then. An older server
+ *  without the field answers with budgets_set, the rule this replaces
+ *  (specs/wizard-budgets-refine.md, "Who saved the plan"). Mobile keeps
+ *  the same rule in components/wizard-logic.ts. */
+export function planSaved(data: Pick<Onboarding, "budgets_set">
+                          & { budgets_saved_by_user?: boolean }): boolean {
+  return !!(data.budgets_saved_by_user ?? data.budgets_set);
+}
+
+/** The wizard's budgets step is kept — Continue may leave it, and Done
+ *  reports its figures: the household saved a plan, and the plan holds
+ *  a budget (budgets_set, the verdict's own gate). */
+export function budgetsStepKept(data: Pick<Onboarding, "budgets_set">
+                                & { budgets_saved_by_user?: boolean }):
+  boolean {
+  return planSaved(data) && !!data.budgets_set;
+}
+
 /** Is any step still open? Today shows the card while one is. */
 export function checklistOpen(data: Onboarding): boolean {
   return checklistSteps(data).some((s) => !s.done);

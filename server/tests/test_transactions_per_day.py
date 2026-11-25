@@ -47,7 +47,7 @@ class TransactionsPerDayTests(unittest.TestCase):
                         primary="FOOD_AND_DRINK")
         finally:
             conn.close()
-        cls.today = mock.patch("oikonome.web.api._today", return_value=TODAY)
+        cls.today = mock.patch("oikonome.web.api_ledger._today", return_value=TODAY)
         cls.today.start()
 
     @classmethod

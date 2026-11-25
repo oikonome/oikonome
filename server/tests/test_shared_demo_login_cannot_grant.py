@@ -21,6 +21,7 @@ from fastapi.testclient import TestClient
 
 from oikonome.db import tenancy
 
+from .push_keys import browser_keys
 from .util import _ensure_db
 
 PW = "correct-horse-battery"
@@ -41,7 +42,12 @@ class SharedDemoLoginGrants(unittest.TestCase):
 
     def _login(self, waived: bool):
         c = TestClient(self.app)
-        email = f"grant-{uuid.uuid4().hex[:10]}@example.dev"
+        # letters only: the activity log cuts any run of eight digits to
+        # its last four (it could be a card number), and a random hex
+        # token holds such a run often enough to break the address checks
+        token = uuid.uuid4().hex[:10].translate(
+            str.maketrans("0123456789", "ghijklmnop"))
+        email = f"grant-{token}@example.dev"
         data = {"email": email, "password": PW}
         if os.environ.get("OIKONOME_HOSTED"):
             from oikonome.auth import signup_invites
@@ -486,6 +492,7 @@ class SharedDemoLoginGrants(unittest.TestCase):
         from fastapi import HTTPException
 
         from oikonome.web import api
+        from oikonome.web.fields import Fields
         _, email, row = self._household_with_a_bank(waived=True)
         user = {"user_id": row["id"], "tenant_id": row["tenant_id"],
                 "email": email, "role": "owner",
@@ -493,7 +500,7 @@ class SharedDemoLoginGrants(unittest.TestCase):
         for call in (lambda: api.connection_disconnect("bank1", user),
                      lambda: api.connection_reconnect("mx1", user),
                      lambda: api.accounts_remove_api(
-                         "acct1", user, {"mode": "disconnect"})):
+                         "acct1", user, Fields({"mode": "disconnect"}))):
             with self.assertRaises(HTTPException) as caught:
                 call()
             self.assertEqual(caught.exception.status_code, 403)
@@ -561,12 +568,13 @@ class SharedDemoLoginGrants(unittest.TestCase):
         from fastapi import HTTPException
 
         from oikonome.web import api
+        from oikonome.web.fields import Fields
         _, email, row = self._login(waived=True)
         user = {"user_id": row["id"], "tenant_id": row["tenant_id"],
                 "email": email, "role": "owner",
                 "second_factor_waived": True}
         with self.assertRaises(HTTPException) as caught:
-            api.enrich_run_api(user=user, body={"limit": 5})
+            api.enrich_run_api(user=user, body=Fields({"limit": 5}))
         self.assertEqual(caught.exception.status_code, 403)
 
     def test_an_ordinary_owner_still_reaches_the_credential_doors(self):
@@ -622,7 +630,7 @@ class SharedDemoLoginGrants(unittest.TestCase):
     def _push(self):
         return {"endpoint": "https://fcm.googleapis.com/fcm/send/"
                             + uuid.uuid4().hex,
-                "keys": {"p256dh": "p" * 20, "auth": "a" * 12}}
+                "keys": browser_keys()}
 
     def test_the_shared_login_cannot_subscribe_a_browser_to_push(self):
         """A web-push subscription is a channel to one visitor's browser

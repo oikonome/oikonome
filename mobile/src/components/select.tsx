@@ -7,8 +7,9 @@
 import { useState } from "react";
 import { Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
-import Sheet, { sheetStyles as b } from "./sheet";
+import Sheet, { FOOTER_SLOP, sheetStyles as b } from "./sheet";
 import { C } from "../lib/theme";
+import { fieldA11y } from "./field";
 
 export type SelectOption = {
   value: string; label: string;
@@ -39,29 +40,36 @@ export default function Select({ title, placeholder, value, options,
   const close = () => { setOpen(false); setNeedle(""); };
   return (
     <>
-      <Pressable style={s.field} onPress={() => setOpen(true)}
-                 accessibilityRole="button" accessibilityLabel={title}>
-        <Text style={{ color: value ? C.text : C.mut, fontSize: 15, flex: 1 }}
-              numberOfLines={1}>
-          {chosen?.label ?? (value || placeholder)}
-        </Text>
+      {/* the ✕ is the field's sibling, not a tap target nested inside it:
+          a screen reader reaches only the outer one of two nested
+          touchables */}
+      <View style={s.field}>
+        <Pressable style={[s.fieldTap, !!value && { paddingRight: 0 }]}
+                   onPress={() => setOpen(true)}
+                   accessibilityRole="button" accessibilityLabel={title}>
+          <Text style={{ color: value ? C.text : C.mut, fontSize: 15, flex: 1 }}
+                numberOfLines={1}>
+            {chosen?.label ?? (value || placeholder)}
+          </Text>
+          {!value && <Text style={{ color: C.mut, fontSize: 12 }}>▾</Text>}
+        </Pressable>
         {value ? (
-          <Text style={{ color: C.mut, fontSize: 15, paddingLeft: 8 }}
-                onPress={() => onChange("")}
-                accessibilityLabel={`clear ${title}`}>✕</Text>
-        ) : (
-          <Text style={{ color: C.mut, fontSize: 12 }}>▾</Text>
-        )}
-      </Pressable>
+          <Pressable style={s.clear} onPress={() => onChange("")} hitSlop={8}
+                     accessibilityRole="button"
+                     accessibilityLabel={`Clear ${title}`}>
+            <Text style={{ color: C.mut, fontSize: 15 }}>✕</Text>
+          </Pressable>
+        ) : null}
+      </View>
       <Sheet visible={open} onClose={close} title={title}
              footer={
                <View style={b.footer}>
-                 <Pressable style={[b.btn, b.btnQuiet]} onPress={close}>
+                 <Pressable accessibilityRole="button" hitSlop={FOOTER_SLOP} style={[b.btn, b.btnQuiet]} onPress={close}>
                    <Text style={b.btnQuietText}>Close</Text>
                  </Pressable>
                </View>}>
         {filter && (
-          <TextInput style={s.input} placeholder="filter…"
+          <TextInput {...fieldA11y(`Filter ${title}`)} style={s.input} placeholder="filter…"
                      placeholderTextColor={C.mut} autoCapitalize="none"
                      autoCorrect={false} value={needle}
                      onChangeText={setNeedle} />
@@ -105,10 +113,16 @@ function Row({ label, on, dim, onPress }: {
 }
 
 const s = StyleSheet.create({
+  // the box; its padding lives on the two tap targets inside it, so a tap
+  // anywhere in the box still lands on one of them
   field: { flexDirection: "row", alignItems: "center",
-           backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
-           borderRadius: 10, paddingHorizontal: 12, paddingVertical: 9 },
-  input: { backgroundColor: C.bg, borderColor: C.border, borderWidth: 1,
+           backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
+           borderRadius: 10 },
+  fieldTap: { flexDirection: "row", alignItems: "center", flexGrow: 1,
+              flexShrink: 1,
+              paddingHorizontal: 12, paddingVertical: 9 },
+  clear: { paddingLeft: 8, paddingRight: 12, paddingVertical: 9 },
+  input: { backgroundColor: C.bg, borderColor: C.field, borderWidth: 1,
            borderRadius: 10, color: C.text, fontSize: 15,
            paddingHorizontal: 12, paddingVertical: 9, marginBottom: 4 },
   row: { flexDirection: "row", alignItems: "center", gap: 8,

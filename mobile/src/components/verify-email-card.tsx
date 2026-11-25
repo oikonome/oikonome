@@ -2,7 +2,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Alert, Pressable, Text } from "react-native";
 
 import { errText, type Me } from "../lib/api";
-import { awaitsEmailConfirm } from "../lib/pure";
+import { awaitsEmailConfirm, verifyNagDue } from "../lib/pure";
 import { useSession } from "../lib/session";
 import { C, mmddyy } from "../lib/theme";
 import { Card, H } from "./ui";
@@ -46,12 +46,13 @@ export function VerifyEmailCard({ me, note }: {
         {note ? `${note} ` : ""}We sent a link to {me.email}. No email?
         Check spam, or resend.
         {me.verify_deadline
+         && verifyNagDue(me.created_at, me.verify_deadline)
           ? ` Unconfirmed accounts are frozen on ${
               mmddyy(me.verify_deadline)} and deleted a week later.`
           : ""}
       </Text>
-      <Pressable style={{ alignSelf: "flex-start", marginTop: 8,
-                          backgroundColor: C.accent, borderRadius: 8,
+      <Pressable accessibilityRole="button" style={{ alignSelf: "flex-start", marginTop: 8,
+                          backgroundColor: C.btn, borderRadius: 8,
                           paddingHorizontal: 16, paddingVertical: 8,
                           opacity: resend.isPending ? 0.5 : 1 }}
                  disabled={resend.isPending}
